@@ -93,16 +93,20 @@ export interface MarkersResponse {
 }
 
 // ---- Timeframe configuration ----
-// barCount: how many bars to request (longer history, Task 13 #5)
+// barCount: how many bars to request. The chart shows the most recent ~150 and
+// the user can pan/scroll back through the rest. Kept moderate — every extra
+// bar is fetched from Alpaca (paginated) and pushed through setData, which
+// directly affects load time and UI responsiveness, especially in multi-chart
+// grids (4 panes × thousands of points was measurably janky).
 export const TIMEFRAMES: Record<Timeframe, { alpaca: string; seconds: number; barCount: number; label: string }> = {
-  '1m': { alpaca: '1Min', seconds: 60, barCount: 1800, label: '1m' },
-  '5m': { alpaca: '5Min', seconds: 300, barCount: 2000, label: '5m' },
-  '15m': { alpaca: '15Min', seconds: 900, barCount: 1600, label: '15m' },
-  '1h': { alpaca: '1Hour', seconds: 3600, barCount: 2000, label: '1H' },
-  '4h': { alpaca: '4Hour', seconds: 14400, barCount: 1000, label: '4H' },
-  '1D': { alpaca: '1Day', seconds: 86400, barCount: 1500, label: '1D' },
-  '1W': { alpaca: '1Week', seconds: 604800, barCount: 520, label: '1W' },
-  '1M': { alpaca: '1Month', seconds: 2592000, barCount: 240, label: '1M' },
+  '1m': { alpaca: '1Min', seconds: 60, barCount: 900, label: '1m' },
+  '5m': { alpaca: '5Min', seconds: 300, barCount: 900, label: '5m' },
+  '15m': { alpaca: '15Min', seconds: 900, barCount: 800, label: '15m' },
+  '1h': { alpaca: '1Hour', seconds: 3600, barCount: 900, label: '1H' },
+  '4h': { alpaca: '4Hour', seconds: 14400, barCount: 600, label: '4H' },
+  '1D': { alpaca: '1Day', seconds: 86400, barCount: 750, label: '1D' },
+  '1W': { alpaca: '1Week', seconds: 604800, barCount: 300, label: '1W' },
+  '1M': { alpaca: '1Month', seconds: 2592000, barCount: 180, label: '1M' },
 }
 
 export function isCryptoSymbol(symbol: string): boolean {

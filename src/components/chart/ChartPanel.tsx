@@ -26,6 +26,7 @@ import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket } from './TradeTicket'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, normSym } from './trading-types'
+import { ttLog } from '@/lib/console-log'
 
 const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 
@@ -100,6 +101,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
+  const feedStateRef = useRef('')
   const dragRef = useRef<DragState | null>(null)
   const draftRef = useRef<{ kind: DrawingKind; p1: DrawingPoint; p2: DrawingPoint } | null>(null)
   const rafRef = useRef(0)
@@ -111,7 +113,6 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [settingsVer, setSettingsVer] = useState(0)
   const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number } | null>(null)
-  const [legend, setLegend] = useState<{ o: number; h: number; l: number; c: number; v: number } | null>(null)
   const [showDrawings, setShowDrawings] = useState(true)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
@@ -137,6 +138,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const syncKeyRef = useRef(syncKey)
   syncKeyRef.current = syncKey
   const suppressSyncUntilRef = useRef(0)
+  const syncRafRef = useRef(0)
+  const pendingSyncRef = useRef<{ group: string; from: string; time: Time | null; price: number | null } | null>(null)
+
+  // OHLC legend: written directly to these DOM nodes from the crosshair handler
+  // (no React state — see note in the chart lifecycle effect)
+  const legendRef = useRef<HTMLDivElement>(null)
+  const symEsc = symbol.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const tfLabelEsc = TIMEFRAMES[tf].label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
   const drawings = useTerminal(useShallow((s) => s.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS))
   const symbolAlerts = useTerminal(useShallow((s) => s.alerts.filter((a) => a.symbol === symbol)))
@@ -459,6 +468,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   useEffect(() => {
     scheduleRedraw()
   }, [drawings, symbolAlerts, showDrawings, drawingTool, activeColor, posData.data, scheduleRedraw])
+
+  // CRITICAL: redraw the overlay whenever the container resizes. Panel splits,
+  // window resizes and sidebar changes alter the pane height -> lightweight-charts
+  // remaps price->pixel (scale margins are relative to height), but NOTHING else
+  // fires a redraw, leaving drawings/painted lines at stale pixel positions
+  // ("drawing not at right position"). The ResizeObserver closes that gap.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => scheduleRedraw())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [scheduleRedraw])
 
   // ---------- hit testing ----------
   const distToSeg = (px: number, py: number, a: { x: number; y: number }, b: { x: number; y: number }) => {
@@ -977,26 +999,43 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     chart.subscribeCrosshairMove((param: MouseEventParams) => {
       const bar = param.seriesData.get(series) as { open?: number; high?: number; low?: number; close?: number; value?: number } | undefined
       const volBar = param.seriesData.get(vol) as { value?: number } | undefined
-      if (bar && bar.close != null) {
-        setLegend({
-          o: bar.open ?? bar.close,
-          h: bar.high ?? bar.close,
-          l: bar.low ?? bar.close,
-          c: bar.close,
-          v: volBar?.value ?? 0,
-        })
+      // update the OHLC legend by writing the DOM directly — a setState here
+      // re-rendered the whole ChartPanel on EVERY mouse move (visibly janky,
+      // multiplied by every pane in multi-chart grids)
+      const leg = legendRef.current
+      if (leg) {
+        if (bar && bar.close != null) {
+          const o = bar.open ?? bar.close
+          const c = bar.close
+          const upBar = c >= o
+          const col = upBar ? 'text-emerald-400' : 'text-rose-400'
+          const volTxt = volBar?.value != null ? `Vol ${(volBar.value / 1e6).toFixed(2)}M` : ''
+          leg.innerHTML =
+            `<div><span class="font-semibold text-zinc-100">${symEsc}</span>` +
+            `<span class="text-zinc-500"> · ${tfLabelEsc} · </span>` +
+            `<span class="text-zinc-500">O</span><span class="${col}"> ${fmtPrice(o)}</span>` +
+            `<span class="text-zinc-500"> H</span><span class="${col}"> ${fmtPrice(bar.high ?? c)}</span>` +
+            `<span class="text-zinc-500"> L</span><span class="${col}"> ${fmtPrice(bar.low ?? c)}</span>` +
+            `<span class="text-zinc-500"> C</span><span class="${col}"> ${fmtPrice(c)}</span></div>` +
+            (volTxt ? `<div class="text-zinc-500">${volTxt}</div>` : '')
+          leg.classList.remove('hidden')
+        }
       }
-      // publish crosshair position to sibling panes (multi-chart sync)
+      // publish crosshair position to sibling panes (multi-chart sync), rAF-throttled
       const group = syncGroupRef.current
       const key = syncKeyRef.current
       if (group && key && Date.now() >= suppressSyncUntilRef.current) {
         const bar2 = param.time != null ? (param.seriesData.get(series) as CandlestickData | undefined) : undefined
         const px = bar2 ? Number((bar2 as CandlestickData).close ?? NaN) : NaN
-        window.dispatchEvent(
-          new CustomEvent('tt:xsync', {
-            detail: { group, from: key, time: param.time ?? null, price: Number.isFinite(px) ? px : null },
-          }),
-        )
+        pendingSyncRef.current = { group, from: key, time: param.time ?? null, price: Number.isFinite(px) ? px : null }
+        if (!syncRafRef.current) {
+          syncRafRef.current = requestAnimationFrame(() => {
+            syncRafRef.current = 0
+            const d = pendingSyncRef.current
+            pendingSyncRef.current = null
+            if (d) window.dispatchEvent(new CustomEvent('tt:xsync', { detail: d }))
+          })
+        }
       }
     })
 
@@ -1026,6 +1065,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (cancelled) return
         setDemo(Boolean(json.meta?.demo))
         setDemoReason(json.meta?.reason as string | undefined)
+        // feed status → bottom console (log once per state change)
+        const demoNow = Boolean(json.meta?.demo)
+        const reasonNow = String(json.meta?.reason ?? '')
+        const feedKey = `${symbol}|${demoNow}|${reasonNow}`
+        if (feedStateRef.current !== feedKey) {
+          feedStateRef.current = feedKey
+          ttLog(
+            'data',
+            demoNow ? `${symbol} → demo data${reasonNow ? ` (${reasonNow})` : ''}` : `${symbol} → live Alpaca data`,
+            demoNow ? 'warn' : 'ok',
+          )
+        }
         const bars: Bar[] = (json.bars as Bar[]) || []
         // dedupe + sort by time
         const map = new Map<number, Bar>()
@@ -1090,10 +1141,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const onRangeChange = () => scheduleRedraw()
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange)
+    // also redraw when the visible TIME range shifts (zoom/scroll can change the
+    // price autoscale without changing the logical bar range)
+    const onTimeRangeChange = () => scheduleRedraw()
+    chart.timeScale().subscribeVisibleTimeRangeChange(onTimeRangeChange)
 
     return () => {
       cancelled = true
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange)
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(onTimeRangeChange)
       window.removeEventListener('tt:xsync', onExternalSync)
       chart.remove()
       chartRef.current = null
@@ -1152,8 +1208,6 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   }, [symbol, chartType, scheduleRedraw])
 
   const up = (quote?.changePct ?? 0) >= 0
-  const last = legend
-  const tfLabel = TIMEFRAMES[tf].label
 
   return (
     <div
@@ -1324,20 +1378,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         </button>
       </div>
 
-      {/* OHLC legend */}
-      {last && (
-        <div className="pointer-events-none absolute left-12 top-12 z-20 rounded bg-zinc-950/50 px-2 py-1 font-mono text-[11px] leading-4 text-zinc-300 backdrop-blur-sm">
-          <div>
-            <span className="font-semibold text-zinc-100">{symbol}</span>
-            <span className="text-zinc-500"> · {tfLabel} · </span>
-            <span className="text-zinc-500">O</span><span className={up ? 'text-emerald-400' : 'text-rose-400'}> {fmtPrice(last.o)}</span>
-            <span className="text-zinc-500"> H</span><span className={up ? 'text-emerald-400' : 'text-rose-400'}> {fmtPrice(last.h)}</span>
-            <span className="text-zinc-500"> L</span><span className={up ? 'text-emerald-400' : 'text-rose-400'}> {fmtPrice(last.l)}</span>
-            <span className="text-zinc-500"> C</span><span className={up ? 'text-emerald-400' : 'text-rose-400'}> {fmtPrice(last.c)}</span>
-          </div>
-          <div className="text-zinc-500">Vol {(last.v / 1e6).toFixed(2)}M</div>
-        </div>
-      )}
+      {/* OHLC legend — content written directly by the crosshair handler (perf) */}
+      <div
+        ref={legendRef}
+        className="pointer-events-none absolute left-12 top-12 z-20 hidden rounded bg-zinc-950/50 px-2 py-1 font-mono text-[11px] leading-4 text-zinc-300 backdrop-blur-sm"
+        aria-hidden
+      />
 
       {/* loading overlay */}
       {loading && (

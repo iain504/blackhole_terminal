@@ -187,6 +187,42 @@ function aggregateDaily(bars: Bar[], timeframe: '1W' | '1M'): Bar[] {
   return out
 }
 
+interface PagedBars {
+  bars: Record<string, AlpacaBar[]>
+  next_page_token?: string
+}
+
+/**
+ * Alpaca PAGINATES bar responses via `next_page_token` even below the limit
+ * param (observed caps vary per feed/timeframe). Ignoring the token silently
+ * truncates to the OLDEST page — the chart then "ends" days/weeks before now.
+ * This helper follows the token until the last page (bounded for safety).
+ */
+async function fetchBarsPaged(
+  path: string,
+  keys: AlpacaKeys,
+  symbol: string,
+  maxPages = 15,
+): Promise<{ bars: AlpacaBar[]; status: number; truncated: boolean }> {
+  let all: AlpacaBar[] = []
+  let token: string | undefined = undefined
+  let status = 200
+  for (let page = 0; page < maxPages; page++) {
+    const url = token ? `${path}&page_token=${encodeURIComponent(token)}` : path
+    const { data, status: st } = await alpacaFetch<PagedBars>(url, keys)
+    if (!data) {
+      // network/HTTP failure — keep what we have (first page failure -> empty)
+      return { bars: all, status: st, truncated: page > 0 }
+    }
+    status = st
+    const chunk = data.bars?.[symbol] || []
+    all = all.concat(chunk)
+    token = data.next_page_token
+    if (!token) return { bars: all, status, truncated: false }
+  }
+  return { bars: all, status, truncated: true }
+}
+
 export async function getBars(
   symbol: string,
   timeframe: Timeframe,
@@ -201,8 +237,6 @@ export async function getBars(
   }
   const tf = TIMEFRAMES[timeframe]
   const end = new Date()
-  const start = new Date(end.getTime() - tf.barCount * tf.seconds * 1000)
-  const startIso = start.toISOString().slice(0, 19) + 'Z'
   const endIso = end.toISOString().slice(0, 19) + 'Z'
 
   if (isCryptoSymbol(symbol)) {
@@ -212,17 +246,16 @@ export async function getBars(
       ? Math.ceil(tf.barCount * 7 * tf.seconds / 86400) + 20
       : tf.barCount
     const s = new Date(Date.now() - lookback * 86400 * 1000).toISOString().slice(0, 19) + 'Z'
-    const { data: raw, status } = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
-      `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}&start=${s}&end=${endIso}&limit=10000`,
-      keys,
-    )
-    if (!raw) {
+    const path =
+      `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}&start=${s}&end=${endIso}&limit=10000`
+    const { bars: rawBars, status, truncated } = await fetchBarsPaged(path, keys, symbol)
+    if (!rawBars.length && status !== 200) {
       return demoResult(
         (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
         status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
       )
     }
-    let bars = mapBars(raw.bars?.[symbol])
+    let bars = mapBars(rawBars)
     if (bars.length === 0) {
       return demoResult(
         (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
@@ -234,19 +267,32 @@ export async function getBars(
   }
 
   // Stocks API: v2/stocks/bars — adjustment enum is `split` (NOT `splits`;
-  // `splits` returns HTTP 400 and silently pushed the whole chart to demo data).
-  const { data: raw, status } = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
-    `/v2/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${tf.alpaca}&start=${startIso}&end=${endIso}` +
-    `&limit=${Math.min(tf.barCount + 50, 10000)}&adjustment=split&feed=iex`,
-    keys,
-  )
-  if (!raw) {
+  // `splits` returns HTTP 400) and responses are PAGINATED (next_page_token).
+  // If the window has no bars (weekend / illiquid IEX names), widen the lookback
+  // so the chart shows the last available session instead of blank/demo data.
+  const makePath = (startIsoS: string) =>
+    `/v2/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${tf.alpaca}&start=${startIsoS}&end=${endIso}` +
+    `&limit=10000&adjustment=split&feed=iex`
+  let rawBars: AlpacaBar[] = []
+  let status = 200
+  let truncated = false
+  for (const mult of [1, 5, 40]) {
+    const s = new Date(end.getTime() - tf.barCount * tf.seconds * 1000 * mult)
+    const res = await fetchBarsPaged(makePath(s.toISOString().slice(0, 19) + 'Z'), keys, symbol)
+    rawBars = res.bars
+    status = res.status
+    truncated = res.truncated
+    if (rawBars.length > 0) break
+    if (status !== 200) break
+  }
+  console.log(`[bars] stock ${symbol} ${timeframe}: ${rawBars.length} bars (truncated=${truncated})`)
+  if (!rawBars.length && status !== 200) {
     return demoResult(
       (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
       status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
     )
   }
-  const bars = mapBars(raw.bars?.[symbol])
+  const bars = mapBars(rawBars)
   if (bars.length === 0) {
     return demoResult(
       (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),

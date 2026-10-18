@@ -42,6 +42,11 @@ export function SymbolSearchDialog({
     return all.filter((r) => r.symbol.includes(q)).slice(0, 60)
   }, [query])
 
+  // Any exact ticker can be loaded even when it is not in the curated list
+  // (Alpaca supports thousands of symbols — e.g. newer listings like SPCX).
+  const exactQuery = query.trim().toUpperCase()
+  const exactMatch = exactQuery.length >= 1 && exactQuery.length <= 15 && !rows.some((r) => r.symbol === exactQuery)
+
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-md border-zinc-800 bg-zinc-900 p-0">
@@ -58,8 +63,8 @@ export function SymbolSearchDialog({
               placeholder="Search — AAPL, TSLA, BTC/USD…"
               className="border-zinc-800 bg-zinc-950 pl-8 text-sm"
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && rows[0]) {
-                  onSelect(rows[0].symbol)
+                if (e.key === 'Enter' && (rows[0] || exactMatch)) {
+                  onSelect(rows[0] ? rows[0].symbol : exactQuery)
                   onOpenChange(false)
                 }
               }}
@@ -67,7 +72,22 @@ export function SymbolSearchDialog({
           </div>
         </div>
         <div className="max-h-[320px] overflow-y-auto terminal-scroll px-2 pb-3">
-          {rows.length === 0 && <p className="py-6 text-center text-xs text-zinc-500">No symbols match “{query}”</p>}
+          {rows.length === 0 && !exactMatch && (
+            <p className="py-6 text-center text-xs text-zinc-500">No symbols match “{query}”</p>
+          )}
+          {exactMatch && (
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-sm text-emerald-400 hover:bg-emerald-500/10"
+              onClick={() => {
+                onSelect(exactQuery)
+                onOpenChange(false)
+              }}
+            >
+              <TrendingUp className="h-4 w-4 shrink-0" />
+              <span className="font-medium">Load “{exactQuery}” anyway</span>
+              <span className="ml-auto text-[10px] uppercase tracking-wide text-zinc-500">Alpaca symbol</span>
+            </button>
+          )}
           {rows.map((r) => (
             <button
               key={r.symbol}

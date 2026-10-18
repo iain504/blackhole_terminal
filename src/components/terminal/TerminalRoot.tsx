@@ -14,6 +14,8 @@ import { BellRing, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { fmtPrice } from '@/lib/market-types'
+import { ttLog } from '@/lib/console-log'
+import { ConsoleDrawer } from './ConsoleDrawer'
 
 export function TerminalRoot() {
   const user = useTerminal((s) => s.user)
@@ -71,8 +73,9 @@ export function TerminalRoot() {
       })
         .then((r) => {
           if (r.ok) store.markLayoutClean()
+          else ttLog('layout', `Autosave failed (HTTP ${r.status}) — will retry`, 'warn')
         })
-        .catch(() => { /* offline */ })
+        .catch(() => ttLog('layout', 'Autosave failed (network) — will retry', 'warn'))
     }, 5000)
     return () => clearInterval(timer)
   }, [user])
@@ -109,6 +112,7 @@ export function TerminalRoot() {
             title: `🔔 Alert: ${t.symbol}`,
             description: `Price is ${t.direction === 'above' ? 'above' : 'below'} ${t.target} — now ${t.price}`,
           })
+          ttLog('alerts', `🔔 ${t.symbol} ${t.direction} ${t.target} — now ${t.price}`, 'warn')
         }
         if (!stopped) useTerminal.getState().loadAlerts()
       } catch { /* offline */ }
@@ -165,6 +169,7 @@ export function TerminalRoot() {
               title: `💼 ${f.side === 'buy' ? 'Bought' : 'Sold'} ${f.qty} ${f.symbol}`,
               description: f.price ? `Filled @ ${f.price} · ${f.type}` : `Filled · ${f.type}`,
             })
+            ttLog('trading', `💼 ${f.side === 'buy' ? 'Bought' : 'Sold'} ${f.qty} ${f.symbol}${f.price ? ` @ ${f.price}` : ''} · ${f.type}`, 'ok')
           }
           beep()
           window.dispatchEvent(new CustomEvent('tt:positions-changed'))
@@ -214,6 +219,7 @@ export function TerminalRoot() {
       <main className="flex min-h-0 flex-1 flex-col">
         <ActiveTabContent />
       </main>
+      <ConsoleDrawer />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
       {/* footer stays glued to bottom on short viewports */}

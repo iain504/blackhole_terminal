@@ -255,3 +255,25 @@ Work Log:
 
 Stage Summary:
 - Multi-chart is back: per-chart-tab grid layouts 1 / 2×1 / 1×2 / 3 / 2×2 with independent symbol+timeframe per pane, focus-following sidebar, crosshair sync, compact panes, full persistence. Legacy single-chart tabs behave exactly as before (grid fields optional, sanitized on hydrate).
+
+---
+Task ID: 20
+Agent: main (Z.ai Code)
+Task: Fix 7 reported issues — drawing position, missing bars, stale chart data (SPCX), unresponsive layout, demo calendar, flat heatmap, missing console
+
+Work Log:
+- BUG bars (missing/stale): ROOT CAUSE — Alpaca PAGINATES /v2/stocks/bars (and crypto bars) via `next_page_token` even under limit=10000; we read only page 1 (the OLDEST chunk) so charts ended weeks/months before "now" (SPCX 4h stopped Aug 13, 1h Aug 21). Fixed with fetchBarsPaged() following page_token (cap 15 pages); param name verified (`page_token`, NOT `token` — first attempt repeated page 1). Added auto-widening lookback (1x→5x→40x) when a window returns 0 bars (weekends/illiquid IEX) so 1m shows the last session instead of demo/blank. Verified SPCX: all TFs (1m/5m/15m/1h/4h/1D/1W/1M) now end at the last trade (Fri 10-16 20:59 IEX).
+- BUG drawing position: measurements (pixel-fit against axis labels) proved stored prices AND render positions are exact — the real defect was a STALE overlay canvas: price-scale changes that don't alter the logical bar range (pane resizes, sidebar/console unfold, manual scale) left lines at old pixels until the next 10s quote tick. Fixed: ResizeObserver on the chart container -> scheduleRedraw, plus subscribeVisibleTimeRangeChange; verified lines re-anchor on viewport resize (spacing scales with height) and on console unfold.
+- PERF (unresponsive layout): OHLC legend no longer uses React state — the crosshair handler writes legend DOM directly (was re-rendering the whole ChartPanel on EVERY mouse move, multiplied per grid pane); crosshair-sync events rAF-throttled; barCount cut ~2x (900/900/800/900/600/750/300/180) since only ~150 bars are visible (fetch+setData cost dominated, esp. 4-pane grids).
+- Calendar demo -> LIVE: the .json mirror answers 429 from this host; switched to ff_calendar_thisweek.xml (200) with regex block parser + ET->UTC conversion via Intl fixed-point (EDT/EST unit-tested: 2:15pm Oct=18:15Z, 9:30am Jan=14:30Z); JSON kept as fallback, sample as last resort. Route now reports source=forexfactory-xml; UI badge shows "Live — ForexFactory" (86 events verified).
+- Heatmap rebuilt as a finviz-style squarified treemap: tile AREA ∝ heat (|daily %|, floored 0.08), color green/red by sign+intensity, per-group layout via measured container width (ResizeObserver) + squarify (Bruls et al., standard worst-ratio row growth — first draft had an inverted comparison producing single-row strips, fixed); "Heat size"/"Equal" toggle; click still selects symbol in the focused chart pane.
+- NEW bottom console: src/lib/console-log.ts (ring-buffer pub/sub, 300 entries) + ConsoleDrawer (slim bar above footer, unfolds to h-52 log, level colors, autoscroll w/ stick-bottom, Clear, fold state persisted via useSyncExternalStore+localStorage — object-method `this` bug found & fixed after dev crash). Wired: data feed status per symbol (live/demo+reason), alert triggers, order fills, layout autosave failures.
+- SymbolSearchDialog: added "Load \"X\" anyway" row so any exact Alpaca ticker outside the curated list (e.g. SPCX) can be charted; Enter prefers first match then the exact query.
+- Cleaned up all test drawings (SPCX + BTC/USD) via API after verification.
+
+Stage Summary:
+- Bars now follow Alpaca pagination + widen on empty windows: every timeframe runs to the last trade (SPCX verified end-to-end incl. live quote + news).
+- Drawings/right-click geometry proven pixel-correct; stale-overlay eliminated via ResizeObserver + time-range subscription.
+- Legend-per-mousemove re-render eliminated; payload per chart halved — grid layouts feel snappy.
+- Calendar is live ForexFactory XML with correct ET times; Heatmap is a real heat-sized treemap with Equal fallback; foldable bottom console logs feeds/alerts/fills/saves.
+- Lint 0 errors; tsc clean (src); browser-verified: chart/quote/news live, console logging, both heatmap modes, calendar badge, drawing + resize re-anchor, SPCX flow incl. search fallback.
