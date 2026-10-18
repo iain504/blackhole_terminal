@@ -10,14 +10,14 @@ import { ChartWorkspace } from './ChartWorkspace'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import { useToast } from '@/hooks/use-toast'
-import { BellRing, Loader2, Settings2 } from 'lucide-react'
+import { BellRing, Home, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
 import { ConsoleDrawer } from './ConsoleDrawer'
 
-export function TerminalRoot() {
+export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const user = useTerminal((s) => s.user)
   const hydrated = useTerminal((s) => s.hydrated)
   const setUser = useTerminal((s) => s.setUser)
@@ -224,9 +224,21 @@ export function TerminalRoot() {
       {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
       {/* footer stays glued to bottom on short viewports */}
       <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
-        <span>
-          TradeTerminal · data: <span className="text-zinc-400">Alpaca</span>
-          {useTerminal.getState().tabs.length > 0 && <BadgeDemoInline />}
+        <span className="flex min-w-0 items-center">
+          {onExit && (
+            <button
+              onClick={onExit}
+              title="Back to landing page"
+              aria-label="Back to landing page"
+              className="mr-2 flex h-6 w-6 shrink-0 items-center justify-center rounded text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <Home className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <span className="truncate">
+            TradeTerminal · data: <span className="text-zinc-400">Alpaca</span>
+            {useTerminal.getState().tabs.length > 0 && <BadgeDemoInline />}
+          </span>
         </span>
         <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
       </footer>

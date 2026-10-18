@@ -14,9 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "TradeTerminal — Charts, Alerts & Market Data by Alpaca",
+  title: "BLACKHOLE Terminal — Charts, Alerts & Trading by Alpaca",
   description:
-    "TradingView-style terminal with US stock & crypto charts, drawings, price alerts, Telegram notifications, economic calendar and heat map. Data provided by Alpaca. Protected by 2FA.",
+    "BLACKHOLE Terminal — TradingView-style terminal with US stock & crypto charts, drawings, price alerts, Telegram notifications, economic calendar and heat map. Data provided by Alpaca. Protected by 2FA.",
   keywords: ["trading", "charts", "alpaca", "crypto", "watchlist", "alerts", "economic calendar"],
   icons: {
     icon: "https://z-cdn.chatglm.cn/z-ai/static/logo.svg",

@@ -277,3 +277,23 @@ Stage Summary:
 - Legend-per-mousemove re-render eliminated; payload per chart halved — grid layouts feel snappy.
 - Calendar is live ForexFactory XML with correct ET times; Heatmap is a real heat-sized treemap with Equal fallback; foldable bottom console logs feeds/alerts/fills/saves.
 - Lint 0 errors; tsc clean (src); browser-verified: chart/quote/news live, console logging, both heatmap modes, calendar badge, drawing + resize re-anchor, SPCX flow incl. search fallback.
+
+---
+Task ID: 20
+Agent: Z.ai Code (main)
+Task: Add a landing page styled like the user's BLACKHOLE Terminal reference screenshot (dark hero, live tickers, blackhole art, stats, status bar) with "Launch Terminal" into the existing app.
+
+Work Log:
+- Generated hero art via z-ai SDK script (1344x768, public/hero-blackhole.png): black hole + orange accretion swirl + blue lensing grid + candlesticks, matching the reference; CLI size whitelist rejected 1440x720/1408x768 (API needs 32-multiples), SDK direct call worked.
+- NEW src/components/landing/LandingPage.tsx: sticky navbar (CSS conic-gradient blackhole logo mark, BLACKHOLE/Terminal brand, nav links with Markets active + blue underline, live ticker strip, Search/Bell/Settings icons, Connect Wallet CTA), hero (brand row, "Trade the Edge of the Market.", subtitle, feature bullets, Launch Terminal + Docs->Alpaca docs CTAs, 24h Volume/Active Traders/Open Interest stats), hero art card with mini deterministic candlestick overlay ("BTC/USD • 1m • Vol 1.24K"), status-bar footer (real US market OPEN/CLOSED via Intl America/New_York, measured quote latency, WSS: Connected, pulsing Live dot, v1.12.4), subtle grid + radial glow backdrop, framer-motion entrance.
+- Live tickers: polls POST /api/market/quote (BTC/ETH/SOL) every 20s, direction-colored ▲/▼, latency feeds status bar; static fallback values on failure (unauth visitors get demo quotes — still looks alive).
+- src/app/page.tsx rewritten as view switch: landing ↔ TerminalRoot. URL hash #terminal is the single source of truth (survives reload natively); hashchange listener syncs browser back/forward; fixed first draft where localStorage persistence fought back-navigation (back kept showing terminal) — removed storage, hash-only. Footer home button added to TerminalRoot (new optional onExit prop, Home icon in terminal footer).
+- Metadata title/description rebranded to "BLACKHOLE Terminal".
+- agent-browser E2E: desktop 1440x900 (layout matches reference, live tickers red/green, latency ~50ms, status CLOSED on Sunday — correct), Launch Terminal → auth → TOTP login → terminal loads with saved tabs; footer Home → back to landing (URL clean); browser back from terminal → landing (after fix); reload in terminal stays in terminal; mobile 390x844 full-page: nav collapses to logo+CTA, hero stacks, stats 3-col, footer sticks to bottom.
+- Lint 0 errors; dev.log clean (only Fast Refresh full-reload notices from edits, all API 200).
+
+Stage Summary:
+- "/" now shows a BLACKHOLE-style public landing page; "Launch Terminal"/"Connect Wallet"/nav links deep-link into the trade terminal via #terminal (deep-linkable, back/forward + reload safe).
+- New files: public/hero-blackhole.png, src/components/landing/LandingPage.tsx; changed: src/app/page.tsx (view switch), src/components/terminal/TerminalRoot.tsx (onExit + footer Home), src/app/layout.tsx (metadata).
+- Terminal itself unchanged (tabs/charts/console all intact post-login).
+
