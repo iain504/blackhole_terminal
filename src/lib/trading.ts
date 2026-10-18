@@ -426,6 +426,10 @@ async function placeCryptoExitLegs(
 
 const OCO_CYCLE_MS = 6000
 const OCO_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+// last attach-failure signature per entry id — the supervisor retries every
+// cycle, but transient rejections (e.g. Alpaca's "potential wash trade
+// detected" while a crossing pending entry rests) must not spam the log
+const attachWarnSig = new Map<string, string>()
 
 /** Supervised (user,mode) pairs — survives dev hot reloads via globalThis. */
 function supervisedSet(): Set<string> {
@@ -491,8 +495,16 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
         wantTp ? plan.tp! : undefined,
         wantSl ? plan.sl! : undefined,
       )
-      if (errs.length) console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, errs.join('; '))
-      else console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
+      if (errs.length) {
+        const sig = errs.join('; ')
+        if (attachWarnSig.get(o.id) !== sig) {
+          attachWarnSig.set(o.id, sig)
+          console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, sig)
+        }
+      } else {
+        attachWarnSig.delete(o.id)
+        console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
+      }
     }
   } catch (e) {
     console.warn('[oco] supervisor cycle failed:', e instanceof Error ? e.message : e)

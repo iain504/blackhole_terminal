@@ -1079,7 +1079,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
   // ---------- trade assistance actions ----------
   const patchExitPrice = useCallback(async (
-    info: ExitInfo, kind: 'sl' | 'tp', price: number,
+    info: ExitInfo, kind: 'sl' | 'tp', price: number, attempt = 0,
   ) => {
     const body: Record<string, unknown> = {
       // the mode the position was loaded from — without it the route falls
@@ -1115,6 +1115,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             ? 'Order re-created on Alpaca (replace rejected)'
             : json?.note || undefined,
         })
+      } else if (attempt === 0 && (res.status === 404 || res.status === 409)) {
+        // STALE-ID HEAL: the exit was JUST re-created (a previous drag or a
+        // concurrent edit replaced the order id) — retry once against the
+        // CURRENT id so the user's drag still lands instead of erroring
+        const fresh = await fetch(`/api/trading/positions?symbol=${encodeURIComponent(symbol)}`)
+          .then((r) => r.json()).catch(() => null)
+        const cur = fresh?.exits?.[normSym(symbol)]?.[kind]
+        if (cur?.orderId && cur.orderId !== info.orderId) {
+          await patchExitPrice(cur, kind, price, 1)
+          return
+        }
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       } else {
         toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       }
@@ -1123,6 +1135,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     } finally {
       void posRefresh()
       window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      // a cancel+re-place replace churns server-side for ~2s — a second
+      // refresh heals any gap state the first refresh raced (lines must never
+      // stay missing after a move)
+      window.setTimeout(() => {
+        void posRefresh()
+        window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      }, 2500)
     }
   }, [posData.data?.mode, posRefresh, toast, symbol])
 
@@ -1177,7 +1196,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // a dragged entry/(pend) TP/SL line (crypto plan orders re-place with a new
   // id; stock brackets PATCH their parent — both handled server-side)
   const patchPendingOrder = useCallback(async (
-    pending: PendingOrderInfo, part: 'entry' | 'tp' | 'sl', price: number,
+    pending: PendingOrderInfo, part: 'entry' | 'tp' | 'sl', price: number, attempt = 0,
   ) => {
     const body: Record<string, unknown> = {
       mode: posData.data?.mode,
@@ -1200,6 +1219,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             ? 'Order re-created on Alpaca (new id)'
             : json?.note || undefined,
         })
+      } else if (attempt === 0 && (res.status === 404 || res.status === 409)) {
+        // STALE-ID HEAL: a previous drag in the same burst already canceled
+        // and re-created this order (crypto plan orders get a NEW id on every
+        // replace) — re-sync once and apply the drop to the CURRENT order
+        const fresh = await fetch(`/api/trading/positions?symbol=${encodeURIComponent(symbol)}`)
+          .then((r) => r.json()).catch(() => null)
+        const list = (fresh?.pending || []).filter((pp: PendingOrderInfo) => normSym(pp.symbol) === normSym(symbol) && pp.orderId !== pending.orderId)
+        const cur = list.find((pp: PendingOrderInfo) => part === 'entry' || (part === 'tp' ? pp.tpPrice != null : pp.slPrice != null)) || list[0]
+        if (cur?.orderId) {
+          await patchPendingOrder(cur, part, price, 1)
+          return
+        }
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       } else {
         toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       }
@@ -1208,6 +1240,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     } finally {
       void posRefresh()
       window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      // crypto plan orders re-place via cancel → wait → POST (~2s) — the
+      // second refresh heals any gap state the first refresh raced
+      window.setTimeout(() => {
+        void posRefresh()
+        window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      }, 2500)
     }
   }, [posData.data?.mode, posRefresh, toast, symbol])
 
@@ -1598,6 +1636,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }
         if (ex?.sl && ex.sl.stopPrice != null) vals.push(ex.sl.stopPrice)
         if (ex?.tp && ex.tp.limitPrice != null) vals.push(ex.tp.limitPrice)
+        // pending orders too — a dragged (pend) entry/TP/SL must never land
+        // outside the visible price range (an out-of-pane line renders clipped
+        // and looks like it "disappeared" after the move)
+        for (const pp of bundle?.pending || []) {
+          if (normSym(pp.symbol) !== normSym(symbol)) continue
+          if (pp.limitPrice != null) vals.push(pp.limitPrice)
+          if (pp.tpPrice != null) vals.push(pp.tpPrice)
+          if (pp.slPrice != null) vals.push(pp.slPrice)
+        }
         if (vals.length === 0) return res
         let min = res?.priceRange?.minValue ?? Math.min(...vals)
         let max = res?.priceRange?.maxValue ?? Math.max(...vals)
