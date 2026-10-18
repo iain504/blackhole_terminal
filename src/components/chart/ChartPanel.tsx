@@ -3,8 +3,8 @@
 // Interactive chart: lightweight-charts + transparent overlay canvas for
 // drawings (hline/vline/trend/fib) and alert lines. Lines stay draggable &
 // resizable after drawing, with right-click context menus (Task 14 #1/#4,
-// Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the PRICE
-// SCALE (y-axis), TradingView-style.
+// Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the TIME
+// AXIS (x-axis), TradingView-style.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
@@ -146,8 +146,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // (no React state — see note in the chart lifecycle effect)
   const legendRef = useRef<HTMLDivElement>(null)
 
-  // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Alpaca) — TradingView
-  // style icons pinned to the right price scale at the event bar's close price
+  // x-axis event markers: earnings [E] (yfinance) + news ⚡ (Alpaca) — TradingView
+  // style icons on the time axis at the event dates (one icon per event day)
   const markersRef = useRef<{
     earnings: { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]
     news: { ts: number; title?: string }[]
@@ -399,7 +399,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // ---- x-axis event icons: earnings [E] (yfinance) + news ⚡ (TradingView-style) ----
     // Icons sit ON the time axis (bottom of the pane), aligned with the event's
     // bar; upcoming earnings extrapolate into the right margin at their real
-    // date. Colliding icons stack upward in 18px rows.
+    // date. Events are deduped per (kind, day) — one icon per event day — and
+    // crowded icons spread HORIZONTALLY along the axis (never stacked into a
+    // vertical column).
     const chartApi = chartRef.current
     const mk = markersRef.current
     axisIconsRef.current = []
@@ -411,10 +413,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const xMin = 8
       const xMax = w - psW - 6
       const yBase = h - tAxisH - 11 // first-row icon center, just above the time axis
-      const yMin = 13
-      const rowH = 18
-      const halfW = 15 // icon half-width used for horizontal collision spacing
-      const maxRows = Math.max(1, Math.floor((yBase - yMin) / rowH) + 1)
+      const halfW = 15 // generic icon half-width used for off-canvas culling
 
       // bar in effect at the event moment (past events snap to their bar)
       const barAt = (ts: number): Bar | null => {
@@ -433,39 +432,56 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         new Date(ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 
       type AxisIcon = { kind: 'e' | 'n'; x: number; y: number; tip: string }
-      const icons: AxisIcon[] = []
-      const place = (kind: 'e' | 'n', ts: number, tip: string) => {
+      // dedupe per (kind, resolved target time): one icon per event day, with
+      // the individual headlines/details merged into its tooltip
+      const grouped = new Map<string, { kind: 'e' | 'n'; t: number; tips: string[] }>()
+      const collect = (kind: 'e' | 'n', ts: number, tip: string) => {
         // past events snap to the bar in effect; future events (upcoming
         // earnings) extrapolate into the right margin at their real date
         const t = ts > lastBarTime ? ts : (barAt(ts)?.time ?? null)
         if (t == null) return
-        const rawX = xOf(t)
-        if (rawX == null || rawX < xMin - halfW * 2 || rawX > w + halfW * 2) return
-        icons.push({ kind, x: Math.min(Math.max(rawX, xMin), xMax), y: 0, tip })
+        const key = `${kind}:${t}`
+        const g = grouped.get(key)
+        if (g) g.tips.push(tip)
+        else grouped.set(key, { kind, t, tips: [tip] })
       }
       for (const e of mk.earnings) {
         const epsBits =
           e.epsActual != null
             ? ` · EPS ${e.epsActual}${e.epsEstimate != null ? ` (est ${e.epsEstimate})` : ''}`
             : ''
-        place('e', e.ts, `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`)
+        collect('e', e.ts, `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`)
       }
       for (const n of mk.news) {
-        place('n', n.ts, `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`)
+        collect('n', n.ts, `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`)
       }
 
-      // stack colliding icons upward from the axis (18px rows)
-      icons.sort((a, b) => a.x - b.x)
-      const rowRight: number[] = []
-      const placed: AxisIcon[] = []
-      for (const ic of icons) {
-        let r = rowRight.findIndex((rx) => ic.x - halfW >= rx)
-        if (r === -1 && rowRight.length < maxRows) r = rowRight.length
-        if (r === -1) continue // no room left — drop the overflow icon
-        rowRight[r] = ic.x + halfW
-        ic.y = yBase - r * rowH
-        placed.push(ic)
+      const icons: AxisIcon[] = []
+      for (const g of grouped.values()) {
+        const rawX = xOf(g.t)
+        if (rawX == null || rawX < xMin - halfW * 2 || rawX > w + halfW * 2) continue
+        const extra = g.tips.length > 1 ? ` (+${g.tips.length - 1} more)` : ''
+        icons.push({ kind: g.kind, x: rawX, y: yBase, tip: `${g.tips[0]}${extra}` })
       }
+
+      // spread crowded icons HORIZONTALLY along the axis: forward pass pushes
+      // each icon right of the previous one, backward pass clamps the tail to
+      // the right edge — the result is a readable row on the time axis
+      icons.sort((a, b) => a.x - b.x)
+      const gapBetween = (a: AxisIcon, b: AxisIcon) =>
+        (a.kind === 'e' ? 14 : 8) + (b.kind === 'e' ? 14 : 8) + 3
+      if (icons.length > 0) {
+        icons[0].x = Math.max(icons[0].x, xMin)
+        for (let i = 1; i < icons.length; i++) {
+          icons[i].x = Math.max(icons[i].x, icons[i - 1].x + gapBetween(icons[i - 1], icons[i]))
+        }
+        icons[icons.length - 1].x = Math.min(icons[icons.length - 1].x, xMax)
+        for (let i = icons.length - 2; i >= 0; i--) {
+          icons[i].x = Math.min(icons[i].x, icons[i + 1].x - gapBetween(icons[i], icons[i + 1]))
+        }
+        icons[0].x = Math.max(icons[0].x, xMin)
+      }
+      const placed = icons
       const hoverIdx = hoverRef.current?.startsWith('axis:') ? parseInt(hoverRef.current.slice(5), 10) : -1
 
       placed.forEach((ic, i) => {
@@ -1357,7 +1373,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           chart.timeScale().setVisibleLogicalRange({ from, to: clean.length + 6 })
         }
 
-        // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Task 20)
+        // x-axis event markers: earnings [E] (yfinance) + news ⚡ (Task 20)
         if (clean.length > 0) {
           try {
             const from = clean[0].time
@@ -1367,14 +1383,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               const mj = await mres.json()
               const earnings = ((mj.earningsInfo as { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]) || [])
                 .filter((e) => e.ts <= lastT || e.upcoming)
-              // cap news markers (~14) evenly across the fetched window so the
-              // axis stays readable regardless of news frequency
+              // cap news markers evenly across the fetched window so the axis
+              // stays readable regardless of news frequency (icons are deduped
+              // per event day at render time)
               const rawNews = ((mj.newsItems as { ts: number; title?: string }[]) || [])
                 .filter((n) => n.ts <= lastT)
                 .sort((a, b) => a.ts - b.ts)
-              const step = Math.max(1, Math.ceil(rawNews.length / 10))
+              const step = Math.max(1, Math.ceil(rawNews.length / 16))
               const spacedNews = rawNews.filter((_, i) => i % step === 0)
-              markersRef.current = { earnings, news: spacedNews.slice(0, 10) }
+              markersRef.current = { earnings, news: spacedNews.slice(0, 16) }
             }
           } catch { /* markers optional */ }
         }

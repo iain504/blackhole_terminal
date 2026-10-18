@@ -1,6 +1,14 @@
 // Shared market data types used by both API routes and client components.
+// MUST stay client-safe: no server-only imports (db/alpaca/crypto) here.
 
 export type Timeframe = '1m' | '5m' | '15m' | '1h' | '4h' | '1D' | '1W' | '1M'
+
+// Alpaca symbols: letters/digits plus . - / : (e.g. BRK.B, BTC/USD). 1–15 chars.
+export const SYMBOL_FORMAT_RE = /^[A-Z0-9./:-]{1,15}$/
+
+export function isValidSymbolFormat(sym: string): boolean {
+  return SYMBOL_FORMAT_RE.test(sym)
+}
 
 export interface Bar {
   time: number // unix seconds (UTC), bar open time
