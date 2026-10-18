@@ -5,6 +5,8 @@ import { readJson, handleError } from '@/lib/api-helpers'
 
 interface ReplaceBody {
   mode?: string
+  /** asset is crypto — switches price rounding to 6/8dp (9dp limit) instead of penny ticks */
+  crypto?: boolean
   stop_price?: number
   limit_price?: number
   trail_percent?: number
@@ -22,10 +24,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     const { id } = await params
     const body = await readJson<ReplaceBody>(req)
     const mode = await resolveTradeMode(user.id, body.mode)
-    const patch: { stop_price?: number; limit_price?: number; trail_percent?: number } = {}
+    const patch: { stop_price?: number; limit_price?: number; trail_percent?: number; crypto?: boolean } = {}
     if (typeof body.stop_price === 'number' && body.stop_price > 0) patch.stop_price = body.stop_price
     if (typeof body.limit_price === 'number' && body.limit_price > 0) patch.limit_price = body.limit_price
     if (typeof body.trail_percent === 'number' && body.trail_percent > 0) patch.trail_percent = body.trail_percent
+    patch.crypto = Boolean(body.crypto)
     if (Object.keys(patch).length === 0) {
       return NextResponse.json({ error: 'nothing to replace' }, { status: 400 })
     }

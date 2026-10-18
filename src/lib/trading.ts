@@ -106,6 +106,21 @@ async function tradeFetch<T>(
 
 // ---------- shapes ----------
 
+/**
+ * Alpaca rejects prices with more than 9 decimal places ("limit price exceeds
+ * maximum precision of 9 decimal places") on CRYPTO, and sub-penny increments
+ * on STOCKS ("sub-penny increment does not fulfill minimum pricing criteria").
+ * Chart drag prices are raw JS floats (65800.22400000001) that blow past both —
+ * first the direct PATCH fails, then the cancel+re-place fallback fails too,
+ * LEAVING THE EXIT ORDER CANCELED AND LOST. Round every outgoing price string:
+ * crypto 6dp (>=1) / 8dp (<1), stocks penny 2dp (>=1) / 4dp (<1).
+ */
+export function fmtPx(v: number, crypto = false): string {
+  if (!Number.isFinite(v) || v <= 0) return String(v)
+  const dp = crypto ? (v >= 1 ? 6 : 8) : v >= 1 ? 2 : 4
+  return String(parseFloat(v.toFixed(dp)))
+}
+
 export interface TradingAccount {
   status: string
   equity: string
@@ -227,7 +242,7 @@ export async function placeOrderWithExits(
       // encode the plan for the chart's pending display: Alpaca materializes
       // bracket LEGS only when the entry activates, so a queued (weekend /
       // pre-market) bracket would otherwise render without its TP/SL lines
-      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit : null, hasSl ? body.stop_loss : null)
+      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
     }
     const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
       method: 'POST',
@@ -244,7 +259,7 @@ export async function placeOrderWithExits(
   if (hasTp || hasSl) {
     // encode the planned exits so the chart can render them while the entry
     // is pending AND the supervisor can attach the legs without extra state
-    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit : null, hasSl ? body.stop_loss : null)
+    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
   }
   const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
     method: 'POST',
@@ -471,6 +486,7 @@ function exitBodyFrom(
   orig: TradingOrder,
   patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
 ): Record<string, unknown> | null {
+  const isCrypto = orig.asset_class === 'crypto' || orig.symbol.includes('/')
   const num = (v: string | null | undefined): number | null => {
     if (v == null) return null
     const n = parseFloat(v)
@@ -488,22 +504,22 @@ function exitBodyFrom(
   }
   if (orig.type === 'stop') {
     if (newStop == null) return null
-    body.stop_price = String(newStop)
+    body.stop_price = fmtPx(newStop, isCrypto)
   } else if (orig.type === 'stop_limit') {
     if (newStop == null) return null
-    body.stop_price = String(newStop)
+    body.stop_price = fmtPx(newStop, isCrypto)
     if (newLimit != null) {
-      body.limit_price = String(newLimit)
+      body.limit_price = fmtPx(newLimit, isCrypto)
     } else {
       // preserve the original stop→limit offset when only the stop moves
       const os = num(orig.stop_price)
       const ol = num(orig.limit_price)
       const ratio = os && ol ? ol / os : orig.side === 'sell' ? 0.999 : 1.001
-      body.limit_price = String(+(newStop * ratio).toFixed(6))
+      body.limit_price = fmtPx(newStop * ratio, isCrypto)
     }
   } else if (orig.type === 'limit') {
     if (newLimit == null) return null
-    body.limit_price = String(newLimit)
+    body.limit_price = fmtPx(newLimit, isCrypto)
   } else if (orig.type === 'trailing_stop') {
     if (newTrail == null) return null
     body.trail_percent = String(newTrail)
@@ -541,12 +557,12 @@ export async function replaceExitOrderSmart(
   userId: string,
   mode: TradeMode,
   orderId: string,
-  patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
+  patch: { stop_price?: number; limit_price?: number; trail_percent?: number; crypto?: boolean },
 ): Promise<ReplaceExitResult> {
   const patchBody: Record<string, unknown> = {}
-  if (patch.stop_price != null) patchBody.stop_price = String(patch.stop_price)
-  if (patch.limit_price != null) patchBody.limit_price = String(patch.limit_price)
-  if (patch.trail_percent != null) patchBody.trail_percent = String(patch.trail_percent)
+  if (patch.stop_price != null) patchBody.stop_price = fmtPx(patch.stop_price, patch.crypto)
+  if (patch.limit_price != null) patchBody.limit_price = fmtPx(patch.limit_price, patch.crypto)
+  if (patch.trail_percent != null) patchBody.trail_percent = String(parseFloat(patch.trail_percent.toFixed(4)))
 
   // 1) PATCH on the requested host; 2) retry the other host on 404 —
   // both hosts share the same key pair, so a wrong-host id self-heals here.
@@ -647,32 +663,34 @@ export async function replaceExitOrderSmart(
       ((isStopish(orig.type) && o.type === 'limit') || (orig.type === 'limit' && isStopish(o.type))),
   )
 
-  const cancelRes = await cancelOrder(userId, mode, targetId)
+  const cancelRes = await cancelOrder(userId, errHost, targetId)
   if (cancelRes.status !== 204 && cancelRes.status !== 200 && cancelRes.status !== 404) {
-    return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode, method: 'cancel-replace' }
+    return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode: errHost, method: 'cancel-replace' }
   }
 
   const newBody = exitBodyFrom(orig, patch)
   if (!newBody) {
-    return { data: null, status: 400, error: `Unsupported exit type ${orig.type} for re-place`, mode, method: 'cancel-replace' }
+    return { data: null, status: 400, error: `Unsupported exit type ${orig.type} for re-place`, mode: errHost, method: 'cancel-replace' }
   }
-  const r2 = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+  // re-place on the host the order actually lives on (`mode` can differ when
+  // the PATCH self-healed across paper/live)
+  const r2 = await tradeFetch<TradingOrder>(userId, errHost, '/v2/orders', {
     method: 'POST',
     body: JSON.stringify(newBody),
   })
   if (!(r2.data && (r2.data as TradingOrder).id)) {
-    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode, method: 'cancel-replace' }
+    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode: errHost, method: 'cancel-replace' }
   }
 
   // heal the sibling if the cancel cascaded (OCO group cancellation)
   let note: string | undefined
   if (sibling) {
-    const stillOpen = await tradeFetch<TradingOrder>(userId, mode, `/v2/orders/${sibling.id}`)
+    const stillOpen = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${sibling.id}`)
     const gone = !stillOpen.data || ['canceled', 'cancelled', 'expired', 'rejected'].includes(String(stillOpen.data.status))
     if (gone) {
       const sibBody = exitBodyFrom(sibling, {})
       if (sibBody) {
-        const rs = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+        const rs = await tradeFetch<TradingOrder>(userId, errHost, '/v2/orders', {
           method: 'POST',
           body: JSON.stringify(sibBody),
         })
@@ -680,7 +698,7 @@ export async function replaceExitOrderSmart(
       }
     }
   }
-  return { data: r2.data, status: r2.status, mode, method: 'cancel-replace', note }
+  return { data: r2.data, status: r2.status, mode: errHost, method: 'cancel-replace', note }
 }
 
 /**
@@ -718,6 +736,131 @@ export async function closePositionFull(
 
 export async function cancelOrder(userId: string, mode: TradeMode, orderId: string) {
   return tradeFetch<null>(userId, mode, `/v2/orders/${orderId}`, { method: 'DELETE' })
+}
+
+// ---------- attach TP/SL to an EXISTING position (chart [TP]/[SL] drag-add) ----------
+
+export interface AttachExitsResult {
+  results: TradingOrder[]
+  errors: string[]
+  oco?: boolean
+}
+
+/**
+ * Attach a TP and/or SL to an open position — the chart's "+TP"/"+SL" chip
+ * drag and the Positions-tab add buttons land here.
+ *
+ * Stocks (verified against the paper API 2026-10):
+ * - order_class=oco REQUIRES take_profit.limit_price AND stop_loss.stop_price
+ *   AND an existing position to exit (without one: "oco orders must be exit
+ *   orders"; parent must be type=limit). With both legs requested we send the
+ *   documented OCO exit body and FALL BACK to separate legs on rejection.
+ * - A single leg is a plain limit (TP) / stop (SL) order on the full position.
+ * Crypto: ALL advanced order classes are rejected — place split exit legs
+ * (50/50 qty, 0.99 fee factor) directly against the position, tagged with a
+ * `ttp-` client_order_id (ignored by the OCO supervisor's `tte-` cleanup).
+ */
+export async function attachExitsToPosition(
+  userId: string,
+  mode: TradeMode,
+  symbol: string,
+  exits: { tp?: number; sl?: number },
+): Promise<AttachExitsResult> {
+  const tSym = tradeSymbol(symbol)
+  const hasTp = typeof exits.tp === 'number' && exits.tp > 0
+  const hasSl = typeof exits.sl === 'number' && exits.sl > 0
+  if (!hasTp && !hasSl) return { results: [], errors: ['no TP/SL price given'] }
+
+  const posRes = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tSym)}`)
+  if (!posRes.data) {
+    return { results: [], errors: [posRes.error && posRes.error !== 'not found' ? posRes.error : 'Position not found'] }
+  }
+  const pos = posRes.data
+  // crypto-ness comes from the POSITION (callers pass either symbol form —
+  // the chart sends the trade symbol BTCUSD, whose crypto-ness the route
+  // cannot infer from a slash)
+  const isCrypto = pos.asset_class === 'crypto' || pos.symbol.includes('/')
+  // orders use the position's own symbol form (crypto keeps the slash)
+  const orderSymbol = pos.symbol
+  // long position -> sell exits; short position -> buy exits
+  const exitSide = pos.side === 'short' ? 'buy' : 'sell'
+  const qtyAvail = parseFloat(pos.qty_available) || parseFloat(pos.qty) || 0
+  if (!(qtyAvail > 0)) return { results: [], errors: ['position has no available qty'] }
+
+  const results: TradingOrder[] = []
+  const errors: string[] = []
+  const post = (body: Record<string, unknown>) =>
+    tradeFetch<TradingOrder>(userId, mode, '/v2/orders', { method: 'POST', body: JSON.stringify(body) })
+  const legQty = (n: number) => String(parseFloat((n * (isCrypto ? 0.99 : 1)).toFixed(8)))
+
+  if (!isCrypto) {
+    if (hasTp && hasSl) {
+      const r = await post({
+        symbol: orderSymbol,
+        qty: String(qtyAvail),
+        side: exitSide,
+        type: 'limit',
+        time_in_force: 'gtc',
+        limit_price: fmtPx(exits.tp!),
+        order_class: 'oco',
+        take_profit: { limit_price: fmtPx(exits.tp!) },
+        stop_loss: { stop_price: fmtPx(exits.sl!) },
+      })
+      if (r.data && (r.data as TradingOrder).id) {
+        return { results: [r.data], errors, oco: true }
+      }
+      errors.push(`OCO rejected, placing legs separately: ${r.error || 'failed'}`)
+    }
+    if (hasTp) {
+      const r = await post({
+        symbol: orderSymbol, qty: String(qtyAvail), side: exitSide, type: 'limit',
+        time_in_force: 'gtc', limit_price: fmtPx(exits.tp!),
+      })
+      if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+      else errors.push(`TP: ${r.error || 'failed'}`)
+    }
+    if (hasSl) {
+      const r = await post({
+        symbol: orderSymbol, qty: String(qtyAvail), side: exitSide, type: 'stop',
+        time_in_force: 'gtc', stop_price: fmtPx(exits.sl!),
+      })
+      if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+      else errors.push(`SL: ${r.error || 'failed'}`)
+    }
+    return { results, errors }
+  }
+
+  // ---- crypto: emulated split legs (balance is reserved per open sell) ----
+  // Each attached leg takes HALF the position (the two legs together cover
+  // it), capped by what is still available — Alpaca reserves every open sell
+  // against qty_available, so a full-size first leg would make attaching the
+  // second one impossible (502 insufficient balance). Legs may be attached
+  // independently in any order.
+  const posQty = parseFloat(pos.qty) || qtyAvail
+  const qty = legQty(Math.min(qtyAvail, posQty / 2))
+  const coidBase = `ttp-${Math.random().toString(36).slice(2, 8)}`
+  if (hasTp) {
+    const r = await post({
+      symbol: orderSymbol, qty, side: exitSide, type: 'limit', time_in_force: 'gtc',
+      limit_price: fmtPx(exits.tp!, true),
+      client_order_id: `${coidBase}-tp`,
+    })
+    if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+    else errors.push(`TP: ${r.error || 'failed'}`)
+  }
+  if (hasSl) {
+    // stop-limit: book-clearing limit offset beyond the stop
+    const limP = exitSide === 'sell' ? exits.sl! * 0.999 : exits.sl! * 1.001
+    const r = await post({
+      symbol: orderSymbol, qty, side: exitSide, type: 'stop_limit', time_in_force: 'gtc',
+      stop_price: fmtPx(exits.sl!, true),
+      limit_price: fmtPx(limP, true),
+      client_order_id: `${coidBase}-sl`,
+    })
+    if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+    else errors.push(`SL: ${r.error || 'failed'}`)
+  }
+  return { results, errors }
 }
 
 export async function closePosition(userId: string, mode: TradeMode, symbol: string) {

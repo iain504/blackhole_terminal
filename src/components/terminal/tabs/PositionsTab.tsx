@@ -3,13 +3,17 @@
 // Positions console tab: every open paper + live position in one table —
 // symbol, market, side/qty, entry price, TP, SL, trailing, P&L — with a
 // per-row close button (market-close via the Alpaca Trading API).
+// Below it: every PENDING (unfilled) entry order with its planned TP/SL and a
+// cancel action. Missing TP/SL cells offer a [+ TP]/[+ SL] button that
+// attaches the exit to the position (drag-to-price also exists on the chart).
 import { useCallback, useEffect, useState } from 'react'
 import { Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice } from '@/lib/market-types'
-import { ExitInfo, PositionRow, normSym } from '@/components/chart/trading-types'
+import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
@@ -18,6 +22,7 @@ interface ModeData {
   mode: Mode
   positions: PositionRow[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
+  pending: PendingOrderInfo[]
   error?: string
   loaded: boolean
 }
@@ -34,29 +39,33 @@ const MODES: Mode[] = ['paper', 'live']
 export default function PositionsTab() {
   const { toast } = useToast()
   const [data, setData] = useState<Record<Mode, ModeData>>({
-    paper: { mode: 'paper', positions: [], exits: {}, loaded: false },
-    live: { mode: 'live', positions: [], exits: {}, loaded: false },
+    paper: { mode: 'paper', positions: [], exits: {}, pending: [], loaded: false },
+    live: { mode: 'live', positions: [], exits: {}, pending: [], loaded: false },
   })
   const [refreshing, setRefreshing] = useState(false)
   const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
+  const [canceling, setCanceling] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     setRefreshing(true)
     const one = async (mode: Mode): Promise<ModeData> => {
       try {
         const res = await fetch(`/api/trading/positions?mode=${mode}`)
-        if (!res.ok) return { mode, positions: [], exits: {}, error: `HTTP ${res.status}`, loaded: true }
+        if (!res.ok) {
+          return { mode, positions: [], exits: {}, pending: [], error: `HTTP ${res.status}`, loaded: true }
+        }
         const json = await res.json()
         const errs: string[] | undefined = json.errors
         return {
           mode,
           positions: (json.positions || []) as PositionRow[],
           exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
+          pending: (json.pending || []) as PendingOrderInfo[],
           error: errs?.length ? errs.join(', ') : undefined,
           loaded: true,
         }
       } catch {
-        return { mode, positions: [], exits: {}, error: 'network error', loaded: true }
+        return { mode, positions: [], exits: {}, pending: [], error: 'network error', loaded: true }
       }
     }
     const [paper, live] = await Promise.all(MODES.map(one))
@@ -85,6 +94,7 @@ export default function PositionsTab() {
       tp: data[m].exits[normSym(pos.tradeSymbol)]?.tp,
     })),
   )
+  const pendingRows = MODES.flatMap((m) => (data[m].pending || []).map((p) => ({ mode: m as Mode, p })))
   const noKeys = (m: Mode) => data[m].loaded && data[m].error === 'no-keys'
 
   const closePosition = async (row: PosConsoleRow) => {
@@ -110,6 +120,25 @@ export default function PositionsTab() {
     }
   }
 
+  const cancelPending = async (mode: Mode, orderId: string, label: string) => {
+    setCanceling(orderId)
+    try {
+      const res = await fetch(`/api/trading/orders/${orderId}?mode=${mode}`, { method: 'DELETE' })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({ title: `Cancelled ${label}` })
+      } else {
+        toast({ title: 'Cancel failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Cancel failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setCanceling(null)
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      void refresh()
+    }
+  }
+
   const totals = rows.reduce(
     (acc, r) => ({ upl: acc.upl + r.pos.upl, count: acc.count + 1 }),
     { upl: 0, count: 0 },
@@ -122,6 +151,9 @@ export default function PositionsTab() {
         <span className="text-sm font-semibold text-zinc-100">Positions</span>
         <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400">
           {totals.count} open
+        </Badge>
+        <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-400">
+          {pendingRows.length} pending
         </Badge>
         <span className={cn('text-sm font-semibold tabular-nums', totals.upl >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
           {totals.upl >= 0 ? '+' : '−'}${Math.abs(totals.upl).toFixed(2)} unrealized
@@ -149,7 +181,7 @@ export default function PositionsTab() {
         </div>
       </div>
 
-      {/* table */}
+      {/* positions table */}
       <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-800/80 bg-zinc-900/70 terminal-scroll">
         <table className="w-full min-w-[900px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
@@ -210,12 +242,18 @@ export default function PositionsTab() {
                   <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.avgEntry)}</td>
                   <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.current)}</td>
                   <td className="px-3 py-2 text-right tabular-nums text-emerald-300">
-                    {r.tp?.limitPrice != null ? fmtPrice(r.tp.limitPrice) : <span className="text-zinc-600">—</span>}
+                    {r.tp?.limitPrice != null ? (
+                      fmtPrice(r.tp.limitPrice)
+                    ) : (
+                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="tp" onAdded={() => void refresh()} />
+                    )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-rose-300">
-                    {r.sl && (r.sl.stopPrice != null || r.sl.limitPrice != null)
-                      ? fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)
-                      : <span className="text-zinc-600">—</span>}
+                    {r.sl && (r.sl.stopPrice != null || r.sl.limitPrice != null) ? (
+                      fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)
+                    ) : (
+                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="sl" onAdded={() => void refresh()} />
+                    )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-amber-300">
                     {trailing ?? <span className="text-zinc-600">—</span>}
@@ -244,10 +282,177 @@ export default function PositionsTab() {
         </table>
       </div>
 
+      {/* pending (unfilled) entry orders */}
+      <div className="flex h-44 shrink-0 flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
+        <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Pending orders</span>
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{pendingRows.length}</Badge>
+          <span className="ml-auto text-[10px] text-zinc-600">unfilled entries · TP/SL plan shown until filled</span>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
+          <table className="w-full min-w-[820px] border-collapse text-xs">
+            <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+              <tr className="border-b border-zinc-800">
+                <th className="px-3 py-1.5 text-left font-semibold">Symbol</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Market</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Side</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Type</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Qty</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Filled</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Limit</th>
+                <th className="px-3 py-1.5 text-right font-semibold">TP</th>
+                <th className="px-3 py-1.5 text-right font-semibold">SL</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Status</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pendingRows.length === 0 && (
+                <tr>
+                  <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
+                    No pending orders.
+                  </td>
+                </tr>
+              )}
+              {pendingRows.map(({ mode, p }) => (
+                <tr key={`${mode}:${p.orderId}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+                  <td className="px-3 py-1.5 font-semibold text-zinc-100">{p.symbol}</td>
+                  <td className="px-3 py-1.5">
+                    <Badge
+                      variant="outline"
+                      className={cn('text-[10px]', mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400')}
+                    >
+                      {mode}
+                    </Badge>
+                  </td>
+                  <td className={cn('px-3 py-1.5 font-medium', p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
+                    {p.side.toUpperCase()}
+                  </td>
+                  <td className="px-3 py-1.5 text-zinc-300">
+                    {p.type.toUpperCase()}
+                    {p.managed ? <span className="ml-1 text-[9px] text-amber-400/80">OCO</span> : null}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{p.qty}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{p.filledQty || '—'}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{p.limitPrice != null ? fmtPrice(p.limitPrice) : '—'}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-emerald-300">
+                    {p.tpPrice != null ? fmtPrice(p.tpPrice) : <span className="text-zinc-600">—</span>}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-rose-300">
+                    {p.slPrice != null ? fmtPrice(p.slPrice) : <span className="text-zinc-600">—</span>}
+                  </td>
+                  <td className="px-3 py-1.5 text-zinc-400">{p.status}</td>
+                  <td className="px-3 py-1.5 text-right">
+                    <Button
+                      size="sm"
+                      className="h-5 border border-zinc-700 bg-transparent px-2 text-[10px] font-semibold text-zinc-400 hover:bg-rose-500/10 hover:text-rose-400"
+                      disabled={canceling === p.orderId}
+                      onClick={() => void cancelPending(mode, p.orderId, `${p.side} ${p.type} ${p.symbol}`)}
+                      aria-label={`Cancel pending ${p.side} ${p.type} ${p.symbol}`}
+                    >
+                      {canceling === p.orderId ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Cancel'}
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <p className="flex shrink-0 items-center gap-1.5 px-1 text-[11px] text-zinc-600">
         <X className="h-3 w-3" aria-hidden />
-        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders.
+        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders · [+TP]/[+SL] attaches a new exit to the position.
       </p>
     </div>
+  )
+}
+
+/** Small "+ TP"/"+ SL" button for a position row missing that exit — opens an
+ * inline price input, POSTs to /positions/[symbol]/exits. */
+function AddExitCell({ mode, tradeSymbol, kind, onAdded }: {
+  mode: Mode
+  tradeSymbol: string
+  kind: 'tp' | 'sl'
+  onAdded: () => void
+}) {
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [v, setV] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const submit = async () => {
+    const price = parseFloat(v)
+    if (!Number.isFinite(price) || price <= 0) return
+    setBusy(true)
+    try {
+      const res = await fetch(`/api/trading/positions/${encodeURIComponent(tradeSymbol)}/exits`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode, [kind]: price }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({
+          title: `${kind.toUpperCase()} added at ${fmtPrice(price)}`,
+          description: json?.oco ? 'OCO exit created on Alpaca' : undefined,
+        })
+      } else {
+        toast({ title: `${kind.toUpperCase()} failed`, description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Network error', variant: 'destructive' })
+    } finally {
+      setBusy(false)
+      setOpen(false)
+      setV('')
+      onAdded()
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+    }
+  }
+
+  if (!open) {
+    return (
+      <button
+        className="rounded border border-dashed border-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-500 transition-colors hover:border-zinc-500 hover:text-zinc-300"
+        onClick={() => setOpen(true)}
+        aria-label={`Add ${kind.toUpperCase()} to ${tradeSymbol}`}
+        title={`Attach a ${kind.toUpperCase()} order to this position`}
+      >
+        + {kind.toUpperCase()}
+      </button>
+    )
+  }
+  return (
+    <span className="relative inline-flex items-center gap-1">
+      <Input
+        autoFocus
+        type="number"
+        step="any"
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void submit()
+          if (e.key === 'Escape') setOpen(false)
+        }}
+        placeholder={`${kind.toUpperCase()} price`}
+        className="h-6 w-28 border-zinc-700 bg-zinc-950 text-[11px]"
+      />
+      <button
+        className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300"
+        onClick={() => void submit()}
+        disabled={busy}
+        aria-label={`Apply ${kind.toUpperCase()}`}
+      >
+        {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+      </button>
+      <button
+        className="text-[10px] text-zinc-500 hover:text-zinc-300"
+        onClick={() => setOpen(false)}
+        aria-label="Cancel"
+      >
+        ✕
+      </button>
+    </span>
   )
 }
