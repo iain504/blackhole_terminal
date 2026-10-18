@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Image from 'next/image'
 import { motion } from 'framer-motion'
-import { Bell, Search, Settings, ArrowRight } from 'lucide-react'
+import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'
 
 interface TickerState {
   symbol: string
@@ -139,9 +139,10 @@ function NavBar({ onLaunch, onLatency }: { onLaunch: () => void; onLatency: (ms:
 
         <button
           onClick={onLaunch}
-          className="whitespace-nowrap rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors hover:bg-blue-500 sm:px-4"
+          className="flex items-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors hover:bg-blue-500 sm:px-4"
         >
-          Connect Wallet
+          <LogIn className="h-4 w-4" aria-hidden />
+          Login
         </button>
       </div>
     </header>

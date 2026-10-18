@@ -168,11 +168,71 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   }, [])
 
   // ---------- coordinate helpers ----------
+  // Time → x. timeToCoordinate() only resolves EXACT bar times, so drawings
+  // captured between bars / in the left-right margins previously vanished or
+  // snapped to the wrong bar. Robust version: exact hit → interpolate between
+  // the bracketing bars (handles weekend/overnight gaps) → extrapolate into
+  // the margins using the per-bar pixel spacing.
   const xOf = useCallback((t: number | null): number | null => {
     if (t == null || !chartRef.current) return null
-    const x = chartRef.current.timeScale().timeToCoordinate(t as UTCTimestamp)
-    return x == null ? null : Number(x)
-  }, [])
+    const ts = chartRef.current.timeScale()
+    const bars = barsRef.current
+    const exact = ts.timeToCoordinate(t as UTCTimestamp)
+    if (exact != null) return Number(exact)
+    if (bars.length === 0) return null
+    const last = bars.length - 1
+    const barX = (i: number): number | null => {
+      const x = ts.timeToCoordinate(bars[i].time as UTCTimestamp)
+      return x == null ? null : Number(x)
+    }
+    // pixels per bar from two reference bars (index→x is globally linear)
+    const pxPerBar = (): number | null => {
+      const vr = ts.getVisibleLogicalRange()
+      let a = vr ? Math.ceil(Number(vr.from)) : 0
+      let b = vr ? Math.floor(Number(vr.to)) : last
+      a = Math.max(0, Math.min(a, last))
+      b = Math.max(0, Math.min(b, last))
+      if (b === a) {
+        a = Math.max(0, a - 1)
+        b = Math.min(last, b + 1)
+      }
+      if (b === a) return null
+      const xa = barX(a)
+      const xb = barX(b)
+      if (xa == null || xb == null || xb === xa) return null
+      return (xb - xa) / (b - a)
+    }
+    if (t > bars[last].time) {
+      const x1 = barX(last)
+      if (x1 == null) return null
+      const ppb = pxPerBar()
+      if (ppb == null) return x1
+      return x1 + ((t - bars[last].time) / TIMEFRAMES[tf].seconds) * ppb
+    }
+    if (t < bars[0].time) {
+      const x0 = barX(0)
+      if (x0 == null) return null
+      const ppb = pxPerBar()
+      if (ppb == null) return x0
+      return x0 + ((t - bars[0].time) / TIMEFRAMES[tf].seconds) * ppb
+    }
+    // bracket: first bar with time >= t, interpolate to the previous bar
+    let lo = 0
+    let hi = last
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (bars[mid].time < t) lo = mid + 1
+      else hi = mid
+    }
+    const j = lo
+    const i = Math.max(0, j - 1)
+    const xa = barX(i)
+    const xb = barX(j)
+    if (xa == null || xb == null) return null
+    const dt = bars[j].time - bars[i].time
+    if (dt <= 0) return xa
+    return xa + ((t - bars[i].time) / dt) * (xb - xa)
+  }, [tf])
 
   const yOf = useCallback((p: number): number | null => {
     if (!seriesRef.current) return null
@@ -186,17 +246,42 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     return p == null ? null : Number(p)
   }, [])
 
-  // time at x, extrapolating beyond the data range
+  // Time under the cursor, CONTINUOUS (no snapping). lightweight-charts'
+  // coordinateToTime() ceils to the NEXT bar, which used to place drawn lines
+  // up to a full bar-width right of the arrow. We derive the exact fractional
+  // bar index from two reference bars (public API only) and map it to a
+  // continuous time: between bars → interpolate across their actual time gap,
+  // beyond the data → extend by the timeframe seconds. Round-trips exactly
+  // through xOf() above, so the committed line lands precisely under the
+  // cursor — matching TradingView (magnet off).
   const timeAt = useCallback((x: number): number | null => {
-    if (!chartRef.current) return null
-    const ts = chartRef.current.timeScale()
-    const t = ts.coordinateToTime(x)
-    if (t != null) return Number(t)
-    const logical = ts.coordinateToLogical(x)
+    const chart = chartRef.current
     const bars = barsRef.current
-    if (logical == null || bars.length === 0) return null
+    if (!chart || bars.length === 0) return null
+    const ts = chart.timeScale()
+    const last = bars.length - 1
+    const vr = ts.getVisibleLogicalRange()
+    let a = vr ? Math.ceil(Number(vr.from)) : 0
+    let b = vr ? Math.floor(Number(vr.to)) : last
+    a = Math.max(0, Math.min(a, last))
+    b = Math.max(0, Math.min(b, last))
+    if (b === a) {
+      a = Math.max(0, a - 1)
+      b = Math.min(last, b + 1)
+    }
+    if (b === a) return null
+    const xa = ts.timeToCoordinate(bars[a].time as UTCTimestamp)
+    const xb = ts.timeToCoordinate(bars[b].time as UTCTimestamp)
+    if (xa == null || xb == null || Number(xb) === Number(xa)) return null
+    const fi = a + ((x - Number(xa)) / (Number(xb) - Number(xa))) * (b - a)
     const tfSec = TIMEFRAMES[tf].seconds
-    return Number(bars[bars.length - 1].time + (Number(logical) - (bars.length - 1)) * tfSec)
+    if (fi >= last) return bars[last].time + (fi - last) * tfSec
+    if (fi <= 0) return bars[0].time + fi * tfSec
+    const i = Math.floor(fi)
+    const f = fi - i
+    const t0 = bars[i].time
+    const t1 = bars[i + 1].time
+    return t1 > t0 ? t0 + f * (t1 - t0) : t0
   }, [tf])
 
   const scheduleRedraw = useCallback(() => {
@@ -562,6 +647,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
   function drawChip(ctx: CanvasRenderingContext2D, x: number, y: number, text: string, color: string, highlighted: boolean) {
     ctx.save()
+    ctx.font = '10px ui-monospace, monospace' // set BEFORE measureText (was measured with a stale font)
     const wTxt = ctx.measureText(text).width
     const bw = Math.max(46, wTxt + 12)
     const bh = 16
@@ -573,7 +659,6 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.fill()
     ctx.globalAlpha = 1
     ctx.fillStyle = '#09090b'
-    ctx.font = '10px ui-monospace, monospace'
     ctx.fillText(text, x + 6, by + 11.5)
     ctx.restore()
   }
@@ -1298,6 +1383,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // price autoscale without changing the logical bar range)
     const onTimeRangeChange = () => scheduleRedraw()
     chart.timeScale().subscribeVisibleTimeRangeChange(onTimeRangeChange)
+
+    // debug handle (harmless): lets DevTools / E2E verify coordinate round-trips
+    ;(window as unknown as Record<string, unknown>).__ttDbg = {
+      rect: () => container.getBoundingClientRect(),
+      priceAt,
+      timeAt,
+      xOf,
+      yOf,
+    }
 
     return () => {
       cancelled = true

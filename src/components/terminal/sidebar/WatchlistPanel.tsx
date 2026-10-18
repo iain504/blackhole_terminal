@@ -2,6 +2,8 @@
 
 // Watchlist panel: multiple personal lists with tag colors; rows show
 // symbol, price, daily change, daily % (Task 13 #2/#4, Task 16 #2).
+// Symbol input has live prediction (symbols starting with the typed query,
+// backed by the Alpaca asset universe) and rejects unknown symbols.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, Watchlist } from '@/store/terminal'
 import { fmtPrice } from '@/lib/market-types'
@@ -9,13 +11,14 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { useToast } from '@/hooks/use-toast'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag } from 'lucide-react'
+import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2 } from 'lucide-react'
 
 const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
 
@@ -24,6 +27,12 @@ interface QuoteRow {
   price: number
   change: number
   changePct: number
+}
+
+interface SuggRow {
+  symbol: string
+  name: string
+  crypto: boolean
 }
 
 export function WatchlistPanel() {
@@ -44,7 +53,14 @@ export function WatchlistPanel() {
   const [createOpen, setCreateOpen] = useState(false)
   const [newName, setNewName] = useState('')
   const [newColor, setNewColor] = useState(LIST_COLORS[0])
+  const [sugg, setSugg] = useState<SuggRow[]>([])
+  const [suggOpen, setSuggOpen] = useState(false)
+  const [suggIdx, setSuggIdx] = useState(-1)
+  const [suggLoading, setSuggLoading] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
+  const suggDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const inputBoxRef = useRef<HTMLDivElement>(null)
+  const { toast } = useToast()
 
   const list: Watchlist | undefined = lists.find((l) => l.id === activeId) || lists[0]
 
@@ -78,11 +94,81 @@ export function WatchlistPanel() {
     }
   }, [itemsKey])
 
-  const addSymbol = async () => {
-    const sym = newSymbol.trim().toUpperCase()
+  // live symbol prediction: query the Alpaca-backed universe as the user types
+  const fetchSuggestions = async (q: string) => {
+    try {
+      setSuggLoading(true)
+      const res = await fetch(`/api/market/symbols?q=${encodeURIComponent(q)}`)
+      if (!res.ok) return
+      const json = (await res.json()) as { symbols?: SuggRow[] }
+      const rows = (json.symbols || []).slice(0, 12)
+      setSugg(rows)
+      setSuggOpen(rows.length > 0)
+      setSuggIdx(-1)
+    } catch {
+      /* offline — dropdown just stays closed */
+    } finally {
+      setSuggLoading(false)
+    }
+  }
+
+  const onInputChange = (v: string) => {
+    setNewSymbol(v)
+    if (suggDebounce.current) clearTimeout(suggDebounce.current)
+    const q = v.trim().toUpperCase()
+    if (!q || /[^A-Z0-9./:\-]/.test(q) || q.length > 15) {
+      setSugg([])
+      setSuggOpen(false)
+      return
+    }
+    suggDebounce.current = setTimeout(() => void fetchSuggestions(q), 160)
+  }
+
+  const closeSuggestions = () => {
+    setSuggOpen(false)
+    setSuggIdx(-1)
+  }
+
+  const addSymbol = async (raw?: string) => {
+    const sym = (raw ?? newSymbol).trim().toUpperCase()
     if (!sym || !list) return
-    const ok = await addSymbolToWatchlist(list.id, sym)
-    if (ok) setNewSymbol('')
+    const res = await addSymbolToWatchlist(list.id, sym)
+    if (res.ok) {
+      setNewSymbol('')
+      closeSuggestions()
+    } else {
+      const desc =
+        res.reason === 'duplicate'
+          ? `${sym} is already in “${list.name}”.`
+          : res.reason === 'invalid'
+            ? `“${sym}” is not a valid symbol format (letters/digits, . - / only).`
+            : res.reason === 'unknown'
+              ? `“${sym}” was not found in the Alpaca asset universe. Pick a suggestion or check the spelling.`
+              : 'Could not save — please try again.'
+      toast({ title: 'Cannot add symbol', description: desc, variant: 'destructive' })
+      if (res.reason === 'duplicate') {
+        setNewSymbol('')
+        closeSuggestions()
+      }
+    }
+  }
+
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown' && suggOpen && sugg.length > 0) {
+      e.preventDefault()
+      setSuggIdx((i) => Math.min(i + 1, sugg.length - 1))
+    } else if (e.key === 'ArrowUp' && suggOpen && sugg.length > 0) {
+      e.preventDefault()
+      setSuggIdx((i) => Math.max(i - 1, -1))
+    } else if (e.key === 'Escape') {
+      closeSuggestions()
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      // highlighted suggestion wins; otherwise validate the exact typed symbol
+      // (unknown symbols are rejected with a clear error)
+      const picked = suggOpen && suggIdx >= 0 && sugg[suggIdx] ? sugg[suggIdx].symbol : undefined
+      void addSymbol(picked)
+    }
   }
 
   const create = async () => {
@@ -160,15 +246,58 @@ export function WatchlistPanel() {
             </DropdownMenu>
           </div>
 
-          {/* add symbol */}
-          <div className="flex items-center gap-1 px-2 py-1.5">
-            <Input
-              value={newSymbol}
-              onChange={(e) => setNewSymbol(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && void addSymbol()}
-              placeholder="Add symbol (AAPL, BTC/USD)"
-              className="h-6 border-zinc-800 bg-zinc-950 text-[11px]"
-            />
+          {/* add symbol + prediction dropdown */}
+          <div className="relative flex items-center gap-1 px-2 py-1.5" ref={inputBoxRef}>
+            <div className="relative flex-1">
+              <Input
+                value={newSymbol}
+                onChange={(e) => onInputChange(e.target.value)}
+                onKeyDown={onInputKeyDown}
+                onBlur={(e) => {
+                  if (!inputBoxRef.current?.contains(e.relatedTarget as Node)) closeSuggestions()
+                }}
+                placeholder="Add symbol (AAPL, BTC/USD)"
+                autoComplete="off"
+                spellCheck={false}
+                className="h-6 border-zinc-800 bg-zinc-950 pr-6 text-[11px]"
+              />
+              {suggLoading && (
+                <Loader2 className="absolute right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 animate-spin text-zinc-600" />
+              )}
+              {suggOpen && sugg.length > 0 && (
+                <div
+                  className="absolute inset-x-0 top-full z-50 mt-1 max-h-56 overflow-y-auto terminal-scroll rounded-md border border-zinc-700/80 bg-zinc-900 py-1 shadow-xl"
+                  role="listbox"
+                  aria-label="Symbol suggestions"
+                >
+                  {sugg.map((r, i) => (
+                    <button
+                      key={r.symbol}
+                      type="button"
+                      role="option"
+                      aria-selected={i === suggIdx}
+                      className={cn(
+                        'flex w-full items-center gap-2 px-2 py-1 text-left text-[11px]',
+                        i === suggIdx ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-300 hover:bg-zinc-800/70',
+                      )}
+                      onMouseDown={(e) => {
+                        e.preventDefault() // keep input focus
+                        void addSymbol(r.symbol)
+                      }}
+                      onMouseEnter={() => setSuggIdx(i)}
+                    >
+                      <span className="w-16 shrink-0 font-semibold">{r.symbol}</span>
+                      <span className="min-w-0 flex-1 truncate text-zinc-500">{r.name || (r.crypto ? 'Crypto pair' : '')}</span>
+                      {r.crypto ? (
+                        <Badge variant="outline" className="shrink-0 border-amber-500/40 px-1 py-0 text-[8px] text-amber-400">7×24</Badge>
+                      ) : (
+                        <span className="shrink-0 text-[8px] uppercase tracking-wide text-zinc-600">US</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             <Button size="sm" variant="secondary" className="h-6 shrink-0 px-2 text-[11px]" onClick={() => void addSymbol()}>
               Add
             </Button>

@@ -84,6 +84,9 @@ export interface Watchlist {
   items: string[]
 }
 
+/** Result of adding a symbol to a watchlist (validation-aware). */
+export type AddSymbolResult = { ok: true } | { ok: false; reason: 'invalid' | 'duplicate' | 'unknown' | 'error' }
+
 export interface Alert {
   id: string
   symbol: string
@@ -160,7 +163,7 @@ interface TerminalState {
   deleteWatchlist: (id: string) => Promise<void>
   updateWatchlist: (id: string, patch: { name?: string; color?: string; sortOrder?: number }) => Promise<void>
   moveWatchlist: (id: string, dir: -1 | 1) => Promise<void>
-  addSymbolToWatchlist: (watchlistId: string, symbol: string) => Promise<boolean>
+  addSymbolToWatchlist: (watchlistId: string, symbol: string) => Promise<AddSymbolResult>
   removeSymbolFromWatchlist: (watchlistId: string, symbol: string) => Promise<void>
 
   // drawings
@@ -480,9 +483,20 @@ export const useTerminal = create<TerminalState>((set, get) => ({
 
   addSymbolToWatchlist: async (watchlistId, symbol) => {
     const list = get().watchlists.find((l) => l.id === watchlistId)
-    if (!list) return false
+    if (!list) return { ok: false, reason: 'error' }
     const sym = symbol.trim().toUpperCase()
-    if (!sym || list.items.includes(sym)) return false
+    // format guard — Alpaca symbols are letters/digits plus . - / : (BRK.B, BTC/USD)
+    if (!sym || !/^[A-Z0-9./:-]{1,15}$/.test(sym)) return { ok: false, reason: 'invalid' }
+    if (list.items.includes(sym)) return { ok: false, reason: 'duplicate' }
+    // existence check against the Alpaca asset universe (crypto majors always allowed)
+    try {
+      const res = await fetch(`/api/market/symbols?q=${encodeURIComponent(sym)}&exact=1`)
+      if (res.ok) {
+        const json = (await res.json()) as { valid?: boolean }
+        if (json.valid !== true) return { ok: false, reason: 'unknown' }
+      }
+      // check endpoint unreachable → allow format-valid symbols (offline tolerance)
+    } catch { /* offline */ }
     const items = [...list.items, sym].slice(0, 50)
     set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
     const res = await fetch(`/api/watchlists/${watchlistId}`, {
@@ -490,7 +504,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ items }),
     })
-    return res.ok
+    return res.ok ? { ok: true } : { ok: false, reason: 'error' }
   },
 
   removeSymbolFromWatchlist: async (watchlistId, symbol) => {

@@ -316,3 +316,28 @@ Stage Summary:
 - Files: src/lib/yahoo.ts (new), src/app/api/market/markers/route.ts, src/lib/market-types.ts (MarkerData.newsItems), src/lib/alpaca.ts (newsItems), src/components/chart/ChartPanel.tsx (axis icons + tooltips), scripts-tmp/gen-totp.mjs (test helper).
 
 
+
+---
+Task ID: 22
+Agent: Z.ai Code (main)
+Task: Fix 6 reported issues — drawing-tool position offset, watchlist invalid symbols, watchlist symbol prediction, right-click alert line offset, landing "Connect Wallet"→"Login", hero art must match reference style
+
+Work Log:
+- ROOT CAUSE (drawings + alerts misplaced): lightweight-charts 4.2.3 `coordinateToTime()` ceils the fractional bar index (`coordinateToIndex = Math.ceil(floatIndex)`), so captured drawing points landed on the NEXT bar (up to a full bar-width right of the arrow); worse, `timeToCoordinate()` returns null for any non-exact bar time, so clicks in the future/left margins stored extrapolated times that rendered as NULL — drawings silently vanished or appeared at wrong anchors after scroll/zoom. Verified in node_modules source, then measured live.
+- ChartPanel `timeAt` rewritten CONTINUOUS: derives the exact fractional bar index from two reference bars via public API (getVisibleLogicalRange + timeToCoordinate) and maps it to continuous time (interpolates across actual bar time-gaps; extends by tf seconds beyond data). No ceil-snap → drawn line lands exactly under the cursor (TradingView magnet-off behavior).
+- ChartPanel `xOf` made robust render-side: exact timeToCoordinate fast-path → interpolate between bracketing bars (correct across weekend/overnight gaps) → extrapolate into margins using per-bar pixel spacing. Round-trip timeAt→xOf is now pixel-exact everywhere including the future margin (previously xOf→null = invisible drawings).
+- Added debug handle `window.__ttDbg` (rect/priceAt/timeAt/xOf/yOf) in the chart lifecycle effect — harmless, lets DevTools/E2E verify coordinate round-trips.
+- drawChip: set ctx.font BEFORE measureText (chip width was measured with a stale font).
+- Watchlist validation (issue 2): NEW src/lib/symbols.ts — full Alpaca US-equity asset universe (GET /v2/assets, ~11k symbols) cached in memory 12h (stale-while-error), paper-host-first fetch, static curated fallback; format regex ^[A-Z0-9./:-]{1,15}$ (BRK.B / BTC/USD valid). Store addSymbolToWatchlist now validates format + existence (GET /api/market/symbols?q=X&exact=1) and returns AddSymbolResult {ok, reason: invalid|duplicate|unknown|error}; panel toasts clear errors, silent-drops nothing.
+- NEW /api/market/symbols route: prediction list (exact kept first → symbol prefix → contains → name matches, 12 rows w/ name + crypto tag) and exact=1 existence check; crypto majors merged.
+- Watchlist prediction (issue 3): debounced (160ms) dropdown under the add-symbol input — rows show symbol/name/US-or-7×24 tag, ArrowUp/Down highlight, Enter adds the highlighted row else validates the exact typed symbol (user's "exact match with Enter" requirement), Escape closes, click via onMouseDown keeps focus, blur closes. Unknown/garbage symbols are REJECTED with a destructive toast.
+- Landing (issue 5): "Connect Wallet" → "Login" with LogIn icon (navbar CTA).
+- Hero art (issue 6): regenerated via z-ai SDK 1344x768 (2 candidates generated, picked the better): massive black hole + orange accretion disk + blue gravitational grid warp + candlestick stream pouring into the hole — replaced public/hero-blackhole.png; temp scripts removed.
+- E2E (agent-browser, trader account): coordinate round-trips errY/errX = 0.00 at 3 in-data points AND 3 future-margin x's; hline drawn via tool renders at y=387.0 vs click 387; trend line with 2nd click in the future margin renders at both exact clicked points (July-2026 extrapolated time — previously invisible); right-click → "Add price alert at 209.01" → dashed line at y=446 vs click 446; screenshot confirms overlay. Watchlist: "SPA" → real Alpaca dropdown (SPAB/SPAI/SPAX/SPAQ/SPAM/SPAL…), click SPAB → row added + input cleared; ZZZZZZ → toast "was not found in the Alpaca asset universe" + no row; "HELLO WORLD!!" → no row (format guard); full-symbol "MU" + Enter → exact-match add works. Note: shadcn radix toasts render as li.toast — my earlier sonner-selector probes were false negatives, toast flow was working.
+- Cleanup: deleted all test drawings (7) + 209.01 test alert + SPAB/MU watchlist entries; kept pre-existing alerts. Lint 0 errors; dev.log clean for this session (markers 500s in log are stale pre-fix entries from the previous session); landing verified desktop + mobile 390x844 (footer sticks, noGap=true after scroll).
+
+Stage Summary:
+- Drawings/alerts now land pixel-exactly under the cursor: continuous (non-snapping) time capture + robust interpolation/extrapolation rendering fixed BOTH the arrow-vs-line offset and invisible drawings in the margins; verified with 0.00px round-trip errors and real tool/right-click flows.
+- Watchlist rejects junk symbols (format + Alpaca-universe existence) with clear toasts and now has live TradingView-style symbol prediction backed by the full ~11k Alpaca asset list (12h server cache).
+- Landing shows "Login" (with icon) instead of "Connect Wallet"; hero art regenerated to the black-hole-swallowing-candlesticks reference style.
+- Files: src/components/chart/ChartPanel.tsx, src/components/terminal/sidebar/WatchlistPanel.tsx, src/store/terminal.ts, src/lib/symbols.ts (new), src/app/api/market/symbols/route.ts (new), src/components/landing/LandingPage.tsx, public/hero-blackhole.png.
