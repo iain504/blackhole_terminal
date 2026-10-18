@@ -239,3 +239,19 @@ Stage Summary:
 - Full trade assistance shipped: ticket + right-click trading + bracket/OCO-style exits + draggable SL/TP lines + fill notifications.
 - All features user thought were missing (FIB retracement, price alerts, right-click alert) verified present and now more discoverable via the right-click menu.
 - User's demo keys stored encrypted; paper position BTC/USD 0.005 @ 81638 with SL 86000 / TP 105000 left open as a live example.
+
+---
+Task ID: 19
+Agent: main (Z.ai Code)
+Task: "Did you add back the multi chart functions?" — implement multi-chart grid (multiple charts visible at once, TradingView-style layout switcher)
+
+Work Log:
+- Store (src/store/terminal.ts): added GridLayoutId ('1'|'2h'|'2v'|'3s'|'4') + GRID_LAYOUTS metadata, Pane {symbol,timeframe}, Tab.grid/focusedPane/syncCrosshair; helpers tabPanes/tabLayout/layoutPaneCount; actions setGridLayout/setPaneSymbol/setPaneTimeframe/setFocusedPane/setSyncCrosshair; selectSymbol now targets the FOCUSED pane of the active chart tab (watchlist/heatmap clicks follow focus); layoutSnapshot serializes tabs as-is (grid rides along); hydrateFromServer sanitizes grid (layout whitelist, pane symbol/timeframe validation, count clamp, '4h' added to TF whitelist); single-chart mode keeps tab.symbol/timeframe mirrored from pane 0 for backward compat.
+- ChartPanel: props refactored from {tab} to {symbol,timeframe,onSymbolChange,onTimeframeChange,onFocus,focused,syncKey,syncGroup,compact} so the same component drives both single chart and grid panes; focus ring (emerald, inset) + onPointerDownCapture focus; compact chrome (h-8 header, smaller TF buttons, chevron/quote hidden) for grid panes; crosshair sync implemented inside the chart lifecycle effect (refs for group/key): publishes {group,from,time,price} on 'tt:xsync' window event, applies sibling positions via chart.setCrosshairPosition/clearCrosshairPosition with 60ms suppress guard against feedback loops.
+- ChartWorkspace: ChartGrid renders the tab's layout with nested react-resizable-panels (2h horizontal, 2v vertical, 3s one-wide-top + two bottom, 4 = 2×2); each pane wired via ChartPane (per-pane setPaneSymbol/setPaneTimeframe); Quote/News sidebars follow focusedPaneSymbol; mobile stacks all panes vertically in a scrollable column; focused pane highlighted.
+- TabBar: "Chart layout" dropdown (only for chart tabs) listing the 5 layouts with active check + short label (1/2×1/1×2/3/2×2) shown in the button; crosshair-sync toggle button appears only when pane count > 1 (emerald when on).
+- Persistence verified: 2×2 layout with per-pane symbols (BTC/USD, AAPL, ...) + sync state survived reload via existing 5s layout autosave.
+- Browser E2E (agent-browser, account trader): 2×1 → changed pane 2 to AAPL (pane 1 stayed BTC/USD); crosshair sync ON → hovering BTC pane moved crosshair to same date on AAPL pane; 2×2 → 4 panes rendered; clicking pane 4 switched Quote+News to BTC/USD (focus-follow); reload → layout fully restored; 3-chart layout renders one wide + two; mobile 390×844 stacks panes; reset tab back to Single (sync toggle auto-hides at pane count 1). Lint clean; tsc clean (src); dev.log no runtime errors; browser console clean (one pre-existing Radix aria-describedby warning).
+
+Stage Summary:
+- Multi-chart is back: per-chart-tab grid layouts 1 / 2×1 / 1×2 / 3 / 2×2 with independent symbol+timeframe per pane, focus-following sidebar, crosshair sync, compact panes, full persistence. Legacy single-chart tabs behave exactly as before (grid fields optional, sanitized on hydrate).

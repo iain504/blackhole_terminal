@@ -12,11 +12,49 @@ export interface SessionUser {
 
 export type TabType = 'chart' | 'calendar' | 'heatmap'
 
+// Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
+// '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid.
+export type GridLayoutId = '1' | '2h' | '2v' | '3s' | '4'
+export const GRID_LAYOUTS: { id: GridLayoutId; label: string; short: string; panes: number }[] = [
+  { id: '1', label: 'Single chart', short: '1', panes: 1 },
+  { id: '2h', label: '2 charts — side by side', short: '2×1', panes: 2 },
+  { id: '2v', label: '2 charts — stacked', short: '1×2', panes: 2 },
+  { id: '3s', label: '3 charts — one wide + two', short: '3', panes: 3 },
+  { id: '4', label: '4 charts — grid', short: '2×2', panes: 4 },
+]
+
+export interface Pane {
+  symbol: string
+  timeframe: Timeframe
+}
+
 export interface Tab {
   id: string
   type: TabType
   symbol: string
   timeframe: Timeframe
+  /** multi-chart grid config; undefined = single chart (legacy layout) */
+  grid?: { layout: GridLayoutId; panes: Pane[] }
+  /** which pane drives the Quote/News sidebar (grid mode) */
+  focusedPane?: number
+  /** sync crosshair across panes of this tab */
+  syncCrosshair?: boolean
+}
+
+/** Resolves the pane list for a tab (grid config or the single legacy pane). */
+export function tabPanes(tab: Tab): Pane[] {
+  if (tab.grid?.panes?.length) return tab.grid.panes
+  return [{ symbol: tab.symbol, timeframe: tab.timeframe }]
+}
+
+/** Resolves the active grid layout for a tab ('1' when unset). */
+export function tabLayout(tab: Tab): GridLayoutId {
+  return tab.grid?.layout ?? '1'
+}
+
+/** Pane count for a layout id. */
+export function layoutPaneCount(id: GridLayoutId): number {
+  return GRID_LAYOUTS.find((l) => l.id === id)?.panes ?? 1
 }
 
 export type PanelId = 'watchlist' | 'quote' | 'news'
@@ -89,6 +127,13 @@ interface TerminalState {
   setTabSymbol: (tabId: string, symbol: string) => void
   setTabTimeframe: (tabId: string, tf: Timeframe) => void
   selectSymbol: (symbol: string) => void
+
+  // multi-chart grid (per chart tab)
+  setGridLayout: (tabId: string, layout: GridLayoutId) => void
+  setPaneSymbol: (tabId: string, paneIdx: number, symbol: string) => void
+  setPaneTimeframe: (tabId: string, paneIdx: number, tf: Timeframe) => void
+  setFocusedPane: (tabId: string, paneIdx: number) => void
+  setSyncCrosshair: (tabId: string, v: boolean) => void
 
   // right sidebar panel layout (Task 12)
   panelOrder: PanelId[]
@@ -191,11 +236,74 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       layoutDirty: true,
     })),
 
+  // ---------- multi-chart grid ----------
+  setGridLayout: (tabId, layout) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== tabId || t.type !== 'chart') return t
+        const panes = tabPanes(t)
+        const count = layoutPaneCount(layout)
+        const next = [...panes]
+        while (next.length < count) next.push({ ...panes[0] })
+        next.length = count
+        if (layout === '1') {
+          // single pane mirrors the legacy tab fields so other panels keep working
+          return { ...t, symbol: next[0].symbol, timeframe: next[0].timeframe, grid: { layout, panes: next } }
+        }
+        return { ...t, grid: { layout, panes: next } }
+      }),
+      layoutDirty: true,
+    })),
+
+  setPaneSymbol: (tabId, paneIdx, symbol) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== tabId) return t
+        const panes = tabPanes(t)
+        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+        if (panes[i].symbol === symbol) return t
+        const next = panes.map((p, j) => (j === i ? { ...p, symbol } : p))
+        // legacy single-chart mode keeps tab fields in sync
+        if (!t.grid || t.grid.layout === '1') return { ...t, symbol, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+      }),
+      layoutDirty: true,
+    })),
+
+  setPaneTimeframe: (tabId, paneIdx, tf) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== tabId) return t
+        const panes = tabPanes(t)
+        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+        if (panes[i].timeframe === tf) return t
+        const next = panes.map((p, j) => (j === i ? { ...p, timeframe: tf } : p))
+        if (!t.grid || t.grid.layout === '1') return { ...t, timeframe: tf, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+      }),
+      layoutDirty: true,
+    })),
+
+  setFocusedPane: (tabId, paneIdx) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => (t.id === tabId && t.focusedPane !== paneIdx ? { ...t, focusedPane: paneIdx } : t)),
+      layoutDirty: true,
+    })),
+
+  setSyncCrosshair: (tabId, v) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, syncCrosshair: v } : t)),
+      layoutDirty: true,
+    })),
+
   selectSymbol: (symbol) => {
     const { activeTabId, tabs } = get()
     const active = tabs.find((t) => t.id === activeTabId)
     if (active && active.type === 'chart') {
-      get().setTabSymbol(active.id, symbol)
+      // target the focused pane so multi-chart grids follow watchlist clicks
+      const panes = tabPanes(active)
+      const idx = Math.min(active.focusedPane ?? 0, panes.length - 1)
+      get().setPaneSymbol(active.id, idx, symbol)
     } else {
       const chartTab = tabs.find((t) => t.type === 'chart')
       if (chartTab) {
@@ -248,14 +356,40 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     if (!data || typeof data !== 'object') return
     const blob = data as Partial<LayoutBlob>
     if (!blob.tabs || !Array.isArray(blob.tabs) || blob.tabs.length === 0) return
+    const VALID_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M']
+    const VALID_LAYOUTS: GridLayoutId[] = ['1', '2h', '2v', '3s', '4']
     const tabs = blob.tabs
       .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap'].includes(t.type))
-      .map((t) => ({
-        id: t.id,
-        type: t.type as TabType,
-        symbol: (t.symbol || 'AAPL').toUpperCase(),
-        timeframe: (['1m', '5m', '15m', '1h', '1D', '1W', '1M'].includes(t.timeframe as string) ? t.timeframe : '1D') as Timeframe,
-      }))
+      .map((t) => {
+        const base = {
+          id: t.id,
+          type: t.type as TabType,
+          symbol: (t.symbol || 'AAPL').toUpperCase(),
+          timeframe: (VALID_TFS.includes(t.timeframe as string) ? t.timeframe : '1D') as Timeframe,
+        }
+        if (t.type !== 'chart') return { ...base }
+        // restore multi-chart grid (sanitized; legacy blobs get a single pane)
+        const layout: GridLayoutId =
+          t.grid && VALID_LAYOUTS.includes(t.grid.layout) ? t.grid.layout : '1'
+        let panes: Pane[] = Array.isArray(t.grid?.panes)
+          ? t.grid.panes
+              .filter((p) => p && typeof p.symbol === 'string')
+              .map((p) => ({
+                symbol: p.symbol.toUpperCase(),
+                timeframe: (VALID_TFS.includes(p.timeframe as string) ? p.timeframe : '1D') as Timeframe,
+              }))
+          : []
+        if (panes.length === 0) panes = [{ symbol: base.symbol, timeframe: base.timeframe }]
+        const count = layoutPaneCount(layout)
+        while (panes.length < count) panes.push({ ...panes[0] })
+        panes.length = count
+        return {
+          ...base,
+          grid: { layout, panes },
+          focusedPane: Math.max(0, Math.min(typeof t.focusedPane === 'number' ? t.focusedPane : 0, count - 1)),
+          syncCrosshair: Boolean(t.syncCrosshair),
+        }
+      })
     if (tabs.length === 0) return
     const activeTabId = tabs.some((t) => t.id === blob.activeTabId) ? (blob.activeTabId as string) : tabs[0].id
     const sb = blob.sidebar

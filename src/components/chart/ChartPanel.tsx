@@ -9,9 +9,9 @@ import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
-import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS, Tab } from '@/store/terminal'
+import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS } from '@/store/terminal'
 import { useShallow } from 'zustand/react/shallow'
-import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar } from '@/lib/market-types'
+import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -64,13 +64,25 @@ const KIND_LABEL: Record<DrawingKind, string> = {
 
 const EMPTY_DRAWINGS: Drawing[] = []
 
-export function ChartPanel({ tab }: { tab: Tab }) {
-  const symbol = tab.symbol
-  const tf = tab.timeframe
+export interface ChartPanelProps {
+  symbol: string
+  timeframe: Timeframe
+  onSymbolChange: (s: string) => void
+  onTimeframeChange: (tf: Timeframe) => void
+  /** grid mode: click to focus this pane (drives Quote/News sidebar) */
+  onFocus?: () => void
+  /** grid mode: visual focus ring */
+  focused?: boolean
+  /** pane key for crosshair sync (must be unique within the group) */
+  syncKey?: string
+  /** crosshair sync group id (tab id) or null to disable */
+  syncGroup?: string | null
+  /** smaller chrome for grid panes */
+  compact?: boolean
+}
 
+export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeChange, onFocus, focused, syncKey, syncGroup, compact }: ChartPanelProps) {
   // store
-  const setTabSymbol = useTerminal((s) => s.setTabSymbol)
-  const setTabTimeframe = useTerminal((s) => s.setTabTimeframe)
   const drawingTool = useTerminal((s) => s.drawingTool)
   const setDrawingTool = useTerminal((s) => s.setDrawingTool)
   const addDrawingLocal = useTerminal((s) => s.addDrawingLocal)
@@ -117,6 +129,14 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   const posRef = useRef(posData.data)
   posRef.current = posData.data
   const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
+
+  // crosshair sync (multi-chart grid): refs so the chart lifecycle effect
+  // always reads fresh values without re-creating the chart
+  const syncGroupRef = useRef(syncGroup)
+  syncGroupRef.current = syncGroup
+  const syncKeyRef = useRef(syncKey)
+  syncKeyRef.current = syncKey
+  const suppressSyncUntilRef = useRef(0)
 
   const drawings = useTerminal(useShallow((s) => s.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS))
   const symbolAlerts = useTerminal(useShallow((s) => s.alerts.filter((a) => a.symbol === symbol)))
@@ -966,7 +986,36 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           v: volBar?.value ?? 0,
         })
       }
+      // publish crosshair position to sibling panes (multi-chart sync)
+      const group = syncGroupRef.current
+      const key = syncKeyRef.current
+      if (group && key && Date.now() >= suppressSyncUntilRef.current) {
+        const bar2 = param.time != null ? (param.seriesData.get(series) as CandlestickData | undefined) : undefined
+        const px = bar2 ? Number((bar2 as CandlestickData).close ?? NaN) : NaN
+        window.dispatchEvent(
+          new CustomEvent('tt:xsync', {
+            detail: { group, from: key, time: param.time ?? null, price: Number.isFinite(px) ? px : null },
+          }),
+        )
+      }
     })
+
+    // apply crosshair positions published by sibling panes (multi-chart sync)
+    const onExternalSync = (e: Event) => {
+      const d = (e as CustomEvent<{ group: string; from: string; time: Time | null; price: number | null }>).detail
+      const group = syncGroupRef.current
+      const key = syncKeyRef.current
+      if (!d || !group || !key || d.group !== group || d.from === key) return
+      suppressSyncUntilRef.current = Date.now() + 60
+      try {
+        if (d.time != null && d.price != null && Number.isFinite(d.price)) {
+          chart.setCrosshairPosition(d.price, d.time, series)
+        } else {
+          chart.clearCrosshairPosition()
+        }
+      } catch { /* chart tearing down */ }
+    }
+    window.addEventListener('tt:xsync', onExternalSync)
 
     let cancelled = false
     ;(async () => {
@@ -1045,6 +1094,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     return () => {
       cancelled = true
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange)
+      window.removeEventListener('tt:xsync', onExternalSync)
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
@@ -1106,31 +1156,40 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   const tfLabel = TIMEFRAMES[tf].label
 
   return (
-    <div ref={containerRef} className="relative h-full w-full overflow-hidden select-none" style={{ background: '#09090b' }}>
+    <div
+      ref={containerRef}
+      className={cn(
+        'relative h-full w-full select-none overflow-hidden',
+        focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
+      )}
+      style={{ background: '#09090b' }}
+      onPointerDownCapture={() => onFocus?.()}
+    >
       {/* chart canvas is injected here by lightweight-charts */}
       <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-10" aria-hidden />
 
       {/* header overlay */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex h-10 items-center gap-2 border-b border-zinc-800/60 bg-zinc-950/85 px-2 backdrop-blur-sm">
+      <div className={cn('pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-zinc-800/60 bg-zinc-950/85 px-2 backdrop-blur-sm', compact ? 'h-8' : 'h-10')}>
         <div className="pointer-events-auto flex items-center">
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 gap-1 px-2 text-sm font-semibold text-zinc-100"
+            className={cn('h-7 gap-1 px-2 font-semibold text-zinc-100', compact ? 'text-xs' : 'text-sm')}
             onClick={() => setSearchOpen(true)}
           >
             {symbol}
-            <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />
+            {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>
         </div>
-        <div className="pointer-events-auto flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
+        <div className="pointer-events-auto flex items-center gap-0.5 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
           {(Object.keys(TIMEFRAMES) as (keyof typeof TIMEFRAMES)[]).map((k) => (
             <button
               key={k}
-              onClick={() => setTabTimeframe(tab.id, k)}
+              onClick={() => onTimeframeChange(k)}
               className={cn(
-                'rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors',
+                'rounded font-medium transition-colors',
+                compact ? 'px-1 py-0.5 text-[10px]' : 'px-1.5 py-0.5 text-[11px]',
                 k === tf ? 'bg-emerald-500/15 text-emerald-400' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200',
               )}
             >
@@ -1180,7 +1239,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
                     : 'data error'}
             </Badge>
           )}
-          {quote && (
+          {quote && !compact && (
             <div className="text-right">
               <span className="text-sm font-semibold tabular-nums text-zinc-100">{fmtPrice(quote.price)}</span>
               <span className={cn('ml-2 text-[11px] tabular-nums', up ? 'text-emerald-400' : 'text-rose-400')}>
@@ -1355,7 +1414,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       <SymbolSearchDialog
         open={searchOpen}
         onOpenChange={setSearchOpen}
-        onSelect={(s) => setTabSymbol(tab.id, s)}
+        onSelect={onSymbolChange}
       />
     </div>
   )

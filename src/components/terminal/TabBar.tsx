@@ -2,9 +2,10 @@
 
 // Top bar: local tabs (chart / calendar / heat map) + add-tab menu + account controls.
 import { useState } from 'react'
-import { useTerminal, TabType } from '@/store/terminal'
+import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
+  PanelsTopLeft, Crosshair, Check,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -15,6 +16,7 @@ import {
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { cn } from '@/lib/utils'
 
 const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart }> = {
   chart: { label: 'Chart', icon: CandlestickChart },
@@ -40,6 +42,13 @@ export function TabBar({
   const alerts = useTerminal((s) => s.alerts)
   const activeAlerts = alerts.filter((a) => a.status === 'active').length
   const [confirmClose, setConfirmClose] = useState<string | null>(null)
+
+  // multi-chart grid controls apply to the active chart tab
+  const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0]
+  const isChartTab = activeTab?.type === 'chart'
+  const layout = activeTab ? tabLayout(activeTab) : '1'
+  const paneCount = activeTab ? tabPanes(activeTab).length : 1
+  const syncOn = Boolean(activeTab?.syncCrosshair)
 
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -113,6 +122,61 @@ export function TabBar({
           </DropdownMenuContent>
         </DropdownMenu>
       </nav>
+
+      {/* multi-chart layout selector + crosshair sync (chart tabs only) */}
+      {isChartTab && (
+        <div className="flex shrink-0 items-center gap-1 pl-1">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1.5 px-2 text-xs text-zinc-400 hover:text-zinc-100"
+                aria-label="Chart layout"
+                title="Chart layout — number of charts in this tab"
+              >
+                <PanelsTopLeft className="h-3.5 w-3.5" />
+                <span className="hidden text-[11px] font-medium sm:inline">{GRID_LAYOUTS.find((l) => l.id === layout)?.short ?? '1'}</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="border-zinc-800 bg-zinc-900">
+              <DropdownMenuLabel className="text-xs text-zinc-500">Chart layout (this tab)</DropdownMenuLabel>
+              <DropdownMenuSeparator className="bg-zinc-800" />
+              {GRID_LAYOUTS.map((l) => (
+                <DropdownMenuItem
+                  key={l.id}
+                  onClick={() => {
+                    if (activeTab) useTerminal.getState().setGridLayout(activeTab.id, l.id as GridLayoutId)
+                  }}
+                  className="gap-2 text-xs"
+                >
+                  <span className="w-7 shrink-0 rounded border border-zinc-700 text-center text-[10px] text-zinc-400">{l.short}</span>
+                  <span className="flex-1">{l.label}</span>
+                  {l.id === layout && <Check className="h-3.5 w-3.5 text-emerald-400" />}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {paneCount > 1 && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                'h-7 w-7',
+                syncOn ? 'bg-emerald-500/20 text-emerald-400' : 'text-zinc-400 hover:text-zinc-100',
+              )}
+              onClick={() => {
+                if (activeTab) useTerminal.getState().setSyncCrosshair(activeTab.id, !syncOn)
+              }}
+              aria-pressed={syncOn}
+              aria-label="Sync crosshair across charts"
+              title={syncOn ? 'Crosshair sync ON — hover one chart, others follow' : 'Sync crosshair across charts'}
+            >
+              <Crosshair className="h-3.5 w-3.5" />
+            </Button>
+          )}
+        </div>
+      )}
 
       {/* account cluster */}
       <div className="ml-auto flex shrink-0 items-center gap-1">
