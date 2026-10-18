@@ -64,3 +64,15 @@ model Alert {
 
   @@index([userId, status])
 }
+
+// Economic-calendar event alarms. Events have no stable id upstream, so the
+// key is "<ISO time>|<currency>|<title>" (same derivation on the client).
+model CalendarAlarm {
+  id        String   @id @default(cuid())
+  userId    String
+  eventKey  String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, eventKey])
+  @@index([userId])
+}

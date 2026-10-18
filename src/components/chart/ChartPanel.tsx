@@ -1343,6 +1343,93 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     window.addEventListener('tt:xsync', onExternalSync)
 
     let cancelled = false
+
+    // ---- scroll-back pagination (Task 28 #1) ----
+    // When the user scrolls/zooms near the LEFT edge of the loaded history,
+    // fetch the preceding chunk (~barCount bars) from the API and prepend it.
+    // Closure flags reset automatically on symbol/timeframe change.
+    let loadingOlder = false
+    let olderExhausted = false
+    const seriesDataFor = (clean: Bar[]) =>
+      clean.map((b) =>
+        chartType === 'candles'
+          ? { time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close }
+          : { time: b.time as UTCTimestamp, value: b.close },
+      )
+    const applyBars = (clean: Bar[]) => {
+      series.setData(seriesDataFor(clean))
+      vol.setData(
+        clean.map((b) => ({
+          time: b.time as UTCTimestamp,
+          value: b.volume,
+          color: b.close >= b.open ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)',
+        })),
+      )
+    }
+    const loadOlder = async () => {
+      const bars = barsRef.current
+      if (loadingOlder || olderExhausted || cancelled || bars.length === 0) return
+      const oldest = bars[0].time
+      loadingOlder = true
+      try {
+        const res = await fetch(
+          `/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}&before=${oldest}`,
+        )
+        if (!res.ok) throw new Error('older bars fetch failed')
+        const json = await res.json()
+        if (cancelled) return
+        const incoming: Bar[] = (json.bars as Bar[]) || []
+        // only bars STRICTLY older than what is loaded (server windows can overlap)
+        const fresh = incoming.filter((b) => b.time < oldest)
+        if (fresh.length === 0) {
+          // nothing older exists — stop asking (until symbol/tf changes)
+          olderExhausted = true
+          return
+        }
+        const map = new Map<number, Bar>()
+        for (const b of bars) map.set(b.time, b)
+        for (const b of fresh) map.set(b.time, b)
+        const merged = [...map.values()].sort((a, b) => a.time - b.time)
+        barsRef.current = merged
+        // prepending N bars shifts every logical index by N — restore the exact
+        // visible window so the view doesn't jump while the user is scrolling
+        const prev = chart.timeScale().getVisibleLogicalRange()
+        applyBars(merged)
+        const added = merged.length - bars.length
+        if (prev) {
+          chart.timeScale().setVisibleLogicalRange({ from: prev.from + added, to: prev.to + added })
+        }
+        scheduleRedraw()
+        // extend the [E]/⚡ event-marker window back over the new history
+        void (async () => {
+          try {
+            const mres = await fetch(
+              `/api/market/markers?symbol=${encodeURIComponent(symbol)}&from=${merged[0].time}&to=${oldest}`,
+            )
+            if (!mres.ok || cancelled) return
+            const mj = await mres.json()
+            const olderEarnings = ((mj.earningsInfo as { ts: number }[]) || []).filter((e) => e.ts < oldest)
+            const rawNews = ((mj.newsItems as { ts: number }[]) || [])
+              .filter((n) => n.ts < oldest)
+              .sort((a, b) => a.ts - b.ts)
+            const step = Math.max(1, Math.ceil(rawNews.length / 16))
+            const spacedNews = rawNews.filter((_, i) => i % step === 0)
+            if (cancelled) return
+            const prevM = markersRef.current
+            markersRef.current = {
+              earnings: [...olderEarnings, ...prevM.earnings],
+              news: [...spacedNews, ...prevM.news],
+            }
+            scheduleRedraw()
+          } catch { /* markers optional */ }
+        })()
+      } catch {
+        // transient failure — the next scroll tick retries
+      } finally {
+        loadingOlder = false
+      }
+    }
+
     ;(async () => {
       try {
         const res = await fetch(`/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}`)
@@ -1375,20 +1462,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const clean = [...map.values()].sort((a, b) => a.time - b.time)
         barsRef.current = clean
 
-        series.setData(
-          clean.map((b) =>
-            chartType === 'candles'
-              ? { time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close }
-              : { time: b.time as UTCTimestamp, value: b.close },
-          ),
-        )
-        vol.setData(
-          clean.map((b) => ({
-            time: b.time as UTCTimestamp,
-            value: b.volume,
-            color: b.close >= b.open ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)',
-          })),
-        )
+        applyBars(clean)
         // TradingView-like: show recent window, not the whole history
         if (clean.length > 0) {
           const from = Math.max(0, clean.length - 150)
@@ -1424,7 +1498,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
     })()
 
-    const onRangeChange = () => scheduleRedraw()
+    const onRangeChange = () => {
+      scheduleRedraw()
+      // near the left edge of the loaded history → pull the preceding chunk
+      const r = chart.timeScale().getVisibleLogicalRange()
+      if (r && r.from < 12) void loadOlder()
+    }
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange)
     // also redraw when the visible TIME range shifts (zoom/scroll can change the
     // price autoscale without changing the logical bar range)
@@ -1438,6 +1517,17 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       timeAt,
       xOf,
       yOf,
+      // scroll-back pagination probes (Task 28 #1)
+      bars: () => barsRef.current.length,
+      oldestBarTime: () => barsRef.current[0]?.time ?? null,
+      firstVisibleTime: () => {
+        try {
+          const r = chart.timeScale().getVisibleRange()
+          return r ? Math.floor((r.from as UTCTimestamp as unknown as number) as number) : null
+        } catch {
+          return null
+        }
+      },
     }
 
     return () => {

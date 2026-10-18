@@ -226,28 +226,43 @@ async function fetchBarsPaged(
   return { bars: all, status, truncated: true }
 }
 
+export interface GetBarsOptions {
+  /** unix seconds — fetch bars ENDING just before this instant (scroll-back pagination) */
+  before?: number
+}
+
 export async function getBars(
   symbol: string,
   timeframe: Timeframe,
   userId?: string,
+  opts?: GetBarsOptions,
 ): Promise<{ bars: Bar[] } & DemoMeta> {
+  // `before` shifts the whole window one chunk INTO THE PAST (end = before),
+  // so each call appends the PRECEDING ~barCount bars to the chart.
+  const before = opts?.before
   // Crypto: Binance FIRST — free public klines, no API key, so charts stream
   // real crypto data even before the user logs in / saves their Alpaca keys.
   if (isCryptoSymbol(symbol)) {
-    const bin = await getBinanceBars(symbol, timeframe)
+    const bin = await getBinanceBars(symbol, timeframe, before != null ? before * 1000 : undefined)
     if (bin.length > 0) return { bars: bin, demo: false, source: 'binance' }
     // Binance unreachable -> fall through to Alpaca (if keys) or demo below.
   }
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
     return demoResult(
-      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      (reason) => ({
+        bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount, before),
+        demo: true,
+        reason,
+      }),
       'no-keys',
     )
   }
   const tf = TIMEFRAMES[timeframe]
   const end = new Date()
-  const endIso = end.toISOString().slice(0, 19) + 'Z'
+  const endIso = before != null
+    ? new Date(before * 1000).toISOString().slice(0, 19) + 'Z'
+    : end.toISOString().slice(0, 19) + 'Z'
 
   if (isCryptoSymbol(symbol)) {
     // Crypto API: v1beta3 — supports up to 1Day; aggregate 1W/1M from daily.
@@ -255,20 +270,28 @@ export async function getBars(
     const lookback = timeframe === '1W' || timeframe === '1M'
       ? Math.ceil(tf.barCount * 7 * tf.seconds / 86400) + 20
       : tf.barCount
-    const s = new Date(Date.now() - lookback * 86400 * 1000).toISOString().slice(0, 19) + 'Z'
+    const s = new Date((before ?? Date.now() / 1000) * 1000 - lookback * 86400 * 1000).toISOString().slice(0, 19) + 'Z'
     const path =
       `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}&start=${s}&end=${endIso}&limit=10000`
     const { bars: rawBars, status, truncated } = await fetchBarsPaged(path, keys, symbol)
     if (!rawBars.length && status !== 200) {
       return demoResult(
-        (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+        (reason) => ({
+          bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount, before),
+          demo: true,
+          reason,
+        }),
         status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
       )
     }
     let bars = mapBars(rawBars)
     if (bars.length === 0) {
       return demoResult(
-        (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+        (reason) => ({
+          bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount, before),
+          demo: true,
+          reason,
+        }),
         'empty',
       )
     }
@@ -287,7 +310,7 @@ export async function getBars(
   let status = 200
   let truncated = false
   for (const mult of [1, 5, 40]) {
-    const s = new Date(end.getTime() - tf.barCount * tf.seconds * 1000 * mult)
+    const s = new Date((before ?? end.getTime() / 1000) * 1000 - tf.barCount * tf.seconds * 1000 * mult)
     const res = await fetchBarsPaged(makePath(s.toISOString().slice(0, 19) + 'Z'), keys, symbol)
     rawBars = res.bars
     status = res.status
@@ -295,17 +318,25 @@ export async function getBars(
     if (rawBars.length > 0) break
     if (status !== 200) break
   }
-  console.log(`[bars] stock ${symbol} ${timeframe}: ${rawBars.length} bars (truncated=${truncated})`)
+  console.log(`[bars] stock ${symbol} ${timeframe}: ${rawBars.length} bars (truncated=${truncated}, before=${before ?? 'now'})`)
   if (!rawBars.length && status !== 200) {
     return demoResult(
-      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      (reason) => ({
+        bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount, before),
+        demo: true,
+        reason,
+      }),
       status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
     )
   }
   const bars = mapBars(rawBars)
   if (bars.length === 0) {
     return demoResult(
-      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      (reason) => ({
+        bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount, before),
+        demo: true,
+        reason,
+      }),
       'empty',
     )
   }

@@ -46,9 +46,13 @@ function stockMarketOpen(d: Date): boolean {
   return hours >= 14.5 && hours < 21 // 9:30-16:00 ET ≈ 14:30-21:00 UTC
 }
 
-export function simBars(symbol: string, timeframe: keyof typeof TIMEFRAMES, barCount: number): Bar[] {
+/**
+ * Demo bars ending "now" (default) or at `endTs` (unix seconds) — the endTs
+ * variant powers the chart's scroll-back pagination in demo mode (no keys).
+ */
+export function simBars(symbol: string, timeframe: keyof typeof TIMEFRAMES, barCount: number, endTs?: number): Bar[] {
   const tf = TIMEFRAMES[timeframe]
-  const now = Math.floor(Date.now() / 1000)
+  const now = endTs ?? Math.floor(Date.now() / 1000)
   const lastOpen = Math.floor(now / tf.seconds) * tf.seconds
   const start = lastOpen - (barCount - 1) * tf.seconds
   const seed = hashSeed(`${symbol}|${timeframe}|v1`)
@@ -87,8 +91,10 @@ export function simBars(symbol: string, timeframe: keyof typeof TIMEFRAMES, barC
     price = close
   }
   // Rescale the whole series so the last close equals the live quote price
-  // (keeps continuity — no fake gap on the final bar).
-  if (bars.length > 0) {
+  // (keeps continuity — no fake gap on the final bar). Historical chunks
+  // (endTs in the past) skip this: their last close must stay where the
+  // walk put it, not jump to today's price.
+  if (bars.length > 0 && endTs == null) {
     const live = simLivePrice(symbol)
     const factor = live / bars[bars.length - 1].close
     if (isFinite(factor) && factor > 0 && Math.abs(Math.log(factor)) < 1.5) {

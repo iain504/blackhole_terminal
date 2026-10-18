@@ -184,8 +184,12 @@ async function fetchJson(): Promise<CalendarEvent[]> {
   }
 }
 
-export async function getEconomicCalendar(): Promise<{ events: CalendarEvent[]; live: boolean; source?: string }> {
-  if (cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
+export async function getEconomicCalendar(
+  opts?: { fresh?: boolean },
+): Promise<{ events: CalendarEvent[]; live: boolean; source?: string }> {
+  // fresh=1 skips the 15-min cache read — used when a watched event time just
+  // passed so the freshly published "actual" value shows up immediately.
+  if (!opts?.fresh && cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
     return { events: cache.events, live: cache.live }
   }
   // 1) XML mirror (currently the one that works) 2) JSON mirror 3) sample

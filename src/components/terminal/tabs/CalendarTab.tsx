@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, RefreshCw, X } from 'lucide-react'
+import { AlertTriangle, Bell, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -61,6 +61,11 @@ const IMPORTANCE_LABEL: Record<'high' | 'medium' | 'low', string> = {
 
 const REFRESH_INTERVAL_MS = 10 * 60 * 1000 // auto-refresh every 10 minutes
 
+/** Stable per-event key used to persist alarms: "<ISO time>|<CCY>|<title>". */
+function eventKey(ev: CalEvent): string {
+  return `${ev.time}|${ev.country}|${ev.event}`
+}
+
 // Importance filter values (all on by default)
 type Imp = 'high' | 'medium' | 'low'
 const IMP_ALL: Imp[] = ['high', 'medium', 'low']
@@ -77,11 +82,14 @@ export default function CalendarTab() {
   const [impSel, setImpSel] = useState<Set<string>>(new Set(IMP_ALL))
   const [countrySel, setCountrySel] = useState<Set<string>>(new Set())
 
-  const refresh = useCallback(async () => {
+  // ---- event alarms (Task 28 #3): grey = off (default), colored = on ----
+  const [alarms, setAlarms] = useState<Set<string>>(new Set())
+
+  const refresh = useCallback(async (fresh = false) => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/api/market/calendar', { cache: 'no-store' })
+      const res = await fetch(`/api/market/calendar${fresh ? '?fresh=1' : ''}`, { cache: 'no-store' })
       if (!res.ok) throw new Error(`Request failed (HTTP ${res.status})`)
       const data = (await res.json()) as { events?: CalEvent[]; source?: CalendarSource }
       const evs = Array.isArray(data.events) ? data.events : []
@@ -107,6 +115,72 @@ export default function CalendarTab() {
     const id = setInterval(() => void refresh(), REFRESH_INTERVAL_MS)
     return () => clearInterval(id)
   }, [refresh])
+
+  // Load the user's enabled alarms once
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const res = await fetch('/api/calendar/alarms')
+        if (!res.ok || !alive) return
+        const json = await res.json()
+        if (alive) setAlarms(new Set((json.keys as string[]) || []))
+      } catch { /* offline */ }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // Optimistic toggle + persisted via /api/calendar/alarms
+  const toggleAlarm = useCallback((key: string, on: boolean) => {
+    setAlarms((prev) => {
+      const next = new Set(prev)
+      if (on) next.add(key)
+      else next.delete(key)
+      return next
+    })
+    void fetch('/api/calendar/alarms', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key, on }),
+    }).catch(() => { /* offline — optimistic state kept */ })
+  }, [])
+
+  // ---- Task 28 #4: keep the calendar fresh around event times ----
+  // Ticking clock so a row's "past" state (opacity, actual column) flips the
+  // moment its time passes — no refresh needed for the visual state.
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 15_000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Next event still in the future (recomputed when the events data changes).
+  const nextEventTime = useMemo(() => {
+    let min: number | null = null
+    for (const ev of events) {
+      const t = new Date(ev.time).getTime()
+      if (Number.isNaN(t)) continue
+      if (t > Date.now() && (min === null || t < min)) min = t
+    }
+    return min
+  }, [events])
+
+  // When an event's time passes, its "actual" value is published shortly
+  // AFTERWARDS — schedule one fresh (cache-bypassing) fetch ~90s after the
+  // next upcoming event so the value updates without waiting for the 10-min
+  // cycle. The 10-min interval above still covers events nobody waits on.
+  useEffect(() => {
+    if (nextEventTime == null) return
+    const wait = Math.min(nextEventTime + 90_000 - Date.now(), REFRESH_INTERVAL_MS)
+    if (wait <= 0) return
+    const id = setTimeout(() => {
+      void refresh(true)
+      setNow(Date.now())
+    }, wait)
+    return () => clearTimeout(id)
+  }, [nextEventTime, refresh])
 
   // Country filter options (sorted by event count desc, then name)
   const countryOptions = useMemo(() => {
@@ -150,7 +224,6 @@ export default function CalendarTab() {
     return Array.from(groups.entries())
   }, [filtered])
 
-  const now = Date.now()
   const today = dayKey(new Date())
   const hasData = events.length > 0
   const filtersActive = impSel.size !== IMP_ALL.length || countrySel.size < countryOptions.length
@@ -162,6 +235,15 @@ export default function CalendarTab() {
       <header className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-zinc-800 bg-zinc-900/60 px-3">
         <div className="flex min-w-0 items-center gap-2">
           <h2 className="truncate text-sm font-semibold text-zinc-100">Economic Calendar</h2>
+          {alarms.size > 0 && (
+            <Badge
+              variant="outline"
+              className="hidden h-5 gap-1 px-1.5 text-[10px] font-medium text-amber-400 sm:inline-flex sm:border-amber-500/30 sm:bg-amber-500/10"
+            >
+              <Bell className="size-2.5" aria-hidden="true" />
+              {alarms.size} alarm{alarms.size === 1 ? '' : 's'}
+            </Badge>
+          )}
           {source && (
             <Badge
               variant="outline"
@@ -366,6 +448,8 @@ export default function CalendarTab() {
                       const imp = normalizeImportance(ev.importance)
                       const high = imp === 'high'
                       const past = new Date(ev.time).getTime() < now
+                      const key = eventKey(ev)
+                      const alarmOn = alarms.has(key)
                       return (
                         <tr
                           key={`${ev.time}-${ev.country}-${ev.event}-${i}`}
@@ -401,7 +485,36 @@ export default function CalendarTab() {
                             </span>
                           </td>
                           <td className={cn('px-2 py-1.5', high ? 'font-medium text-zinc-100' : 'text-zinc-300')}>
-                            {ev.event}
+                            <div className="flex items-center gap-1.5">
+                              {/* event alarm — grey (off, default) / amber (on) */}
+                              <button
+                                type="button"
+                                onClick={() => toggleAlarm(key, !alarmOn)}
+                                aria-pressed={alarmOn}
+                                aria-label={
+                                  alarmOn
+                                    ? `Disable alarm for ${ev.event}`
+                                    : `Set alarm for ${ev.event}`
+                                }
+                                title={
+                                  alarmOn
+                                    ? 'Alarm on — click to disable'
+                                    : 'Set an alarm for this event'
+                                }
+                                className={cn(
+                                  '-ml-1 shrink-0 rounded p-1 transition-colors',
+                                  alarmOn
+                                    ? 'text-amber-400 hover:text-amber-300'
+                                    : 'text-zinc-600 hover:text-zinc-400',
+                                )}
+                              >
+                                <Bell
+                                  className={cn('size-3.5', alarmOn && 'fill-amber-400/40')}
+                                  aria-hidden="true"
+                                />
+                              </button>
+                              <span className="min-w-0">{ev.event}</span>
+                            </div>
                           </td>
                           <td
                             className={cn(

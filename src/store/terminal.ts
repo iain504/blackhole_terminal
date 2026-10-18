@@ -127,6 +127,8 @@ interface TerminalState {
   addTab: (type: TabType) => void
   closeTab: (id: string) => void
   setActiveTab: (id: string) => void
+  /** drag-and-drop reorder: move a tab to a target index (clamped) */
+  moveTab: (dragId: string, toIndex: number) => void
   setTabSymbol: (tabId: string, symbol: string) => void
   setTabTimeframe: (tabId: string, tf: Timeframe) => void
   selectSymbol: (symbol: string) => void
@@ -226,6 +228,18 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   },
 
   setActiveTab: (id) => set({ activeTabId: id, layoutDirty: true }),
+
+  moveTab: (dragId, toIndex) =>
+    set((s) => {
+      const from = s.tabs.findIndex((t) => t.id === dragId)
+      if (from < 0) return {}
+      // remove first, then clamp the insertion point into the shortened array
+      const next = s.tabs.filter((t) => t.id !== dragId)
+      const idx = Math.max(0, Math.min(toIndex, next.length))
+      next.splice(idx, 0, s.tabs[from])
+      if (next.every((t, i) => t.id === s.tabs[i].id)) return {} // no-op order
+      return { tabs: next, layoutDirty: true }
+    }),
 
   setTabSymbol: (tabId, symbol) =>
     set((s) => ({

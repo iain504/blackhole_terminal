@@ -135,19 +135,27 @@ type Kline = [number, string, string, string, string, string, ...unknown[]]
 /**
  * OHLCV bars from Binance's free /api/v3/klines endpoint (limit max 1000 —
  * every configured barCount fits). Returns [] when Binance is unreachable.
- * Cached 15s keyed by symbol+tf (multi-pane grids poll this a lot).
+ * `endTimeMs` (optional) fetches the chunk of klines ENDING just before that
+ * instant — powers the chart's scroll-back pagination (older history).
+ * Cached 15s keyed by symbol+tf(+endTime) (multi-pane grids poll this a lot).
  */
-export async function getBinanceBars(symbol: string, timeframe: Timeframe): Promise<Bar[]> {
-  const cacheKey = `${symbol}|${timeframe}`
+export async function getBinanceBars(symbol: string, timeframe: Timeframe, endTimeMs?: number): Promise<Bar[]> {
+  const cacheKey = endTimeMs ? `${symbol}|${timeframe}|b${endTimeMs}` : `${symbol}|${timeframe}`
   const hit = barsCache.get(cacheKey)
   if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.data ?? []
 
   const pair = toBinanceSymbol(symbol)
   if (!pair) return []
   const tf = TIMEFRAMES[timeframe]
-  const data = await binanceFetch<Kline[]>(
-    `/api/v3/klines?symbol=${pair}&interval=${KLINE_INTERVAL[timeframe]}&limit=${Math.min(tf.barCount, 1000)}`,
-  )
+  const q = new URLSearchParams({
+    symbol: pair,
+    interval: KLINE_INTERVAL[timeframe],
+    limit: '1000',
+  })
+  // Binance endTime is inclusive on kline OPEN time; subtract 1ms so the
+  // candle that opens exactly at `endTimeMs` (already on the chart) is excluded.
+  if (endTimeMs != null) q.set('endTime', String(endTimeMs - 1))
+  const data = await binanceFetch<Kline[]>(`/api/v3/klines?${q.toString()}`)
   if (!data || !Array.isArray(data)) {
     barsCache.set(cacheKey, { at: Date.now(), data: null })
     return []
@@ -162,5 +170,12 @@ export async function getBinanceBars(symbol: string, timeframe: Timeframe): Prom
   }))
   const clean = bars.filter((b) => b.close > 0)
   barsCache.set(cacheKey, { at: Date.now(), data: clean })
+  // endTime-keyed entries accumulate as the user scrolls back — prune stale ones
+  if (barsCache.size > 64) {
+    const now = Date.now()
+    for (const [k, v] of barsCache) {
+      if (now - v.at > BARS_TTL_MS) barsCache.delete(k)
+    }
+  }
   return clean
 }

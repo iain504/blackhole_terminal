@@ -1,6 +1,8 @@
 'use client'
 
 // Top bar: local tabs (chart / calendar / heat map) + add-tab menu + account controls.
+// Tabs are drag-reorderable (HTML5 DnD, Task 28 #2) and the order persists via
+// the autosaved layout.
 import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
@@ -39,10 +41,31 @@ export function TabBar({
   const setActiveTab = useTerminal((s) => s.setActiveTab)
   const addTab = useTerminal((s) => s.addTab)
   const closeTab = useTerminal((s) => s.closeTab)
+  const moveTab = useTerminal((s) => s.moveTab)
   const user = useTerminal((s) => s.user)
   const alerts = useTerminal((s) => s.alerts)
   const activeAlerts = alerts.filter((a) => a.status === 'active').length
   const [confirmClose, setConfirmClose] = useState<string | null>(null)
+
+  // ---- tab drag-and-drop reorder (Task 28 #2) ----
+  // HTML5 DnD: dragging over a tab shows an emerald insertion edge on the
+  // hovered half; dropping moves the dragged tab there.
+  const [dragTabId, setDragTabId] = useState<string | null>(null)
+  const [dropEdge, setDropEdge] = useState<{ id: string; side: 'before' | 'after' } | null>(null)
+  const reorderable = tabs.length > 1
+  const clearDropEdge = () => setDropEdge(null)
+  const handleDropOn = (targetId: string) => {
+    if (!dragTabId || dragTabId === targetId) return clearDropEdge()
+    const edge = dropEdge && dropEdge.id === targetId ? dropEdge.side : 'before'
+    const fromIdx = tabs.findIndex((t) => t.id === dragTabId)
+    const targetIdx = tabs.findIndex((t) => t.id === targetId)
+    if (fromIdx < 0 || targetIdx < 0) return clearDropEdge()
+    // index in the array WITHOUT the dragged tab (store removes-then-inserts)
+    let insertAt = edge === 'before' ? targetIdx : targetIdx + 1
+    if (fromIdx < insertAt) insertAt -= 1
+    moveTab(dragTabId, insertAt)
+    clearDropEdge()
+  }
 
   // multi-chart grid controls apply to the active chart tab
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0]
@@ -69,15 +92,52 @@ export function TabBar({
           const Icon = TYPE_META[t.type].icon
           const isActive = t.id === activeTabId
           const title = t.type === 'chart' ? t.symbol : TYPE_META[t.type].label
+          const edge = dropEdge?.id === t.id ? dropEdge.side : null
+          const dragging = dragTabId === t.id
           return (
             <div
               key={t.id}
-              className={`group flex shrink-0 items-center gap-1.5 rounded-t-md border-b-2 px-2.5 py-1.5 text-xs transition-colors ${
+              className={`relative group flex shrink-0 items-center gap-1.5 rounded-t-md border-b-2 px-2.5 py-1.5 text-xs transition-colors ${
                 isActive
                   ? 'border-emerald-500 bg-zinc-800/80 text-zinc-100'
                   : 'border-transparent text-zinc-400 hover:bg-zinc-800/40 hover:text-zinc-200'
-              }`}
+              } ${dragging ? 'opacity-40' : ''}`}
+              draggable={reorderable}
+              onDragStart={(e) => {
+                if (!reorderable) {
+                  e.preventDefault()
+                  return
+                }
+                setDragTabId(t.id)
+                e.dataTransfer.effectAllowed = 'move'
+                e.dataTransfer.setData('text/plain', t.id)
+              }}
+              onDragOver={(e) => {
+                if (!dragTabId) return
+                e.preventDefault()
+                e.dataTransfer.dropEffect = 'move'
+                const side = e.clientX <= e.currentTarget.getBoundingClientRect().left + e.currentTarget.clientWidth / 2 ? 'before' : 'after'
+                setDropEdge((prev) => (prev?.id === t.id && prev.side === side ? prev : { id: t.id, side }))
+              }}
+              onDrop={(e) => {
+                e.preventDefault()
+                handleDropOn(t.id)
+              }}
+              onDragEnd={() => {
+                setDragTabId(null)
+                clearDropEdge()
+              }}
+              title={reorderable ? `${title} — drag to reorder` : title}
             >
+              {/* insertion edge indicator */}
+              {edge && (
+                <span
+                  aria-hidden="true"
+                  className={`absolute top-1 bottom-1 z-10 w-0.5 rounded-full bg-emerald-400 ${
+                    edge === 'before' ? '-left-px' : '-right-px'
+                  }`}
+                />
+              )}
               <button
                 className="flex items-center gap-1.5"
                 onClick={() => setActiveTab(t.id)}
