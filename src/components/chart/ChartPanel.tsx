@@ -125,7 +125,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [editValue, setEditValue] = useState<{
-    type: 'drawing' | 'alert' | 'exit' | 'ghost'; id?: string; part?: 'sl' | 'tp'; price: number; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }
+    type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
   } | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
@@ -138,6 +138,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const posRef = useRef(posData.data)
   posRef.current = posData.data
   const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
+  // pending-order drag (entry / planned TP / planned SL of an unfilled order)
+  const pendingDragRef = useRef<{ part: 'entry' | 'tp' | 'sl'; price: number | null } | null>(null)
   // ghost [+TP]/[+SL] chip rects (rebuilt each overlay pass, hit-tested to
   // let the user DRAG a new exit out of the position line)
   const ghostChipRectsRef = useRef<{ part: 'sl' | 'tp'; x: number; y: number; w: number; h: number }[]>([])
@@ -505,6 +507,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.setLineDash([])
         ctx.restore()
         drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+      }
+    }
+    // preview of the NEW pending entry/TP/SL while dragging (drops → PATCH)
+    const pDrag = pendingDragRef.current
+    if (pDrag && pDrag.price != null) {
+      const yD = yOf(pDrag.price)
+      if (yD != null) {
+        const color = pDrag.part === 'tp' ? '#4ade80' : pDrag.part === 'sl' ? '#fb7185' : '#e4e4e7'
+        ctx.save()
+        ctx.strokeStyle = color
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([3, 4])
+        ctx.globalAlpha = 1
+        hlinePath(ctx, yD, w)
+        ctx.setLineDash([])
+        ctx.restore()
+        const label = pDrag.part === 'entry' ? 'ENTRY' : pDrag.part.toUpperCase()
+        drawChip(ctx, w - 122, yD, `new ${label} ${fmtPrice(pDrag.price)}`, color, true)
       }
     }
 
@@ -1153,6 +1173,44 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     window.dispatchEvent(new CustomEvent('tt:positions-changed'))
   }, [posData.data?.mode, posRefresh, toast])
 
+  // change a PENDING order's entry limit price or planned TP/SL — the drop of
+  // a dragged entry/(pend) TP/SL line (crypto plan orders re-place with a new
+  // id; stock brackets PATCH their parent — both handled server-side)
+  const patchPendingOrder = useCallback(async (
+    pending: PendingOrderInfo, part: 'entry' | 'tp' | 'sl', price: number,
+  ) => {
+    const body: Record<string, unknown> = {
+      mode: posData.data?.mode,
+      crypto: symbol.includes('/'),
+    }
+    if (part === 'entry') body.entry_limit = price
+    else if (part === 'tp') body.tp_price = price
+    else body.sl_price = price
+    try {
+      const res = await fetch(`/api/trading/orders/${pending.orderId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({
+          title: `${part === 'entry' ? 'Entry' : part.toUpperCase()} updated to ${fmtPrice(price)}`,
+          description: json?.method === 'cancel-replace'
+            ? 'Order re-created on Alpaca (new id)'
+            : json?.note || undefined,
+        })
+      } else {
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Update failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      void posRefresh()
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+    }
+  }, [posData.data?.mode, posRefresh, toast, symbol])
+
   const closePositionBySymbol = useCallback(async (tradeSymbol: string) => {
     try {
       const res = await fetch(`/api/trading/positions/${encodeURIComponent(tradeSymbol)}`, { method: 'DELETE' })
@@ -1207,7 +1265,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
 
       const hit = hitTest(x, y)
-      if (hit && (hit.type === 'drawing' || hit.type === 'alert' || hit.type === 'exit' || hit.type === 'ghost')) {
+      if (hit && (hit.type === 'drawing' || hit.type === 'alert' || hit.type === 'exit' || hit.type === 'ghost' || hit.type === 'pending')) {
         e.stopPropagation()
         e.preventDefault()
         setMenu(null)
@@ -1235,6 +1293,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           orig = [{ time: null, price: hit.origPrice }]
           origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
           exitDragRef.current = { kind: hit.part, price: hit.origPrice }
+        } else if (hit.type === 'pending') {
+          // pending entry / planned TP/SL line drag — relative move like exits
+          orig = [{ time: null, price: hit.origPrice }]
+          origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
+          pendingDragRef.current = { part: hit.part === 'whole' ? 'entry' : hit.part, price: hit.origPrice }
         } else {
           // ghost [+TP]/[+SL] chip — dragging it CREATES the exit at the drop
           // price (starts from the suggested ±5% level, follows the cursor)
@@ -1261,6 +1324,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             if (oy != null) {
               const np = priceAt(oy + dy)
               exitDragRef.current = { kind: drag.hit.part, price: np }
+              scheduleRedraw()
+            }
+            return
+          }
+          if (drag.hit.type === 'pending') {
+            const oy = drag.origPixels[0]?.y
+            if (oy != null) {
+              const np = priceAt(oy + dy)
+              pendingDragRef.current = { part: drag.hit.part === 'whole' ? 'entry' : drag.hit.part, price: np }
               scheduleRedraw()
             }
             return
@@ -1320,6 +1392,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             scheduleRedraw()
             if (drag.moved && d?.price != null) {
               void patchExitPrice(drag.hit.exit, drag.hit.part, d.price)
+            }
+            return
+          }
+          if (drag?.hit.type === 'pending') {
+            const d = pendingDragRef.current
+            pendingDragRef.current = null
+            scheduleRedraw()
+            if (drag.moved && d?.price != null) {
+              void patchPendingOrder(drag.hit.pending, d.part, d.price)
             }
             return
           }
@@ -1424,6 +1505,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
       } else if (hit.type === 'exit') {
         setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+      } else if (hit.type === 'pending') {
+        setEditValue({
+          type: 'pending',
+          id: hit.id,
+          part: hit.part === 'whole' ? 'entry' : hit.part,
+          price: hit.origPrice,
+          pending: hit.pending,
+        })
       } else if (hit.type === 'ghost') {
         const pos = posRef.current?.positions.find((pp) => normSym(pp.symbol) === normSym(symbol))
         setEditValue({
@@ -1462,7 +1551,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       el.removeEventListener('dblclick', onDoubleClick)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
+  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
 
   // ---------- chart lifecycle ----------
   useEffect(() => {
@@ -2064,6 +2153,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
           } else if (hit.type === 'exit') {
             setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+          } else if (hit.type === 'pending') {
+            setEditValue({
+              type: 'pending',
+              id: hit.id,
+              part: hit.part === 'whole' ? 'entry' : hit.part,
+              price: hit.origPrice,
+              pending: hit.pending,
+            })
           } else if (hit.type === 'ghost') {
             const pos = posRef.current?.positions.find((pp) => normSym(pp.symbol) === normSym(symbol))
             setEditValue({
@@ -2096,7 +2193,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             if (editValue.type === 'alert') void patchAlert(editValue.id!, { price })
             else if (editValue.type === 'exit' && editValue.exit) {
               void patchExitPrice(editValue.exit.info, editValue.exit.kind, price)
-            } else if (editValue.type === 'ghost' && editValue.part) {
+            } else if (editValue.type === 'pending' && editValue.pending) {
+              void patchPendingOrder(editValue.pending, editValue.part === 'tp' ? 'tp' : editValue.part === 'sl' ? 'sl' : 'entry', price)
+            } else if (editValue.type === 'ghost' && (editValue.part === 'tp' || editValue.part === 'sl')) {
               void addExitToPosition(editValue.part, price)
             } else {
               const d = (useTerminal.getState().drawingsBySymbol[symbol] || []).find((dd) => dd.id === editValue.id)
@@ -2268,6 +2367,19 @@ function ContextMenu({
           {p.slPrice != null ? ` · SL ${fmtPrice(p.slPrice)}` : ''}
           {p.managed ? ' · OCO-managed' : ''}
         </div>
+        <MenuItem label="✏️ Change entry price…" onClick={() => { onEditValue({ ...hit, part: 'whole' }); onClose() }} />
+        {p.tpPrice != null && (
+          <MenuItem
+            label={<span className="text-emerald-400">✏️ Change TP to…</span>}
+            onClick={() => { onEditValue({ ...hit, part: 'tp', origPrice: p.tpPrice! }); onClose() }}
+          />
+        )}
+        {p.slPrice != null && (
+          <MenuItem
+            label={<span className="text-rose-400">✏️ Change SL to…</span>}
+            onClick={() => { onEditValue({ ...hit, part: 'sl', origPrice: p.slPrice! }); onClose() }}
+          />
+        )}
         <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
         <div className="my-1 h-px bg-zinc-800" />
         <MenuItem

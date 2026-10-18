@@ -1,11 +1,14 @@
 'use client'
 
-// Positions console tab: every open paper + live position in one table —
-// symbol, market, side/qty, entry price, TP, SL, trailing, P&L — with a
-// per-row close button (market-close via the Alpaca Trading API).
-// Below it: every PENDING (unfilled) entry order with its planned TP/SL and a
-// cancel action. Missing TP/SL cells offer a [+ TP]/[+ SL] button that
-// attaches the exit to the position (drag-to-price also exists on the chart).
+// Positions console tab: account strip (balance, buying power, daily P&L,
+// equity curve Hour..Year, full account details) + every open paper + live
+// position in one table — symbol, market, side/qty, entry price, TP, SL,
+// trailing, P&L — with a per-row close button (market-close via the Alpaca
+// Trading API). Below it: every PENDING (unfilled) entry order with its
+// planned TP/SL — click any price to edit it (same PATCH the chart drags
+// use) — and a cancel action. Missing TP/SL cells offer a [+ TP]/[+ SL]
+// button that attaches the exit to the position (drag-to-price also exists
+// on the chart).
 import { useCallback, useEffect, useState } from 'react'
 import { Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -14,6 +17,7 @@ import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
+import AccountOverview from './AccountOverview'
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
@@ -145,7 +149,10 @@ export default function PositionsTab() {
   )
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+    <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2 terminal-scroll">
+      {/* account strip: balance, buying power, daily P&L, equity curve, details */}
+      <AccountOverview />
+
       {/* header */}
       <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-2">
         <span className="text-sm font-semibold text-zinc-100">Positions</span>
@@ -182,7 +189,7 @@ export default function PositionsTab() {
       </div>
 
       {/* positions table */}
-      <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-800/80 bg-zinc-900/70 terminal-scroll">
+      <div className="max-h-72 shrink-0 overflow-auto rounded-md border border-zinc-800/80 bg-zinc-900/70 terminal-scroll">
         <table className="w-full min-w-[900px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
             <tr className="border-b border-zinc-800">
@@ -334,12 +341,18 @@ export default function PositionsTab() {
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{p.qty}</td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{p.filledQty || '—'}</td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{p.limitPrice != null ? fmtPrice(p.limitPrice) : '—'}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">
+                    {p.type === 'limit' || p.limitPrice != null ? (
+                      <PendingPriceCell mode={mode} p={p} field="entry" onSaved={() => void refresh()} />
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-emerald-300">
-                    {p.tpPrice != null ? fmtPrice(p.tpPrice) : <span className="text-zinc-600">—</span>}
+                    <PendingPriceCell mode={mode} p={p} field="tp" onSaved={() => void refresh()} />
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-rose-300">
-                    {p.slPrice != null ? fmtPrice(p.slPrice) : <span className="text-zinc-600">—</span>}
+                    <PendingPriceCell mode={mode} p={p} field="sl" onSaved={() => void refresh()} />
                   </td>
                   <td className="px-3 py-1.5 text-zinc-400">{p.status}</td>
                   <td className="px-3 py-1.5 text-right">
@@ -365,6 +378,95 @@ export default function PositionsTab() {
         Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders · [+TP]/[+SL] attaches a new exit to the position.
       </p>
     </div>
+  )
+}
+
+/** Click-to-edit price cell for a pending order's entry limit / TP / SL.
+ * PATCHes the same endpoint the chart's line-drag uses. */
+function PendingPriceCell({ mode, p, field, onSaved }: {
+  mode: Mode
+  p: PendingOrderInfo
+  field: 'entry' | 'tp' | 'sl'
+  onSaved: () => void
+}) {
+  const { toast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [v, setV] = useState('')
+  const [busy, setBusy] = useState(false)
+  const value = field === 'entry' ? p.limitPrice : field === 'tp' ? p.tpPrice : p.slPrice
+
+  const save = async () => {
+    const price = parseFloat(v)
+    if (!Number.isFinite(price) || price <= 0) return
+    setBusy(true)
+    try {
+      const body: Record<string, unknown> = { mode, crypto: p.symbol.includes('/') }
+      if (field === 'entry') body.entry_limit = price
+      else if (field === 'tp') body.tp_price = price
+      else body.sl_price = price
+      const res = await fetch(`/api/trading/orders/${p.orderId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({
+          title: `${field === 'entry' ? 'Entry' : field.toUpperCase()} updated to ${fmtPrice(price)}`,
+          description: json?.method === 'cancel-replace' ? 'Order re-created on Alpaca (new id)' : json?.note || undefined,
+        })
+      } else {
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Update failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setBusy(false)
+      setOpen(false)
+      onSaved()
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+    }
+  }
+
+  if (!open) {
+    return (
+      <button
+        className="tabular-nums underline-offset-2 transition-colors hover:text-emerald-300 hover:underline decoration-dashed"
+        onClick={() => { setV(value != null ? String(value) : ''); setOpen(true) }}
+        aria-label={`Edit ${field === 'entry' ? 'entry limit' : field.toUpperCase()} of pending ${p.side} ${p.symbol}`}
+        title={`Click to change the ${field === 'entry' ? 'entry limit' : field.toUpperCase()} price`}
+      >
+        {value != null ? fmtPrice(value) : <span className="text-zinc-600">—</span>}
+      </button>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1">
+      <Input
+        autoFocus
+        type="number"
+        step="any"
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void save()
+          if (e.key === 'Escape') setOpen(false)
+        }}
+        className="h-6 w-24 border-zinc-700 bg-zinc-950 text-[11px]"
+        aria-label={`${field === 'entry' ? 'Entry limit' : field.toUpperCase()} price`}
+      />
+      <button
+        className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300"
+        onClick={() => void save()}
+        disabled={busy}
+        aria-label="Apply price"
+      >
+        {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+      </button>
+      <button className="text-[10px] text-zinc-500 hover:text-zinc-300" onClick={() => setOpen(false)} aria-label="Cancel edit">
+        ✕
+      </button>
+    </span>
   )
 }
 

@@ -127,6 +127,35 @@ export interface TradingAccount {
   cash: string
   buying_power: string
   currency: string
+  // extended fields (present on current Alpaca accounts) — the Positions-tab
+  // account panel / details dialog read these
+  account_number?: string
+  portfolio_value?: string
+  last_equity?: string
+  regt_buying_power?: string
+  daytrading_buying_power?: string
+  non_marginable_buying_power?: string
+  daytrade_count?: number
+  initial_margin?: string
+  maintenance_margin?: string
+  multiplier?: string
+  shorting_enabled?: boolean
+  trading_blocked?: boolean
+  transfers_blocked?: boolean
+  account_blocked?: boolean
+  pattern_day_trader?: boolean
+  sma?: string
+  created_at?: string
+}
+
+/** Raw GET /v2/account/portfolio/history response (nulls mark empty slots). */
+export interface PortfolioHistoryRaw {
+  timestamp: number[] // unix seconds
+  equity: (number | null)[]
+  profit_loss: (number | null)[]
+  profit_loss_pct: (number | null)[]
+  base_value: number | null
+  timeframe: string
 }
 
 export interface TradingPosition {
@@ -168,6 +197,15 @@ export interface TradingOrder {
 
 export async function getAccount(userId: string, mode: TradeMode) {
   return tradeFetch<TradingAccount>(userId, mode, '/v2/account')
+}
+
+/** Equity curve for the Positions tab (Hour/Day/Week/Month/Year ranges). */
+export async function getPortfolioHistory(userId: string, mode: TradeMode, period: string, timeframe: string) {
+  return tradeFetch<PortfolioHistoryRaw>(
+    userId,
+    mode,
+    `/v2/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}&extended_hours=true`,
+  )
 }
 
 export async function getPositions(userId: string, mode: TradeMode) {
@@ -699,6 +737,174 @@ export async function replaceExitOrderSmart(
     }
   }
   return { data: r2.data, status: r2.status, mode: errHost, method: 'cancel-replace', note }
+}
+
+// ---------- pending ENTRY order replacement (drag entry/TP/SL lines) ----------
+
+export interface ReplaceEntryResult {
+  data: TradingOrder | null
+  status: number
+  error?: string
+  mode?: TradeMode
+  method?: 'replace' | 'cancel-replace'
+  note?: string
+}
+
+const ENTRY_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+
+/** Poll the order until the async cancel lands (buying power frees up). */
+async function waitUntilCanceled(userId: string, host: TradeMode, orderId: string): Promise<void> {
+  for (let i = 0; i < 4; i++) {
+    await new Promise((res) => setTimeout(res, 350))
+    const r = await tradeFetch<TradingOrder>(userId, host, `/v2/orders/${orderId}`)
+    const s = String(r.data?.status || '')
+    if (['canceled', 'cancelled', 'expired', 'rejected'].includes(s)) return
+    if (!r.data) return // gone / unreachable — best effort
+  }
+}
+
+/**
+ * Change the entry limit price and/or the planned TP/SL of a PENDING
+ * (unfilled) entry order — the chart drag on the dashed entry / (pend)
+ * TP / SL lines lands here.
+ *
+ * - STOCK bracket parents: a direct PATCH accepts limit_price plus
+ *   take_profit/stop_loss bodies — both legs' prices are always sent so the
+ *   untouched leg keeps its level.
+ * - CRYPTO managed entries (`ttb-` plan in client_order_id): ALWAYS cancel →
+ *   wait → re-place with a freshly encoded plan. A direct PATCH replaces the
+ *   order WITHOUT carrying the client_order_id over (verified live: the
+ *   replacement lost the plan and the OCO supervisor would never attach the
+ *   exits), and client_order_id cannot be safely re-sent (uniqueness).
+ *   Re-placing keeps the REMAINING qty (a partially filled entry keeps its
+ *   fill).
+ * - Plain limit entries (no plan): direct PATCH on limit_price.
+ * - Any direct-PATCH rejection falls back to cancel+re-place with a full
+ *   body (mirrors replaceExitOrderSmart's strategy).
+ */
+export async function replacePendingEntrySmart(
+  userId: string,
+  mode: TradeMode,
+  orderId: string,
+  patch: { limit_price?: number; tp?: number; sl?: number; crypto?: boolean },
+): Promise<ReplaceEntryResult> {
+  // 1) locate the order (host fallback, same id spaces as exits)
+  const hosts: TradeMode[] = mode === 'paper' ? ['paper', 'live'] : ['live', 'paper']
+  let host: TradeMode = mode
+  let orig: TradingOrder | null = null
+  let last: TradeFetchResult<TradingOrder> | null = null
+  for (const m of hosts) {
+    const r = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`)
+    if (r.data && (r.data as TradingOrder).id) {
+      orig = r.data
+      host = m
+      break
+    }
+    last = r
+  }
+  if (!orig) {
+    return { data: null, status: last?.status || 404, error: last?.error || 'Order not found on paper or live', mode }
+  }
+  const statusStr = String(orig.status)
+  if (!ENTRY_OPEN_STATUSES.includes(statusStr)) {
+    return { data: null, status: 409, error: `Order is ${statusStr} — nothing to change (refresh the chart)`, mode: host }
+  }
+
+  const isCrypto = orig.asset_class === 'crypto' || orig.symbol.includes('/')
+  const crypto = Boolean(patch.crypto) || isCrypto
+  const plan = parseCryptoPlan(orig.client_order_id)
+  const exitLegs = (orig.legs || []).filter((l) => l.side !== orig.side)
+  const num = (v: string | null | undefined): number | null => {
+    if (v == null) return null
+    const n = parseFloat(v)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  // current TP/SL: requested patch wins, else the parent's legs, else the plan
+  const curTp =
+    patch.tp ??
+    num(exitLegs.find((l) => l.type === 'limit')?.limit_price) ??
+    plan?.tp ??
+    null
+  const curSl =
+    patch.sl ??
+    num(exitLegs.find((l) => l.type === 'stop' || l.type === 'stop_limit')?.stop_price) ??
+    plan?.sl ??
+    null
+  const origHasTp = curTp != null
+  const origHasSl = curSl != null
+  const newLimit = patch.limit_price ?? num(orig.limit_price)
+  // a PATCH cannot ADD a bracket leg the order does not have — full re-place
+  const addsLeg = (patch.tp != null && !origHasTp) || (patch.sl != null && !origHasSl)
+  // crypto plan orders ALWAYS re-place: a direct PATCH drops the ttb-
+  // client_order_id (verified live), losing the TP/SL plan entirely
+  const managedCrypto = Boolean(plan)
+
+  // 2) direct PATCH (limit change and/or leg price updates, no new legs)
+  if (!addsLeg && !managedCrypto) {
+    const body: Record<string, unknown> = {}
+    if (patch.limit_price != null && newLimit != null) body.limit_price = fmtPx(newLimit, crypto)
+    if (origHasTp) body.take_profit = { limit_price: fmtPx(curTp!, crypto) }
+    if (origHasSl) body.stop_loss = { stop_price: fmtPx(curSl!, crypto) }
+    if (Object.keys(body).length > 0) {
+      const r = await tradeFetch<TradingOrder>(userId, host, `/v2/orders/${orderId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      })
+      if (r.data && (r.data as TradingOrder).id) {
+        return { data: r.data, status: r.status, mode: host, method: 'replace' }
+      }
+      if (r.status === 422 && String(r.error || '').includes('not changed')) {
+        return { data: orig, status: 200, mode: host, method: 'replace', note: 'Order already at this value' }
+      }
+      // real rejection → cancel+re-place below
+    } else {
+      return { data: null, status: 400, error: 'nothing to change', mode: host }
+    }
+  }
+
+  // 3) cancel + re-place (plan change on crypto, new leg, or rejected PATCH)
+  const cancelRes = await cancelOrder(userId, host, orderId)
+  if (cancelRes.status !== 204 && cancelRes.status !== 200 && cancelRes.status !== 404) {
+    return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode: host, method: 'cancel-replace' }
+  }
+  if (cancelRes.status !== 404) await waitUntilCanceled(userId, host, orderId)
+
+  const remaining = (parseFloat(orig.qty) || 0) - (parseFloat(orig.filled_qty) || 0)
+  if (!(remaining > 0)) {
+    return { data: null, status: 200, mode: host, method: 'cancel-replace', note: 'Entry filled — nothing re-placed' }
+  }
+  const body: Record<string, unknown> = {
+    symbol: orig.symbol,
+    qty: String(remaining),
+    side: orig.side,
+    type: orig.type,
+    time_in_force: orig.time_in_force || 'gtc',
+  }
+  if (newLimit != null && (orig.type === 'limit' || orig.type === 'stop_limit')) {
+    body.limit_price = fmtPx(newLimit, crypto)
+  }
+  if (orig.type === 'stop' && curSl != null) body.stop_price = fmtPx(curSl, crypto)
+  const wantTp = patch.tp ?? curTp
+  const wantSl = patch.sl ?? curSl
+  const hadPlan = Boolean(plan) || (orig.legs?.length ?? 0) > 0 || patch.tp != null || patch.sl != null
+  if (hadPlan) {
+    if (isCrypto) {
+      // re-encode the plan — the supervisor attaches legs from it on fill
+      body.client_order_id = encodePlanClientId(host, wantTp ?? null, wantSl ?? null)
+    } else {
+      body.order_class = 'bracket'
+      if (wantTp != null) body.take_profit = { limit_price: fmtPx(wantTp, false) }
+      if (wantSl != null) body.stop_loss = { stop_price: fmtPx(wantSl, false) }
+    }
+  }
+  const r2 = await tradeFetch<TradingOrder>(userId, host, '/v2/orders', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+  if (!(r2.data && (r2.data as TradingOrder).id)) {
+    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode: host, method: 'cancel-replace' }
+  }
+  return { data: r2.data, status: r2.status, mode: host, method: 'cancel-replace' }
 }
 
 /**
