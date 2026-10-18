@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { KeyRound, Loader2, Send } from 'lucide-react';
+import { KeyRound, Loader2, PlugZap, Send } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -14,6 +14,10 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
+
+export const SETTINGS_CHANGED_EVENT = 'tt:settings-changed';
+
+type AlpacaValidation = { valid: boolean; status: number; message: string };
 
 type SettingsState = {
   alpaca: { keyIdMasked: string; secretSet: boolean; serverKeysPresent: boolean };
@@ -40,6 +44,21 @@ export default function SettingsDialog({
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+
+  // Any typed-but-unsaved credential — closing the dialog would lose it.
+  const dirty = Boolean(keyId.trim() || secret.trim() || token.trim());
+
+  const confirmDiscard = useCallback(
+    (nextOpen: boolean) => {
+      if (!nextOpen && dirty) {
+        return window.confirm(
+          'You typed credentials that are NOT saved yet.\n\nClick Cancel, then press Save to keep them.'
+        );
+      }
+      return true;
+    },
+    [dirty]
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -71,6 +90,10 @@ export default function SettingsDialog({
     if (secret.trim()) payload.alpacaSecret = secret.trim();
     if (token.trim()) payload.telegramToken = token.trim();
     if (chatId.trim()) payload.telegramChatId = chatId.trim();
+    if (Object.keys(payload).length === 0) {
+      toast({ title: 'Nothing to save', description: 'Enter a value first.' });
+      return;
+    }
     setSaving(true);
     try {
       const res = await fetch('/api/settings', {
@@ -88,11 +111,31 @@ export default function SettingsDialog({
         }
         throw new Error(msg);
       }
+      const data: { ok: boolean; alpaca?: AlpacaValidation | null } = await res
+        .json()
+        .catch(() => ({ ok: true }));
       // Clear secret inputs so they read "unchanged" again.
       setKeyId('');
       setSecret('');
       setToken('');
-      toast({ title: 'Settings saved' });
+      if (data.alpaca && !data.alpaca.valid) {
+        // Saved, but Alpaca rejected the keys — say so loudly, the chart
+        // would otherwise silently keep showing demo data.
+        toast({
+          title: 'Saved, but Alpaca rejected the keys',
+          description: `${data.alpaca.message} The chart will stay in demo mode until fixed.`,
+          variant: 'destructive',
+        });
+      } else if (data.alpaca?.valid) {
+        toast({
+          title: 'Settings saved — keys verified ✓',
+          description: 'Live Alpaca data is loading now.',
+        });
+      } else {
+        toast({ title: 'Settings saved' });
+      }
+      // Tell every open panel (chart, footer badge, watchlist) to refetch.
+      window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_EVENT));
       await load();
     } catch (err) {
       toast({
@@ -102,6 +145,46 @@ export default function SettingsDialog({
       });
     } finally {
       setSaving(false);
+    }
+  }
+
+  // Verify Alpaca keys: uses what is typed (unsaved) when both fields are
+  // filled, otherwise the stored keys.
+  async function handleTestAlpaca() {
+    setTesting(true);
+    try {
+      const res = await fetch('/api/settings/alpaca/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          alpacaKeyId: keyId.trim() || undefined,
+          alpacaSecret: secret.trim() || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.valid) {
+        toast({
+          title: 'Alpaca keys working ✓',
+          description:
+            data.tested === 'typed'
+              ? 'These typed keys are valid — press Save to use them.'
+              : data.message || 'Saved keys are valid.',
+        });
+      } else {
+        toast({
+          title: 'Alpaca keys failed',
+          description: data?.message || `Test failed (${res.status}).`,
+          variant: 'destructive',
+        });
+      }
+    } catch (err) {
+      toast({
+        title: 'Test failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setTesting(false);
     }
   }
 
@@ -136,8 +219,21 @@ export default function SettingsDialog({
     'border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600';
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto border-zinc-800 bg-zinc-900 sm:max-w-lg">
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (confirmDiscard(next)) onOpenChange(next);
+      }}
+    >
+      <DialogContent
+        className="max-h-[85vh] overflow-y-auto border-zinc-800 bg-zinc-900 sm:max-w-lg"
+        onInteractOutside={(e) => {
+          if (dirty) e.preventDefault();
+        }}
+        onEscapeKeyDown={(e) => {
+          if (dirty) e.preventDefault();
+        }}
+      >
         <DialogHeader>
           <DialogTitle className="text-zinc-100">Settings</DialogTitle>
           <DialogDescription className="text-zinc-400">
@@ -228,6 +324,16 @@ export default function SettingsDialog({
               Keys are encrypted (AES-256-GCM) and only used server-side. Get
               keys at alpaca.markets (free). Real-time US stock + crypto data.
             </p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleTestAlpaca}
+              disabled={testing || saving}
+              className="w-fit border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+              Test keys
+            </Button>
           </section>
 
           <div className="h-px bg-zinc-800" />
@@ -296,15 +402,22 @@ export default function SettingsDialog({
             </p>
           </section>
 
-          <div className="flex justify-end gap-2 border-t border-zinc-800 pt-4">
-            <Button
-              type="submit"
-              disabled={loading || saving}
-              className="bg-emerald-600 text-white hover:bg-emerald-500"
-            >
-              {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-              Save
-            </Button>
+          <div className="flex items-center justify-between gap-2 border-t border-zinc-800 pt-4">
+            {dirty && (
+              <span className="text-xs text-amber-400">
+                Unsaved changes — press Save before closing.
+              </span>
+            )}
+            <div className="ml-auto flex gap-2">
+              <Button
+                type="submit"
+                disabled={loading || saving}
+                className="bg-emerald-600 text-white hover:bg-emerald-500"
+              >
+                {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                Save
+              </Button>
+            </div>
           </div>
         </form>
       </DialogContent>

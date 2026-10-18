@@ -189,3 +189,27 @@ Work Log:
 
 Stage Summary:
 - APP COMPLETE AND BROWSER-VERIFIED. Test account: username "trader" / password "S****99", TOTP secret P7FT****REDACTED (add to authenticator to log in). Users can register their own 2FA account. Alpaca keys can be added per-user in Settings (encrypted) or via APCA_API_KEY_ID/APCA_API_SECRET_KEY env; without keys the app runs on deterministic demo data ("demo" badges shown).
+
+---
+Task ID: 17
+Agent: main (Z.ai Code)
+Task: Fix "after enter the alpaca key+secret, the chart still show demo"
+
+Work Log:
+- Diagnosed: DB showed User.settings = null and dev.log had ZERO `PUT /api/settings` — the typed keys never reached the server (dialog closed without saving, no warning existed). Also found 2 secondary bugs: (a) server silently fell back to demo on invalid keys with no way to distinguish "no keys" from "keys rejected"; (b) footer/chart demo badges fetched once and never refreshed after saving keys.
+- src/lib/alpaca.ts: added DemoMeta {demo, reason} threading through getBars/getQuotes/getNews/getMarkers ('no-keys' | 'empty' | 'alpaca-http-<status>' | 'alpaca-error'); alpacaFetch now returns {data,status}; added validateAlpacaKeys() hitting a cheap /v2/stocks/snapshots?feed=iex request.
+- Market routes (bars/quote/news/markers): meta now includes reason.
+- New POST /api/settings/alpaca/test: validates typed (unsaved) keys or stored keys, returns {valid,status,message,tested}.
+- New POST /api/settings/telegram/test: fixed previously-404 endpoint the dialog already referenced; sends a real test message from stored creds.
+- PUT /api/settings: after save, auto-validates new Alpaca keys and returns {ok, alpaca:{valid,status,message}}.
+- SettingsDialog: "Test keys" button (tests typed-then-unsaved keys), save toasts per validation outcome ("Settings saved — keys verified ✓" / "Saved, but Alpaca rejected the keys" destructive), unsaved-changes guard (confirm on close/escape/outside-click + inline amber "Unsaved changes" hint), dispatches window event 'tt:settings-changed' after successful save.
+- TerminalRoot footer badge: re-checks on 'tt:settings-changed' + every 60s, and now distinguishes "demo data — add Alpaca keys in Settings" (amber) vs "keys rejected — check Settings" (rose).
+- ChartPanel: refetches bars/markers on 'tt:settings-changed' (settingsVer in effect deps); badge shows "demo" / "keys rejected" / "data error" with explanatory tooltips.
+- Verified via curl with crafted session: test endpoint → {valid:false,status:401}; PUT persists + returns validation; bars meta {demo:true,reason:'alpaca-http-401'}; settings GET shows masked key. Reset test keys to null afterwards.
+- Verified in agent-browser as user trader: typed fake keys → "Alpaca keys failed" toast; unsaved warning appears; Save → destructive "Saved, but Alpaca rejected the keys" toast AND chart badge + footer badge flipped live to "keys rejected" without reload; after DB cleanup + reload everything returns to amber "demo" state. No console errors; lint clean.
+
+Stage Summary:
+- Root cause was keys never being saved (no PUT ever fired) compounded by silent demo fallback and one-shot demo badges.
+- Saving keys now: auto-verifies against Alpaca, gives loud feedback, and every panel (chart, footer, watchlist via polling) switches to live data without reload.
+- Invalid keys are now explicitly labeled "keys rejected" (rose) instead of ambiguous "demo".
+- Telegram test endpoint 404 fixed. No schema changes; no other behavior changed for valid-keys path.

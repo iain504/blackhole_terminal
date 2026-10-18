@@ -17,8 +17,8 @@ export async function POST(req: Request) {
       .slice(0, 60)
     if (symbols.length === 0) return NextResponse.json({ quotes: [], meta: { demo: false } })
     const user = await getSessionUser()
-    const { quotes, demo } = await getQuotes(symbols, user?.id)
-    return NextResponse.json({ quotes, meta: { demo } })
+    const { quotes, demo, reason } = await getQuotes(symbols, user?.id)
+    return NextResponse.json({ quotes, meta: { demo, reason } })
   } catch (e) {
     return handleError(e)
   }

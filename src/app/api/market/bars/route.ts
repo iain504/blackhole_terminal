@@ -13,8 +13,8 @@ export async function GET(req: Request) {
     const tf: Timeframe = TIMEFRAMES[tfParam] ? tfParam : '1D'
     if (!symbol) return NextResponse.json({ error: 'symbol required' }, { status: 400 })
     const user = await getSessionUser()
-    const { bars, demo } = await getBars(symbol, tf, user?.id)
-    return NextResponse.json({ bars, meta: { demo } })
+    const { bars, demo, reason } = await getBars(symbol, tf, user?.id)
+    return NextResponse.json({ bars, meta: { demo, reason } })
   } catch (e) {
     return handleError(e)
   }

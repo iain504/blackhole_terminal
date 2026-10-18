@@ -170,20 +170,33 @@ export function TerminalRoot() {
 }
 
 function BadgeDemoInline() {
-  const demo = useDemoFlag()
+  const { demo, reason } = useDemoMeta()
   if (!demo) return null
+  const rejected = Boolean(reason && reason.startsWith('alpaca-http-40'))
   return (
-    <Badge variant="outline" className="ml-2 border-amber-500/40 text-[10px] text-amber-400">
-      demo data — add Alpaca keys in Settings
+    <Badge
+      variant="outline"
+      title={
+        rejected
+          ? 'Alpaca rejected the saved keys — open Settings and re-check them'
+          : 'Demo data — add your Alpaca API keys in Settings'
+      }
+      className={
+        rejected
+          ? 'ml-2 border-rose-500/40 text-[10px] text-rose-400'
+          : 'ml-2 border-amber-500/40 text-[10px] text-amber-400'
+      }
+    >
+      {rejected ? 'keys rejected — check Settings' : 'demo data — add Alpaca keys in Settings'}
     </Badge>
   )
 }
 
-function useDemoFlag(): boolean {
-  const [demo, setDemo] = useState(false)
+function useDemoMeta(): { demo: boolean; reason?: string } {
+  const [meta, setMeta] = useState<{ demo: boolean; reason?: string }>({ demo: false })
   useEffect(() => {
     let alive = true
-    ;(async () => {
+    const check = async () => {
       try {
         const res = await fetch('/api/market/quote', {
           method: 'POST',
@@ -192,14 +205,21 @@ function useDemoFlag(): boolean {
         })
         if (!res.ok || !alive) return
         const json = await res.json()
-        if (alive) setDemo(Boolean(json.meta?.demo))
+        if (alive) setMeta({ demo: Boolean(json.meta?.demo), reason: json.meta?.reason })
       } catch { /* offline */ }
-    })()
+    }
+    check()
+    // Re-check right after keys are saved/changed and periodically, so the
+    // badge never lies after Settings are updated without a page reload.
+    window.addEventListener('tt:settings-changed', check)
+    const timer = setInterval(check, 60000)
     return () => {
       alive = false
+      window.removeEventListener('tt:settings-changed', check)
+      clearInterval(timer)
     }
   }, [])
-  return demo
+  return meta
 }
 
 function ActiveTabContent() {

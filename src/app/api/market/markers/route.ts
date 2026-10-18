@@ -13,8 +13,8 @@ export async function GET(req: Request) {
     const to = parseInt(searchParams.get('to') || String(now + 86400 * 30), 10)
     if (!symbol) return NextResponse.json({ earnings: [], news: [], meta: { demo: false } })
     const user = await getSessionUser()
-    const { earnings, news, demo } = await getMarkers(symbol, from, to, user?.id)
-    return NextResponse.json({ earnings, news, meta: { demo } })
+    const { earnings, news, demo, reason } = await getMarkers(symbol, from, to, user?.id)
+    return NextResponse.json({ earnings, news, meta: { demo, reason } })
   } catch (e) {
     return handleError(e)
   }

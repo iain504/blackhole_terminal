@@ -1,7 +1,8 @@
 // Alpaca market data client (server-side only).
 // Stocks use v2/stocks/*; Crypto uses the DIFFERENT v1beta3/crypto/us/* API.
 // When no API keys exist (env or per-user), all functions fall back to the
-// deterministic demo simulator so the app always works.
+// deterministic demo simulator so the app always works — but the failure
+// REASON is surfaced so the UI can tell "no keys" apart from "keys rejected".
 import { db } from '@/lib/db'
 import { decrypt } from '@/lib/crypt'
 import {
@@ -16,6 +17,67 @@ const ALPACA_TIMEOUT_MS = 9000
 export interface AlpacaKeys {
   keyId: string
   secret: string
+}
+
+/** Why a response fell back to demo data (undefined = live data, not demo). */
+export type DemoReason = 'no-keys' | 'empty' | `alpaca-http-${number}` | 'alpaca-error'
+
+export interface DemoMeta {
+  demo: boolean
+  reason?: DemoReason
+}
+
+function demoResult<T>(make: (reason: DemoReason) => T & DemoMeta, reason: DemoReason): T & DemoMeta {
+  return make(reason)
+}
+
+/**
+ * Validate Alpaca data-API credentials with a cheap real request.
+ * Used by the settings test endpoint and after saving new keys.
+ */
+export async function validateAlpacaKeys(
+  keyId: string,
+  secret: string,
+): Promise<{ valid: boolean; status: number; message: string }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ALPACA_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${DATA_BASE}/v2/stocks/snapshots?symbols=AAPL&feed=iex`, {
+      headers: {
+        'APCA-API-KEY-ID': keyId,
+        'APCA-API-SECRET-KEY': secret,
+        accept: 'application/json',
+      },
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+    if (res.ok) {
+      return { valid: true, status: res.status, message: 'Keys verified — live Alpaca data enabled' }
+    }
+    if (res.status === 401 || res.status === 403) {
+      return {
+        valid: false,
+        status: res.status,
+        message: 'Alpaca rejected these keys — check the Key ID and Secret (401/403).',
+      }
+    }
+    if (res.status === 429) {
+      return {
+        valid: false,
+        status: res.status,
+        message: 'Alpaca rate limit reached (429) — wait a minute and test again.',
+      }
+    }
+    return { valid: false, status: res.status, message: `Alpaca returned HTTP ${res.status}` }
+  } catch (e) {
+    return {
+      valid: false,
+      status: 0,
+      message: `Could not reach Alpaca: ${e instanceof Error ? e.message : 'network error'}`,
+    }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 interface UserSettings {
@@ -45,7 +107,8 @@ export async function hasAlpacaKeys(userId?: string): Promise<boolean> {
   return (await getAlpacaKeys(userId)) !== null
 }
 
-async function alpacaFetch<T>(path: string, keys: AlpacaKeys): Promise<T | null> {
+/** Returns the parsed body plus HTTP status (0 = network/timeout failure). */
+async function alpacaFetch<T>(path: string, keys: AlpacaKeys): Promise<{ data: T | null; status: number }> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), ALPACA_TIMEOUT_MS)
   try {
@@ -60,12 +123,12 @@ async function alpacaFetch<T>(path: string, keys: AlpacaKeys): Promise<T | null>
     })
     if (!res.ok) {
       console.error(`Alpaca ${path} -> HTTP ${res.status}`)
-      return null
+      return { data: null, status: res.status }
     }
-    return (await res.json()) as T
+    return { data: (await res.json()) as T, status: res.status }
   } catch (e) {
     console.error(`Alpaca ${path} failed:`, e instanceof Error ? e.message : e)
-    return null
+    return { data: null, status: 0 }
   } finally {
     clearTimeout(timer)
   }
@@ -128,10 +191,13 @@ export async function getBars(
   symbol: string,
   timeframe: Timeframe,
   userId?: string,
-): Promise<{ bars: Bar[]; demo: boolean }> {
+): Promise<{ bars: Bar[] } & DemoMeta> {
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
-    return { bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true }
+    return demoResult(
+      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      'no-keys',
+    )
   }
   const tf = TIMEFRAMES[timeframe]
   const end = new Date()
@@ -146,27 +212,45 @@ export async function getBars(
       ? Math.ceil(tf.barCount * 7 * tf.seconds / 86400) + 20
       : tf.barCount
     const s = new Date(Date.now() - lookback * 86400 * 1000).toISOString().slice(0, 19) + 'Z'
-    const raw = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
+    const { data: raw, status } = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
       `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}&start=${s}&end=${endIso}&limit=10000`,
       keys,
     )
-    let bars = mapBars(raw?.bars?.[symbol])
+    if (!raw) {
+      return demoResult(
+        (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+        status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
+      )
+    }
+    let bars = mapBars(raw.bars?.[symbol])
     if (bars.length === 0) {
-      return { bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true }
+      return demoResult(
+        (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+        'empty',
+      )
     }
     if (timeframe === '1W' || timeframe === '1M') bars = aggregateDaily(bars, timeframe)
     return { bars, demo: false }
   }
 
   // Stocks API: v2/stocks/bars
-  const raw = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
+  const { data: raw, status } = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
     `/v2/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${tf.alpaca}&start=${startIso}&end=${endIso}` +
     `&limit=${Math.min(tf.barCount + 50, 10000)}&adjustment=splits&feed=iex`,
     keys,
   )
-  const bars = mapBars(raw?.bars?.[symbol])
+  if (!raw) {
+    return demoResult(
+      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason),
+    )
+  }
+  const bars = mapBars(raw.bars?.[symbol])
   if (bars.length === 0) {
-    return { bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true }
+    return demoResult(
+      (reason) => ({ bars: simBars(symbol, timeframe, TIMEFRAMES[timeframe].barCount), demo: true, reason }),
+      'empty',
+    )
   }
   return { bars, demo: false }
 }
@@ -204,15 +288,19 @@ function snapshotToQuote(symbol: string, snap: StockSnapshot | CryptoSnapshot | 
   }
 }
 
-export async function getQuotes(symbols: string[], userId?: string): Promise<{ quotes: Quote[]; demo: boolean }> {
+export async function getQuotes(symbols: string[], userId?: string): Promise<{ quotes: Quote[] } & DemoMeta> {
   if (symbols.length === 0) return { quotes: [], demo: false }
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
-    return { quotes: symbols.map((s) => simQuote(s)), demo: true }
+    return demoResult(
+      (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
+      'no-keys',
+    )
   }
   const stocks = symbols.filter((s) => !isCryptoSymbol(s))
   const cryptos = symbols.filter((s) => isCryptoSymbol(s))
   const quotes: Quote[] = []
+  let lastStatus = 0
   const jobs: Promise<void>[] = []
 
   if (stocks.length > 0) {
@@ -220,11 +308,14 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
     for (let i = 0; i < stocks.length; i += 30) {
       const chunk = stocks.slice(i, i + 30)
       jobs.push((async () => {
-        const raw = await alpacaFetch<Record<string, StockSnapshot>>(
+        const { data: raw, status } = await alpacaFetch<Record<string, StockSnapshot>>(
           `/v2/stocks/snapshots?symbols=${encodeURIComponent(chunk.join(','))}&feed=iex`,
           keys,
         )
-        if (!raw) return
+        if (!raw) {
+          lastStatus = status
+          return
+        }
         for (const s of chunk) {
           const q = snapshotToQuote(s, raw[s])
           if (q) quotes.push(q)
@@ -236,11 +327,14 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
     for (let i = 0; i < cryptos.length; i += 15) {
       const chunk = cryptos.slice(i, i + 15)
       jobs.push((async () => {
-        const raw = await alpacaFetch<Record<string, CryptoSnapshot>>(
+        const { data: raw, status } = await alpacaFetch<Record<string, CryptoSnapshot>>(
           `/v1beta3/crypto/us/snapshots?symbols=${encodeURIComponent(chunk.join(','))}`,
           keys,
         )
-        if (!raw) return
+        if (!raw) {
+          lastStatus = status
+          return
+        }
         for (const s of chunk) {
           const q = snapshotToQuote(s, raw[s])
           if (q) quotes.push(q)
@@ -250,7 +344,10 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
   }
   await Promise.all(jobs)
   if (quotes.length === 0) {
-    return { quotes: symbols.map((s) => simQuote(s)), demo: true }
+    return demoResult(
+      (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
+      lastStatus === 0 ? 'alpaca-error' : lastStatus ? (`alpaca-http-${lastStatus}` as DemoReason) : 'empty',
+    )
   }
   // fill any missing with simulator to keep rows visible
   const have = new Set(quotes.map((q) => q.symbol))
@@ -275,16 +372,22 @@ interface AlpacaNewsItem {
   source: string
 }
 
-export async function getNews(symbol: string | null, limit: number, userId?: string): Promise<{ news: NewsItem[]; demo: boolean }> {
+export async function getNews(symbol: string | null, limit: number, userId?: string): Promise<{ news: NewsItem[] } & DemoMeta> {
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
-    return { news: simNews(symbol || 'MARKET', limit), demo: true }
+    return demoResult(
+      (reason) => ({ news: simNews(symbol || 'MARKET', limit), demo: true, reason }),
+      'no-keys',
+    )
   }
   const params = new URLSearchParams({ limit: String(Math.min(limit, 50)), sort: 'desc' })
   if (symbol && !isCryptoSymbol(symbol)) params.set('symbols', symbol)
-  const raw = await alpacaFetch<{ news: AlpacaNewsItem[] }>(`/v1beta1/news?${params.toString()}`, keys)
+  const { data: raw, status } = await alpacaFetch<{ news: AlpacaNewsItem[] }>(`/v1beta1/news?${params.toString()}`, keys)
   if (!raw || !raw.news || raw.news.length === 0) {
-    return { news: simNews(symbol || 'MARKET', limit), demo: true }
+    return demoResult(
+      (reason) => ({ news: simNews(symbol || 'MARKET', limit), demo: true, reason }),
+      !raw ? (status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason)) : 'empty',
+    )
   }
   const news = raw.news.map((n) => ({
     id: String(n.id),
@@ -303,10 +406,13 @@ export async function getNews(symbol: string | null, limit: number, userId?: str
 
 const EARNINGS_RE = /earnings|reports q[1-4]|quarterly results|q[1-4] (results|report|earnings)|fiscal.*(results|earnings)|reports (fourth|first|second|third)-?quarter/i
 
-export async function getMarkers(symbol: string, from: number, to: number, userId?: string): Promise<MarkerData & { demo: boolean }> {
+export async function getMarkers(symbol: string, from: number, to: number, userId?: string): Promise<MarkerData & DemoMeta> {
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
-    return { ...simMarkers(symbol, from, to), demo: true }
+    return demoResult(
+      (reason) => ({ ...simMarkers(symbol, from, to), demo: true, reason }),
+      'no-keys',
+    )
   }
   const params = new URLSearchParams({
     symbols: isCryptoSymbol(symbol) ? '' : symbol,
@@ -317,9 +423,12 @@ export async function getMarkers(symbol: string, from: number, to: number, userI
   })
   if (!isCryptoSymbol(symbol)) params.set('symbols', symbol)
   else params.delete('symbols') // crypto news not symbol-filterable; use all
-  const raw = await alpacaFetch<{ news: AlpacaNewsItem[] }>(`/v1beta1/news?${params.toString()}`, keys)
+  const { data: raw, status } = await alpacaFetch<{ news: AlpacaNewsItem[] }>(`/v1beta1/news?${params.toString()}`, keys)
   if (!raw || !raw.news) {
-    return { ...simMarkers(symbol, from, to), demo: true }
+    return demoResult(
+      (reason) => ({ ...simMarkers(symbol, from, to), demo: true, reason }),
+      !raw ? (status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason)) : 'empty',
+    )
   }
   const earnings: number[] = []
   const news: number[] = []

@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { encrypt, decrypt, maskKey } from '@/lib/crypt'
+import { validateAlpacaKeys } from '@/lib/alpaca'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface UserSettings {
@@ -65,7 +66,17 @@ export async function PUT(req: Request) {
       where: { id: user.id },
       data: { settings: s as unknown as Prisma.InputJsonValue },
     })
-    return NextResponse.json({ ok: true })
+    // Auto-verify freshly saved Alpaca keys so the user knows immediately
+    // whether live data will work (invalid keys silently showed "demo" before).
+    let alpacaValidation: { valid: boolean; status: number; message: string } | null = null
+    if (typeof s.alpacaKeyIdEnc === 'string' && typeof s.alpacaSecretEnc === 'string') {
+      const keyId = decrypt(s.alpacaKeyIdEnc)
+      const secret = decrypt(s.alpacaSecretEnc)
+      if (keyId && secret) {
+        alpacaValidation = await validateAlpacaKeys(keyId, secret)
+      }
+    }
+    return NextResponse.json({ ok: true, alpaca: alpacaValidation })
   } catch (e) {
     return handleError(e)
   }

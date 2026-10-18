@@ -81,6 +81,8 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   // ui state
   const [loading, setLoading] = useState(true)
   const [demo, setDemo] = useState(false)
+  const [demoReason, setDemoReason] = useState<string | undefined>(undefined)
+  const [settingsVer, setSettingsVer] = useState(0)
   const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number } | null>(null)
   const [legend, setLegend] = useState<{ o: number; h: number; l: number; c: number; v: number } | null>(null)
@@ -92,6 +94,13 @@ export function ChartPanel({ tab }: { tab: Tab }) {
 
   const drawings = useTerminal(useShallow((s) => s.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS))
   const symbolAlerts = useTerminal(useShallow((s) => s.alerts.filter((a) => a.symbol === symbol)))
+
+  // Refetch market data when credentials change in Settings (save/test keys)
+  useEffect(() => {
+    const onChanged = () => setSettingsVer((v) => v + 1)
+    window.addEventListener('tt:settings-changed', onChanged)
+    return () => window.removeEventListener('tt:settings-changed', onChanged)
+  }, [])
 
   // ---------- coordinate helpers ----------
   const xOf = useCallback((t: number | null): number | null => {
@@ -745,6 +754,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
         const json = await res.json()
         if (cancelled) return
         setDemo(Boolean(json.meta?.demo))
+        setDemoReason(json.meta?.reason as string | undefined)
         const bars: Bar[] = (json.bars as Bar[]) || []
         // dedupe + sort by time
         const map = new Map<number, Bar>()
@@ -818,7 +828,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       seriesRef.current = null
       barsRef.current = []
     }
-  }, [symbol, tf, chartType, scheduleRedraw])
+  }, [symbol, tf, chartType, settingsVer, scheduleRedraw])
 
   // load drawings for this symbol
   useEffect(() => {
@@ -904,8 +914,26 @@ export function ChartPanel({ tab }: { tab: Tab }) {
         </div>
         <div className="ml-auto flex items-center gap-2 pr-1">
           {demo && (
-            <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-400">
-              demo
+            <Badge
+              variant="outline"
+              title={
+                !demoReason || demoReason === 'no-keys'
+                  ? 'Demo data — add your Alpaca API keys in Settings → Test keys'
+                  : demoReason.startsWith('alpaca-http-40')
+                    ? 'Alpaca rejected the saved keys — check them in Settings'
+                    : `Alpaca request failed (${demoReason}) — will retry`
+              }
+              className={
+                demoReason && demoReason.startsWith('alpaca-http-40')
+                  ? 'border-rose-500/40 text-[10px] text-rose-400'
+                  : 'border-amber-500/40 text-[10px] text-amber-400'
+              }
+            >
+              {!demoReason || demoReason === 'no-keys'
+                ? 'demo'
+                : demoReason.startsWith('alpaca-http-40')
+                  ? 'keys rejected'
+                  : 'data error'}
             </Badge>
           )}
           {quote && (
