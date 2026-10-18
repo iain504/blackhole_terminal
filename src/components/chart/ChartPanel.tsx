@@ -24,7 +24,7 @@ import {
   Briefcase,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
-import { TradeTicket } from './TradeTicket'
+import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
@@ -122,7 +122,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   } | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
-  const [ticketPrefill, setTicketPrefill] = useState<{ side?: 'buy' | 'sell'; price?: number } | null>(null)
+  const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
   const { toast } = useToast()
 
   // trading positions + SL/TP exits for this symbol (polls every 15s)
@@ -904,7 +904,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const patchExitPrice = useCallback(async (
     info: ExitInfo, kind: 'sl' | 'tp', price: number,
   ) => {
-    const body: Record<string, unknown> = {}
+    const body: Record<string, unknown> = {
+      // the mode the position was loaded from — without it the route falls
+      // back to the stored preference and can PATCH the WRONG host (paper vs
+      // live have separate order-id spaces), which silently never updated
+      // the order on Alpaca
+      mode: posData.data?.mode,
+    }
     if (kind === 'tp') {
       body.limit_price = price
     } else {
@@ -923,7 +929,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       })
       const json = await res.json().catch(() => null)
       if (res.ok) {
-        toast({ title: `${kind.toUpperCase()} updated to ${fmtPrice(price)}` })
+        toast({
+          title: `${kind.toUpperCase()} updated to ${fmtPrice(price)}`,
+          description: json?.method === 'cancel-replace'
+            ? 'Order re-created on Alpaca (replace rejected)'
+            : json?.note || undefined,
+        })
       } else {
         toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       }
@@ -933,13 +944,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       void posRefresh()
       window.dispatchEvent(new CustomEvent('tt:positions-changed'))
     }
-  }, [posRefresh, toast])
+  }, [posData.data?.mode, posRefresh, toast])
 
   const cancelExitOrder = useCallback(async (orderId: string) => {
-    await fetch(`/api/trading/orders/${orderId}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+    const q = posData.data?.mode ? `?mode=${posData.data.mode}` : ''
+    await fetch(`/api/trading/orders/${orderId}${q}`, { method: 'DELETE' }).catch(() => { /* offline */ })
     toast({ title: 'Exit order cancelled' })
     void posRefresh()
-  }, [posRefresh, toast])
+  }, [posData.data?.mode, posRefresh, toast])
 
   const closePositionBySymbol = useCallback(async (tradeSymbol: string) => {
     try {
@@ -1689,7 +1701,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           void createDrawing('hline', [{ time: null, price }])
         }}
         onTrade={(side, price) => {
-          setTicketPrefill({ side, price })
+          // right-click price => limit order AT that price
+          setTicketPrefill({ side, price, type: 'limit' })
           setTradeOpen(true)
         }}
         onOpenTicket={() => {
@@ -1943,13 +1956,13 @@ function ContextMenu({
         <div className="my-1 h-px bg-zinc-800" />
         {price != null && (
           <MenuItem
-            label={<span className="text-emerald-400">🟢 Buy {symbol} (market)</span>}
+            label={<span className="text-emerald-400">🟢 Buy limit @ {fmtPrice(price)}</span>}
             onClick={() => { onTrade('buy', price); onClose() }}
           />
         )}
         {price != null && (
           <MenuItem
-            label={<span className="text-rose-400">🔴 Sell {symbol} (market)</span>}
+            label={<span className="text-rose-400">🔴 Sell limit @ {fmtPrice(price)}</span>}
             onClick={() => { onTrade('sell', price); onClose() }}
           />
         )}

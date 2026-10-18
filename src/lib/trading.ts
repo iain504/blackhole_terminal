@@ -129,6 +129,7 @@ export interface TradingOrder {
   side: string
   type: string
   status: string
+  time_in_force?: string
   stop_price: string | null
   limit_price: string | null
   trail_percent: string | null
@@ -136,6 +137,7 @@ export interface TradingOrder {
   filled_at: string | null
   created_at: string | null
   replaces: string | null
+  replaced_by?: string | null
   legs: TradingOrder[] | null
   client_order_id?: string
 }
@@ -306,22 +308,222 @@ export async function placeTrailingStop(
   })
 }
 
-/** Replace SL/TP prices on an open order. NOTE: Alpaca returns a replacement
- * order with a NEW id — callers must refresh their order ids. */
-export async function replaceOrder(
+/** Rebuild an open exit order body from an existing order (used by the
+ * cancel+re-place fallback and OCO-sibling regeneration). */
+function exitBodyFrom(
+  orig: TradingOrder,
+  patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
+): Record<string, unknown> | null {
+  const num = (v: string | null | undefined): number | null => {
+    if (v == null) return null
+    const n = parseFloat(v)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  const newStop = patch.stop_price ?? num(orig.stop_price)
+  const newLimit = patch.limit_price ?? num(orig.limit_price)
+  const newTrail = patch.trail_percent ?? num(orig.trail_percent)
+  const body: Record<string, unknown> = {
+    symbol: orig.symbol,
+    qty: orig.qty,
+    side: orig.side,
+    type: orig.type,
+    time_in_force: orig.time_in_force || 'gtc',
+  }
+  if (orig.type === 'stop') {
+    if (newStop == null) return null
+    body.stop_price = String(newStop)
+  } else if (orig.type === 'stop_limit') {
+    if (newStop == null) return null
+    body.stop_price = String(newStop)
+    if (newLimit != null) {
+      body.limit_price = String(newLimit)
+    } else {
+      // preserve the original stop→limit offset when only the stop moves
+      const os = num(orig.stop_price)
+      const ol = num(orig.limit_price)
+      const ratio = os && ol ? ol / os : orig.side === 'sell' ? 0.999 : 1.001
+      body.limit_price = String(+(newStop * ratio).toFixed(6))
+    }
+  } else if (orig.type === 'limit') {
+    if (newLimit == null) return null
+    body.limit_price = String(newLimit)
+  } else if (orig.type === 'trailing_stop') {
+    if (newTrail == null) return null
+    body.trail_percent = String(newTrail)
+  } else {
+    return null // market / unknown — never re-placed blindly
+  }
+  return body
+}
+
+export interface ReplaceExitResult {
+  data: TradingOrder | null
+  status: number
+  error?: string
+  mode?: TradeMode
+  method?: 'replace' | 'cancel-replace'
+  note?: string
+}
+
+/**
+ * Replace SL/TP prices on an open exit order — the chart line-drag path.
+ *
+ * Verified against the paper API (2026-10):
+ * - A PATCH on a STANDALONE exit (crypto split exits) replaces cleanly:
+ *   type/time_in_force/sibling prices are preserved and a NEW order id is
+ *   returned.
+ * - The chart drag used to 404 when the order lived on the OTHER host: the
+ *   client did not send `mode`, so the PATCH went to the stored trade-mode
+ *   preference — paper order ids do not exist on live and vice versa, the
+ *   update silently never landed on Alpaca.
+ * - Bracket OCO legs may refuse direct replacement; cancel+re-place is the
+ *   universal fallback (canceling one OCO leg can cascade-cancel the sibling,
+ *   which we detect and regenerate).
+ */
+export async function replaceExitOrderSmart(
   userId: string,
   mode: TradeMode,
   orderId: string,
   patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
-) {
-  const body: Record<string, unknown> = {}
-  if (patch.stop_price != null) body.stop_price = String(patch.stop_price)
-  if (patch.limit_price != null) body.limit_price = String(patch.limit_price)
-  if (patch.trail_percent != null) body.trail_percent = String(patch.trail_percent)
-  return tradeFetch<TradingOrder>(userId, mode, `/v2/orders/${orderId}`, {
-    method: 'PATCH',
-    body: JSON.stringify(body),
+): Promise<ReplaceExitResult> {
+  const patchBody: Record<string, unknown> = {}
+  if (patch.stop_price != null) patchBody.stop_price = String(patch.stop_price)
+  if (patch.limit_price != null) patchBody.limit_price = String(patch.limit_price)
+  if (patch.trail_percent != null) patchBody.trail_percent = String(patch.trail_percent)
+
+  // 1) PATCH on the requested host; 2) retry the other host on 404 —
+  // both hosts share the same key pair, so a wrong-host id self-heals here.
+  const order: TradeMode[] = mode === 'paper' ? ['paper', 'live'] : ['live', 'paper']
+  let last: TradeFetchResult<TradingOrder> | null = null
+  let errHost: TradeMode = mode
+  for (const m of order) {
+    const r = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patchBody),
+    })
+    if (r.data && (r.data as TradingOrder).id) {
+      return { data: r.data, status: r.status, mode: m, method: 'replace' }
+    }
+    last = r
+    // 422 "order parameters are not changed" — the order ALREADY carries the
+    // requested value (e.g. a second drag to the same level). That IS the
+    // desired end state: return the current order instead of churning a
+    // cancel+re-place cycle.
+    if (r.status === 422 && String(r.error || '').includes('not changed')) {
+      const cur = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`)
+      if (cur.data) {
+        return { data: cur.data, status: 200, mode: m, method: 'replace', note: 'Order already at this value' }
+      }
+    }
+    if (r.status !== 404) {
+      // real rejection — the order lives on THIS host; run the fallback there
+      errHost = m
+      break
+    }
+  }
+
+  // 3) The id may have JUST been replaced (fast double-drag: Alpaca's
+  // cancel/replace is async and 404s for a beat) — follow the replaced_by
+  // chain and retry the direct PATCH on the live successor first.
+  const OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+  let orig: TradingOrder | null = null
+  let targetId = orderId
+  for (let hop = 0; hop < 4; hop++) {
+    const o = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${targetId}`)
+    if (!o.data) break
+    const od = o.data
+    if (OPEN_STATUSES.includes(String(od.status))) {
+      orig = od
+      if (targetId !== orderId) {
+        // the open successor exists — retry the direct PATCH on it
+        const retry = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${targetId}`, {
+          method: 'PATCH',
+          body: JSON.stringify(patchBody),
+        })
+        if (retry.data && (retry.data as TradingOrder).id) {
+          return { data: retry.data, status: 200, mode: errHost, method: 'replace', note: 'Applied to the replacement order' }
+        }
+        if (retry.status === 422 && String(retry.error || '').includes('not changed')) {
+          return { data: od, status: 200, mode: errHost, method: 'replace', note: 'Order already at this value' }
+        }
+        last = retry
+      }
+      break
+    }
+    const rb = od.replaced_by
+    if (typeof rb === 'string' && rb && rb !== targetId) {
+      targetId = rb
+      continue
+    }
+    orig = od // terminal status without a successor
+    break
+  }
+  if (!orig) {
+    return {
+      data: null,
+      status: last?.status || 502,
+      error: last?.error || 'Order not found on paper or live',
+      mode: errHost,
+      method: 'cancel-replace',
+    }
+  }
+  if (!OPEN_STATUSES.includes(String(orig.status))) {
+    return {
+      data: null,
+      status: 409,
+      error: `Order is ${orig.status} on ${errHost} — nothing to replace (refresh the chart)`,
+      mode: errHost,
+      method: 'cancel-replace',
+    }
+  }
+
+  // snapshot the OCO sibling BEFORE cancelling (limit TP vs stop-ish SL of
+  // the same symbol + same side) so a cascade-cancel can be healed
+  const openRes = await tradeFetch<TradingOrder[]>(userId, errHost, "/v2/orders?status=open&limit=500")
+  const norm = (s: string) => s.replace('/', '').toUpperCase()
+  const isStopish = (t: string) => t === 'stop' || t === 'stop_limit' || t === 'trailing_stop'
+  const sibling = (openRes.data || []).find(
+    (o) =>
+      o.id !== orderId &&
+      norm(o.symbol) === norm(orig.symbol) &&
+      o.side === orig.side &&
+      ((isStopish(orig.type) && o.type === 'limit') || (orig.type === 'limit' && isStopish(o.type))),
+  )
+
+  const cancelRes = await cancelOrder(userId, mode, targetId)
+  if (cancelRes.status !== 204 && cancelRes.status !== 200 && cancelRes.status !== 404) {
+    return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode, method: 'cancel-replace' }
+  }
+
+  const newBody = exitBodyFrom(orig, patch)
+  if (!newBody) {
+    return { data: null, status: 400, error: `Unsupported exit type ${orig.type} for re-place`, mode, method: 'cancel-replace' }
+  }
+  const r2 = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+    method: 'POST',
+    body: JSON.stringify(newBody),
   })
+  if (!(r2.data && (r2.data as TradingOrder).id)) {
+    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode, method: 'cancel-replace' }
+  }
+
+  // heal the sibling if the cancel cascaded (OCO group cancellation)
+  let note: string | undefined
+  if (sibling) {
+    const stillOpen = await tradeFetch<TradingOrder>(userId, mode, `/v2/orders/${sibling.id}`)
+    const gone = !stillOpen.data || ['canceled', 'cancelled', 'expired', 'rejected'].includes(String(stillOpen.data.status))
+    if (gone) {
+      const sibBody = exitBodyFrom(sibling, {})
+      if (sibBody) {
+        const rs = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+          method: 'POST',
+          body: JSON.stringify(sibBody),
+        })
+        note = rs.data ? 'OCO sibling re-created' : `Warning: sibling exit lost (${rs.error || 're-place failed'})`
+      }
+    }
+  }
+  return { data: r2.data, status: r2.status, mode, method: 'cancel-replace', note }
 }
 
 export async function cancelOrder(userId: string, mode: TradeMode, orderId: string) {

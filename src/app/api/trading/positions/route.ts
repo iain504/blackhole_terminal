@@ -59,8 +59,11 @@ export async function GET(req: Request) {
     if (posRes.error && posRes.error !== 'no-keys') errors.push(posRes.error)
     if (ordRes.error && ordRes.error !== 'no-keys') errors.push(ordRes.error)
 
-    const positions: TradingPosition[] = posRes.data || []
-    const orders: TradingOrder[] = ordRes.data || []
+    // A failed fetch (401 on live with paper-only keys, network error) returns
+    // an error OBJECT — only treat real arrays as data or the .filter below
+    // crashes the whole route.
+    const positions: TradingPosition[] = Array.isArray(posRes.data) ? posRes.data : []
+    const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
 
     const rows: PositionRow[] = positions
       .filter((p) => !symbolParam || normSymbol(p.symbol) === normSymbol(symbolParam))

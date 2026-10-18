@@ -16,6 +16,15 @@ import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
 
+export interface TicketPrefill {
+  side?: 'buy' | 'sell'
+  price?: number
+  /** right-click "buy/sell limit here" pre-selects a limit order at price */
+  type?: 'market' | 'limit'
+}
+
+const fmtP = (v: number) => String(v >= 1 ? +v.toFixed(2) : +v.toFixed(6))
+
 export function TradeTicket({
   symbol,
   livePrice,
@@ -25,7 +34,7 @@ export function TradeTicket({
 }: {
   symbol: string
   livePrice: number | null
-  prefill: { side?: 'buy' | 'sell'; price?: number } | null
+  prefill: TicketPrefill | null
   onClose: () => void
   onPlaced: () => void
 }) {
@@ -33,18 +42,23 @@ export function TradeTicket({
   const [mode, setMode] = useState<Mode>('paper')
   const [side, setSide] = useState<'buy' | 'sell'>(prefill?.side ?? 'buy')
   const [qty, setQty] = useState('1')
-  const [orderType, setOrderType] = useState<'market' | 'limit'>('market')
-  const [limitPrice, setLimitPrice] = useState(prefill?.price ? String(prefill.price) : '')
+  const [orderType, setOrderType] = useState<'market' | 'limit'>(prefill?.type ?? 'market')
+  const [limitPrice, setLimitPrice] = useState(prefill?.price ? fmtP(prefill.price) : '')
   const [slPrice, setSlPrice] = useState('')
   const [tpPrice, setTpPrice] = useState('')
+  const [slPct, setSlPct] = useState('5')
+  const [tpPct, setTpPct] = useState('5')
   const [trailPct, setTrailPct] = useState('')
+  // once the user edits SL/TP by hand the auto-fill stops overwriting them
+  const [slTouched, setSlTouched] = useState(false)
+  const [tpTouched, setTpTouched] = useState(false)
   const [account, setAccount] = useState<{ buyingPower: string; equity: string; currency: string } | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const isCrypto = isCryptoTradeSymbol(symbol)
   const refPrice = livePrice ?? 0
 
-  // load saved trade mode + account info when opened / mode toggles
+  // load saved trade mode + default TP/SL percent when opened / mode toggles
   useEffect(() => {
     let alive = true
     ;(async () => {
@@ -53,6 +67,10 @@ export function TradeTicket({
         if (sres.ok) {
           const s = await sres.json()
           if (alive && (s.tradeMode === 'live' || s.tradeMode === 'paper') && !prefill) setMode(s.tradeMode)
+          if (alive && typeof s.tpslPercent === 'number' && s.tpslPercent > 0) {
+            if (!slTouched) setSlPct(String(s.tpslPercent))
+            if (!tpTouched) setTpPct(String(s.tpslPercent))
+          }
         }
       } catch { /* ignore */ }
       try {
@@ -68,7 +86,7 @@ export function TradeTicket({
     return () => {
       alive = false
     }
-  }, [mode])
+  }, [mode, slTouched, tpTouched])
 
   const changeMode = (m: Mode) => {
     setMode(m)
@@ -107,7 +125,6 @@ export function TradeTicket({
     if (!Number.isNaN(tp) && tp > 0) body.take_profit = tp
     const tr = parseFloat(trailPct)
     if (!Number.isNaN(tr) && tr > 0) body.trail_percent = tr
-
     setSubmitting(true)
     try {
       const res = await fetch('/api/trading/orders', {
@@ -134,9 +151,12 @@ export function TradeTicket({
       window.dispatchEvent(new CustomEvent('tt:positions-changed'))
       onPlaced()
       // keep the ticket open for follow-up trades; reset protective inputs
+      // (auto-fill re-applies the configured % because touched flags clear)
       setSlPrice('')
       setTpPrice('')
       setTrailPct('')
+      setSlTouched(false)
+      setTpTouched(false)
     } catch (err) {
       toast({
         title: 'Order failed',
@@ -149,6 +169,25 @@ export function TradeTicket({
   }, [qty, mode, symbol, side, orderType, limitPrice, slPrice, tpPrice, trailPct, toast, onPlaced])
 
   const est = refPrice * (parseFloat(qty) || 0)
+
+  // ---- auto TP/SL: pre-fill ± configured % from the entry basis ----
+  // basis = limit price for limit orders (right-click price included), else
+  // the live price. Runs until the user edits a price by hand.
+  const basis =
+    orderType === 'limit' && parseFloat(limitPrice) > 0
+      ? parseFloat(limitPrice)
+      : refPrice > 0
+        ? refPrice
+        : 0
+  useEffect(() => {
+    if (basis <= 0) return
+    const slP = parseFloat(slPct)
+    const tpP = parseFloat(tpPct)
+    if (!isFinite(slP) || slP <= 0 || !isFinite(tpP) || tpP <= 0) return
+    const dir = side === 'buy' ? 1 : -1
+    if (!slTouched) setSlPrice(fmtP(basis * (1 - (dir * slP) / 100)))
+    if (!tpTouched) setTpPrice(fmtP(basis * (1 + (dir * tpP) / 100)))
+  }, [basis, side, slPct, tpPct, slTouched, tpTouched])
 
   return (
     <div
@@ -256,27 +295,79 @@ export function TradeTicket({
           </div>
         )}
         <div className="col-span-1">
-          <Label htmlFor="tt-sl" className="text-[10px] text-zinc-400">Stop loss</Label>
+          <div className="flex items-center justify-between">
+            <Label htmlFor="tt-sl" className="text-[10px] text-zinc-400">Stop loss</Label>
+            <div className="flex items-center gap-0.5">
+              <input
+                aria-label="Stop loss percent"
+                type="number"
+                min="0.1"
+                step="0.5"
+                value={slPct}
+                onChange={(e) => {
+                  const p = e.target.value
+                  setSlPct(p)
+                  const pv = parseFloat(p)
+                  if (isFinite(pv) && pv > 0 && basis > 0) {
+                    const dir = side === 'buy' ? 1 : -1
+                    setSlPrice(fmtP(basis * (1 - (dir * pv) / 100)))
+                  }
+                  setSlTouched(true)
+                }}
+                className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+              />
+              <span className="text-[9px] text-zinc-600">%</span>
+            </div>
+          </div>
           <Input
             id="tt-sl"
             type="number"
             min="0"
             step="any"
             value={slPrice}
-            onChange={(e) => setSlPrice(e.target.value)}
+            onChange={(e) => {
+              setSlPrice(e.target.value)
+              setSlTouched(true)
+            }}
             placeholder="none"
             className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
           />
         </div>
         <div className="col-span-1">
-          <Label htmlFor="tt-tp" className="text-[10px] text-zinc-400">Take profit</Label>
+          <div className="flex items-center justify-between">
+            <Label htmlFor="tt-tp" className="text-[10px] text-zinc-400">Take profit</Label>
+            <div className="flex items-center gap-0.5">
+              <input
+                aria-label="Take profit percent"
+                type="number"
+                min="0.1"
+                step="0.5"
+                value={tpPct}
+                onChange={(e) => {
+                  const p = e.target.value
+                  setTpPct(p)
+                  const pv = parseFloat(p)
+                  if (isFinite(pv) && pv > 0 && basis > 0) {
+                    const dir = side === 'buy' ? 1 : -1
+                    setTpPrice(fmtP(basis * (1 + (dir * pv) / 100)))
+                  }
+                  setTpTouched(true)
+                }}
+                className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+              />
+              <span className="text-[9px] text-zinc-600">%</span>
+            </div>
+          </div>
           <Input
             id="tt-tp"
             type="number"
             min="0"
             step="any"
             value={tpPrice}
-            onChange={(e) => setTpPrice(e.target.value)}
+            onChange={(e) => {
+              setTpPrice(e.target.value)
+              setTpTouched(true)
+            }}
             placeholder="none"
             className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
           />

@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
-  PanelsTopLeft, Crosshair, Check,
+  PanelsTopLeft, Crosshair, Check, Layers,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -22,6 +22,7 @@ const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart 
   chart: { label: 'Chart', icon: CandlestickChart },
   calendar: { label: 'Economic Calendar', icon: CalendarDays },
   heatmap: { label: 'Heat Map', icon: Flame },
+  positions: { label: 'Positions', icon: Layers },
 }
 
 export function TabBar({
@@ -118,6 +119,9 @@ export function TabBar({
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => addTab('heatmap')} className="gap-2 text-xs">
               <Flame className="h-3.5 w-3.5" /> Heat Map
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTab('positions')} className="gap-2 text-xs">
+              <Layers className="h-3.5 w-3.5" /> Positions
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

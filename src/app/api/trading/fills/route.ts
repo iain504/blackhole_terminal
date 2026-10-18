@@ -30,7 +30,13 @@ export async function GET(req: Request) {
       if (r.error === 'no-keys') return NextResponse.json({ mode, fills: [], configured: false })
       return NextResponse.json({ error: r.error || 'Fills fetch failed' }, { status: r.status || 502 })
     }
-    const fills: FillRow[] = (r.data as TradingOrder[])
+    // A failed fetch (401/403, network) resolves to an error OBJECT — only a
+    // real array may be filtered or the poller 500s every tick.
+    const orderList: TradingOrder[] = Array.isArray(r.data) ? r.data : []
+    if (orderList.length === 0 && r.error && r.error !== 'no-keys') {
+      return NextResponse.json({ mode, fills: [], configured: true, error: r.error })
+    }
+    const fills: FillRow[] = orderList
       .filter((o) => o.status === 'filled' && o.filled_at && new Date(o.filled_at).getTime() >= since)
       .map((o) => ({
         id: o.id,

@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { KeyRound, Loader2, PlugZap, Send } from 'lucide-react';
+import { KeyRound, Loader2, Percent, PlugZap, Send } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -22,6 +22,8 @@ type AlpacaValidation = { valid: boolean; status: number; message: string };
 type SettingsState = {
   alpaca: { keyIdMasked: string; secretSet: boolean; serverKeysPresent: boolean };
   telegram: { tokenSet: boolean; chatId: string };
+  tradeMode?: string;
+  tpslPercent?: number;
 };
 
 export default function SettingsDialog({
@@ -41,6 +43,8 @@ export default function SettingsDialog({
   const [secret, setSecret] = useState('');
   const [token, setToken] = useState('');
   const [chatId, setChatId] = useState('');
+  const [tpslPct, setTpslPct] = useState('5');
+  const [tpslPctLoaded, setTpslPctLoaded] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -69,6 +73,10 @@ export default function SettingsDialog({
       const data: SettingsState = await res.json();
       setState(data);
       setChatId(data?.telegram?.chatId ?? '');
+      if (!tpslPctLoaded) {
+        setTpslPct(String(data?.tpslPercent ?? 5));
+        setTpslPctLoaded(true);
+      }
     } catch (err) {
       setLoadError(
         err instanceof Error ? err.message : 'Failed to load settings.'
@@ -85,11 +93,13 @@ export default function SettingsDialog({
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     // Only send fields the user actually changed (non-empty = "send me").
-    const payload: Record<string, string> = {};
+    const payload: Record<string, string | number> = {};
     if (keyId.trim()) payload.alpacaKeyId = keyId.trim();
     if (secret.trim()) payload.alpacaSecret = secret.trim();
     if (token.trim()) payload.telegramToken = token.trim();
     if (chatId.trim()) payload.telegramChatId = chatId.trim();
+    const pct = parseFloat(tpslPct);
+    if (tpslPctLoaded && isFinite(pct) && pct > 0) payload.tpslPercent = pct;
     if (Object.keys(payload).length === 0) {
       toast({ title: 'Nothing to save', description: 'Enter a value first.' });
       return;
@@ -334,6 +344,37 @@ export default function SettingsDialog({
               {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
               Test keys
             </Button>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- Trading defaults ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Percent className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">Trading defaults</h3>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="tpsl-percent" className="text-zinc-300">
+                Default TP / SL distance (% from entry)
+              </Label>
+              <Input
+                id="tpsl-percent"
+                type="number"
+                min="0.1"
+                max="90"
+                step="any"
+                value={tpslPct}
+                onChange={(e) => setTpslPct(e.target.value)}
+                disabled={loading || saving}
+                className={inputClass}
+              />
+              <p className="text-xs leading-relaxed text-zinc-500">
+                New orders in the trade ticket are pre-filled with take-profit
+                and stop-loss at this distance from the entry price (5 = ±5%).
+                Still adjustable per order before submitting.
+              </p>
+            </div>
           </section>
 
           <div className="h-px bg-zinc-800" />

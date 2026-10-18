@@ -10,7 +10,7 @@ export interface SessionUser {
   username: string
 }
 
-export type TabType = 'chart' | 'calendar' | 'heatmap'
+export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions'
 
 // Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
 // '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid.
@@ -363,7 +363,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     const VALID_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M']
     const VALID_LAYOUTS: GridLayoutId[] = ['1', '2h', '2v', '3s', '4']
     const tabs = blob.tabs
-      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap'].includes(t.type))
+      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions'].includes(t.type))
       .map((t) => {
         const base = {
           id: t.id,

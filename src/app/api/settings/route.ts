@@ -12,7 +12,10 @@ interface UserSettings {
   telegramTokenEnc?: string
   telegramChatId?: string
   tradeMode?: string
+  tpslPercent?: number
 }
+
+export const DEFAULT_TPSL_PERCENT = 5
 
 // GET /api/settings — masked values + availability flags
 export async function GET() {
@@ -32,6 +35,10 @@ export async function GET() {
         chatId: s?.telegramChatId || '',
       },
       tradeMode: s?.tradeMode === 'live' ? 'live' : 'paper',
+      tpslPercent:
+        typeof s?.tpslPercent === 'number' && isFinite(s.tpslPercent) && s.tpslPercent > 0
+          ? s.tpslPercent
+          : DEFAULT_TPSL_PERCENT,
     })
   } catch (e) {
     return handleError(e)
@@ -44,6 +51,7 @@ interface PutBody {
   telegramToken?: string
   telegramChatId?: string
   tradeMode?: string
+  tpslPercent?: number
 }
 
 // PUT /api/settings — update private credentials (stored encrypted, never returned)
@@ -67,6 +75,9 @@ export async function PUT(req: Request) {
     }
     if (body.tradeMode === 'paper' || body.tradeMode === 'live') {
       s.tradeMode = body.tradeMode
+    }
+    if (typeof body.tpslPercent === 'number' && isFinite(body.tpslPercent) && body.tpslPercent > 0 && body.tpslPercent <= 90) {
+      s.tpslPercent = Math.round(body.tpslPercent * 100) / 100
     }
     await db.user.update({
       where: { id: user.id },

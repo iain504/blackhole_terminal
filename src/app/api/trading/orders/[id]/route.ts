@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { replaceOrder, cancelOrder, resolveTradeMode } from '@/lib/trading'
+import { replaceExitOrderSmart, cancelOrder, resolveTradeMode } from '@/lib/trading'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface ReplaceBody {
@@ -11,6 +11,9 @@ interface ReplaceBody {
 }
 
 // PATCH /api/trading/orders/[id] — replace SL/TP prices (chart line drag).
+// Smart replace: PATCH with automatic paper/live host fallback (the drag used
+// to hit the wrong host and silently never land), then cancel+re-place
+// fallback for orders that refuse direct replacement (bracket OCO legs).
 // Alpaca returns a replacement order with a NEW id.
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -26,11 +29,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (Object.keys(patch).length === 0) {
       return NextResponse.json({ error: 'nothing to replace' }, { status: 400 })
     }
-    const r = await replaceOrder(user.id, mode, id, patch)
+    const r = await replaceExitOrderSmart(user.id, mode, id, patch)
     if (!r.data) {
       return NextResponse.json({ error: r.error || 'Replace failed' }, { status: r.status || 502 })
     }
-    return NextResponse.json({ mode, order: r.data })
+    return NextResponse.json({ mode: r.mode, order: r.data, method: r.method, note: r.note })
   } catch (e) {
     return handleError(e)
   }

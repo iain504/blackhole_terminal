@@ -1,0 +1,253 @@
+'use client'
+
+// Positions console tab: every open paper + live position in one table —
+// symbol, market, side/qty, entry price, TP, SL, trailing, P&L — with a
+// per-row close button (market-close via the Alpaca Trading API).
+import { useCallback, useEffect, useState } from 'react'
+import { Loader2, RefreshCw, X } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import { useToast } from '@/hooks/use-toast'
+import { fmtPrice } from '@/lib/market-types'
+import { ExitInfo, PositionRow, normSym } from '@/components/chart/trading-types'
+import { cn } from '@/lib/utils'
+
+type Mode = 'paper' | 'live'
+
+interface ModeData {
+  mode: Mode
+  positions: PositionRow[]
+  exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
+  error?: string
+  loaded: boolean
+}
+
+interface PosConsoleRow {
+  mode: Mode
+  pos: PositionRow
+  sl?: ExitInfo
+  tp?: ExitInfo
+}
+
+const MODES: Mode[] = ['paper', 'live']
+
+export default function PositionsTab() {
+  const { toast } = useToast()
+  const [data, setData] = useState<Record<Mode, ModeData>>({
+    paper: { mode: 'paper', positions: [], exits: {}, loaded: false },
+    live: { mode: 'live', positions: [], exits: {}, loaded: false },
+  })
+  const [refreshing, setRefreshing] = useState(false)
+  const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
+
+  const refresh = useCallback(async () => {
+    setRefreshing(true)
+    const one = async (mode: Mode): Promise<ModeData> => {
+      try {
+        const res = await fetch(`/api/trading/positions?mode=${mode}`)
+        if (!res.ok) return { mode, positions: [], exits: {}, error: `HTTP ${res.status}`, loaded: true }
+        const json = await res.json()
+        const errs: string[] | undefined = json.errors
+        return {
+          mode,
+          positions: (json.positions || []) as PositionRow[],
+          exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
+          error: errs?.length ? errs.join(', ') : undefined,
+          loaded: true,
+        }
+      } catch {
+        return { mode, positions: [], exits: {}, error: 'network error', loaded: true }
+      }
+    }
+    const [paper, live] = await Promise.all(MODES.map(one))
+    setData({ paper, live })
+    setRefreshing(false)
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+    const timer = setInterval(() => void refresh(), 10000)
+    const onChanged = () => void refresh()
+    window.addEventListener('tt:positions-changed', onChanged)
+    window.addEventListener('tt:settings-changed', onChanged)
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener('tt:positions-changed', onChanged)
+      window.removeEventListener('tt:settings-changed', onChanged)
+    }
+  }, [refresh])
+
+  const rows: PosConsoleRow[] = MODES.flatMap((m) =>
+    (data[m].positions || []).map((pos) => ({
+      mode: m,
+      pos,
+      sl: data[m].exits[normSym(pos.tradeSymbol)]?.sl,
+      tp: data[m].exits[normSym(pos.tradeSymbol)]?.tp,
+    })),
+  )
+  const noKeys = (m: Mode) => data[m].loaded && data[m].error === 'no-keys'
+
+  const closePosition = async (row: PosConsoleRow) => {
+    const key = `${row.mode}:${row.pos.tradeSymbol}`
+    setClosing(key)
+    try {
+      const res = await fetch(
+        `/api/trading/positions/${encodeURIComponent(row.pos.tradeSymbol)}?mode=${row.mode}`,
+        { method: 'DELETE' },
+      )
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({ title: `Closing ${row.pos.tradeSymbol} (${row.mode})`, description: 'Market close submitted' })
+      } else {
+        toast({ title: 'Close failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Close failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setClosing(null)
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      void refresh()
+    }
+  }
+
+  const totals = rows.reduce(
+    (acc, r) => ({ upl: acc.upl + r.pos.upl, count: acc.count + 1 }),
+    { upl: 0, count: 0 },
+  )
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+      {/* header */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-2">
+        <span className="text-sm font-semibold text-zinc-100">Positions</span>
+        <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400">
+          {totals.count} open
+        </Badge>
+        <span className={cn('text-sm font-semibold tabular-nums', totals.upl >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
+          {totals.upl >= 0 ? '+' : '−'}${Math.abs(totals.upl).toFixed(2)} unrealized
+        </span>
+        <div className="ml-auto flex items-center gap-1.5">
+          {MODES.map((m) => (
+            <Badge
+              key={m}
+              variant="outline"
+              className={cn(
+                'text-[10px]',
+                m === 'live'
+                  ? 'border-amber-500/40 text-amber-400'
+                  : 'border-emerald-500/40 text-emerald-400',
+              )}
+              title={noKeys(m) ? `No Alpaca keys can serve ${m} — add them in Settings` : `${data[m].positions.length} position(s)`}
+            >
+              {m}
+              {noKeys(m) ? ' · no keys' : ''}
+            </Badge>
+          ))}
+          <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={() => void refresh()} aria-label="Refresh positions">
+            <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
+          </Button>
+        </div>
+      </div>
+
+      {/* table */}
+      <div className="min-h-0 flex-1 overflow-auto rounded-md border border-zinc-800/80 bg-zinc-900/70 terminal-scroll">
+        <table className="w-full min-w-[900px] border-collapse text-xs">
+          <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+            <tr className="border-b border-zinc-800">
+              <th className="px-3 py-2 text-left font-semibold">Symbol</th>
+              <th className="px-3 py-2 text-left font-semibold">Market</th>
+              <th className="px-3 py-2 text-left font-semibold">Side</th>
+              <th className="px-3 py-2 text-right font-semibold">Qty</th>
+              <th className="px-3 py-2 text-right font-semibold">Entry price</th>
+              <th className="px-3 py-2 text-right font-semibold">Last</th>
+              <th className="px-3 py-2 text-right font-semibold">TP</th>
+              <th className="px-3 py-2 text-right font-semibold">SL</th>
+              <th className="px-3 py-2 text-right font-semibold">Trailing</th>
+              <th className="px-3 py-2 text-right font-semibold">P&amp;L</th>
+              <th className="px-3 py-2 text-right font-semibold">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={11} className="px-3 py-10 text-center text-zinc-500">
+                  {data.paper.loaded && data.live.loaded ? (
+                    <>
+                      No open positions on paper or live.
+                      <span className="mt-1 block text-[11px] text-zinc-600">
+                        Place a trade from the chart (right-click → trade ticket) and it appears here.
+                      </span>
+                    </>
+                  ) : (
+                    <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading positions…</span>
+                  )}
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => {
+              const key = `${r.mode}:${r.pos.tradeSymbol}`
+              const long = r.pos.side === 'long'
+              const up = r.pos.upl >= 0
+              const trailing = r.sl?.type === 'trailing_stop' ? `${r.sl.trailPercent ?? '—'}%` : null
+              return (
+                <tr key={key} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+                  <td className="px-3 py-2 font-semibold text-zinc-100">{r.pos.symbol}</td>
+                  <td className="px-3 py-2">
+                    <Badge
+                      variant="outline"
+                      className={cn(
+                        'text-[10px]',
+                        r.mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400',
+                      )}
+                    >
+                      {r.mode}
+                    </Badge>
+                  </td>
+                  <td className={cn('px-3 py-2 font-medium', long ? 'text-emerald-400' : 'text-rose-400')}>
+                    {long ? 'LONG' : 'SHORT'}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{r.pos.qty}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.avgEntry)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.current)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums text-emerald-300">
+                    {r.tp?.limitPrice != null ? fmtPrice(r.tp.limitPrice) : <span className="text-zinc-600">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-rose-300">
+                    {r.sl && (r.sl.stopPrice != null || r.sl.limitPrice != null)
+                      ? fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)
+                      : <span className="text-zinc-600">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-right tabular-nums text-amber-300">
+                    {trailing ?? <span className="text-zinc-600">—</span>}
+                  </td>
+                  <td className={cn('px-3 py-2 text-right font-semibold tabular-nums', up ? 'text-emerald-400' : 'text-rose-400')}>
+                    {up ? '+' : '−'}${Math.abs(r.pos.upl).toFixed(2)}
+                    <span className="ml-1 text-[10px] font-normal opacity-80">
+                      ({up ? '+' : '−'}{Math.abs(r.pos.uplPct).toFixed(2)}%)
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 text-right">
+                    <Button
+                      size="sm"
+                      className="h-6 border border-rose-500/40 bg-rose-500/10 px-2 text-[11px] font-semibold text-rose-400 hover:bg-rose-500/20 hover:text-rose-300"
+                      disabled={closing === key}
+                      onClick={() => void closePosition(r)}
+                      aria-label={`Close ${r.mode} position ${r.pos.tradeSymbol}`}
+                    >
+                      {closing === key ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Close position'}
+                    </Button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="flex shrink-0 items-center gap-1.5 px-1 text-[11px] text-zinc-600">
+        <X className="h-3 w-3" aria-hidden />
+        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders.
+      </p>
+    </div>
+  )
+}

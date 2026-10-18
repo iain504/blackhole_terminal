@@ -9,6 +9,7 @@ import { TabBar } from './TabBar'
 import { ChartWorkspace } from './ChartWorkspace'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
+import PositionsTab from './tabs/PositionsTab'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Home, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -306,6 +307,7 @@ function ActiveTabContent() {
   if (!active) return null
   if (active.type === 'calendar') return <CalendarTab />
   if (active.type === 'heatmap') return <HeatmapTab />
+  if (active.type === 'positions') return <PositionsTab />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 
