@@ -1,11 +1,12 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, RefreshCw } from 'lucide-react'
+import { AlertTriangle, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
+import { FilterMultiSelect } from './FilterMultiSelect'
 
 /* ------------------------------------------------------------------ types */
 
@@ -60,6 +61,10 @@ const IMPORTANCE_LABEL: Record<'high' | 'medium' | 'low', string> = {
 
 const REFRESH_INTERVAL_MS = 10 * 60 * 1000 // auto-refresh every 10 minutes
 
+// Importance filter values (all on by default)
+type Imp = 'high' | 'medium' | 'low'
+const IMP_ALL: Imp[] = ['high', 'medium', 'low']
+
 /* -------------------------------------------------------------- component */
 
 export default function CalendarTab() {
@@ -68,6 +73,10 @@ export default function CalendarTab() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // ---- filters (Task 23 #2): importance + country ----
+  const [impSel, setImpSel] = useState<Set<string>>(new Set(IMP_ALL))
+  const [countrySel, setCountrySel] = useState<Set<string>>(new Set())
+
   const refresh = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -75,8 +84,16 @@ export default function CalendarTab() {
       const res = await fetch('/api/market/calendar', { cache: 'no-store' })
       if (!res.ok) throw new Error(`Request failed (HTTP ${res.status})`)
       const data = (await res.json()) as { events?: CalEvent[]; source?: CalendarSource }
-      setEvents(Array.isArray(data.events) ? data.events : [])
+      const evs = Array.isArray(data.events) ? data.events : []
+      setEvents(evs)
       setSource(data.source === 'forexfactory' ? 'forexfactory' : 'sample')
+      // register any NEW countries/currencies that appeared, keep the user's
+      // exclusions untouched
+      setCountrySel((prev) => {
+        const next = new Set(prev)
+        for (const ev of evs) if (ev.country) next.add(ev.country)
+        return next
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load calendar')
     } finally {
@@ -91,10 +108,35 @@ export default function CalendarTab() {
     return () => clearInterval(id)
   }, [refresh])
 
-  // Group events by local calendar date, sorted chronologically within each day
+  // Country filter options (sorted by event count desc, then name)
+  const countryOptions = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const ev of events) {
+      const c = ev.country || '—'
+      counts.set(c, (counts.get(c) ?? 0) + 1)
+    }
+    return Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, label: value, count }))
+  }, [events])
+
+  // Apply the filters BEFORE day grouping
+  const filtered = useMemo(
+    () =>
+      events.filter((ev) => {
+        const imp = normalizeImportance(ev.importance)
+        if (!impSel.has(imp)) return false
+        if (ev.country && !countrySel.has(ev.country)) return false
+        if (!ev.country && !countrySel.has('—')) return false
+        return true
+      }),
+    [events, impSel, countrySel],
+  )
+
+  // Group filtered events by local calendar date, sorted chronologically within each day
   const days = useMemo(() => {
     const groups = new Map<string, CalEvent[]>()
-    const sorted = [...events].sort(
+    const sorted = [...filtered].sort(
       (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
     )
     for (const ev of sorted) {
@@ -106,11 +148,13 @@ export default function CalendarTab() {
       else groups.set(key, [ev])
     }
     return Array.from(groups.entries())
-  }, [events])
+  }, [filtered])
 
   const now = Date.now()
   const today = dayKey(new Date())
   const hasData = events.length > 0
+  const filtersActive = impSel.size !== IMP_ALL.length || countrySel.size < countryOptions.length
+  const hiddenCount = events.length - filtered.length
 
   return (
     <div className="flex h-full flex-col bg-zinc-950/40">
@@ -144,6 +188,66 @@ export default function CalendarTab() {
           <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} aria-hidden="true" />
         </Button>
       </header>
+
+      {/* ---------------------------------------------------- filter toolbar */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-zinc-800 bg-zinc-900/30 px-3 py-1.5">
+        {/* importance chips — click to include/exclude a level */}
+        <div
+          className="flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5"
+          role="group"
+          aria-label="Importance filter"
+        >
+          {IMP_ALL.map((imp) => {
+            const on = impSel.has(imp)
+            return (
+              <button
+                key={imp}
+                onClick={() =>
+                  setImpSel((prev) => {
+                    const next = new Set(prev)
+                    if (next.has(imp)) next.delete(imp)
+                    else next.add(imp)
+                    return next
+                  })
+                }
+                aria-pressed={on}
+                title={`${IMPORTANCE_LABEL[imp]} importance events`}
+                className={cn(
+                  'flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors',
+                  on ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
+                )}
+              >
+                <span className={cn('size-1.5 rounded-full', IMPORTANCE_DOT[imp], !on && 'opacity-30')} aria-hidden="true" />
+                {IMPORTANCE_LABEL[imp]}
+              </button>
+            )
+          })}
+        </div>
+        {/* country / currency multi-select */}
+        <FilterMultiSelect
+          label="Country"
+          options={countryOptions}
+          selected={countrySel}
+          onChange={setCountrySel}
+        />
+        {filtersActive && (
+          <div className="ml-auto flex items-center gap-2">
+            <span className="text-[10px] tabular-nums text-zinc-500">{hiddenCount} hidden</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setImpSel(new Set(IMP_ALL))
+                setCountrySel(new Set(countryOptions.map((o) => o.value)))
+              }}
+              className="h-6 gap-1 rounded px-1.5 text-[10px] text-zinc-400 hover:text-zinc-100"
+            >
+              <X className="size-3" aria-hidden="true" />
+              Clear filters
+            </Button>
+          </div>
+        )}
+      </div>
 
       {/* ------------------------------------------------------------- body */}
       <div
@@ -200,6 +304,25 @@ export default function CalendarTab() {
           <p className="p-8 text-center text-xs text-zinc-500">
             No economic events scheduled for the rest of this week.
           </p>
+        )}
+
+        {/* Everything filtered out */}
+        {!loading && !error && hasData && filtered.length === 0 && (
+          <div className="flex flex-col items-center gap-3 p-8 text-center">
+            <p className="text-xs text-zinc-500">No events match the current filters.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setImpSel(new Set(IMP_ALL))
+                setCountrySel(new Set(countryOptions.map((o) => o.value)))
+              }}
+              className="h-7 border-zinc-800 bg-zinc-900 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <X className="size-3.5" aria-hidden="true" />
+              Reset filters
+            </Button>
+          </div>
         )}
 
         {/* One section per day */}
@@ -306,7 +429,10 @@ export default function CalendarTab() {
 
       {/* ------------------------------------------------------------ footer */}
       <footer className="flex h-7 shrink-0 items-center justify-between border-t border-zinc-800 bg-zinc-900/60 px-3 text-[10px] text-zinc-500">
-        <span>Times shown in your local timezone</span>
+        <span>
+          Times shown in your local timezone
+          {filtersActive && hiddenCount > 0 ? ` · ${filtered.length} of ${events.length} events shown` : ''}
+        </span>
         <span className="hidden sm:inline">Auto-refreshes every 10 min</span>
       </footer>
     </div>

@@ -310,11 +310,12 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     } else {
       const chartTab = tabs.find((t) => t.type === 'chart')
       if (chartTab) {
-        set((s) => ({
-          tabs: s.tabs.map((t) => (t.id === chartTab.id ? { ...t, symbol } : t)),
-          activeTabId: chartTab.id,
-          layoutDirty: true,
-        }))
+        // Activate the first chart tab and route through setPaneSymbol so the
+        // tab's PANES are updated too — setting only `symbol` left
+        // grid.panes[0] on the old symbol (tab label said XOM, chart showed
+        // AAPL after clicking a heatmap tile from the heatmap tab).
+        get().setPaneSymbol(chartTab.id, chartTab.focusedPane ?? 0, symbol)
+        set((s) => ({ activeTabId: chartTab.id, layoutDirty: true }))
       }
     }
   },

@@ -10,6 +10,7 @@ import {
   isCryptoSymbol,
 } from './market-types'
 import { simBars, simQuote, simNews, simMarkers } from './simulator'
+import { getBinanceBars, getBinanceQuotes } from './binance'
 
 const DATA_BASE = 'https://data.alpaca.markets'
 const ALPACA_TIMEOUT_MS = 9000
@@ -25,6 +26,8 @@ export type DemoReason = 'no-keys' | 'empty' | `alpaca-http-${number}` | 'alpaca
 export interface DemoMeta {
   demo: boolean
   reason?: DemoReason
+  /** live data provider, e.g. 'binance' | 'alpaca' (undefined for demo data) */
+  source?: string
 }
 
 function demoResult<T>(make: (reason: DemoReason) => T & DemoMeta, reason: DemoReason): T & DemoMeta {
@@ -228,6 +231,13 @@ export async function getBars(
   timeframe: Timeframe,
   userId?: string,
 ): Promise<{ bars: Bar[] } & DemoMeta> {
+  // Crypto: Binance FIRST — free public klines, no API key, so charts stream
+  // real crypto data even before the user logs in / saves their Alpaca keys.
+  if (isCryptoSymbol(symbol)) {
+    const bin = await getBinanceBars(symbol, timeframe)
+    if (bin.length > 0) return { bars: bin, demo: false, source: 'binance' }
+    // Binance unreachable -> fall through to Alpaca (if keys) or demo below.
+  }
   const keys = await getAlpacaKeys(userId)
   if (!keys) {
     return demoResult(
@@ -337,73 +347,89 @@ function snapshotToQuote(symbol: string, snap: StockSnapshot | CryptoSnapshot | 
 
 export async function getQuotes(symbols: string[], userId?: string): Promise<{ quotes: Quote[] } & DemoMeta> {
   if (symbols.length === 0) return { quotes: [], demo: false }
-  const keys = await getAlpacaKeys(userId)
-  if (!keys) {
-    return demoResult(
-      (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
-      'no-keys',
-    )
-  }
   const stocks = symbols.filter((s) => !isCryptoSymbol(s))
   const cryptos = symbols.filter((s) => isCryptoSymbol(s))
   const quotes: Quote[] = []
   let lastStatus = 0
+  let usedBinance = false
+
+  // Crypto first: Binance free 24h tickers, no API key — real crypto prices
+  // for logged-out visitors (missing symbols fall through to Alpaca/demo).
+  if (cryptos.length > 0) {
+    const bq = await getBinanceQuotes(cryptos)
+    if (bq.length > 0) {
+      quotes.push(...bq)
+      usedBinance = true
+    }
+  }
+
+  // Anything Binance missed (or all stock symbols) via Alpaca — only when the
+  // user has keys; without keys non-crypto symbols stay on the simulator.
+  const have = new Set(quotes.map((q) => q.symbol))
+  const needStocks = stocks.filter((s) => !have.has(s))
+  const needCrypto = cryptos.filter((s) => !have.has(s))
   const jobs: Promise<void>[] = []
 
-  if (stocks.length > 0) {
-    // chunk to keep URLs short
-    for (let i = 0; i < stocks.length; i += 30) {
-      const chunk = stocks.slice(i, i + 30)
-      jobs.push((async () => {
-        const { data: raw, status } = await alpacaFetch<Record<string, StockSnapshot>>(
-          `/v2/stocks/snapshots?symbols=${encodeURIComponent(chunk.join(','))}&feed=iex`,
-          keys,
-        )
-        if (!raw) {
-          lastStatus = status
-          return
-        }
-        for (const s of chunk) {
-          const q = snapshotToQuote(s, raw[s])
-          if (q) quotes.push(q)
-        }
-      })())
+  if (needStocks.length > 0 || needCrypto.length > 0) {
+    const keys = await getAlpacaKeys(userId)
+    if (keys) {
+      for (let i = 0; i < needStocks.length; i += 30) {
+        const chunk = needStocks.slice(i, i + 30)
+        jobs.push((async () => {
+          const { data: raw, status } = await alpacaFetch<Record<string, StockSnapshot>>(
+            `/v2/stocks/snapshots?symbols=${encodeURIComponent(chunk.join(','))}&feed=iex`,
+            keys,
+          )
+          if (!raw) {
+            lastStatus = status
+            return
+          }
+          for (const s of chunk) {
+            const q = snapshotToQuote(s, raw[s])
+            if (q) quotes.push(q)
+          }
+        })())
+      }
+      for (let i = 0; i < needCrypto.length; i += 15) {
+        const chunk = needCrypto.slice(i, i + 15)
+        jobs.push((async () => {
+          // NOTE: crypto snapshots nest under `snapshots` (stocks are flat)
+          const { data: raw, status } = await alpacaFetch<{ snapshots?: Record<string, CryptoSnapshot> }>(
+            `/v1beta3/crypto/us/snapshots?symbols=${encodeURIComponent(chunk.join(','))}`,
+            keys,
+          )
+          if (!raw) {
+            lastStatus = status
+            return
+          }
+          const map = raw.snapshots ?? (raw as unknown as Record<string, CryptoSnapshot>)
+          for (const s of chunk) {
+            const q = snapshotToQuote(s, map[s])
+            if (q) quotes.push(q)
+          }
+        })())
+      }
+      await Promise.all(jobs)
     }
   }
-  if (cryptos.length > 0) {
-    for (let i = 0; i < cryptos.length; i += 15) {
-      const chunk = cryptos.slice(i, i + 15)
-      jobs.push((async () => {
-        // NOTE: crypto snapshots nest under `snapshots` (stocks are flat)
-        const { data: raw, status } = await alpacaFetch<{ snapshots?: Record<string, CryptoSnapshot> }>(
-          `/v1beta3/crypto/us/snapshots?symbols=${encodeURIComponent(chunk.join(','))}`,
-          keys,
-        )
-        if (!raw) {
-          lastStatus = status
-          return
-        }
-        const map = raw.snapshots ?? (raw as unknown as Record<string, CryptoSnapshot>)
-        for (const s of chunk) {
-          const q = snapshotToQuote(s, map[s])
-          if (q) quotes.push(q)
-        }
-      })())
-    }
-  }
-  await Promise.all(jobs)
+
   if (quotes.length === 0) {
     return demoResult(
       (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
-      lastStatus === 0 ? 'alpaca-error' : lastStatus ? (`alpaca-http-${lastStatus}` as DemoReason) : 'empty',
+      lastStatus === 0 ? 'no-keys' : lastStatus ? (`alpaca-http-${lastStatus}` as DemoReason) : 'empty',
     )
   }
   // fill any missing with simulator to keep rows visible
-  const have = new Set(quotes.map((q) => q.symbol))
+  const have2 = new Set(quotes.map((q) => q.symbol))
+  let simFilled = false
   for (const s of symbols) {
-    if (!have.has(s)) quotes.push({ ...simQuote(s), symbol: s })
+    if (!have2.has(s)) {
+      quotes.push({ ...simQuote(s), symbol: s })
+      simFilled = true
+    }
   }
-  return { quotes, demo: false }
+  const source = usedBinance ? (simFilled ? 'binance+sim-fill' : 'binance') : simFilled ? 'alpaca+sim-fill' : 'alpaca'
+  return { quotes, demo: false, source }
 }
 
 // ---------- News ----------

@@ -1,0 +1,1984 @@
+     1→'use client'
+     2→
+     3→// Interactive chart: lightweight-charts + transparent overlay canvas for
+     4→// drawings (hline/vline/trend/fib) and alert lines. Lines stay draggable &
+     5→// resizable after drawing, with right-click context menus (Task 14 #1/#4,
+     6→// Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the PRICE
+     7→// SCALE (y-axis), TradingView-style.
+     8→import { useCallback, useEffect, useRef, useState } from 'react'
+     9→import {
+    10→  createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
+    11→  IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
+    12→} from 'lightweight-charts'
+    13→import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS } from '@/store/terminal'
+    14→import { useShallow } from 'zustand/react/shallow'
+    15→import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
+    16→import { cn } from '@/lib/utils'
+    17→import { Button } from '@/components/ui/button'
+    18→import { Badge } from '@/components/ui/badge'
+    19→import { Input } from '@/components/ui/input'
+    20→import { useToast } from '@/hooks/use-toast'
+    21→import {
+    22→  MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
+    23→  ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
+    24→  Briefcase,
+    25→} from 'lucide-react'
+    26→import { SymbolSearchDialog } from './SymbolSearchDialog'
+    27→import { TradeTicket } from './TradeTicket'
+    28→import { useSymbolPositions } from './usePositions'
+    29→import { ExitInfo, normSym } from './trading-types'
+    30→import { ttLog } from '@/lib/console-log'
+    31→
+    32→const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
+    33→
+    34→type Hit =
+    35→  | { type: 'drawing'; id: string; part: 'whole' | 'point'; index?: number }
+    36→  | { type: 'alert'; id: string; part: 'whole' }
+    37→  | { type: 'exit'; id: string; part: 'sl' | 'tp'; origPrice: number; exit: ExitInfo }
+    38→  | { type: 'position'; id: string; part: 'whole'; origPrice: number }
+    39→  | { type: 'chart'; part: 'whole' }
+    40→
+    41→/** Hits that exist on the canvas (everything except the synthetic chart-menu hit). */
+    42→type SceneHit = Exclude<Hit, { type: 'chart' }>
+    43→
+    44→interface MenuState {
+    45→  x: number
+    46→  y: number
+    47→  hit: Hit
+    48→  price?: number | null
+    49→}
+    50→
+    51→interface DragState {
+    52→  hit: SceneHit
+    53→  x0: number
+    54→  y0: number
+    55→  orig: { time: number | null; price: number }[]
+    56→  origPixels: ({ x: number; y: number } | null)[]
+    57→  moved: boolean
+    58→}
+    59→
+    60→const KIND_LABEL: Record<DrawingKind, string> = {
+    61→  hline: 'Horizontal line',
+    62→  vline: 'Vertical line',
+    63→  trend: 'Trend line',
+    64→  fib: 'Fib retracement',
+    65→}
+    66→
+    67→const EMPTY_DRAWINGS: Drawing[] = []
+    68→
+    69→export interface ChartPanelProps {
+    70→  symbol: string
+    71→  timeframe: Timeframe
+    72→  onSymbolChange: (s: string) => void
+    73→  onTimeframeChange: (tf: Timeframe) => void
+    74→  /** grid mode: click to focus this pane (drives Quote/News sidebar) */
+    75→  onFocus?: () => void
+    76→  /** grid mode: visual focus ring */
+    77→  focused?: boolean
+    78→  /** pane key for crosshair sync (must be unique within the group) */
+    79→  syncKey?: string
+    80→  /** crosshair sync group id (tab id) or null to disable */
+    81→  syncGroup?: string | null
+    82→  /** smaller chrome for grid panes */
+    83→  compact?: boolean
+    84→}
+    85→
+    86→export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeChange, onFocus, focused, syncKey, syncGroup, compact }: ChartPanelProps) {
+    87→  // store
+    88→  const drawingTool = useTerminal((s) => s.drawingTool)
+    89→  const setDrawingTool = useTerminal((s) => s.setDrawingTool)
+    90→  const addDrawingLocal = useTerminal((s) => s.addDrawingLocal)
+    91→  const patchDrawingLocal = useTerminal((s) => s.patchDrawingLocal)
+    92→  const removeDrawingLocal = useTerminal((s) => s.removeDrawingLocal)
+    93→  const patchAlertLocal = useTerminal((s) => s.patchAlertLocal)
+    94→  const removeAlertLocal = useTerminal((s) => s.removeAlertLocal)
+    95→  const addAlertLocal = useTerminal((s) => s.addAlertLocal)
+    96→  const loadDrawings = useTerminal((s) => s.loadDrawings)
+    97→
+    98→  // refs
+    99→  const containerRef = useRef<HTMLDivElement>(null)
+   100→  const canvasRef = useRef<HTMLCanvasElement>(null)
+   101→  const chartRef = useRef<IChartApi | null>(null)
+   102→  const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
+   103→  const barsRef = useRef<Bar[]>([])
+   104→  const hoverRef = useRef<string | null>(null)
+   105→  const feedStateRef = useRef('')
+   106→  const dragRef = useRef<DragState | null>(null)
+   107→  const draftRef = useRef<{ kind: DrawingKind; p1: DrawingPoint; p2: DrawingPoint } | null>(null)
+   108→  const rafRef = useRef(0)
+   109→
+   110→  // ui state
+   111→  const [loading, setLoading] = useState(true)
+   112→  const [demo, setDemo] = useState(false)
+   113→  const [demoReason, setDemoReason] = useState<string | undefined>(undefined)
+   114→  const [settingsVer, setSettingsVer] = useState(0)
+   115→  const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
+   116→  const [quote, setQuote] = useState<{ price: number; changePct: number; change: number } | null>(null)
+   117→  const [showDrawings, setShowDrawings] = useState(true)
+   118→  const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
+   119→  const [menu, setMenu] = useState<MenuState | null>(null)
+   120→  const [editValue, setEditValue] = useState<{
+   121→    type: 'drawing' | 'alert' | 'exit'; id: string; price: number; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }
+   122→  } | null>(null)
+   123→  const [searchOpen, setSearchOpen] = useState(false)
+   124→  const [tradeOpen, setTradeOpen] = useState(false)
+   125→  const [ticketPrefill, setTicketPrefill] = useState<{ side?: 'buy' | 'sell'; price?: number } | null>(null)
+   126→  const { toast } = useToast()
+   127→
+   128→  // trading positions + SL/TP exits for this symbol (polls every 15s)
+   129→  const posData = useSymbolPositions(symbol)
+   130→  const posRefresh = posData.refresh
+   131→  const posRef = useRef(posData.data)
+   132→  posRef.current = posData.data
+   133→  const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
+   134→
+   135→  // crosshair sync (multi-chart grid): refs so the chart lifecycle effect
+   136→  // always reads fresh values without re-creating the chart
+   137→  const syncGroupRef = useRef(syncGroup)
+   138→  syncGroupRef.current = syncGroup
+   139→  const syncKeyRef = useRef(syncKey)
+   140→  syncKeyRef.current = syncKey
+   141→  const suppressSyncUntilRef = useRef(0)
+   142→  const syncRafRef = useRef(0)
+   143→  const pendingSyncRef = useRef<{ group: string; from: string; time: Time | null; price: number | null } | null>(null)
+   144→
+   145→  // OHLC legend: written directly to these DOM nodes from the crosshair handler
+   146→  // (no React state — see note in the chart lifecycle effect)
+   147→  const legendRef = useRef<HTMLDivElement>(null)
+   148→
+   149→  // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Alpaca) — TradingView
+   150→  // style icons pinned to the right price scale at the event bar's close price
+   151→  const markersRef = useRef<{
+   152→    earnings: { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]
+   153→    news: { ts: number; title?: string }[]
+   154→  }>({ earnings: [], news: [] })
+   155→  // icon hit rects (rebuilt each renderOverlay pass, used for hover tooltips)
+   156→  const axisIconsRef = useRef<{ kind: 'e' | 'n'; x: number; y: number; w: number; h: number; tip: string }[]>([])
+   157→  const symEsc = symbol.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+   158→  const tfLabelEsc = TIMEFRAMES[tf].label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+   159→
+   160→  const drawings = useTerminal(useShallow((s) => s.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS))
+   161→  const symbolAlerts = useTerminal(useShallow((s) => s.alerts.filter((a) => a.symbol === symbol)))
+   162→
+   163→  // Refetch market data when credentials change in Settings (save/test keys)
+   164→  useEffect(() => {
+   165→    const onChanged = () => setSettingsVer((v) => v + 1)
+   166→    window.addEventListener('tt:settings-changed', onChanged)
+   167→    return () => window.removeEventListener('tt:settings-changed', onChanged)
+   168→  }, [])
+   169→
+   170→  // ---------- coordinate helpers ----------
+   171→  // Time → x. timeToCoordinate() only resolves EXACT bar times, so drawings
+   172→  // captured between bars / in the left-right margins previously vanished or
+   173→  // snapped to the wrong bar. Robust version: exact hit → interpolate between
+   174→  // the bracketing bars (handles weekend/overnight gaps) → extrapolate into
+   175→  // the margins using the per-bar pixel spacing.
+   176→  const xOf = useCallback((t: number | null): number | null => {
+   177→    if (t == null || !chartRef.current) return null
+   178→    const ts = chartRef.current.timeScale()
+   179→    const bars = barsRef.current
+   180→    const exact = ts.timeToCoordinate(t as UTCTimestamp)
+   181→    if (exact != null) return Number(exact)
+   182→    if (bars.length === 0) return null
+   183→    const last = bars.length - 1
+   184→    const barX = (i: number): number | null => {
+   185→      const x = ts.timeToCoordinate(bars[i].time as UTCTimestamp)
+   186→      return x == null ? null : Number(x)
+   187→    }
+   188→    // pixels per bar from two reference bars (index→x is globally linear)
+   189→    const pxPerBar = (): number | null => {
+   190→      const vr = ts.getVisibleLogicalRange()
+   191→      let a = vr ? Math.ceil(Number(vr.from)) : 0
+   192→      let b = vr ? Math.floor(Number(vr.to)) : last
+   193→      a = Math.max(0, Math.min(a, last))
+   194→      b = Math.max(0, Math.min(b, last))
+   195→      if (b === a) {
+   196→        a = Math.max(0, a - 1)
+   197→        b = Math.min(last, b + 1)
+   198→      }
+   199→      if (b === a) return null
+   200→      const xa = barX(a)
+   201→      const xb = barX(b)
+   202→      if (xa == null || xb == null || xb === xa) return null
+   203→      return (xb - xa) / (b - a)
+   204→    }
+   205→    if (t > bars[last].time) {
+   206→      const x1 = barX(last)
+   207→      if (x1 == null) return null
+   208→      const ppb = pxPerBar()
+   209→      if (ppb == null) return x1
+   210→      return x1 + ((t - bars[last].time) / TIMEFRAMES[tf].seconds) * ppb
+   211→    }
+   212→    if (t < bars[0].time) {
+   213→      const x0 = barX(0)
+   214→      if (x0 == null) return null
+   215→      const ppb = pxPerBar()
+   216→      if (ppb == null) return x0
+   217→      return x0 + ((t - bars[0].time) / TIMEFRAMES[tf].seconds) * ppb
+   218→    }
+   219→    // bracket: first bar with time >= t, interpolate to the previous bar
+   220→    let lo = 0
+   221→    let hi = last
+   222→    while (lo < hi) {
+   223→      const mid = (lo + hi) >> 1
+   224→      if (bars[mid].time < t) lo = mid + 1
+   225→      else hi = mid
+   226→    }
+   227→    const j = lo
+   228→    const i = Math.max(0, j - 1)
+   229→    const xa = barX(i)
+   230→    const xb = barX(j)
+   231→    if (xa == null || xb == null) return null
+   232→    const dt = bars[j].time - bars[i].time
+   233→    if (dt <= 0) return xa
+   234→    return xa + ((t - bars[i].time) / dt) * (xb - xa)
+   235→  }, [tf])
+   236→
+   237→  const yOf = useCallback((p: number): number | null => {
+   238→    if (!seriesRef.current) return null
+   239→    const y = seriesRef.current.priceToCoordinate(p)
+   240→    return y == null ? null : Number(y)
+   241→  }, [])
+   242→
+   243→  const priceAt = useCallback((y: number): number | null => {
+   244→    if (!seriesRef.current) return null
+   245→    const p = seriesRef.current.coordinateToPrice(y)
+   246→    return p == null ? null : Number(p)
+   247→  }, [])
+   248→
+   249→  // Time under the cursor, CONTINUOUS (no snapping). lightweight-charts'
+   250→  // coordinateToTime() ceils to the NEXT bar, which used to place drawn lines
+   251→  // up to a full bar-width right of the arrow. We derive the exact fractional
+   252→  // bar index from two reference bars (public API only) and map it to a
+   253→  // continuous time: between bars → interpolate across their actual time gap,
+   254→  // beyond the data → extend by the timeframe seconds. Round-trips exactly
+   255→  // through xOf() above, so the committed line lands precisely under the
+   256→  // cursor — matching TradingView (magnet off).
+   257→  const timeAt = useCallback((x: number): number | null => {
+   258→    const chart = chartRef.current
+   259→    const bars = barsRef.current
+   260→    if (!chart || bars.length === 0) return null
+   261→    const ts = chart.timeScale()
+   262→    const last = bars.length - 1
+   263→    const vr = ts.getVisibleLogicalRange()
+   264→    let a = vr ? Math.ceil(Number(vr.from)) : 0
+   265→    let b = vr ? Math.floor(Number(vr.to)) : last
+   266→    a = Math.max(0, Math.min(a, last))
+   267→    b = Math.max(0, Math.min(b, last))
+   268→    if (b === a) {
+   269→      a = Math.max(0, a - 1)
+   270→      b = Math.min(last, b + 1)
+   271→    }
+   272→    if (b === a) return null
+   273→    const xa = ts.timeToCoordinate(bars[a].time as UTCTimestamp)
+   274→    const xb = ts.timeToCoordinate(bars[b].time as UTCTimestamp)
+   275→    if (xa == null || xb == null || Number(xb) === Number(xa)) return null
+   276→    const fi = a + ((x - Number(xa)) / (Number(xb) - Number(xa))) * (b - a)
+   277→    const tfSec = TIMEFRAMES[tf].seconds
+   278→    if (fi >= last) return bars[last].time + (fi - last) * tfSec
+   279→    if (fi <= 0) return bars[0].time + fi * tfSec
+   280→    const i = Math.floor(fi)
+   281→    const f = fi - i
+   282→    const t0 = bars[i].time
+   283→    const t1 = bars[i + 1].time
+   284→    return t1 > t0 ? t0 + f * (t1 - t0) : t0
+   285→  }, [tf])
+   286→
+   287→  const scheduleRedraw = useCallback(() => {
+   288→    if (rafRef.current) return
+   289→    rafRef.current = requestAnimationFrame(() => {
+   290→      rafRef.current = 0
+   291→      renderOverlay()
+   292→    })
+   293→     
+   294→  }, [])
+   295→
+   296→  // ---------- overlay rendering ----------
+   297→  const renderOverlay = useCallback(() => {
+   298→    const canvas = canvasRef.current
+   299→    const container = containerRef.current
+   300→    if (!canvas || !container) return
+   301→    const w = container.clientWidth
+   302→    const h = container.clientHeight
+   303→    const dpr = window.devicePixelRatio || 1
+   304→    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+   305→      canvas.width = Math.round(w * dpr)
+   306→      canvas.height = Math.round(h * dpr)
+   307→    }
+   308→    const ctx = canvas.getContext('2d')
+   309→    if (!ctx) return
+   310→    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+   311→    ctx.clearRect(0, 0, w, h)
+   312→
+   313→    const st = useTerminal.getState()
+   314→    const ds = st.drawingsBySymbol[symbol] || []
+   315→    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+   316→
+   317→    if (st.drawingTool !== 'cursor' || draftRef.current) {
+   318→      // drawing hint strip
+   319→      ctx.fillStyle = 'rgba(161,161,170,0.75)'
+   320→      ctx.font = '11px ui-sans-serif, system-ui'
+   321→      const label =
+   322→        draftRef.current
+   323→          ? `${KIND_LABEL[draftRef.current.kind]}: click to set end point · Esc to cancel`
+   324→          : `${KIND_LABEL[st.drawingTool as DrawingKind]}: click on the chart${st.drawingTool === 'trend' || st.drawingTool === 'fib' ? ' (2 clicks)' : ''}`
+   325→      ctx.fillText(label, 46, 84)
+   326→    }
+   327→
+   328→    if (st.drawingTool === 'cursor') {
+   329→      if (showDrawings) for (const d of ds) drawDrawing(ctx, d, w, h, hoverRef.current === d.id || (dragRef.current?.hit.type === 'drawing' && dragRef.current.hit.id === d.id))
+   330→      for (const a of als) drawAlert(ctx, a, w)
+   331→    } else if (showDrawings) {
+   332→      for (const d of ds) drawDrawing(ctx, d, w, h, false)
+   333→    }
+   334→
+   335→    // ---- position + SL/TP exit lines (trade assistance) ----
+   336→    const posBundle = posRef.current
+   337→    const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
+   338→    const myExits = posBundle?.exits[normSym(symbol)]
+   339→    if (myPos) {
+   340→      const yEntry = yOf(myPos.avgEntry)
+   341→      if (yEntry != null) {
+   342→        ctx.save()
+   343→        ctx.strokeStyle = '#e4e4e7'
+   344→        ctx.lineWidth = 1.5
+   345→        ctx.setLineDash([10, 4])
+   346→        ctx.globalAlpha = 0.85
+   347→        hlinePath(ctx, yEntry, w)
+   348→        ctx.setLineDash([])
+   349→        ctx.restore()
+   350→        drawChip(ctx, w - 150, yEntry, `POS ${myPos.side === 'long' ? '+' : '-'}${myPos.qty} @ ${fmtPrice(myPos.avgEntry)}`, '#a1a1aa', false)
+   351→      }
+   352→    }
+   353→    if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
+   354→      const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
+   355→      const ySl = yOf(slPrice)
+   356→      if (ySl != null) {
+   357→        ctx.save()
+   358→        ctx.strokeStyle = '#f43f5e'
+   359→        ctx.lineWidth = 1.5
+   360→        ctx.setLineDash([7, 5])
+   361→        ctx.globalAlpha = 0.95
+   362→        hlinePath(ctx, ySl, w)
+   363→        ctx.setLineDash([])
+   364→        ctx.restore()
+   365→        drawChip(ctx, w - 92, ySl, `SL ${fmtPrice(slPrice)}`, '#f43f5e', hoverRef.current?.startsWith('exit') ?? false)
+   366→      }
+   367→    }
+   368→    if (myExits?.tp && myExits.tp.limitPrice != null) {
+   369→      const yTp = yOf(myExits.tp.limitPrice)
+   370→      if (yTp != null) {
+   371→        ctx.save()
+   372→        ctx.strokeStyle = '#22c55e'
+   373→        ctx.lineWidth = 1.5
+   374→        ctx.setLineDash([7, 5])
+   375→        ctx.globalAlpha = 0.95
+   376→        hlinePath(ctx, yTp, w)
+   377→        ctx.setLineDash([])
+   378→        ctx.restore()
+   379→        drawChip(ctx, w - 92, yTp, `TP ${fmtPrice(myExits.tp.limitPrice)}`, '#22c55e', hoverRef.current?.startsWith('exit') ?? false)
+   380→      }
+   381→    }
+   382→    // preview of the NEW sl/tp value while dragging (user asked explicitly)
+   383→    const exDrag = exitDragRef.current
+   384→    if (exDrag && exDrag.price != null) {
+   385→      const yD = yOf(exDrag.price)
+   386→      if (yD != null) {
+   387→        ctx.save()
+   388→        ctx.strokeStyle = exDrag.kind === 'sl' ? '#fb7185' : '#4ade80'
+   389→        ctx.lineWidth = 1.5
+   390→        ctx.setLineDash([3, 4])
+   391→        ctx.globalAlpha = 1
+   392→        hlinePath(ctx, yD, w)
+   393→        ctx.setLineDash([])
+   394→        ctx.restore()
+   395→        drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+   396→      }
+   397→    }
+   398→
+   399→    // ---- y-axis event icons: earnings [E] (yfinance) + news ⚡ (TradingView-style) ----
+   400→    const chartApi = chartRef.current
+   401→    const mk = markersRef.current
+   402→    axisIconsRef.current = []
+   403→    if (chartApi && (mk.earnings.length > 0 || mk.news.length > 0) && barsRef.current.length > 0) {
+   404→      const psW = chartApi.priceScale('right').width()
+   405→      const tAxisH = chartApi.timeScale().height()
+   406→      const bars = barsRef.current
+   407→      const vis = chartApi.timeScale().getVisibleRange()
+   408→      const visFrom = vis ? Number(vis.from) : null
+   409→      const visTo = vis ? Number(vis.to) : null
+   410→      const cx = w - psW / 2
+   411→      const yMin = 13
+   412→      const yMax = Math.max(yMin + 1, h - tAxisH - 10)
+   413→
+   414→      // bar in effect at the event moment (upcoming events → last bar)
+   415→      const barAt = (ts: number): Bar | null => {
+   416→        if (ts < bars[0].time) return null
+   417→        if (ts >= bars[bars.length - 1].time) return bars[bars.length - 1]
+   418→        let lo = 0
+   419→        let hi = bars.length - 1
+   420→        while (lo < hi) {
+   421→          const mid = (lo + hi + 1) >> 1
+   422→          if (bars[mid].time <= ts) lo = mid
+   423→          else hi = mid - 1
+   424→        }
+   425→        return bars[lo]
+   426→      }
+   427→      const fmtDay = (ts: number) =>
+   428→        new Date(ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+   429→
+   430→      type AxisIcon = { kind: 'e' | 'n'; rawY: number; tip: string; atLast?: boolean }
+   431→      const icons: AxisIcon[] = []
+   432→      const lastBarTime = bars[bars.length - 1].time
+   433→      for (const e of mk.earnings) {
+   434→        const bar = barAt(e.ts)
+   435→        if (!bar) continue
+   436→        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
+   437→        const y = yOf(bar.close)
+   438→        if (y == null) continue
+   439→        const epsBits =
+   440→          e.epsActual != null
+   441→            ? ` · EPS ${e.epsActual}${e.epsEstimate != null ? ` (est ${e.epsEstimate})` : ''}`
+   442→            : ''
+   443→        icons.push({ kind: 'e', rawY: y, tip: `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`, atLast: bar.time === lastBarTime })
+   444→      }
+   445→      for (const n of mk.news) {
+   446→        const bar = barAt(n.ts)
+   447→        if (!bar) continue
+   448→        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
+   449→        const y = yOf(bar.close)
+   450→        if (y == null) continue
+   451→        icons.push({ kind: 'n', rawY: y, tip: `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`, atLast: bar.time === lastBarTime })
+   452→      }
+   453→
+   454→      // icons pinned to the last bar sit on the current-price label — lift them
+   455→      // above it so the price tag stays readable
+   456→      for (const ic of icons) {
+   457→        if (ic.atLast) ic.rawY -= 17
+   458→      }
+   459→
+   460→      // resolve vertical collisions (min 16px gap), then clamp into the pane
+   461→      icons.sort((a, b) => a.rawY - b.rawY)
+   462→      for (let i = 1; i < icons.length; i++) {
+   463→        if (icons[i].rawY - icons[i - 1].rawY < 16) icons[i].rawY = icons[i - 1].rawY + 16
+   464→      }
+   465→      const hoverIdx = hoverRef.current?.startsWith('axis:') ? parseInt(hoverRef.current.slice(5), 10) : -1
+   466→
+   467→      icons.forEach((ic, i) => {
+   468→        const y = Math.min(yMax, Math.max(yMin, ic.rawY))
+   469→        const highlighted = i === hoverIdx
+   470→        ctx.save()
+   471→        ctx.textAlign = 'center'
+   472→        ctx.textBaseline = 'middle'
+   473→        if (ic.kind === 'e') {
+   474→          const bw = 27
+   475→          const bh = 15
+   476→          ctx.fillStyle = 'rgba(24,24,27,0.92)'
+   477→          ctx.strokeStyle = highlighted ? '#fde047' : '#f59e0b'
+   478→          ctx.lineWidth = highlighted ? 1.6 : 1
+   479→          ctx.beginPath()
+   480→          ctx.roundRect(cx - bw / 2, y - bh / 2, bw, bh, 4)
+   481→          ctx.fill()
+   482→          ctx.stroke()
+   483→          ctx.fillStyle = highlighted ? '#fde047' : '#fbbf24'
+   484→          ctx.font = `${highlighted ? '600 ' : ''}9px ui-monospace, monospace`
+   485→          ctx.fillText('[E]', cx, y + 0.5)
+   486→        } else {
+   487→          ctx.fillStyle = 'rgba(24,24,27,0.92)'
+   488→          ctx.strokeStyle = highlighted ? '#f0abfc' : 'rgba(232,121,249,0.55)'
+   489→          ctx.lineWidth = highlighted ? 1.6 : 1
+   490→          ctx.beginPath()
+   491→          ctx.arc(cx, y, 7.5, 0, Math.PI * 2)
+   492→          ctx.fill()
+   493→          ctx.stroke()
+   494→          ctx.font = '10px sans-serif'
+   495→          ctx.fillText('⚡', cx, y + 0.5)
+   496→        }
+   497→        ctx.restore()
+   498→        axisIconsRef.current.push({ kind: ic.kind, x: w - psW - 5, y: y - 9, w: psW + 10, h: 18, tip: ic.tip })
+   499→      })
+   500→
+   501→      // tooltip for the hovered axis icon
+   502→      if (hoverIdx >= 0 && hoverIdx < axisIconsRef.current.length) {
+   503→        const hit = axisIconsRef.current[hoverIdx]
+   504→        ctx.save()
+   505→        ctx.font = '10px ui-sans-serif, system-ui'
+   506→        const maxW = 240
+   507→        const words = hit.tip.split(' ')
+   508→        const lines: string[] = []
+   509→        let line = ''
+   510→        for (const wd of words) {
+   511→          const cand = line ? `${line} ${wd}` : wd
+   512→          if (ctx.measureText(cand).width > maxW && line) {
+   513→            lines.push(line)
+   514→            line = wd
+   515→          } else line = cand
+   516→        }
+   517→        if (line) lines.push(line)
+   518→        const tw = Math.min(maxW, ...lines.map((l) => ctx.measureText(l).width)) + 14
+   519→        const th = lines.length * 14 + 9
+   520→        const tx = w - psW - tw - 12
+   521→        const ty = Math.min(yMax, Math.max(yMin, hit.y + hit.h / 2)) - th / 2
+   522→        ctx.fillStyle = 'rgba(9,9,11,0.96)'
+   523→        ctx.strokeStyle = 'rgba(113,113,122,0.6)'
+   524→        ctx.lineWidth = 1
+   525→        ctx.beginPath()
+   526→        ctx.roundRect(tx, ty, tw, th, 5)
+   527→        ctx.fill()
+   528→        ctx.stroke()
+   529→        ctx.textAlign = 'left'
+   530→        ctx.textBaseline = 'top'
+   531→        lines.forEach((l, li) => {
+   532→          ctx.fillStyle = li === 0 && hit.kind === 'e' ? '#fbbf24' : li === 0 && hit.kind === 'n' ? '#e879f9' : '#d4d4d8'
+   533→          ctx.font = `${li === 0 ? '600 ' : ''}10px ui-sans-serif, system-ui`
+   534→          ctx.fillText(l, tx + 7, ty + 5 + li * 14)
+   535→        })
+   536→        ctx.restore()
+   537→      }
+   538→    }
+   539→
+   540→    // draft preview
+   541→    const draft = draftRef.current
+   542→    if (draft) {
+   543→      const p1 = pixelPoint(draft.p1)
+   544→      const p2 = pixelPoint(draft.p2)
+   545→      ctx.save()
+   546→      ctx.strokeStyle = activeColor
+   547→      ctx.globalAlpha = 0.75
+   548→      ctx.setLineDash([5, 4])
+   549→      ctx.lineWidth = 1.5
+   550→      if (draft.kind === 'hline' && p1) hlinePath(ctx, p1.y, w)
+   551→      else if (draft.kind === 'vline' && p1) vlinePath(ctx, p1.x, h)
+   552→      else if (p1 && p2) segPath(ctx, p1, p2, w, draft.kind === 'fib')
+   553→      ctx.restore()
+   554→    }
+   555→     
+   556→  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt])
+   557→
+   558→  function pixelPoint(pt: DrawingPoint): { x: number; y: number } | null {
+   559→    const x = pt.time == null ? null : xOf(pt.time)
+   560→    const y = yOf(pt.price)
+   561→    if (x == null || y == null) return null
+   562→    return { x, y }
+   563→  }
+   564→
+   565→  function hlinePath(ctx: CanvasRenderingContext2D, y: number, w: number) {
+   566→    ctx.beginPath()
+   567→    ctx.moveTo(0, Math.round(y) + 0.5)
+   568→    ctx.lineTo(w, Math.round(y) + 0.5)
+   569→    ctx.stroke()
+   570→  }
+   571→  function vlinePath(ctx: CanvasRenderingContext2D, x: number, h: number) {
+   572→    ctx.beginPath()
+   573→    ctx.moveTo(Math.round(x) + 0.5, 0)
+   574→    ctx.lineTo(Math.round(x) + 0.5, h)
+   575→    ctx.stroke()
+   576→  }
+   577→  function segPath(ctx: CanvasRenderingContext2D, p1: { x: number; y: number }, p2: { x: number; y: number }, w: number, extendRight: boolean) {
+   578→    ctx.beginPath()
+   579→    ctx.moveTo(p1.x, p1.y)
+   580→    if (extendRight) {
+   581→      const dx = p2.x - p1.x
+   582→      const dy = p2.y - p1.y
+   583→      const farX = dx !== 0 ? (w - p1.x) / dx : Infinity
+   584→      const ex = farX >= 0 ? w : p1.x - dx * 100
+   585→      const ey = p1.y + dy * (farX >= 0 ? farX : -100)
+   586→      ctx.lineTo(ex, ey)
+   587→    } else {
+   588→      ctx.lineTo(p2.x, p2.y)
+   589→    }
+   590→    ctx.stroke()
+   591→  }
+   592→
+   593→  function drawDrawing(ctx: CanvasRenderingContext2D, d: Drawing, w: number, h: number, highlighted: boolean) {
+   594→    ctx.save()
+   595→    ctx.strokeStyle = d.color
+   596→    ctx.lineWidth = d.width + (highlighted ? 1 : 0)
+   597→    ctx.globalAlpha = 1
+   598→
+   599→    if (d.kind === 'hline') {
+   600→      const y = yOf(d.points[0]?.price ?? 0)
+   601→      if (y != null) {
+   602→        hlinePath(ctx, y, w)
+   603→        drawChip(ctx, w - 74, y, fmtPrice(d.points[0].price), d.color, highlighted)
+   604→        // move grip dots at center
+   605→        dot(ctx, w / 2, y, d.color, highlighted)
+   606→      }
+   607→    } else if (d.kind === 'vline') {
+   608→      const x = xOf(d.points[0]?.time ?? null)
+   609→      if (x != null) {
+   610→        vlinePath(ctx, x, h)
+   611→        dot(ctx, x, h / 2, d.color, highlighted)
+   612→      }
+   613→    } else if (d.kind === 'trend' || d.kind === 'fib') {
+   614→      const p1 = pixelPoint(d.points[0])
+   615→      const p2 = pixelPoint(d.points[1])
+   616→      if (p1 && p2) {
+   617→        if (d.kind === 'trend') {
+   618→          segPath(ctx, p1, p2, w, false)
+   619→        } else {
+   620→          // fib: levels between p1..p2 extended to right edge
+   621→          const xLeft = Math.min(p1.x, p2.x)
+   622→          const price1 = d.points[0].price
+   623→          const price2 = d.points[1].price
+   624→          ctx.font = '10px ui-monospace, monospace'
+   625→          for (const lv of FIB_LEVELS) {
+   626→            const priceLv = price2 + (price1 - price2) * lv
+   627→            const y = yOf(priceLv)
+   628→            if (y == null) continue
+   629→            ctx.globalAlpha = lv === 0 || lv === 1 ? 0.9 : 0.6
+   630→            ctx.setLineDash(lv === 0.5 ? [6, 3] : [])
+   631→            ctx.beginPath()
+   632→            ctx.moveTo(xLeft, Math.round(y) + 0.5)
+   633→            ctx.lineTo(w, Math.round(y) + 0.5)
+   634→            ctx.stroke()
+   635→            ctx.globalAlpha = 0.95
+   636→            ctx.fillStyle = d.color
+   637→            const label = `${lv.toFixed(3)}  ${fmtPrice(priceLv)}`
+   638→            ctx.fillText(label, xLeft + 4, y - 3)
+   639→          }
+   640→        }
+   641→        dot(ctx, p1.x, p1.y, d.color, highlighted)
+   642→        dot(ctx, p2.x, p2.y, d.color, highlighted)
+   643→      }
+   644→    }
+   645→    ctx.restore()
+   646→  }
+   647→
+   648→  function drawChip(ctx: CanvasRenderingContext2D, x: number, y: number, text: string, color: string, highlighted: boolean) {
+   649→    ctx.save()
+   650→    ctx.font = '10px ui-monospace, monospace' // set BEFORE measureText (was measured with a stale font)
+   651→    const wTxt = ctx.measureText(text).width
+   652→    const bw = Math.max(46, wTxt + 12)
+   653→    const bh = 16
+   654→    const by = Math.round(y) - bh / 2
+   655→    ctx.fillStyle = color
+   656→    ctx.globalAlpha = highlighted ? 1 : 0.9
+   657→    ctx.beginPath()
+   658→    ctx.roundRect(x, by, bw, bh, 3)
+   659→    ctx.fill()
+   660→    ctx.globalAlpha = 1
+   661→    ctx.fillStyle = '#09090b'
+   662→    ctx.fillText(text, x + 6, by + 11.5)
+   663→    ctx.restore()
+   664→  }
+   665→
+   666→  function dot(ctx: CanvasRenderingContext2D, x: number, y: number, color: string, highlighted: boolean) {
+   667→    ctx.save()
+   668→    ctx.beginPath()
+   669→    ctx.arc(x, y, highlighted ? 4.5 : 3.5, 0, Math.PI * 2)
+   670→    ctx.fillStyle = '#09090b'
+   671→    ctx.fill()
+   672→    ctx.strokeStyle = color
+   673→    ctx.lineWidth = 1.5
+   674→    ctx.stroke()
+   675→    ctx.restore()
+   676→  }
+   677→
+   678→  function drawAlert(ctx: CanvasRenderingContext2D, a: { id: string; price: number; color: string; status: string }, w: number) {
+   679→    const y = yOf(a.price)
+   680→    if (y == null) return
+   681→    ctx.save()
+   682→    ctx.strokeStyle = a.color
+   683→    ctx.lineWidth = 1.5
+   684→    ctx.setLineDash(a.status === 'paused' ? [2, 5] : [7, 5])
+   685→    ctx.globalAlpha = a.status === 'paused' ? 0.6 : 0.95
+   686→    hlinePath(ctx, y, w)
+   687→    ctx.setLineDash([])
+   688→    // bell chip on the right axis
+   689→    const label = `${a.status === 'paused' ? '⏸' : '🔔'} ${fmtPrice(a.price)}`
+   690→    ctx.font = '10px ui-monospace, monospace'
+   691→    const bw = ctx.measureText(label).width + 14
+   692→    const by = Math.round(y) - 8
+   693→    ctx.globalAlpha = 1
+   694→    ctx.fillStyle = a.color
+   695→    ctx.beginPath()
+   696→    ctx.roundRect(w - bw - 4, by, bw, 16, 3)
+   697→    ctx.fill()
+   698→    ctx.fillStyle = '#09090b'
+   699→    ctx.fillText(label, w - bw + 2, by + 11.5)
+   700→    ctx.restore()
+   701→  }
+   702→
+   703→  // redraw when relevant state changes
+   704→  useEffect(() => {
+   705→    scheduleRedraw()
+   706→  }, [drawings, symbolAlerts, showDrawings, drawingTool, activeColor, posData.data, scheduleRedraw])
+   707→
+   708→  // CRITICAL: redraw the overlay whenever the container resizes. Panel splits,
+   709→  // window resizes and sidebar changes alter the pane height -> lightweight-charts
+   710→  // remaps price->pixel (scale margins are relative to height), but NOTHING else
+   711→  // fires a redraw, leaving drawings/painted lines at stale pixel positions
+   712→  // ("drawing not at right position"). The ResizeObserver closes that gap.
+   713→  useEffect(() => {
+   714→    const el = containerRef.current
+   715→    if (!el || typeof ResizeObserver === 'undefined') return
+   716→    const ro = new ResizeObserver(() => scheduleRedraw())
+   717→    ro.observe(el)
+   718→    return () => ro.disconnect()
+   719→  }, [scheduleRedraw])
+   720→
+   721→  // ---------- hit testing ----------
+   722→  const distToSeg = (px: number, py: number, a: { x: number; y: number }, b: { x: number; y: number }) => {
+   723→    const dx = b.x - a.x
+   724→    const dy = b.y - a.y
+   725→    const len2 = dx * dx + dy * dy
+   726→    if (len2 === 0) return Math.hypot(px - a.x, py - a.y)
+   727→    let t = ((px - a.x) * dx + (py - a.y) * dy) / len2
+   728→    t = Math.max(0, Math.min(1, t))
+   729→    return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy))
+   730→  }
+   731→
+   732→  const hitTest = useCallback((x: number, y: number): SceneHit | null => {
+   733→    const st = useTerminal.getState()
+   734→    const ds = st.drawingsBySymbol[symbol] || []
+   735→    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+   736→
+   737→    // trade lines take priority (position entry / SL / TP)
+   738→    const posBundle = posRef.current
+   739→    const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
+   740→    const myExits = posBundle?.exits[normSym(symbol)]
+   741→    if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
+   742→      const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
+   743→      if (myExits.sl.type !== 'trailing_stop') {
+   744→        const yl = yOf(slPrice)
+   745→        if (yl != null && Math.abs(y - yl) < 7) {
+   746→          return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
+   747→        }
+   748→      }
+   749→    }
+   750→    if (myExits?.tp && myExits.tp.limitPrice != null) {
+   751→      const yl = yOf(myExits.tp.limitPrice)
+   752→      if (yl != null && Math.abs(y - yl) < 7) {
+   753→        return { type: 'exit', id: myExits.tp.orderId, part: 'tp', origPrice: myExits.tp.limitPrice, exit: myExits.tp }
+   754→      }
+   755→    }
+   756→    if (myPos && myPos.avgEntry > 0) {
+   757→      const yl = yOf(myPos.avgEntry)
+   758→      if (yl != null && Math.abs(y - yl) < 6) {
+   759→        return { type: 'position', id: myPos.tradeSymbol, part: 'whole', origPrice: myPos.avgEntry }
+   760→      }
+   761→    }
+   762→
+   763→    if (showDrawings) {
+   764→      for (let i = ds.length - 1; i >= 0; i--) {
+   765→        const d = ds[i]
+   766→        if (d.kind === 'hline') {
+   767→          const yl = yOf(d.points[0]?.price ?? 0)
+   768→          if (yl != null && Math.abs(y - yl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
+   769→        } else if (d.kind === 'vline') {
+   770→          const xl = xOf(d.points[0]?.time ?? null)
+   771→          if (xl != null && Math.abs(x - xl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
+   772→        } else {
+   773→          const p1 = pixelPoint(d.points[0])
+   774→          const p2 = pixelPoint(d.points[1])
+   775→          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
+   776→          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
+   777→          if (d.kind === 'trend' && p1 && p2 && distToSeg(x, y, p1, p2) < 7) {
+   778→            return { type: 'drawing', id: d.id, part: 'whole' }
+   779→          }
+   780→          if (d.kind === 'fib' && p1 && p2) {
+   781→            const xLeft = Math.min(p1.x, p2.x)
+   782→            if (x >= xLeft - 4) {
+   783→              const price1 = d.points[0].price
+   784→              const price2 = d.points[1].price
+   785→              for (const lv of FIB_LEVELS) {
+   786→                const yl = yOf(price2 + (price1 - price2) * lv)
+   787→                if (yl != null && Math.abs(y - yl) < 6) return { type: 'drawing', id: d.id, part: 'whole' }
+   788→              }
+   789→            }
+   790→          }
+   791→        }
+   792→      }
+   793→    }
+   794→    for (let i = als.length - 1; i >= 0; i--) {
+   795→      const yl = yOf(als[i].price)
+   796→      if (yl != null && Math.abs(y - yl) < 7) return { type: 'alert', id: als[i].id, part: 'whole' }
+   797→    }
+   798→    return null
+   799→     
+   800→  }, [symbol, showDrawings, xOf, yOf])
+   801→
+   802→  // ---------- drawing persistence ----------
+   803→  const createDrawing = useCallback(async (kind: DrawingKind, points: DrawingPoint[]) => {
+   804→    const optimistic: Drawing = {
+   805→      id: `tmp-${Date.now()}`,
+   806→      symbol,
+   807→      kind,
+   808→      points,
+   809→      color: activeColor,
+   810→      width: 2,
+   811→      meta: null,
+   812→    }
+   813→    addDrawingLocal(optimistic)
+   814→    try {
+   815→      const res = await fetch('/api/drawings', {
+   816→        method: 'POST',
+   817→        headers: { 'content-type': 'application/json' },
+   818→        body: JSON.stringify({ symbol, kind, points, color: activeColor, width: 2 }),
+   819→      })
+   820→      if (res.ok) {
+   821→        const json = await res.json()
+   822→        removeDrawingLocal(optimistic.id, symbol)
+   823→        addDrawingLocal(json.drawing)
+   824→      }
+   825→    } catch { /* offline — optimistic stays */ }
+   826→  }, [symbol, activeColor, addDrawingLocal, removeDrawingLocal])
+   827→
+   828→  const patchDrawing = useCallback(async (id: string, patch: { points?: DrawingPoint[]; color?: string }) => {
+   829→    patchDrawingLocal(id, symbol, patch)
+   830→    await fetch(`/api/drawings/${id}`, {
+   831→      method: 'PATCH',
+   832→      headers: { 'content-type': 'application/json' },
+   833→      body: JSON.stringify(patch),
+   834→    }).catch(() => { /* offline */ })
+   835→  }, [symbol, patchDrawingLocal])
+   836→
+   837→  const deleteDrawing = useCallback(async (id: string) => {
+   838→    removeDrawingLocal(id, symbol)
+   839→    await fetch(`/api/drawings/${id}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+   840→  }, [symbol, removeDrawingLocal])
+   841→
+   842→  const patchAlert = useCallback(async (id: string, patch: Record<string, unknown>) => {
+   843→    patchAlertLocal(id, patch)
+   844→    await fetch(`/api/alerts/${id}`, {
+   845→      method: 'PATCH',
+   846→      headers: { 'content-type': 'application/json' },
+   847→      body: JSON.stringify(patch),
+   848→    }).catch(() => { /* offline */ })
+   849→  }, [patchAlertLocal])
+   850→
+   851→  const deleteAlert = useCallback(async (id: string) => {
+   852→    removeAlertLocal(id)
+   853→    await fetch(`/api/alerts/${id}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+   854→  }, [removeAlertLocal])
+   855→
+   856→  const addAlertAtPrice = useCallback(async (price: number) => {
+   857→    const cur = quote?.price ?? price
+   858→    // 'above' fires when price rises into the level (current price below it);
+   859→    // 'below' fires when price falls into it (current price above it).
+   860→    const direction = cur > price ? 'below' : 'above'
+   861→    try {
+   862→      const res = await fetch('/api/alerts', {
+   863→        method: 'POST',
+   864→        headers: { 'content-type': 'application/json' },
+   865→        body: JSON.stringify({ symbol, price, direction, color: DRAW_COLORS[2] }),
+   866→      })
+   867→      if (res.ok) {
+   868→        const json = await res.json()
+   869→        addAlertLocal(json.alert)
+   870→      }
+   871→    } catch { /* offline */ }
+   872→  }, [symbol, quote, addAlertLocal])
+   873→
+   874→  // ---------- trade assistance actions ----------
+   875→  const patchExitPrice = useCallback(async (
+   876→    info: ExitInfo, kind: 'sl' | 'tp', price: number,
+   877→  ) => {
+   878→    const body: Record<string, unknown> = {}
+   879→    if (kind === 'tp') {
+   880→      body.limit_price = price
+   881→    } else {
+   882→      body.stop_price = price
+   883→      if (info.type === 'stop_limit' && info.stopPrice != null && info.limitPrice != null) {
+   884→        // preserve the stop→limit offset of the original stop-limit order
+   885→        const off = info.stopPrice - info.limitPrice
+   886→        body.limit_price = Math.max(1e-9, price - off)
+   887→      }
+   888→    }
+   889→    try {
+   890→      const res = await fetch(`/api/trading/orders/${info.orderId}`, {
+   891→        method: 'PATCH',
+   892→        headers: { 'content-type': 'application/json' },
+   893→        body: JSON.stringify(body),
+   894→      })
+   895→      const json = await res.json().catch(() => null)
+   896→      if (res.ok) {
+   897→        toast({ title: `${kind.toUpperCase()} updated to ${fmtPrice(price)}` })
+   898→      } else {
+   899→        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+   900→      }
+   901→    } catch {
+   902→      toast({ title: 'Update failed', description: 'Network error', variant: 'destructive' })
+   903→    } finally {
+   904→      void posRefresh()
+   905→      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+   906→    }
+   907→  }, [posRefresh, toast])
+   908→
+   909→  const cancelExitOrder = useCallback(async (orderId: string) => {
+   910→    await fetch(`/api/trading/orders/${orderId}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+   911→    toast({ title: 'Exit order cancelled' })
+   912→    void posRefresh()
+   913→  }, [posRefresh, toast])
+   914→
+   915→  const closePositionBySymbol = useCallback(async (tradeSymbol: string) => {
+   916→    try {
+   917→      const res = await fetch(`/api/trading/positions/${encodeURIComponent(tradeSymbol)}`, { method: 'DELETE' })
+   918→      const json = await res.json().catch(() => null)
+   919→      if (res.ok) {
+   920→        toast({ title: `Closing ${tradeSymbol}`, description: 'Market close submitted' })
+   921→      } else {
+   922→        toast({ title: 'Close failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+   923→      }
+   924→    } catch {
+   925→      toast({ title: 'Close failed', description: 'Network error', variant: 'destructive' })
+   926→    } finally {
+   927→      void posRefresh()
+   928→    }
+   929→  }, [posRefresh, toast])
+   930→
+   931→  // ---------- pointer interaction ----------
+   932→  useEffect(() => {
+   933→    const el = containerRef.current
+   934→    if (!el) return
+   935→
+   936→    const rel = (e: { clientX: number; clientY: number }) => {
+   937→      const r = el.getBoundingClientRect()
+   938→      return { x: e.clientX - r.left, y: e.clientY - r.top }
+   939→    }
+   940→
+   941→    const onPointerDown = (e: PointerEvent) => {
+   942→      if (e.button !== 0) return
+   943→      const { x, y } = rel(e)
+   944→      const tool = useTerminal.getState().drawingTool
+   945→
+   946→      if (tool !== 'cursor') {
+   947→        e.stopPropagation()
+   948→        e.preventDefault()
+   949→        const t = timeAt(x)
+   950→        const p = priceAt(y)
+   951→        if (p == null) return
+   952→        const pt: DrawingPoint = { time: t, price: p }
+   953→        if (tool === 'hline' || tool === 'vline') {
+   954→          void createDrawing(tool, [pt])
+   955→          setDrawingTool('cursor')
+   956→        } else if (!draftRef.current) {
+   957→          draftRef.current = { kind: tool, p1: pt, p2: { ...pt } }
+   958→          scheduleRedraw()
+   959→        } else {
+   960→          const d = draftRef.current
+   961→          draftRef.current = null
+   962→          void createDrawing(d.kind, [d.p1, pt])
+   963→          setDrawingTool('cursor')
+   964→        }
+   965→        return
+   966→      }
+   967→
+   968→      const hit = hitTest(x, y)
+   969→      if (hit && (hit.type === 'drawing' || hit.type === 'alert' || hit.type === 'exit')) {
+   970→        e.stopPropagation()
+   971→        e.preventDefault()
+   972→        setMenu(null)
+   973→        const st = useTerminal.getState()
+   974→        let orig: { time: number | null; price: number }[] = []
+   975→        let origPixels: ({ x: number; y: number } | null)[] = []
+   976→        if (hit.type === 'drawing') {
+   977→          const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
+   978→          if (!d) return
+   979→          orig = d.points.map((p) => ({ ...p }))
+   980→          origPixels = orig.map((p) => pixelPoint(p))
+   981→        } else if (hit.type === 'alert') {
+   982→          const a = st.alerts.find((aa) => aa.id === hit.id)
+   983→          if (!a) return
+   984→          orig = [{ time: null, price: a.price }]
+   985→          origPixels = [{ x: 0, y: yOf(a.price) ?? y }]
+   986→        } else {
+   987→          // exit line drag (SL/TP) — preview handled in onMove via exitDragRef
+   988→          orig = [{ time: null, price: hit.origPrice }]
+   989→          origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
+   990→          exitDragRef.current = { kind: hit.part, price: hit.origPrice }
+   991→        }
+   992→        dragRef.current = { hit, x0: x, y0: y, orig, origPixels, moved: false }
+   993→
+   994→        const onMove = (ev: PointerEvent) => {
+   995→          const drag = dragRef.current
+   996→          if (!drag) return
+   997→          const { x: cx, y: cy } = rel(ev)
+   998→          const dx = cx - drag.x0
+   999→          const dy = cy - drag.y0
+  1000→          if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true
+  1001→          const store = useTerminal.getState()
+  1002→          if (drag.hit.type === 'exit') {
+  1003→            const oy = drag.origPixels[0]?.y
+  1004→            if (oy != null) {
+  1005→              const np = priceAt(oy + dy)
+  1006→              exitDragRef.current = { kind: drag.hit.part, price: np }
+  1007→              scheduleRedraw()
+  1008→            }
+  1009→            return
+  1010→          }
+  1011→          if (drag.hit.type === 'alert') {
+  1012→            const oy = drag.origPixels[0]?.y
+  1013→            if (oy != null) {
+  1014→              const np = priceAt(oy + dy)
+  1015→              if (np != null) store.patchAlertLocal(drag.hit.id, { price: np })
+  1016→            }
+  1017→            return
+  1018→          }
+  1019→          const ds = store.drawingsBySymbol[symbol] || []
+  1020→          const d = ds.find((dd) => dd.id === drag.hit.id)
+  1021→          if (!d) return
+  1022→          const points = d.points.map((p, i) => {
+  1023→            if (drag.hit.part === 'point' && drag.hit.index !== i) return { ...p }
+  1024→            const op = drag.origPixels[i]
+  1025→            const oo = drag.orig[i]
+  1026→            if (!op) return { ...p }
+  1027→            let time = oo.time
+  1028→            let price = oo.price
+  1029→            if (d.kind !== 'hline') {
+  1030→              const nt = timeAt(op.x + dx)
+  1031→              if (nt != null) time = nt
+  1032→            }
+  1033→            if (d.kind !== 'vline') {
+  1034→              const oy = yOf(oo.price)
+  1035→              if (oy != null) {
+  1036→                const np = priceAt(oy + dy)
+  1037→                if (np != null) price = np
+  1038→              }
+  1039→            }
+  1040→            return { time, price }
+  1041→          })
+  1042→          store.patchDrawingLocal(drag.hit.id, symbol, { points })
+  1043→        }
+  1044→        const onUp = () => {
+  1045→          window.removeEventListener('pointermove', onMove)
+  1046→          const drag = dragRef.current
+  1047→          dragRef.current = null
+  1048→          el.style.cursor = ''
+  1049→          if (drag?.hit.type === 'exit') {
+  1050→            const d = exitDragRef.current
+  1051→            exitDragRef.current = null
+  1052→            scheduleRedraw()
+  1053→            if (drag.moved && d?.price != null) {
+  1054→              void patchExitPrice(drag.hit.exit, drag.hit.part, d.price)
+  1055→            }
+  1056→            return
+  1057→          }
+  1058→          if (!drag || !drag.moved) {
+  1059→            scheduleRedraw()
+  1060→            return
+  1061→          }
+  1062→          const store = useTerminal.getState()
+  1063→          if (drag.hit.type === 'alert') {
+  1064→            const a = store.alerts.find((aa) => aa.id === drag.hit.id)
+  1065→            if (a) void patchAlert(a.id, { price: a.price })
+  1066→          } else if (drag.hit.type === 'drawing') {
+  1067→            const d = (store.drawingsBySymbol[symbol] || []).find((dd) => dd.id === drag.hit.id)
+  1068→            if (d) void patchDrawing(d.id, { points: d.points })
+  1069→          }
+  1070→        }
+  1071→        window.addEventListener('pointermove', onMove)
+  1072→        window.addEventListener('pointerup', onUp, { once: true })
+  1073→        el.style.cursor = 'grabbing'
+  1074→      }
+  1075→    }
+  1076→
+  1077→    const onPointerMove = (e: PointerEvent) => {
+  1078→      if (dragRef.current) return
+  1079→      const { x, y } = rel(e)
+  1080→      const tool = useTerminal.getState().drawingTool
+  1081→      if (tool !== 'cursor') {
+  1082→        el.style.cursor = 'crosshair'
+  1083→        const t = timeAt(x)
+  1084→        const p = priceAt(y)
+  1085→        if (draftRef.current && p != null) {
+  1086→          draftRef.current.p2 = { time: t, price: p }
+  1087→          scheduleRedraw()
+  1088→        }
+  1089→        return
+  1090→      }
+  1091→      const hit = hitTest(x, y)
+  1092→      // y-axis event icons ([E]/⚡) hover — hit rects come from the last overlay pass
+  1093→      let axisIdx = -1
+  1094→      if (!hit && chartRef.current) {
+  1095→        const cw = containerRef.current?.clientWidth ?? 0
+  1096→        const psW = chartRef.current.priceScale('right').width()
+  1097→        if (psW > 0 && x >= cw - psW - 8) {
+  1098→          axisIdx = axisIconsRef.current.findIndex((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+  1099→        }
+  1100→      }
+  1101→      const newHover = hit ? `${hit.type}:${hit.id}` : axisIdx >= 0 ? `axis:${axisIdx}` : null
+  1102→      if (newHover !== hoverRef.current) {
+  1103→        hoverRef.current = newHover
+  1104→        scheduleRedraw()
+  1105→      }
+  1106→      el.style.cursor = hit ? (hit.part === 'point' ? 'nwse-resize' : 'grab') : axisIdx >= 0 ? 'pointer' : ''
+  1107→    }
+  1108→
+  1109→    const onPointerLeave = () => {
+  1110→      if (hoverRef.current) {
+  1111→        hoverRef.current = null
+  1112→        scheduleRedraw()
+  1113→      }
+  1114→    }
+  1115→
+  1116→    const onContextMenu = (e: MouseEvent) => {
+  1117→      const { x, y } = rel(e)
+  1118→      const hit = hitTest(x, y)
+  1119→      e.preventDefault()
+  1120→      e.stopPropagation()
+  1121→      if (hit) {
+  1122→        setMenu({ x, y, hit })
+  1123→        return
+  1124→      }
+  1125→      // empty chart: custom menu with price-aware actions (alert / trade / hline)
+  1126→      const price = priceAt(y)
+  1127→      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price })
+  1128→    }
+  1129→
+  1130→    const onDoubleClick = (e: MouseEvent) => {
+  1131→      // double-click near a line edits its value quickly
+  1132→      const { x, y } = rel(e)
+  1133→      const hit = hitTest(x, y)
+  1134→      if (!hit) return
+  1135→      const st = useTerminal.getState()
+  1136→      if (hit.type === 'alert') {
+  1137→        const a = st.alerts.find((aa) => aa.id === hit.id)
+  1138→        if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
+  1139→      } else if (hit.type === 'exit') {
+  1140→        setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+  1141→      } else if (hit.type === 'drawing') {
+  1142→        const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
+  1143→        if (d && d.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
+  1144→      }
+  1145→    }
+  1146→
+  1147→    const onKeyDown = (e: KeyboardEvent) => {
+  1148→      if (e.key === 'Escape') {
+  1149→        if (draftRef.current) {
+  1150→          draftRef.current = null
+  1151→          scheduleRedraw()
+  1152→        }
+  1153→        if (useTerminal.getState().drawingTool !== 'cursor') setDrawingTool('cursor')
+  1154→        setMenu(null)
+  1155→      }
+  1156→    }
+  1157→
+  1158→    el.addEventListener('pointerdown', onPointerDown, true)
+  1159→    el.addEventListener('pointermove', onPointerMove, true)
+  1160→    el.addEventListener('pointerleave', onPointerLeave)
+  1161→    el.addEventListener('contextmenu', onContextMenu, true)
+  1162→    el.addEventListener('dblclick', onDoubleClick)
+  1163→    window.addEventListener('keydown', onKeyDown)
+  1164→    return () => {
+  1165→      el.removeEventListener('pointerdown', onPointerDown, true)
+  1166→      el.removeEventListener('pointermove', onPointerMove, true)
+  1167→      el.removeEventListener('pointerleave', onPointerLeave)
+  1168→      el.removeEventListener('contextmenu', onContextMenu, true)
+  1169→      el.removeEventListener('dblclick', onDoubleClick)
+  1170→      window.removeEventListener('keydown', onKeyDown)
+  1171→    }
+  1172→  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
+  1173→
+  1174→  // ---------- chart lifecycle ----------
+  1175→  useEffect(() => {
+  1176→    const container = containerRef.current
+  1177→    if (!container) return
+  1178→    setLoading(true)
+  1179→    const chart = createChart(container, {
+  1180→      autoSize: true,
+  1181→      layout: {
+  1182→        background: { type: ColorType.Solid, color: '#09090b' },
+  1183→        textColor: '#a1a1aa',
+  1184→        fontSize: 11,
+  1185→      },
+  1186→      grid: { vertLines: { color: '#18181b' }, horzLines: { color: '#18181b' } },
+  1187→      crosshair: {
+  1188→        mode: CrosshairMode.Normal,
+  1189→        vertLine: { color: '#52525b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#27272a' },
+  1190→        horzLine: { color: '#52525b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#27272a' },
+  1191→      },
+  1192→      rightPriceScale: { borderColor: '#27272a', scaleMargins: { top: 0.1, bottom: 0.24 } },
+  1193→      timeScale: {
+  1194→        borderColor: '#27272a',
+  1195→        timeVisible: TIMEFRAMES[tf].seconds < 86400,
+  1196→        secondsVisible: false,
+  1197→        rightOffset: 6,
+  1198→      },
+  1199→    })
+  1200→    chartRef.current = chart
+  1201→
+  1202→    const seriesOptions = {
+  1203→      // keep position/SL/TP lines inside the visible price range
+  1204→      autoscaleInfoProvider: (base: () => { priceRange?: { minValue: number; maxValue: number }; margins?: unknown } | null) => {
+  1205→        const res = base()
+  1206→        const bundle = posRef.current
+  1207→        const ex = bundle?.exits[normSym(symbol)]
+  1208→        const vals: number[] = []
+  1209→        const p = bundle?.positions.find((pp) => normSym(pp.symbol) === normSym(symbol))
+  1210→        if (p && p.avgEntry > 0) vals.push(p.avgEntry)
+  1211→        if (ex?.sl && ex.sl.stopPrice != null) vals.push(ex.sl.stopPrice)
+  1212→        if (ex?.tp && ex.tp.limitPrice != null) vals.push(ex.tp.limitPrice)
+  1213→        if (vals.length === 0) return res
+  1214→        let min = res?.priceRange?.minValue ?? Math.min(...vals)
+  1215→        let max = res?.priceRange?.maxValue ?? Math.max(...vals)
+  1216→        for (const v of vals) {
+  1217→          min = Math.min(min, v)
+  1218→          max = Math.max(max, v)
+  1219→        }
+  1220→        return { priceRange: { minValue: min, maxValue: max } }
+  1221→      },
+  1222→    }
+  1223→    let series: ISeriesApi<'Candlestick'> | ISeriesApi<'Line'>
+  1224→    if (chartType === 'candles') {
+  1225→      series = chart.addCandlestickSeries({
+  1226→        upColor: '#22c55e', downColor: '#ef4444',
+  1227→        borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+  1228→        wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+  1229→        ...seriesOptions,
+  1230→      })
+  1231→    } else {
+  1232→      series = chart.addLineSeries({ color: '#22c55e', lineWidth: 2, ...seriesOptions })
+  1233→    }
+  1234→    seriesRef.current = series
+  1235→
+  1236→    const vol = chart.addHistogramSeries({
+  1237→      priceScaleId: 'vol',
+  1238→      priceFormat: { type: 'volume' },
+  1239→      lastValueVisible: false,
+  1240→      priceLineVisible: false,
+  1241→    })
+  1242→    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
+  1243→
+  1244→    chart.subscribeCrosshairMove((param: MouseEventParams) => {
+  1245→      const bar = param.seriesData.get(series) as { open?: number; high?: number; low?: number; close?: number; value?: number } | undefined
+  1246→      const volBar = param.seriesData.get(vol) as { value?: number } | undefined
+  1247→      // update the OHLC legend by writing the DOM directly — a setState here
+  1248→      // re-rendered the whole ChartPanel on EVERY mouse move (visibly janky,
+  1249→      // multiplied by every pane in multi-chart grids)
+  1250→      const leg = legendRef.current
+  1251→      if (leg) {
+  1252→        if (bar && bar.close != null) {
+  1253→          const o = bar.open ?? bar.close
+  1254→          const c = bar.close
+  1255→          const upBar = c >= o
+  1256→          const col = upBar ? 'text-emerald-400' : 'text-rose-400'
+  1257→          const volTxt = volBar?.value != null ? `Vol ${(volBar.value / 1e6).toFixed(2)}M` : ''
+  1258→          leg.innerHTML =
+  1259→            `<div><span class="font-semibold text-zinc-100">${symEsc}</span>` +
+  1260→            `<span class="text-zinc-500"> · ${tfLabelEsc} · </span>` +
+  1261→            `<span class="text-zinc-500">O</span><span class="${col}"> ${fmtPrice(o)}</span>` +
+  1262→            `<span class="text-zinc-500"> H</span><span class="${col}"> ${fmtPrice(bar.high ?? c)}</span>` +
+  1263→            `<span class="text-zinc-500"> L</span><span class="${col}"> ${fmtPrice(bar.low ?? c)}</span>` +
+  1264→            `<span class="text-zinc-500"> C</span><span class="${col}"> ${fmtPrice(c)}</span></div>` +
+  1265→            (volTxt ? `<div class="text-zinc-500">${volTxt}</div>` : '')
+  1266→          leg.classList.remove('hidden')
+  1267→        }
+  1268→      }
+  1269→      // publish crosshair position to sibling panes (multi-chart sync), rAF-throttled
+  1270→      const group = syncGroupRef.current
+  1271→      const key = syncKeyRef.current
+  1272→      if (group && key && Date.now() >= suppressSyncUntilRef.current) {
+  1273→        const bar2 = param.time != null ? (param.seriesData.get(series) as CandlestickData | undefined) : undefined
+  1274→        const px = bar2 ? Number((bar2 as CandlestickData).close ?? NaN) : NaN
+  1275→        pendingSyncRef.current = { group, from: key, time: param.time ?? null, price: Number.isFinite(px) ? px : null }
+  1276→        if (!syncRafRef.current) {
+  1277→          syncRafRef.current = requestAnimationFrame(() => {
+  1278→            syncRafRef.current = 0
+  1279→            const d = pendingSyncRef.current
+  1280→            pendingSyncRef.current = null
+  1281→            if (d) window.dispatchEvent(new CustomEvent('tt:xsync', { detail: d }))
+  1282→          })
+  1283→        }
+  1284→      }
+  1285→    })
+  1286→
+  1287→    // apply crosshair positions published by sibling panes (multi-chart sync)
+  1288→    const onExternalSync = (e: Event) => {
+  1289→      const d = (e as CustomEvent<{ group: string; from: string; time: Time | null; price: number | null }>).detail
+  1290→      const group = syncGroupRef.current
+  1291→      const key = syncKeyRef.current
+  1292→      if (!d || !group || !key || d.group !== group || d.from === key) return
+  1293→      suppressSyncUntilRef.current = Date.now() + 60
+  1294→      try {
+  1295→        if (d.time != null && d.price != null && Number.isFinite(d.price)) {
+  1296→          chart.setCrosshairPosition(d.price, d.time, series)
+  1297→        } else {
+  1298→          chart.clearCrosshairPosition()
+  1299→        }
+  1300→      } catch { /* chart tearing down */ }
+  1301→    }
+  1302→    window.addEventListener('tt:xsync', onExternalSync)
+  1303→
+  1304→    let cancelled = false
+  1305→    ;(async () => {
+  1306→      try {
+  1307→        const res = await fetch(`/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}`)
+  1308→        if (!res.ok) throw new Error('bars fetch failed')
+  1309→        const json = await res.json()
+  1310→        if (cancelled) return
+  1311→        setDemo(Boolean(json.meta?.demo))
+  1312→        setDemoReason(json.meta?.reason as string | undefined)
+  1313→        // feed status → bottom console (log once per state change)
+  1314→        const demoNow = Boolean(json.meta?.demo)
+  1315→        const reasonNow = String(json.meta?.reason ?? '')
+  1316→        const feedKey = `${symbol}|${demoNow}|${reasonNow}`
+  1317→        if (feedStateRef.current !== feedKey) {
+  1318→          feedStateRef.current = feedKey
+  1319→          ttLog(
+  1320→            'data',
+  1321→            demoNow ? `${symbol} → demo data${reasonNow ? ` (${reasonNow})` : ''}` : `${symbol} → live Alpaca data`,
+  1322→            demoNow ? 'warn' : 'ok',
+  1323→          )
+  1324→        }
+  1325→        const bars: Bar[] = (json.bars as Bar[]) || []
+  1326→        // dedupe + sort by time
+  1327→        const map = new Map<number, Bar>()
+  1328→        for (const b of bars) map.set(b.time, b)
+  1329→        const clean = [...map.values()].sort((a, b) => a.time - b.time)
+  1330→        barsRef.current = clean
+  1331→
+  1332→        series.setData(
+  1333→          clean.map((b) =>
+  1334→            chartType === 'candles'
+  1335→              ? { time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close }
+  1336→              : { time: b.time as UTCTimestamp, value: b.close },
+  1337→          ),
+  1338→        )
+  1339→        vol.setData(
+  1340→          clean.map((b) => ({
+  1341→            time: b.time as UTCTimestamp,
+  1342→            value: b.volume,
+  1343→            color: b.close >= b.open ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)',
+  1344→          })),
+  1345→        )
+  1346→        // TradingView-like: show recent window, not the whole history
+  1347→        if (clean.length > 0) {
+  1348→          const from = Math.max(0, clean.length - 150)
+  1349→          chart.timeScale().setVisibleLogicalRange({ from, to: clean.length + 6 })
+  1350→        }
+  1351→
+  1352→        // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Task 20)
+  1353→        if (clean.length > 0) {
+  1354→          try {
+  1355→            const from = clean[0].time
+  1356→            const lastT = clean[clean.length - 1].time
+  1357→            const mres = await fetch(`/api/market/markers?symbol=${encodeURIComponent(symbol)}&from=${from}&to=${lastT}`)
+  1358→            if (mres.ok && !cancelled) {
+  1359→              const mj = await mres.json()
+  1360→              const earnings = ((mj.earningsInfo as { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]) || [])
+  1361→                .filter((e) => e.ts <= lastT || e.upcoming)
+  1362→              // cap news markers (~14) evenly across the fetched window so the
+  1363→              // axis stays readable regardless of news frequency
+  1364→              const rawNews = ((mj.newsItems as { ts: number; title?: string }[]) || [])
+  1365→                .filter((n) => n.ts <= lastT)
+  1366→                .sort((a, b) => a.ts - b.ts)
+  1367→              const step = Math.max(1, Math.ceil(rawNews.length / 10))
+  1368→              const spacedNews = rawNews.filter((_, i) => i % step === 0)
+  1369→              markersRef.current = { earnings, news: spacedNews.slice(0, 10) }
+  1370→            }
+  1371→          } catch { /* markers optional */ }
+  1372→        }
+  1373→        setLoading(false)
+  1374→        scheduleRedraw()
+  1375→      } catch {
+  1376→        if (!cancelled) setLoading(false)
+  1377→      }
+  1378→    })()
+  1379→
+  1380→    const onRangeChange = () => scheduleRedraw()
+  1381→    chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange)
+  1382→    // also redraw when the visible TIME range shifts (zoom/scroll can change the
+  1383→    // price autoscale without changing the logical bar range)
+  1384→    const onTimeRangeChange = () => scheduleRedraw()
+  1385→    chart.timeScale().subscribeVisibleTimeRangeChange(onTimeRangeChange)
+  1386→
+  1387→    // debug handle (harmless): lets DevTools / E2E verify coordinate round-trips
+  1388→    ;(window as unknown as Record<string, unknown>).__ttDbg = {
+  1389→      rect: () => container.getBoundingClientRect(),
+  1390→      priceAt,
+  1391→      timeAt,
+  1392→      xOf,
+  1393→      yOf,
+  1394→    }
+  1395→
+  1396→    return () => {
+  1397→      cancelled = true
+  1398→      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange)
+  1399→      chart.timeScale().unsubscribeVisibleTimeRangeChange(onTimeRangeChange)
+  1400→      window.removeEventListener('tt:xsync', onExternalSync)
+  1401→      chart.remove()
+  1402→      chartRef.current = null
+  1403→      seriesRef.current = null
+  1404→      barsRef.current = []
+  1405→      markersRef.current = { earnings: [], news: [] }
+  1406→      axisIconsRef.current = []
+  1407→    }
+  1408→  }, [symbol, tf, chartType, settingsVer, scheduleRedraw])
+  1409→
+  1410→  // load drawings for this symbol
+  1411→  useEffect(() => {
+  1412→    void loadDrawings(symbol)
+  1413→  }, [symbol, loadDrawings])
+  1414→
+  1415→  // quote polling (10s) — also feeds the live price into the last bar so the
+  1416→  // chart tracks the market between bar closes and re-autoscales (which keeps
+  1417→  // position/SL/TP lines in view)
+  1418→  useEffect(() => {
+  1419→    let alive = true
+  1420→    const fetchQ = async () => {
+  1421→      try {
+  1422→        const res = await fetch('/api/market/quote', {
+  1423→          method: 'POST',
+  1424→          headers: { 'content-type': 'application/json' },
+  1425→          body: JSON.stringify({ symbols: [symbol] }),
+  1426→        })
+  1427→        if (!res.ok || !alive) return
+  1428→        const json = await res.json()
+  1429→        const q = json.quotes?.[0]
+  1430→        if (q && alive) {
+  1431→          setQuote({ price: q.price, changePct: q.changePct, change: q.change })
+  1432→          const bars = barsRef.current
+  1433→          const s = seriesRef.current
+  1434→          if (bars.length > 0 && s && json.meta?.demo !== true) {
+  1435→            const lastB = bars[bars.length - 1]
+  1436→            const close = q.price as number
+  1437→            const high = Math.max(lastB.high, close)
+  1438→            const low = Math.min(lastB.low, close)
+  1439→            const bar = (
+  1440→              chartType === 'candles'
+  1441→                ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close }
+  1442→                : { time: lastB.time as UTCTimestamp, value: close }
+  1443→            ) as CandlestickData<Time> | LineData<Time>
+  1444→            s.update(bar)
+  1445→            barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
+  1446→            scheduleRedraw()
+  1447→          }
+  1448→        }
+  1449→      } catch { /* offline */ }
+  1450→    }
+  1451→    fetchQ()
+  1452→    const timer = setInterval(fetchQ, 10000)
+  1453→    return () => {
+  1454→      alive = false
+  1455→      clearInterval(timer)
+  1456→    }
+  1457→  }, [symbol, chartType, scheduleRedraw])
+  1458→
+  1459→  const up = (quote?.changePct ?? 0) >= 0
+  1460→
+  1461→  return (
+  1462→    <div
+  1463→      ref={containerRef}
+  1464→      className={cn(
+  1465→        'relative h-full w-full select-none overflow-hidden',
+  1466→        focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
+  1467→      )}
+  1468→      style={{ background: '#09090b' }}
+  1469→      onPointerDownCapture={() => onFocus?.()}
+  1470→    >
+  1471→      {/* chart canvas is injected here by lightweight-charts */}
+  1472→      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-10" aria-hidden />
+  1473→
+  1474→      {/* header overlay */}
+  1475→      <div className={cn('pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-zinc-800/60 bg-zinc-950/85 px-2 backdrop-blur-sm', compact ? 'h-8' : 'h-10')}>
+  1476→        <div className="pointer-events-auto flex items-center">
+  1477→          <Button
+  1478→            variant="ghost"
+  1479→            size="sm"
+  1480→            className={cn('h-7 gap-1 px-2 font-semibold text-zinc-100', compact ? 'text-xs' : 'text-sm')}
+  1481→            onClick={() => setSearchOpen(true)}
+  1482→          >
+  1483→            {symbol}
+  1484→            {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
+  1485→            {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
+  1486→          </Button>
+  1487→        </div>
+  1488→        <div className="pointer-events-auto flex items-center gap-0.5 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
+  1489→          {(Object.keys(TIMEFRAMES) as (keyof typeof TIMEFRAMES)[]).map((k) => (
+  1490→            <button
+  1491→              key={k}
+  1492→              onClick={() => onTimeframeChange(k)}
+  1493→              className={cn(
+  1494→                'rounded font-medium transition-colors',
+  1495→                compact ? 'px-1 py-0.5 text-[10px]' : 'px-1.5 py-0.5 text-[11px]',
+  1496→                k === tf ? 'bg-emerald-500/15 text-emerald-400' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200',
+  1497→              )}
+  1498→            >
+  1499→              {TIMEFRAMES[k].label}
+  1500→            </button>
+  1501→          ))}
+  1502→        </div>
+  1503→        <div className="pointer-events-auto flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
+  1504→          <button
+  1505→            className={cn('rounded px-1.5 py-1', chartType === 'candles' ? 'bg-zinc-800 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300')}
+  1506→            onClick={() => setChartType('candles')}
+  1507→            aria-label="Candlesticks"
+  1508→          >
+  1509→            <CandleIcon className="h-3.5 w-3.5" />
+  1510→          </button>
+  1511→          <button
+  1512→            className={cn('rounded px-1.5 py-1', chartType === 'line' ? 'bg-zinc-800 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300')}
+  1513→            onClick={() => setChartType('line')}
+  1514→            aria-label="Line"
+  1515→          >
+  1516→            <LineIcon className="h-3.5 w-3.5" />
+  1517→          </button>
+  1518→        </div>
+  1519→        <div className="ml-auto flex items-center gap-2 pr-1">
+  1520→          {demo && (
+  1521→            <Badge
+  1522→              variant="outline"
+  1523→              title={
+  1524→                !demoReason || demoReason === 'no-keys'
+  1525→                  ? 'Demo data — add your Alpaca API keys in Settings → Test keys'
+  1526→                  : demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
+  1527→                    ? 'Alpaca rejected the saved keys — check them in Settings'
+  1528→                    : `Alpaca request failed (${demoReason}) — will retry`
+  1529→              }
+  1530→              className={
+  1531→                demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
+  1532→                  ? 'border-rose-500/40 text-[10px] text-rose-400'
+  1533→                  : 'border-amber-500/40 text-[10px] text-amber-400'
+  1534→              }
+  1535→            >
+  1536→              {!demoReason || demoReason === 'no-keys'
+  1537→                ? 'demo'
+  1538→                : demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
+  1539→                  ? 'keys rejected'
+  1540→                  : demoReason === 'alpaca-http-429'
+  1541→                    ? 'rate limited'
+  1542→                    : 'data error'}
+  1543→            </Badge>
+  1544→          )}
+  1545→          {quote && !compact && (
+  1546→            <div className="text-right">
+  1547→              <span className="text-sm font-semibold tabular-nums text-zinc-100">{fmtPrice(quote.price)}</span>
+  1548→              <span className={cn('ml-2 text-[11px] tabular-nums', up ? 'text-emerald-400' : 'text-rose-400')}>
+  1549→                {up ? '+' : ''}{quote.changePct.toFixed(2)}%
+  1550→              </span>
+  1551→            </div>
+  1552→          )}
+  1553→        </div>
+  1554→      </div>
+  1555→
+  1556→      {/* drawing toolbar — semi-transparent so values behind stay visible (Task 14 #4) */}
+  1557→      <div className="absolute left-2 top-12 z-30 flex flex-col gap-0.5 rounded-lg border border-zinc-800/80 bg-zinc-900/60 p-1 opacity-40 backdrop-blur-sm transition-opacity hover:opacity-100 focus-within:opacity-100">
+  1558→        <button
+  1559→          title="Trade ticket — buy/sell with SL/TP/trailing (paper or live)"
+  1560→          aria-label="Open trade ticket"
+  1561→          aria-pressed={tradeOpen}
+  1562→          onClick={() => {
+  1563→            setTicketPrefill(null)
+  1564→            setTradeOpen((v) => !v)
+  1565→          }}
+  1566→          className={cn(
+  1567→            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+  1568→            tradeOpen ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',
+  1569→          )}
+  1570→        >
+  1571→          <Briefcase className="h-3.5 w-3.5" />
+  1572→        </button>
+  1573→        <div className="mx-1 my-0.5 h-px bg-zinc-800" />
+  1574→        {(
+  1575→          [
+  1576→            { tool: 'cursor' as const, icon: MousePointer2, label: 'Cursor (pan/zoom)' },
+  1577→            { tool: 'hline' as const, icon: Minus, label: 'Horizontal line' },
+  1578→            { tool: 'vline' as const, icon: ArrowUpDown, label: 'Vertical line' },
+  1579→            { tool: 'trend' as const, icon: TrendingUp, label: 'Trend line (2 clicks)' },
+  1580→            { tool: 'fib' as const, icon: Ruler, label: 'Fib retracement (2 clicks)' },
+  1581→          ]
+  1582→        ).map(({ tool, icon: Icon, label }) => (
+  1583→          <button
+  1584→            key={tool}
+  1585→            title={label}
+  1586→            aria-label={label}
+  1587→            aria-pressed={drawingTool === tool}
+  1588→            onClick={() => setDrawingTool(tool)}
+  1589→            className={cn(
+  1590→              'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+  1591→              drawingTool === tool ? 'bg-emerald-500/20 text-emerald-400' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100',
+  1592→            )}
+  1593→          >
+  1594→            <Icon className="h-3.5 w-3.5" />
+  1595→          </button>
+  1596→        ))}
+  1597→        <div className="mx-1 my-0.5 h-px bg-zinc-800" />
+  1598→        <div className="flex flex-col items-center gap-1 py-0.5">
+  1599→          {DRAW_COLORS.map((c) => (
+  1600→            <button
+  1601→              key={c}
+  1602→              aria-label={`Drawing color ${c}`}
+  1603→              onClick={() => setActiveColor(c)}
+  1604→              className={cn('h-3 w-3 rounded-full transition-transform', activeColor === c ? 'scale-125 ring-1 ring-white/70' : 'opacity-70 hover:opacity-100')}
+  1605→              style={{ backgroundColor: c }}
+  1606→            />
+  1607→          ))}
+  1608→        </div>
+  1609→        <div className="mx-1 my-0.5 h-px bg-zinc-800" />
+  1610→        <button
+  1611→          title={showDrawings ? 'Hide drawings' : 'Show drawings'}
+  1612→          aria-label={showDrawings ? 'Hide drawings' : 'Show drawings'}
+  1613→          onClick={() => setShowDrawings((v) => !v)}
+  1614→          className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+  1615→        >
+  1616→          {showDrawings ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+  1617→        </button>
+  1618→        <button
+  1619→          title="Delete all drawings"
+  1620→          aria-label="Delete all drawings"
+  1621→          onClick={() => {
+  1622→            for (const d of drawings) void deleteDrawing(d.id)
+  1623→          }}
+  1624→          className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-rose-400"
+  1625→        >
+  1626→          <Trash2 className="h-3.5 w-3.5" />
+  1627→        </button>
+  1628→      </div>
+  1629→
+  1630→      {/* OHLC legend — content written directly by the crosshair handler (perf) */}
+  1631→      <div
+  1632→        ref={legendRef}
+  1633→        className="pointer-events-none absolute left-12 top-12 z-20 hidden rounded bg-zinc-950/50 px-2 py-1 font-mono text-[11px] leading-4 text-zinc-300 backdrop-blur-sm"
+  1634→        aria-hidden
+  1635→      />
+  1636→
+  1637→      {/* loading overlay */}
+  1638→      {loading && (
+  1639→        <div className="absolute inset-0 z-20 flex items-center justify-center bg-zinc-950/40">
+  1640→          <Loader2 className="h-6 w-6 animate-spin text-emerald-500" />
+  1641→        </div>
+  1642→      )}
+  1643→
+  1644→      {/* context menu */}
+  1645→      {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} container={containerRef.current} symbol={symbol}
+  1646→        posData={posData.data}
+  1647→        onAddAlert={(price) => void addAlertAtPrice(price)}
+  1648→        onAddHline={(price) => {
+  1649→          void createDrawing('hline', [{ time: null, price }])
+  1650→        }}
+  1651→        onTrade={(side, price) => {
+  1652→          setTicketPrefill({ side, price })
+  1653→          setTradeOpen(true)
+  1654→        }}
+  1655→        onOpenTicket={() => {
+  1656→          setTicketPrefill(null)
+  1657→          setTradeOpen(true)
+  1658→        }}
+  1659→        onEditValue={(hit) => {
+  1660→          const st = useTerminal.getState()
+  1661→          if (hit.type === 'alert') {
+  1662→            const a = st.alerts.find((aa) => aa.id === hit.id)
+  1663→            if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
+  1664→          } else if (hit.type === 'exit') {
+  1665→            setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+  1666→          } else if (hit.type === 'drawing') {
+  1667→            const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
+  1668→            if (d?.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
+  1669→          }
+  1670→        }}
+  1671→        onPatchDrawing={patchDrawing}
+  1672→        onDeleteDrawing={deleteDrawing}
+  1673→        onPatchAlert={patchAlert}
+  1674→        onDeleteAlert={deleteAlert}
+  1675→        onPatchExit={(info, kind, price) => void patchExitPrice(info, kind, price)}
+  1676→        onCancelExit={(orderId) => void cancelExitOrder(orderId)}
+  1677→        onClosePosition={(tradeSymbol) => void closePositionBySymbol(tradeSymbol)}
+  1678→      />}
+  1679→
+  1680→      {/* edit value popover */}
+  1681→      {editValue && (
+  1682→        <EditValuePopover
+  1683→          value={editValue.price}
+  1684→          onCancel={() => setEditValue(null)}
+  1685→          onSave={(price) => {
+  1686→            if (editValue.type === 'alert') void patchAlert(editValue.id, { price })
+  1687→            else if (editValue.type === 'exit' && editValue.exit) {
+  1688→              void patchExitPrice(editValue.exit.info, editValue.exit.kind, price)
+  1689→            } else {
+  1690→              const d = (useTerminal.getState().drawingsBySymbol[symbol] || []).find((dd) => dd.id === editValue.id)
+  1691→              if (d) void patchDrawing(d.id, { points: d.points.map((p, i) => (i === 0 ? { ...p, price } : p)) })
+  1692→            }
+  1693→            setEditValue(null)
+  1694→          }}
+  1695→        />
+  1696→      )}
+  1697→
+  1698→      {/* trade ticket (paper / live via Alpaca Trading API) */}
+  1699→      {tradeOpen && (
+  1700→        <TradeTicket
+  1701→          symbol={symbol}
+  1702→          livePrice={quote?.price ?? null}
+  1703→          prefill={ticketPrefill}
+  1704→          onClose={() => setTradeOpen(false)}
+  1705→          onPlaced={() => void posData.refresh()}
+  1706→        />
+  1707→      )}
+  1708→
+  1709→      <SymbolSearchDialog
+  1710→        open={searchOpen}
+  1711→        onOpenChange={setSearchOpen}
+  1712→        onSelect={onSymbolChange}
+  1713→      />
+  1714→    </div>
+  1715→  )
+  1716→}
+  1717→
+  1718→// ---------- context menu ----------
+  1719→function ContextMenu({
+  1720→  menu, onClose, container, symbol, posData,
+  1721→  onAddAlert, onAddHline, onTrade, onOpenTicket,
+  1722→  onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
+  1723→  onPatchExit, onCancelExit, onClosePosition,
+  1724→}: {
+  1725→  menu: MenuState
+  1726→  onClose: () => void
+  1727→  container: HTMLElement | null
+  1728→  symbol: string
+  1729→  posData: { positions: { symbol: string; tradeSymbol: string; qty: number; side: string; avgEntry: number }[]; exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> } | null
+  1730→  onAddAlert: (price: number) => void
+  1731→  onAddHline: (price: number) => void
+  1732→  onTrade: (side: 'buy' | 'sell', price?: number) => void
+  1733→  onOpenTicket: () => void
+  1734→  onEditValue: (hit: SceneHit) => void
+  1735→  onPatchDrawing: (id: string, patch: { color?: string }) => Promise<void>
+  1736→  onDeleteDrawing: (id: string) => Promise<void>
+  1737→  onPatchAlert: (id: string, patch: Record<string, unknown>) => Promise<void>
+  1738→  onDeleteAlert: (id: string) => Promise<void>
+  1739→  onPatchExit: (info: ExitInfo, kind: 'sl' | 'tp', price: number) => void
+  1740→  onCancelExit: (orderId: string) => void
+  1741→  onClosePosition: (tradeSymbol: string) => void
+  1742→}) {
+  1743→  const symDrawing = menu.hit.type === 'drawing' ? menu.hit : null
+  1744→  const alertHit = menu.hit.type === 'alert' ? menu.hit : null
+  1745→  const alert = alertHit ? useTerminal.getState().alerts.find((a) => a.id === alertHit.id) : null
+  1746→  const symDrawingData = symDrawing ? (useTerminal.getState().drawingsBySymbol[symbol] || []).find((d) => d.id === symDrawing.id) : null
+  1747→
+  1748→  useEffect(() => {
+  1749→    const close = () => onClose()
+  1750→    window.addEventListener('pointerdown', close, { once: true })
+  1751→    window.addEventListener('wheel', close, { once: true })
+  1752→    return () => {
+  1753→      window.removeEventListener('pointerdown', close)
+  1754→      window.removeEventListener('wheel', close)
+  1755→    }
+  1756→  }, [onClose])
+  1757→
+  1758→  if (!container) return null
+  1759→  const w = container.clientWidth
+  1760→  const h = container.clientHeight
+  1761→  const left = Math.min(menu.x + 4, w - 230)
+  1762→  const top = Math.min(menu.y + 4, h - 320)
+  1763→  const price = menu.price ?? null
+  1764→
+  1765→  if (menu.hit.type === 'alert' && alert && alertHit) {
+  1766→    return (
+  1767→      <div
+  1768→        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+  1769→        style={{ left, top }}
+  1770→        onPointerDown={(e) => e.stopPropagation()}
+  1771→        role="menu"
+  1772→      >
+  1773→        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+  1774→          Alert · {alert.symbol} @ {fmtPrice(alert.price)}
+  1775→        </div>
+  1776→        <MenuItem
+  1777→          label={alert.status === 'paused' ? '▶ Resume alert' : '⏸ Pause alert'}
+  1778→          onClick={() => {
+  1779→            void onPatchAlert(alert.id, { status: alert.status === 'paused' ? 'active' : 'paused' })
+  1780→            onClose()
+  1781→          }}
+  1782→        />
+  1783→        <MenuItem label="✏️ Edit value…" onClick={() => { onEditValue(alertHit); onClose() }} />
+  1784→        <MenuItem
+  1785→          label={alert.direction === 'above' ? '▲ Trigger when rising above' : '▼ Trigger when falling below'}
+  1786→          onClick={() => {
+  1787→            void onPatchAlert(alert.id, { direction: alert.direction === 'above' ? 'below' : 'above' })
+  1788→            onClose()
+  1789→          }}
+  1790→        />
+  1791→        <ColorRow
+  1792→          active={alert.color}
+  1793→          onPick={(c) => { void onPatchAlert(alert.id, { color: c }); onClose() }}
+  1794→        />
+  1795→        <div className="my-1 h-px bg-zinc-800" />
+  1796→        <MenuItem label="🗑 Delete alert" danger onClick={() => { void onDeleteAlert(alert.id); onClose() }} />
+  1797→      </div>
+  1798→    )
+  1799→  }
+  1800→
+  1801→  if (menu.hit.type === 'drawing' && symDrawing && symDrawingData) {
+  1802→    const d = symDrawingData
+  1803→    const drawingHit = symDrawing
+  1804→    return (
+  1805→      <div
+  1806→        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+  1807→        style={{ left, top }}
+  1808→        onPointerDown={(e) => e.stopPropagation()}
+  1809→        role="menu"
+  1810→      >
+  1811→        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+  1812→          {KIND_LABEL[d.kind]}
+  1813→        </div>
+  1814→        {d.kind !== 'vline' && (
+  1815→          <MenuItem
+  1816→            label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add alert at {fmtPrice(d.kind === 'hline' ? d.points[0].price : d.points[d.points.length - 1].price)}</span>}
+  1817→            onClick={() => {
+  1818→              onAddAlert(d.kind === 'hline' ? d.points[0].price : d.points[d.points.length - 1].price)
+  1819→              onClose()
+  1820→            }}
+  1821→          />
+  1822→        )}
+  1823→        {d.kind === 'hline' && (
+  1824→          <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(drawingHit); onClose() }} />
+  1825→        )}
+  1826→        <ColorRow
+  1827→          active={d.color}
+  1828→          onPick={(c) => { void onPatchDrawing(d.id, { color: c }); onClose() }}
+  1829→        />
+  1830→        <div className="my-1 h-px bg-zinc-800" />
+  1831→        <MenuItem label="🗑 Delete drawing" danger onClick={() => { void onDeleteDrawing(d.id); onClose() }} />
+  1832→      </div>
+  1833→    )
+  1834→  }
+  1835→
+  1836→  if (menu.hit.type === 'exit') {
+  1837→    const hit = menu.hit
+  1838→    const label = hit.part === 'sl' ? 'Stop loss' : 'Take profit'
+  1839→    return (
+  1840→      <div
+  1841→        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+  1842→        style={{ left, top }}
+  1843→        onPointerDown={(e) => e.stopPropagation()}
+  1844→        role="menu"
+  1845→      >
+  1846→        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+  1847→          {label} · {fmtPrice(hit.origPrice)} <span className="text-zinc-600">({hit.exit.type})</span>
+  1848→        </div>
+  1849→        <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(hit); onClose() }} />
+  1850→        <MenuItem
+  1851→          label="🧾 Trade ticket…"
+  1852→          onClick={() => { onOpenTicket(); onClose() }}
+  1853→        />
+  1854→        <div className="my-1 h-px bg-zinc-800" />
+  1855→        <MenuItem label={`🗑 Cancel ${hit.part.toUpperCase()} order`} danger onClick={() => { onCancelExit(hit.exit.orderId); onClose() }} />
+  1856→      </div>
+  1857→    )
+  1858→  }
+  1859→
+  1860→  if (menu.hit.type === 'position') {
+  1861→    const hit = menu.hit
+  1862→    const pos = posData?.positions.find((p) => p.tradeSymbol === hit.id)
+  1863→    return (
+  1864→      <div
+  1865→        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+  1866→        style={{ left, top }}
+  1867→        onPointerDown={(e) => e.stopPropagation()}
+  1868→        role="menu"
+  1869→      >
+  1870→        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+  1871→          Position {pos ? `${pos.side === 'long' ? '+' : '-'}${pos.qty} @ ${fmtPrice(pos.avgEntry)}` : hit.id}
+  1872→        </div>
+  1873→        <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
+  1874→        <MenuItem
+  1875→          label={pos?.side === 'long' ? '🔴 Sell to close (market)' : '🟢 Buy to close (market)'}
+  1876→          danger
+  1877→          onClick={() => { onClosePosition(hit.id); onClose() }}
+  1878→        />
+  1879→      </div>
+  1880→    )
+  1881→  }
+  1882→
+  1883→  if (menu.hit.type === 'chart') {
+  1884→    return (
+  1885→      <div
+  1886→        className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+  1887→        style={{ left, top }}
+  1888→        onPointerDown={(e) => e.stopPropagation()}
+  1889→        role="menu"
+  1890→      >
+  1891→        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+  1892→          {symbol}{price != null ? ` · ${fmtPrice(price)}` : ''}
+  1893→        </div>
+  1894→        {price != null && (
+  1895→          <MenuItem
+  1896→            label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add price alert at {fmtPrice(price)}</span>}
+  1897→            onClick={() => { onAddAlert(price); onClose() }}
+  1898→          />
+  1899→        )}
+  1900→        {price != null && (
+  1901→          <MenuItem label="─ Horizontal line here" onClick={() => { onAddHline(price); onClose() }} />
+  1902→        )}
+  1903→        <div className="my-1 h-px bg-zinc-800" />
+  1904→        {price != null && (
+  1905→          <MenuItem
+  1906→            label={<span className="text-emerald-400">🟢 Buy {symbol} (market)</span>}
+  1907→            onClick={() => { onTrade('buy', price); onClose() }}
+  1908→          />
+  1909→        )}
+  1910→        {price != null && (
+  1911→          <MenuItem
+  1912→            label={<span className="text-rose-400">🔴 Sell {symbol} (market)</span>}
+  1913→            onClick={() => { onTrade('sell', price); onClose() }}
+  1914→          />
+  1915→        )}
+  1916→        <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
+  1917→      </div>
+  1918→    )
+  1919→  }
+  1920→  return null
+  1921→}
+  1922→
+  1923→function MenuItem({ label, onClick, danger }: { label: React.ReactNode; onClick: () => void; danger?: boolean }) {
+  1924→  return (
+  1925→    <button
+  1926→      className={cn(
+  1927→        'flex w-full items-center px-3 py-1.5 text-left text-zinc-200 hover:bg-zinc-800',
+  1928→        danger && 'text-rose-400 hover:text-rose-300',
+  1929→      )}
+  1930→      onClick={onClick}
+  1931→      role="menuitem"
+  1932→    >
+  1933→      {label}
+  1934→    </button>
+  1935→  )
+  1936→}
+  1937→
+  1938→function ColorRow({ active, onPick }: { active: string; onPick: (c: string) => void }) {
+  1939→  return (
+  1940→    <div className="flex items-center gap-1.5 px-3 py-1.5">
+  1941→      <span className="mr-1 text-[10px] text-zinc-500">Color</span>
+  1942→      {DRAW_COLORS.map((c) => (
+  1943→        <button
+  1944→          key={c}
+  1945→          aria-label={`color ${c}`}
+  1946→          className={cn('h-4 w-4 rounded-full', active === c && 'ring-2 ring-white/70')}
+  1947→          style={{ backgroundColor: c }}
+  1948→          onClick={() => onPick(c)}
+  1949→        />
+  1950→      ))}
+  1951→    </div>
+  1952→  )
+  1953→}
+  1954→
+  1955→function EditValuePopover({ value, onSave, onCancel }: { value: number; onSave: (v: number) => void; onCancel: () => void }) {
+  1956→  const [v, setV] = useState(String(value))
+  1957→  return (
+  1958→    <div className="absolute inset-0 z-50 flex items-center justify-center">
+  1959→      <button className="absolute inset-0 bg-black/40" onClick={onCancel} aria-label="Cancel" />
+  1960→      <div className="relative w-64 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
+  1961→        <p className="mb-2 text-xs font-medium text-zinc-300">Set value</p>
+  1962→        <Input
+  1963→          autoFocus
+  1964→          type="number"
+  1965→          step="any"
+  1966→          value={v}
+  1967→          onChange={(e) => setV(e.target.value)}
+  1968→          onKeyDown={(e) => {
+  1969→            if (e.key === 'Enter') onSave(parseFloat(v))
+  1970→            if (e.key === 'Escape') onCancel()
+  1971→          }}
+  1972→          className="border-zinc-700 bg-zinc-950 text-sm"
+  1973→        />
+  1974→        <div className="mt-3 flex justify-end gap-2">
+  1975→          <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={onCancel}>Cancel</Button>
+  1976→          <Button size="sm" className="h-7 bg-emerald-500 text-xs text-zinc-950 hover:bg-emerald-400" onClick={() => onSave(parseFloat(v))}>
+  1977→            Apply
+  1978→          </Button>
+  1979→        </div>
+  1980→      </div>
+  1981→    </div>
+  1982→  )
+  1983→}
+  1984→

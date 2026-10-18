@@ -1,17 +1,20 @@
 'use client'
 
-// Heat Map tab — finviz-style squarified TREEMAP: tile AREA is proportional to
-// the "heat" (|daily % change|, floored so flat names stay clickable), color is
-// green/red by sign and intensity. Toggle between heat-sized and equal tiles.
-// Clicking a tile selects the symbol in the terminal store (switches to chart).
+// Heat Map tab — finviz-style NESTED squarified TREEMAP: each SECTOR is a big
+// square sized by its total heat, and inside it each stock is a small square
+// whose AREA is proportional to its own "heat" (|daily % change|, floored so
+// flat names stay clickable). Color is green/red by sign and intensity.
+// Sectors can be filtered via the multi-select; tiles are still clickable and
+// select the symbol in the terminal store (switches to the chart).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { LayoutGrid, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useTerminal } from '@/store/terminal'
+import { FilterMultiSelect } from './FilterMultiSelect'
 
 interface HeatTile {
   symbol: string
@@ -51,6 +54,11 @@ function formatPrice(price: number): string {
   }
   if (price >= 1) return price.toFixed(2)
   return price.toFixed(4)
+}
+
+/** weight of one tile in the treemap (heat-sized mode) */
+function heatWeight(t: HeatTile, sized: boolean): number {
+  return sized ? Math.max(Math.abs(t.pct), 0.08) : 1
 }
 
 /* ------------------------------------------------- squarified treemap ---- */
@@ -119,7 +127,10 @@ function squarify(weights: number[], rect: Rect): Rect[] {
       let cx = x
       for (const it of row) {
         const rw = it.a / rh
-        out[it.i] = { x, y, w: rw, h: rh }
+        // MUST advance the cursor: using `x` here stacked EVERY tile of a
+        // horizontal row on the same left edge (overlapping tiles) — the
+        // vertical branch correctly uses `cy`, this one now uses `cx`.
+        out[it.i] = { x: cx, y, w: rw, h: rh }
         cx += rw
       }
       y += rh
@@ -164,7 +175,49 @@ function TreeTile({ tile, rect }: { tile: HeatTile; rect: Rect }) {
   )
 }
 
-function TreemapGroup({ group, sized, height }: { group: HeatGroup; sized: boolean; height: number }) {
+/* ------------------------------------------------------ nested treemap ---- */
+
+interface NestedTile { tile: HeatTile; rect: Rect }
+interface NestedSector {
+  group: HeatGroup
+  rect: Rect
+  labelH: number
+  tiles: NestedTile[]
+}
+
+/**
+ * Lays out the visible sectors as big squares (sized by total group heat)
+ * inside the full map rect, then lays each sector's stocks out inside its
+ * rect below a small label strip. Classic finviz "map within the map".
+ */
+function buildNestedLayout(groups: HeatGroup[], width: number, height: number, sized: boolean): NestedSector[] | null {
+  if (width <= 0 || height <= 0 || groups.length === 0) return null
+  const sectorWeights = groups.map((g) =>
+    g.symbols.reduce((s, t) => s + heatWeight(t, sized), 0),
+  )
+  const sectorRects = squarify(sectorWeights, { x: 0, y: 0, w: width, h: height })
+  return groups.map((g, i) => {
+    const rect = sectorRects[i]
+    // label strip only fits on reasonably large sector squares
+    const labelH = rect.w >= 96 && rect.h >= 48 ? 16 : 0
+    const inner: Rect = {
+      x: rect.x + 2,
+      y: rect.y + 2 + labelH,
+      w: Math.max(0, rect.w - 4),
+      h: Math.max(0, rect.h - 4 - labelH),
+    }
+    const weights = g.symbols.map((t) => heatWeight(t, sized))
+    const rects = squarify(weights, inner)
+    return {
+      group: g,
+      rect,
+      labelH,
+      tiles: g.symbols.map((tile, j) => ({ tile, rect: rects[j] })),
+    }
+  })
+}
+
+function NestedHeatmap({ groups, sized }: { groups: HeatGroup[]; sized: boolean }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
 
@@ -179,47 +232,67 @@ function TreemapGroup({ group, sized, height }: { group: HeatGroup; sized: boole
     return () => ro.disconnect()
   }, [])
 
-  const rects = useMemo(() => {
-    if (width <= 0) return null
-    const syms = [...group.symbols].sort(
-      (a, b) => Math.abs(b.pct) - Math.abs(a.pct),
-    )
-    const weights = syms.map((s) => (sized ? Math.max(Math.abs(s.pct), 0.08) : 1))
-    return { syms, rects: squarify(weights, { x: 0, y: 0, w: width, h: height }) }
-  }, [group.symbols, sized, width, height])
+  // map height adapts to the viewport: compact on phones, tall on desktop
+  const height = width < 560 ? 460 : width < 1024 ? 560 : 660
+
+  const layout = useMemo(
+    () => buildNestedLayout(groups, width, height, sized),
+    [groups, sized, width, height],
+  )
 
   return (
-    <section>
-      <h3 className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-zinc-400">
-        {group.name}
-        <span className="rounded border border-zinc-800 px-1 py-px text-[10px] font-normal text-zinc-600">
-          {group.symbols.length}
-        </span>
-      </h3>
-      <div ref={wrapRef} className="relative w-full" style={{ height }}>
-        {rects ? (
-          rects.syms.map((s, i) => (
-            <TreeTile key={s.symbol} tile={s} rect={rects.rects[i]} />
-          ))
-        ) : (
-          <div className="h-full w-full animate-pulse rounded-md bg-zinc-800/60" />
-        )}
-      </div>
-    </section>
+    <div
+      ref={wrapRef}
+      className="relative w-full select-none"
+      style={{ height }}
+      role="grid"
+      aria-label="Nested sector heat map"
+    >
+      {layout ? (
+        <>
+          {/* big sector squares (under the stock tiles) */}
+          {layout.map(({ group, rect, labelH }) => (
+            <div
+              key={`sec-${group.name}`}
+              aria-label={`Sector ${group.name}, ${group.symbols.length} symbols`}
+              style={{
+                position: 'absolute',
+                left: Math.round(rect.x) + 1,
+                top: Math.round(rect.y) + 1,
+                width: Math.max(0, Math.round(rect.w) - 2),
+                height: Math.max(0, Math.round(rect.h) - 2),
+              }}
+              className="rounded-md border border-zinc-600/70 bg-zinc-900/60"
+            >
+              {labelH > 0 && (
+                <div
+                  className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center gap-1.5 truncate rounded-t-md bg-zinc-950/75 px-1.5 text-[10px] font-semibold text-zinc-300 backdrop-blur-[1px]"
+                  style={{ height: labelH }}
+                >
+                  <span className="truncate">{group.name}</span>
+                  <span className="shrink-0 tabular-nums text-zinc-500">{group.symbols.length}</span>
+                </div>
+              )}
+            </div>
+          ))}
+          {/* small stock tiles (coordinates are relative to the outer wrap) */}
+          {layout.flatMap(({ tiles }) =>
+            tiles.map(({ tile, rect }) => <TreeTile key={tile.symbol} tile={tile} rect={rect} />),
+          )}
+        </>
+      ) : (
+        <Skeleton className="h-full w-full rounded-md bg-zinc-800/70" />
+      )}
+    </div>
   )
 }
 
-function SkeletonGrid() {
-  const groups = [8, 8, 8, 8, 8, 6, 8, 8]
+function SkeletonMap() {
   return (
-    <div className="space-y-6">
-      {groups.map((n, gi) => (
-        <div key={gi}>
-          <Skeleton className="mb-2 h-3 w-28 bg-zinc-800" />
-          <Skeleton className="h-[260px] w-full rounded-md bg-zinc-800/70" />
-          <span className="sr-only">{n} tiles</span>
-        </div>
-      ))}
+    <div className="space-y-3">
+      <Skeleton className="h-[140px] w-full rounded-md bg-zinc-800" />
+      <Skeleton className="h-[240px] w-full rounded-md bg-zinc-800/80" />
+      <Skeleton className="h-[180px] w-full rounded-md bg-zinc-800" />
     </div>
   )
 }
@@ -230,6 +303,8 @@ export default function HeatmapTab() {
   const [error, setError] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [sized, setSized] = useState(true) // heat-sized treemap vs equal grid
+  // sector filter — set of INCLUDED sector names; kept in sync on refresh
+  const [sectorSel, setSectorSel] = useState<Set<string>>(new Set())
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -240,6 +315,12 @@ export default function HeatmapTab() {
       setData(json)
       setError(null)
       setUpdatedAt(Date.now())
+      // register any NEW sectors, keep the user's exclusions untouched
+      setSectorSel((prev) => {
+        const next = new Set(prev)
+        for (const g of [...(json.us ?? []), ...(json.crypto ?? [])]) next.add(g.name)
+        return next
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Request failed')
     } finally {
@@ -254,7 +335,16 @@ export default function HeatmapTab() {
     return () => clearInterval(id)
   }, [load])
 
-  const groups = data ? [...(data.us ?? []), ...(data.crypto ?? [])] : []
+  const allGroups = data ? [...(data.us ?? []), ...(data.crypto ?? [])] : []
+  const sectorOptions = useMemo(
+    () => allGroups.map((g) => ({ value: g.name, label: g.name, count: g.symbols?.length ?? 0 })),
+    [allGroups],
+  )
+  const visibleGroups = useMemo(
+    () => allGroups.filter((g) => sectorSel.has(g.name) && (g.symbols?.length ?? 0) > 0),
+    [allGroups, sectorSel],
+  )
+  const filtersActive = sectorOptions.length > 0 && visibleGroups.length < allGroups.filter((g) => (g.symbols?.length ?? 0) > 0).length
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -275,6 +365,13 @@ export default function HeatmapTab() {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {/* sector filter */}
+          <FilterMultiSelect
+            label="Sectors"
+            options={sectorOptions}
+            selected={sectorSel}
+            onChange={setSectorSel}
+          />
           {/* treemap sizing toggle */}
           <div className="flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
             <button
@@ -292,12 +389,11 @@ export default function HeatmapTab() {
               onClick={() => setSized(false)}
               aria-pressed={!sized}
               className={cn(
-                'flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors',
+                'rounded px-2 py-0.5 text-[11px] font-medium transition-colors',
                 !sized ? 'bg-emerald-500/15 text-emerald-400' : 'text-zinc-400 hover:text-zinc-200',
               )}
               title="Equal-size tiles"
             >
-              <LayoutGrid className="h-3 w-3" />
               Equal
             </button>
           </div>
@@ -319,10 +415,11 @@ export default function HeatmapTab() {
         </div>
       </div>
 
-      {/* Scrollable content */}
+      {/* Scrollable content — ONE nested map: big sector squares, small stock
+          squares inside them */}
       <div
         className={cn(
-          'min-h-0 flex-1 space-y-5 overflow-y-auto p-4',
+          'min-h-0 flex-1 overflow-y-auto p-3 sm:p-4',
           '[scrollbar-width:thin] [scrollbar-color:#3f3f46_transparent]',
           '[&::-webkit-scrollbar]:h-2 [&::-webkit-scrollbar]:w-2',
           '[&::-webkit-scrollbar-track]:bg-transparent',
@@ -330,12 +427,22 @@ export default function HeatmapTab() {
           'hover:[&::-webkit-scrollbar-thumb]:bg-zinc-600',
         )}
       >
-        {data ? (
-          groups.map((group) =>
-            group.symbols?.length ? (
-              <TreemapGroup key={group.name} group={group} sized={sized} height={group.symbols.length > 8 ? 300 : 240} />
-            ) : null,
-          )
+        {data && visibleGroups.length > 0 ? (
+          <NestedHeatmap groups={visibleGroups} sized={sized} />
+        ) : data && filtersActive ? (
+          <div className="flex flex-col items-center gap-3 py-16 text-center">
+            <p className="text-xs text-zinc-500">All sectors are filtered out.</p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setSectorSel(new Set(sectorOptions.map((o) => o.value)))}
+              className="h-7 border-zinc-800 bg-zinc-900 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              Show all sectors
+            </Button>
+          </div>
+        ) : data ? (
+          <p className="py-16 text-center text-xs text-zinc-500">No heat map data available.</p>
         ) : error ? (
           <div className="flex h-full min-h-[200px] flex-col items-center justify-center gap-3 text-center">
             <p className="text-sm text-rose-400">Failed to load heat map{error ? ` (${error})` : ''}.</p>
@@ -350,8 +457,17 @@ export default function HeatmapTab() {
             </Button>
           </div>
         ) : (
-          <SkeletonGrid />
+          <SkeletonMap />
         )}
+      </div>
+
+      {/* footer hint */}
+      <div className="flex h-7 shrink-0 items-center justify-between border-t border-zinc-800 bg-zinc-900/60 px-3 text-[10px] text-zinc-500">
+        <span>
+          Tile area ∝ {sized ? 'heat (|daily %|)' : 'equal'} · click a tile to chart it
+          {filtersActive ? ` · ${visibleGroups.length}/${allGroups.length} sectors` : ''}
+        </span>
+        <span className="hidden sm:inline">Auto-refreshes every 60 s</span>
       </div>
     </div>
   )

@@ -1316,9 +1316,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const feedKey = `${symbol}|${demoNow}|${reasonNow}`
         if (feedStateRef.current !== feedKey) {
           feedStateRef.current = feedKey
+          const src = String(json.meta?.source ?? '')
           ttLog(
             'data',
-            demoNow ? `${symbol} → demo data${reasonNow ? ` (${reasonNow})` : ''}` : `${symbol} → live Alpaca data`,
+            demoNow
+              ? `${symbol} → demo data${reasonNow ? ` (${reasonNow})` : ''}`
+              : src === 'binance'
+                ? `${symbol} → live Binance data (free feed)`
+                : `${symbol} → live data${src ? ` (${src})` : ''}`,
             demoNow ? 'warn' : 'ok',
           )
         }
@@ -1469,7 +1474,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       onPointerDownCapture={() => onFocus?.()}
     >
       {/* chart canvas is injected here by lightweight-charts */}
-      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-10" aria-hidden />
+      {/* h-full/w-full is CRITICAL: a canvas with only inset-0 renders at its
+          intrinsic (backing-store) CSS size, so on devicePixelRatio > 1 screens
+          (retina / 125-150% Windows scaling) every overlay drawing appeared at
+          dpr× its intended position — exactly the "line is not where I clicked"
+          bug. Explicit CSS size + dpr-scaled backing store = 1:1 coordinates. */}
+      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-10 h-full w-full" aria-hidden />
 
       {/* header overlay */}
       <div className={cn('pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-zinc-800/60 bg-zinc-950/85 px-2 backdrop-blur-sm', compact ? 'h-8' : 'h-10')}>
