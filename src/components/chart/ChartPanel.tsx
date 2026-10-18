@@ -396,7 +396,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
     }
 
-    // ---- y-axis event icons: earnings [E] (yfinance) + news ⚡ (TradingView-style) ----
+    // ---- x-axis event icons: earnings [E] (yfinance) + news ⚡ (TradingView-style) ----
+    // Icons sit ON the time axis (bottom of the pane), aligned with the event's
+    // bar; upcoming earnings extrapolate into the right margin at their real
+    // date. Colliding icons stack upward in 18px rows.
     const chartApi = chartRef.current
     const mk = markersRef.current
     axisIconsRef.current = []
@@ -404,14 +407,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const psW = chartApi.priceScale('right').width()
       const tAxisH = chartApi.timeScale().height()
       const bars = barsRef.current
-      const vis = chartApi.timeScale().getVisibleRange()
-      const visFrom = vis ? Number(vis.from) : null
-      const visTo = vis ? Number(vis.to) : null
-      const cx = w - psW / 2
+      const lastBarTime = bars[bars.length - 1].time
+      const xMin = 8
+      const xMax = w - psW - 6
+      const yBase = h - tAxisH - 11 // first-row icon center, just above the time axis
       const yMin = 13
-      const yMax = Math.max(yMin + 1, h - tAxisH - 10)
+      const rowH = 18
+      const halfW = 15 // icon half-width used for horizontal collision spacing
+      const maxRows = Math.max(1, Math.floor((yBase - yMin) / rowH) + 1)
 
-      // bar in effect at the event moment (upcoming events → last bar)
+      // bar in effect at the event moment (past events snap to their bar)
       const barAt = (ts: number): Bar | null => {
         if (ts < bars[0].time) return null
         if (ts >= bars[bars.length - 1].time) return bars[bars.length - 1]
@@ -427,45 +432,43 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const fmtDay = (ts: number) =>
         new Date(ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
 
-      type AxisIcon = { kind: 'e' | 'n'; rawY: number; tip: string; atLast?: boolean }
+      type AxisIcon = { kind: 'e' | 'n'; x: number; y: number; tip: string }
       const icons: AxisIcon[] = []
-      const lastBarTime = bars[bars.length - 1].time
+      const place = (kind: 'e' | 'n', ts: number, tip: string) => {
+        // past events snap to the bar in effect; future events (upcoming
+        // earnings) extrapolate into the right margin at their real date
+        const t = ts > lastBarTime ? ts : (barAt(ts)?.time ?? null)
+        if (t == null) return
+        const rawX = xOf(t)
+        if (rawX == null || rawX < xMin - halfW * 2 || rawX > w + halfW * 2) return
+        icons.push({ kind, x: Math.min(Math.max(rawX, xMin), xMax), y: 0, tip })
+      }
       for (const e of mk.earnings) {
-        const bar = barAt(e.ts)
-        if (!bar) continue
-        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
-        const y = yOf(bar.close)
-        if (y == null) continue
         const epsBits =
           e.epsActual != null
             ? ` · EPS ${e.epsActual}${e.epsEstimate != null ? ` (est ${e.epsEstimate})` : ''}`
             : ''
-        icons.push({ kind: 'e', rawY: y, tip: `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`, atLast: bar.time === lastBarTime })
+        place('e', e.ts, `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`)
       }
       for (const n of mk.news) {
-        const bar = barAt(n.ts)
-        if (!bar) continue
-        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
-        const y = yOf(bar.close)
-        if (y == null) continue
-        icons.push({ kind: 'n', rawY: y, tip: `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`, atLast: bar.time === lastBarTime })
+        place('n', n.ts, `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`)
       }
 
-      // icons pinned to the last bar sit on the current-price label — lift them
-      // above it so the price tag stays readable
+      // stack colliding icons upward from the axis (18px rows)
+      icons.sort((a, b) => a.x - b.x)
+      const rowRight: number[] = []
+      const placed: AxisIcon[] = []
       for (const ic of icons) {
-        if (ic.atLast) ic.rawY -= 17
-      }
-
-      // resolve vertical collisions (min 16px gap), then clamp into the pane
-      icons.sort((a, b) => a.rawY - b.rawY)
-      for (let i = 1; i < icons.length; i++) {
-        if (icons[i].rawY - icons[i - 1].rawY < 16) icons[i].rawY = icons[i - 1].rawY + 16
+        let r = rowRight.findIndex((rx) => ic.x - halfW >= rx)
+        if (r === -1 && rowRight.length < maxRows) r = rowRight.length
+        if (r === -1) continue // no room left — drop the overflow icon
+        rowRight[r] = ic.x + halfW
+        ic.y = yBase - r * rowH
+        placed.push(ic)
       }
       const hoverIdx = hoverRef.current?.startsWith('axis:') ? parseInt(hoverRef.current.slice(5), 10) : -1
 
-      icons.forEach((ic, i) => {
-        const y = Math.min(yMax, Math.max(yMin, ic.rawY))
+      placed.forEach((ic, i) => {
         const highlighted = i === hoverIdx
         ctx.save()
         ctx.textAlign = 'center'
@@ -477,28 +480,28 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           ctx.strokeStyle = highlighted ? '#fde047' : '#f59e0b'
           ctx.lineWidth = highlighted ? 1.6 : 1
           ctx.beginPath()
-          ctx.roundRect(cx - bw / 2, y - bh / 2, bw, bh, 4)
+          ctx.roundRect(ic.x - bw / 2, ic.y - bh / 2, bw, bh, 4)
           ctx.fill()
           ctx.stroke()
           ctx.fillStyle = highlighted ? '#fde047' : '#fbbf24'
           ctx.font = `${highlighted ? '600 ' : ''}9px ui-monospace, monospace`
-          ctx.fillText('[E]', cx, y + 0.5)
+          ctx.fillText('[E]', ic.x, ic.y + 0.5)
         } else {
           ctx.fillStyle = 'rgba(24,24,27,0.92)'
           ctx.strokeStyle = highlighted ? '#f0abfc' : 'rgba(232,121,249,0.55)'
           ctx.lineWidth = highlighted ? 1.6 : 1
           ctx.beginPath()
-          ctx.arc(cx, y, 7.5, 0, Math.PI * 2)
+          ctx.arc(ic.x, ic.y, 7.5, 0, Math.PI * 2)
           ctx.fill()
           ctx.stroke()
           ctx.font = '10px sans-serif'
-          ctx.fillText('⚡', cx, y + 0.5)
+          ctx.fillText('⚡', ic.x, ic.y + 0.5)
         }
         ctx.restore()
-        axisIconsRef.current.push({ kind: ic.kind, x: w - psW - 5, y: y - 9, w: psW + 10, h: 18, tip: ic.tip })
+        axisIconsRef.current.push({ kind: ic.kind, x: ic.x - 15, y: ic.y - 9, w: 30, h: 18, tip: ic.tip })
       })
 
-      // tooltip for the hovered axis icon
+      // tooltip for the hovered axis icon (above the icon, clamped to the pane)
       if (hoverIdx >= 0 && hoverIdx < axisIconsRef.current.length) {
         const hit = axisIconsRef.current[hoverIdx]
         ctx.save()
@@ -517,8 +520,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (line) lines.push(line)
         const tw = Math.min(maxW, ...lines.map((l) => ctx.measureText(l).width)) + 14
         const th = lines.length * 14 + 9
-        const tx = w - psW - tw - 12
-        const ty = Math.min(yMax, Math.max(yMin, hit.y + hit.h / 2)) - th / 2
+        const tx = Math.min(Math.max(hit.x + hit.w / 2 - tw / 2, 6), w - psW - tw - 6)
+        const ty = Math.max(6, hit.y - th - 6)
         ctx.fillStyle = 'rgba(9,9,11,0.96)'
         ctx.strokeStyle = 'rgba(113,113,122,0.6)'
         ctx.lineWidth = 1
@@ -1089,12 +1092,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         return
       }
       const hit = hitTest(x, y)
-      // y-axis event icons ([E]/⚡) hover — hit rects come from the last overlay pass
+      // x-axis event icons ([E]/⚡) hover — hit rects come from the last overlay pass
       let axisIdx = -1
       if (!hit && chartRef.current) {
-        const cw = containerRef.current?.clientWidth ?? 0
-        const psW = chartRef.current.priceScale('right').width()
-        if (psW > 0 && x >= cw - psW - 8) {
+        const ch = containerRef.current?.clientHeight ?? 0
+        const tH = chartRef.current.timeScale().height()
+        if (ch > 0 && y >= ch - tH - 90) {
           axisIdx = axisIconsRef.current.findIndex((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
         }
       }

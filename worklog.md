@@ -365,3 +365,22 @@ Stage Summary:
 - Economic Calendar has importance chips + country multi-select with hidden-count feedback.
 - All crypto data (quotes, bars on every timeframe, heatmap, landing tickers) streams from Binance's FREE API with no login/keys required; Alpaca remains for stocks and as crypto fallback; console reports the live source.
 - Files: src/components/chart/ChartPanel.tsx (canvas fix + feed log), src/lib/binance.ts (new), src/lib/alpaca.ts, src/app/api/market/quote/route.ts, src/app/api/market/bars/route.ts, src/components/terminal/tabs/CalendarTab.tsx, src/components/terminal/tabs/HeatmapTab.tsx, src/components/terminal/tabs/FilterMultiSelect.tsx (new), src/store/terminal.ts.
+
+---
+Task ID: 24
+Agent: Z.ai Code (main)
+Task: Fix 2 reported issues — filter popovers render WHITE (hard to read) in Heatmap + Economic Calendar; news ⚡ / earnings [E] icons are on the wrong axis (were y-axis, must be x-axis)
+
+Work Log:
+- WHITE FILTER ROOT CAUSE: FilterMultiSelect's PopoverContent had no background override — shadcn tokens resolve to the LIGHT theme (app has no `.dark` class; `--popover: oklch(1 0 0)` = white). Every other terminal surface already hardcodes zinc classes, so this popover was the lone white element; it is SHARED by both the calendar Country filter and the Heatmap Sectors filter, matching the user's "happening in both" report exactly. Fixed with `border-zinc-800 bg-zinc-900 text-zinc-100 shadow-black/40` on PopoverContent (same pattern as WatchlistPanel/TabBar dropdowns).
+- X-AXIS ICONS: ChartPanel renderOverlay icon block rewritten. Icons were pinned to the right PRICE SCALE at the event bar's close price; now they sit ON THE TIME AXIS (bottom): x = xOf(event time) (exact bar snap for past events via barAt; upcoming earnings extrapolate into the right margin at their REAL future date via the continuous xOf, clamped left of the price scale), y rows stack UPWARD from yBase = h - timeAxisH - 11 in 18px rows; horizontal collision via per-row right-edge array (30px half-width spacing), overflow rows dropped beyond maxRows; off-canvas events culled by rawX bounds (replaces old visible-range gating).
+- Hover system updated: hit rects now 30x18 at each icon (axisIconsRef), pointermove gate switched from "over right price scale" to "bottom strip (y >= ch - timeAxisH - 90)"; tooltip now renders ABOVE the icon, horizontally centered and clamped to the pane; removed the old atLast/price-tag lift (no longer applicable).
+- E2E (agent-browser through :81... actually direct 127.0.0.1:3000; NOTE: sandbox reaps background processes between tool calls, so server restarted per call; chrome + login session persist): login trader+TOTP; AAPL 1D shows amber [E] pills on the time axis at Apr/Jul/Oct earnings + one [E] extrapolated into the future margin for the upcoming report, ⚡ news column stacking above the axis at the last bars; pixel-scanned the canvas for the amber pill, synthetic pointermove → hover highlight + tooltip "News · 13 Oct 2026 — In-Depth Analysis: Apple Versus Competitors…" renders above the icon (new bottom-strip hit zone verified).
+- Dark popover verified via getComputedStyle: background lab(8.3…) ≈ #18181b (zinc-900), text ≈ zinc-100; screenshots of both the calendar Country popover (10 currencies w/ counts) and Heatmap Sectors popover (10 sectors w/ counts, nested treemap behind) confirm dark panels.
+- Restored the tester tab state (BTC/USD 1W via symbol dialog after watchlist-row checks); lint 0 errors; no page errors; dev.log clean (0 5xx); kept scripts-tmp/gen-totp.mjs helper, removed temp e2e shell scripts.
+- Infra note (for future sessions): background dev servers die when the Bash tool call ends — run server + E2E steps in ONE call, or restart per call (login/cookies survive in the agent-browser chrome daemon).
+
+Stage Summary:
+- Filter popovers (calendar Country + Heatmap Sectors) are now dark zinc-900 with light text — matches the rest of the terminal.
+- Earnings [E] and news ⚡ icons live on the X-AXIS: bottom of the pane aligned with the event's bar, upcoming earnings in the right margin at their real date, 18px row stacking on collisions, hover tooltips intact.
+- Files: src/components/terminal/tabs/FilterMultiSelect.tsx, src/components/chart/ChartPanel.tsx (renderOverlay icon block + pointermove hover gate).

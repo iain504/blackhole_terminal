@@ -57,7 +57,7 @@ export function FilterMultiSelect({ label, options, selected, onChange, triggerC
           <ChevronsUpDown className="h-3 w-3 opacity-60" aria-hidden="true" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-56 p-2">
+      <PopoverContent align="start" className="w-56 border-zinc-800 bg-zinc-900 p-2 text-zinc-100 shadow-black/40">
         <div className="mb-1 flex items-center justify-between px-1">
           <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">{label}</span>
           <div className="flex gap-1">
