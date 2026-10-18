@@ -529,7 +529,18 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       const res = await fetch(`/api/drawings?symbol=${encodeURIComponent(symbol)}`)
       if (!res.ok) return
       const json = await res.json()
-      set((s) => ({ drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: (json.drawings as Drawing[]) || [] } }))
+      set((s) => {
+        const server = (json.drawings as Drawing[]) || []
+        // The response was computed before the request finished, so it can be
+        // stale: a drawing created WHILE the GET was in flight (optimistic
+        // `tmp-` entry, or the confirmed one after the POST resolved) would be
+        // silently wiped by a blind replace. Keep local-only entries — a
+        // locally deleted drawing is absent from this list already, so
+        // nothing deleted ever resurrects.
+        const serverIds = new Set(server.map((d) => d.id))
+        const localOnly = (s.drawingsBySymbol[symbol] || []).filter((d) => !serverIds.has(d.id))
+        return { drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: [...server, ...localOnly] } }
+      })
     } catch {
       /* offline */
     }

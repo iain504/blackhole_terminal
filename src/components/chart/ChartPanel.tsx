@@ -284,13 +284,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     return t1 > t0 ? t0 + f * (t1 - t0) : t0
   }, [tf])
 
+  // scheduleRedraw must invoke the LATEST renderOverlay: a rAF closure over
+  // renderOverlay directly would capture the FIRST render's copy (useCallback
+  // deps []), whose `symbol`/`showDrawings`/`activeColor` are frozen — after a
+  // symbol switch every redraw rendered the OLD symbol's drawings, so a newly
+  // drawn line never appeared until a full page reload. The ref always points
+  // at the current render's overlay renderer (assigned right after its
+  // definition below).
+  const renderOverlayRef = useRef<() => void>(() => {})
   const scheduleRedraw = useCallback(() => {
     if (rafRef.current) return
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0
-      renderOverlay()
+      renderOverlayRef.current()
     })
-     
   }, [])
 
   // ---------- overlay rendering ----------
@@ -573,6 +580,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
      
   }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt])
+  // keep the redraw scheduler pointed at the freshest overlay renderer
+  // (see the stale-closure note above scheduleRedraw)
+  renderOverlayRef.current = renderOverlay
 
   function pixelPoint(pt: DrawingPoint): { x: number; y: number } | null {
     const x = pt.time == null ? null : xOf(pt.time)
