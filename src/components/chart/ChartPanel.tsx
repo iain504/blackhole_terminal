@@ -26,7 +26,7 @@ import {
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { useSymbolPositions } from './usePositions'
-import { ExitInfo, normSym } from './trading-types'
+import { ExitInfo, PendingOrderInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
 
 const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
@@ -36,6 +36,7 @@ type Hit =
   | { type: 'alert'; id: string; part: 'whole' }
   | { type: 'exit'; id: string; part: 'sl' | 'tp'; origPrice: number; exit: ExitInfo }
   | { type: 'position'; id: string; part: 'whole'; origPrice: number }
+  | { type: 'pending'; id: string; part: 'whole' | 'tp' | 'sl'; pending: PendingOrderInfo; origPrice: number }
   | { type: 'chart'; part: 'whole' }
 
 /** Hits that exist on the canvas (everything except the synthetic chart-menu hit). */
@@ -339,10 +340,38 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       for (const d of ds) drawDrawing(ctx, d, w, h, false)
     }
 
-    // ---- position + SL/TP exit lines (trade assistance) ----
+    // ---- trade zones + position / pending-order lines (trade assistance) ----
+    // Zones (entry↔TP green / entry↔SL red, 50% translucent) paint FIRST so
+    // every line and chip renders on top of them.
     const posBundle = posRef.current
     const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
     const myExits = posBundle?.exits[normSym(symbol)]
+    const pendings = (posBundle?.pending || []).filter((p) => normSym(p.symbol) === normSym(symbol) && p.limitPrice != null)
+    const TP_ZONE = 'rgba(34,197,94,0.5)' // transparent green 50% (user spec)
+    const SL_ZONE = 'rgba(244,63,94,0.5)' // transparent red 50% (user spec)
+    const drawZone = (priceA: number, priceB: number, color: string) => {
+      const yA = yOf(priceA)
+      const yB = yOf(priceB)
+      if (yA == null || yB == null || Math.abs(yA - yB) < 1) return
+      ctx.save()
+      ctx.fillStyle = color
+      ctx.fillRect(0, Math.min(yA, yB), w, Math.abs(yB - yA))
+      ctx.restore()
+    }
+    // filled-position zones
+    if (myPos && myPos.avgEntry > 0) {
+      if (myExits?.tp?.limitPrice != null) drawZone(myPos.avgEntry, myExits.tp.limitPrice, TP_ZONE)
+      if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
+        drawZone(myPos.avgEntry, myExits.sl.stopPrice ?? myExits.sl.limitPrice!, SL_ZONE)
+      }
+    }
+    // pending-order zones (planned TP/SL from the bracket legs / ttb- plan)
+    for (const p of pendings) {
+      if (p.tpPrice != null) drawZone(p.limitPrice!, p.tpPrice, TP_ZONE)
+      if (p.slPrice != null) drawZone(p.limitPrice!, p.slPrice, SL_ZONE)
+    }
+
+    // position entry line
     if (myPos) {
       const yEntry = yOf(myPos.avgEntry)
       if (yEntry != null) {
@@ -356,6 +385,27 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.restore()
         drawChip(ctx, w - 150, yEntry, `POS ${myPos.side === 'long' ? '+' : '-'}${myPos.qty} @ ${fmtPrice(myPos.avgEntry)}`, '#a1a1aa', false)
       }
+    }
+    // pending entry line (dashed; right-click → cancel)
+    for (const p of pendings) {
+      const yEntry = yOf(p.limitPrice!)
+      if (yEntry == null) continue
+      ctx.save()
+      ctx.strokeStyle = p.side === 'buy' ? '#34d399' : '#fb7185'
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 4])
+      ctx.globalAlpha = 0.95
+      hlinePath(ctx, yEntry, w)
+      ctx.setLineDash([])
+      ctx.restore()
+      drawChip(
+        ctx,
+        w - 210,
+        yEntry,
+        `${p.side === 'buy' ? 'BUY' : 'SELL'} ${p.type.toUpperCase()} ${p.qty} @ ${fmtPrice(p.limitPrice!)}${p.managed ? ' · TP/SL' : ''}`,
+        p.side === 'buy' ? '#34d399' : '#fb7185',
+        hoverRef.current?.startsWith('pending') ?? false,
+      )
     }
     if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
@@ -384,6 +434,37 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.setLineDash([])
         ctx.restore()
         drawChip(ctx, w - 92, yTp, `TP ${fmtPrice(myExits.tp.limitPrice)}`, '#22c55e', hoverRef.current?.startsWith('exit') ?? false)
+      }
+    }
+    // pending TP/SL lines (green/red dashed per spec)
+    for (const p of pendings) {
+      if (p.tpPrice != null) {
+        const yTp = yOf(p.tpPrice)
+        if (yTp != null) {
+          ctx.save()
+          ctx.strokeStyle = '#22c55e'
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([7, 5])
+          ctx.globalAlpha = 0.95
+          hlinePath(ctx, yTp, w)
+          ctx.setLineDash([])
+          ctx.restore()
+          drawChip(ctx, w - 118, yTp, `TP ${fmtPrice(p.tpPrice)} (pend)`, '#22c55e', hoverRef.current?.startsWith('pending') ?? false)
+        }
+      }
+      if (p.slPrice != null) {
+        const ySl = yOf(p.slPrice)
+        if (ySl != null) {
+          ctx.save()
+          ctx.strokeStyle = '#f43f5e'
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([7, 5])
+          ctx.globalAlpha = 0.95
+          hlinePath(ctx, ySl, w)
+          ctx.setLineDash([])
+          ctx.restore()
+          drawChip(ctx, w - 118, ySl, `SL ${fmtPrice(p.slPrice)} (pend)`, '#f43f5e', hoverRef.current?.startsWith('pending') ?? false)
+        }
       }
     }
     // preview of the NEW sl/tp value while dragging (user asked explicitly)
@@ -763,10 +844,29 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const ds = st.drawingsBySymbol[symbol] || []
     const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
 
-    // trade lines take priority (position entry / SL / TP)
+    // trade lines take priority (pending orders / position entry / SL / TP)
     const posBundle = posRef.current
     const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
     const myExits = posBundle?.exits[normSym(symbol)]
+    const pendings = (posBundle?.pending || []).filter((pp) => normSym(pp.symbol) === normSym(symbol) && pp.limitPrice != null)
+    for (const p of pendings) {
+      const yE = yOf(p.limitPrice!)
+      if (yE != null && Math.abs(y - yE) < 7) {
+        return { type: 'pending', id: p.orderId, part: 'whole', pending: p, origPrice: p.limitPrice! }
+      }
+      if (p.tpPrice != null) {
+        const yT = yOf(p.tpPrice)
+        if (yT != null && Math.abs(y - yT) < 7) {
+          return { type: 'pending', id: p.orderId, part: 'tp', pending: p, origPrice: p.tpPrice }
+        }
+      }
+      if (p.slPrice != null) {
+        const yS = yOf(p.slPrice)
+        if (yS != null && Math.abs(y - yS) < 7) {
+          return { type: 'pending', id: p.orderId, part: 'sl', pending: p, origPrice: p.slPrice }
+        }
+      }
+    }
     if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
       if (myExits.sl.type !== 'trailing_stop') {
@@ -951,6 +1051,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     await fetch(`/api/trading/orders/${orderId}${q}`, { method: 'DELETE' }).catch(() => { /* offline */ })
     toast({ title: 'Exit order cancelled' })
     void posRefresh()
+  }, [posData.data?.mode, posRefresh, toast])
+
+  // cancel a pending (unfilled) ENTRY order from the chart context menu
+  const cancelPendingOrder = useCallback(async (orderId: string) => {
+    const q = posData.data?.mode ? `?mode=${posData.data.mode}` : ''
+    await fetch(`/api/trading/orders/${orderId}${q}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+    toast({ title: 'Pending order cancelled' })
+    void posRefresh()
+    window.dispatchEvent(new CustomEvent('tt:positions-changed'))
   }, [posData.data?.mode, posRefresh, toast])
 
   const closePositionBySymbol = useCallback(async (tradeSymbol: string) => {
@@ -1817,6 +1926,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         onDeleteAlert={deleteAlert}
         onPatchExit={(info, kind, price) => void patchExitPrice(info, kind, price)}
         onCancelExit={(orderId) => void cancelExitOrder(orderId)}
+        onCancelPending={(orderId) => void cancelPendingOrder(orderId)}
         onClosePosition={(tradeSymbol) => void closePositionBySymbol(tradeSymbol)}
       />}
 
@@ -1863,7 +1973,7 @@ function ContextMenu({
   menu, onClose, container, symbol, posData,
   onAddAlert, onAddHline, onTrade, onOpenTicket,
   onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
-  onPatchExit, onCancelExit, onClosePosition,
+  onPatchExit, onCancelExit, onCancelPending, onClosePosition,
 }: {
   menu: MenuState
   onClose: () => void
@@ -1881,6 +1991,7 @@ function ContextMenu({
   onDeleteAlert: (id: string) => Promise<void>
   onPatchExit: (info: ExitInfo, kind: 'sl' | 'tp', price: number) => void
   onCancelExit: (orderId: string) => void
+  onCancelPending: (orderId: string) => void
   onClosePosition: (tradeSymbol: string) => void
 }) {
   const symDrawing = menu.hit.type === 'drawing' ? menu.hit : null
@@ -1972,6 +2083,38 @@ function ContextMenu({
         />
         <div className="my-1 h-px bg-zinc-800" />
         <MenuItem label="🗑 Delete drawing" danger onClick={() => { void onDeleteDrawing(d.id); onClose() }} />
+      </div>
+    )
+  }
+
+  if (menu.hit.type === 'pending') {
+    const hit = menu.hit
+    const p = hit.pending
+    const sideLabel = p.side === 'buy' ? 'Buy' : 'Sell'
+    return (
+      <div
+        className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+        style={{ left, top }}
+        onPointerDown={(e) => e.stopPropagation()}
+        role="menu"
+      >
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          Pending {sideLabel} {p.type} · {fmtPrice(hit.origPrice)}
+          {hit.part !== 'whole' ? ` · ${hit.part.toUpperCase()} line` : ''}
+        </div>
+        <div className="px-3 pb-1 text-[10px] text-zinc-500">
+          {p.qty} {p.symbol}
+          {p.tpPrice != null ? ` · TP ${fmtPrice(p.tpPrice)}` : ''}
+          {p.slPrice != null ? ` · SL ${fmtPrice(p.slPrice)}` : ''}
+          {p.managed ? ' · OCO-managed' : ''}
+        </div>
+        <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
+        <div className="my-1 h-px bg-zinc-800" />
+        <MenuItem
+          label="🗑 Cancel pending order"
+          danger
+          onClick={() => { onCancelPending(p.orderId); onClose() }}
+        />
       </div>
     )
   }

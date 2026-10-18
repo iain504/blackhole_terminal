@@ -3,11 +3,17 @@
 //
 // Verified against the paper API (2026-10):
 // - Stocks support order_class=bracket (entry + take_profit/stop_loss legs).
-// - Crypto rejects ALL advanced order classes AND plain `stop` type; exits use
-//   stop_limit/limit orders and the balance is reserved per open sell order,
-//   so dual exits split the qty 50/50.
+// - Crypto rejects ALL advanced order classes (order_class=oco -> 40010001
+//   "invalid order type for crypto order"; bracket -> 42210000) AND plain
+//   `stop` type. Sell exits also CANNOT be reserved against a PENDING buy
+//   (40310000 "insufficient balance" — only settled position qty counts),
+//   so crypto complex orders are EMULATED: the entry carries its intended
+//   TP/SL in the client_order_id (`ttb-…`) and the OCO supervisor below
+//   attaches the exit legs (`tte-…`) the moment the entry FILLS, canceling
+//   any surviving leg once the position is gone.
 // - PATCH /v2/orders/{id} creates a REPLACEMENT order with a NEW id.
-// - Position symbols drop the crypto slash (BTC/USD -> BTCUSD).
+// - Position symbols drop the crypto slash (BTC/USD -> BTCUSD); ORDER
+//   symbols keep it (BTC/USD).
 import { db } from './db'
 import { getAlpacaKeys } from './alpaca'
 
@@ -140,6 +146,7 @@ export interface TradingOrder {
   replaced_by?: string | null
   legs: TradingOrder[] | null
   client_order_id?: string
+  asset_class?: string
 }
 
 // ---------- API wrappers ----------
@@ -181,8 +188,9 @@ export interface PlaceOrderBody {
 /**
  * Place an entry order with optional exits.
  * Stocks: single bracket request when TP/SL present (Alpaca attaches legs).
- * Crypto: advanced classes are rejected — entry is placed alone, exits are
- * separate stop_limit/limit orders; with both exits qty is split 50/50.
+ * Crypto: advanced classes are rejected — the entry is placed ALONE carrying
+ * the intended TP/SL in its client_order_id (`ttb-…`); the OCO supervisor
+ * (ensureCryptoOcoSupervisor) attaches the exit legs when the entry fills.
  */
 export async function placeOrderWithExits(
   userId: string,
@@ -216,6 +224,10 @@ export async function placeOrderWithExits(
       entry.order_class = 'bracket'
       if (hasTp) entry.take_profit = { limit_price: body.take_profit!.toFixed(2) }
       if (hasSl) entry.stop_loss = { stop_price: body.stop_loss!.toFixed(2) }
+      // encode the plan for the chart's pending display: Alpaca materializes
+      // bracket LEGS only when the entry activates, so a queued (weekend /
+      // pre-market) bracket would otherwise render without its TP/SL lines
+      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit : null, hasSl ? body.stop_loss : null)
     }
     const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
       method: 'POST',
@@ -226,7 +238,14 @@ export async function placeOrderWithExits(
     return { results, errors }
   }
 
-  // Crypto: entry alone (no advanced classes).
+  // ---- Crypto: complex orders are EMULATED (no native bracket/OCO) ----
+  const hasTp = typeof body.take_profit === 'number' && body.take_profit > 0
+  const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
+  if (hasTp || hasSl) {
+    // encode the planned exits so the chart can render them while the entry
+    // is pending AND the supervisor can attach the legs without extra state
+    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit : null, hasSl ? body.stop_loss : null)
+  }
   const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
     method: 'POST',
     body: JSON.stringify(entry),
@@ -236,56 +255,194 @@ export async function placeOrderWithExits(
     errors.push(r.error || 'Entry order failed')
     return { results, errors }
   }
-
-  // Exits: separate orders; qty split when both requested (balance reserved
-  // per open sell order — full qty twice is rejected by Alpaca). Crypto buys
-  // receive qty minus a trading fee, so exits apply a 0.99 safety factor to
-  // avoid 403 "insufficient balance" on the second exit.
-  const hasTp = typeof body.take_profit === 'number' && body.take_profit > 0
-  const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
   if (!hasTp && !hasSl) return { results, errors }
 
-  const halfRaw = hasTp && hasSl ? body.qty / 2 : body.qty
-  const exitQty = (halfRaw * 0.99).toFixed(8).replace(/0+$/, '').replace(/\.$/, '')
-  const exitSide = body.side === 'buy' ? 'sell' : 'buy'
-  if (hasTp) {
-    const tp = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
-      method: 'POST',
-      body: JSON.stringify({
-        symbol: tradeSymbol(body.symbol),
-        qty: exitQty,
-        side: exitSide,
-        type: 'limit',
-        time_in_force: 'gtc',
-        limit_price: body.take_profit!.toFixed(body.take_profit! < 1 ? 6 : 2),
-      }),
-    })
-    if (tp.data && (tp.data as TradingOrder).id) results.push(tp.data)
-    else errors.push(`TP: ${tp.error || 'failed'}`)
-  }
-  if (hasSl) {
-    const stopP = body.stop_loss!
-    // stop-limit sell: limit slightly below the stop so it clears the book
-    const limP = exitSide === 'sell' ? stopP * 0.999 : stopP * 1.001
-    const sl = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
-      method: 'POST',
-      body: JSON.stringify({
-        symbol: tradeSymbol(body.symbol),
-        qty: exitQty,
-        side: exitSide,
-        type: 'stop_limit',
-        time_in_force: 'gtc',
-        stop_price: stopP.toFixed(stopP < 1 ? 6 : 2),
-        limit_price: limP.toFixed(limP < 1 ? 6 : 2),
-      }),
-    })
-    if (sl.data && (sl.data as TradingOrder).id) results.push(sl.data)
-    else errors.push(`SL: ${sl.error || 'failed'}`)
+  // Fast path: a MARKET entry usually fills instantly — poll briefly and
+  // attach the exits in-line so protection starts immediately. Limit entries
+  // return right away (the supervisor attaches on fill within ~6s).
+  if (type === 'market') {
+    let cur: TradingOrder | null = r.data
+    for (let i = 0; i < 4 && cur && cur.status !== 'filled'; i++) {
+      await new Promise((res) => setTimeout(res, 600))
+      const s = await tradeFetch<TradingOrder>(userId, mode, `/v2/orders/${(r.data as TradingOrder).id}`)
+      cur = s.data ?? cur
+      if (cur && ['canceled', 'cancelled', 'rejected', 'expired'].includes(cur.status)) break
+    }
+    if (cur?.status === 'filled') {
+      const legErrs = await placeCryptoExitLegs(
+        userId,
+        mode,
+        cur,
+        hasTp ? body.take_profit : undefined,
+        hasSl ? body.stop_loss : undefined,
+      )
+      errors.push(...legErrs)
+      return { results, errors }
+    }
   }
   return {
     results,
     errors,
-    splitNote: hasTp && hasSl ? 'Crypto exits split 50/50 (Alpaca crypto has no bracket orders)' : undefined,
+    splitNote: 'TP/SL attach automatically when the entry fills (OCO-managed)',
+  }
+}
+
+// ---------- crypto complex-order emulation (OCO supervisor) ----------
+
+/** Price -> client_order_id-safe digits (6dp fixed point). */
+function encP(v: number): string {
+  return String(Math.round(v * 1e6))
+}
+
+/** client_order_id prefix identifying a MANAGED crypto exit leg. */
+function exitLegClientId(entryOrderId: string, kind: 'tp' | 'sl'): string {
+  return `tte-${entryOrderId}-${kind}`
+}
+
+/** Encode the OCO/bracket plan (mode + TP/SL prices) into the entry's client_order_id. */
+function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null): string {
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `ttb-${mode[0]}-tp${tp != null && tp > 0 ? encP(tp) : '0'}-sl${sl != null && sl > 0 ? encP(sl) : '0'}-${rand}`
+}
+
+/** Decode the plan from a `ttb-…` client_order_id. Returns null when not ours. */
+function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null } | null {
+  const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(clientOrderId || '')
+  if (!m) return null
+  const dec = (s: string | undefined) => (s ? parseInt(s, 10) / 1e6 : 0)
+  const tp = dec(m[1])
+  const sl = dec(m[2])
+  return { tp: tp > 0 ? tp : null, sl: sl > 0 ? sl : null }
+}
+
+/**
+ * Place the exit legs for a FILLED crypto entry (50/50 qty split when both
+ * legs are requested — Alpaca reserves balance per open sell order). Leg ids
+ * are deterministic (`tte-<entryId>-tp|-sl`) so the supervisor is idempotent.
+ * Crypto buys receive qty minus a trading fee, so legs apply a 0.99 safety
+ * factor to avoid 403 "insufficient balance".
+ */
+async function placeCryptoExitLegs(
+  userId: string,
+  mode: TradeMode,
+  entry: TradingOrder,
+  tp?: number,
+  sl?: number,
+): Promise<string[]> {
+  const errors: string[] = []
+  const filledQty = parseFloat(entry.filled_qty) || parseFloat(entry.qty) || 0
+  if (!(filledQty > 0)) return ['entry has no filled qty']
+  const exitSide = entry.side === 'buy' ? 'sell' : 'buy'
+  const both = tp != null && sl != null
+  const legQty = ((both ? filledQty / 2 : filledQty) * 0.99).toFixed(8).replace(/0+$/, '').replace(/\.$/, '')
+  if (tp != null) {
+    const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+      method: 'POST',
+      body: JSON.stringify({
+        symbol: entry.symbol,
+        qty: legQty,
+        side: exitSide,
+        type: 'limit',
+        time_in_force: 'gtc',
+        limit_price: tp.toFixed(tp < 1 ? 6 : 2),
+        client_order_id: exitLegClientId(entry.id, 'tp'),
+      }),
+    })
+    if (!(r.data && (r.data as TradingOrder).id)) errors.push(`TP: ${r.error || 'failed'}`)
+  }
+  if (sl != null) {
+    // stop-limit sell: limit slightly below the stop so it clears the book
+    const limP = exitSide === 'sell' ? sl * 0.999 : sl * 1.001
+    const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+      method: 'POST',
+      body: JSON.stringify({
+        symbol: entry.symbol,
+        qty: legQty,
+        side: exitSide,
+        type: 'stop_limit',
+        time_in_force: 'gtc',
+        stop_price: sl.toFixed(sl < 1 ? 6 : 2),
+        limit_price: limP.toFixed(limP < 1 ? 6 : 2),
+        client_order_id: exitLegClientId(entry.id, 'sl'),
+      }),
+    })
+    if (!(r.data && (r.data as TradingOrder).id)) errors.push(`SL: ${r.error || 'failed'}`)
+  }
+  return errors
+}
+
+const OCO_CYCLE_MS = 6000
+const OCO_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+
+/** Supervised (user,mode) pairs — survives dev hot reloads via globalThis. */
+function supervisedSet(): Set<string> {
+  const g = globalThis as { __ttOcoSupervised?: Set<string> }
+  if (!g.__ttOcoSupervised) g.__ttOcoSupervised = new Set<string>()
+  return g.__ttOcoSupervised
+}
+
+/**
+ * Start the OCO supervisor for a (user, mode) pair (idempotent). One cycle
+ * every 6s: (a) cancel managed exit legs whose position is gone (OCO
+ * semantics — when the position closes, the surviving leg dies),
+ * (b) attach exit legs to managed entries that have FILLED.
+ */
+export function ensureCryptoOcoSupervisor(userId: string, mode: TradeMode): void {
+  const key = `${userId}|${mode}`
+  if (supervisedSet().has(key)) return
+  supervisedSet().add(key)
+  const timer = setInterval(() => {
+    void runOcoCycle(userId, mode)
+  }, OCO_CYCLE_MS)
+  // never keep the process alive just for the supervisor
+  if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+    ;(timer as { unref: () => void }).unref()
+  }
+}
+
+async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
+  try {
+    const [ordRes, posRes] = await Promise.all([
+      tradeFetch<TradingOrder[]>(userId, mode, '/v2/orders?status=all&limit=500&direction=desc'),
+      tradeFetch<TradingPosition[]>(userId, mode, '/v2/positions'),
+    ])
+    const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
+    const positions: TradingPosition[] = Array.isArray(posRes.data) ? posRes.data : []
+    const norm = (s: string) => s.replace('/', '').toUpperCase()
+    const posSet = new Set(positions.map((p) => norm(p.symbol)))
+    const knownCoids = new Set(orders.map((o) => o.client_order_id || ''))
+    const isCrypto = (o: TradingOrder) => o.asset_class === 'crypto' || o.symbol.includes('/')
+
+    // (a) OCO cleanup: a managed exit leg dies with its position
+    for (const o of orders) {
+      if (!isCrypto(o) || !OCO_OPEN_STATUSES.includes(o.status)) continue
+      if (!(o.client_order_id || '').startsWith('tte-')) continue
+      if (!posSet.has(norm(o.symbol))) {
+        const r = await cancelOrder(userId, mode, o.id)
+        console.log(`[oco] canceled orphaned exit ${o.client_order_id} (${o.symbol}) -> ${r.status}`)
+      }
+    }
+
+    // (b) attach exit legs to managed entries that have FILLED
+    for (const o of orders) {
+      if (!isCrypto(o) || o.status !== 'filled') continue
+      const plan = parseCryptoPlan(o.client_order_id)
+      if (!plan || (plan.tp == null && plan.sl == null)) continue
+      const wantTp = plan.tp != null && !knownCoids.has(exitLegClientId(o.id, 'tp'))
+      const wantSl = plan.sl != null && !knownCoids.has(exitLegClientId(o.id, 'sl'))
+      if (!wantTp && !wantSl) continue
+      const errs = await placeCryptoExitLegs(
+        userId,
+        mode,
+        o,
+        wantTp ? plan.tp! : undefined,
+        wantSl ? plan.sl! : undefined,
+      )
+      if (errs.length) console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, errs.join('; '))
+      else console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
+    }
+  } catch (e) {
+    console.warn('[oco] supervisor cycle failed:', e instanceof Error ? e.message : e)
   }
 }
 
@@ -524,6 +681,39 @@ export async function replaceExitOrderSmart(
     }
   }
   return { data: r2.data, status: r2.status, mode, method: 'cancel-replace', note }
+}
+
+/**
+ * Market-close a position. Crypto balances are reserved per open exit order,
+ * so lingering SL/TP legs would starve the liquidation (Alpaca sells only
+ * qty_available) — cancel the symbol's opposite-side (exit) orders FIRST,
+ * then close. Returns the close order and how many exits were cancelled.
+ */
+export async function closePositionFull(
+  userId: string,
+  mode: TradeMode,
+  symbol: string,
+): Promise<{ close: TradeFetchResult<TradingOrder>; canceledExits: number }> {
+  const tSym = tradeSymbol(symbol)
+  const norm = (s: string) => s.replace('/', '').toUpperCase()
+  // snapshot the position side BEFORE closing (long -> sell exits, short -> buy)
+  const posRes = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tSym)}`)
+  const posSide = posRes.data?.side
+  let canceledExits = 0
+  // fetch ALL open orders and filter here — Alpaca's `symbols=` query wants
+  // the slash form for crypto (BTC/USD) while callers pass either form
+  const openRes = await getOpenOrders(userId, mode)
+  const orders: TradingOrder[] = (Array.isArray(openRes.data) ? openRes.data : [])
+    .filter((o) => norm(o.symbol) === norm(tSym))
+  const exitSide = posSide === 'long' ? 'sell' : posSide === 'short' ? 'buy' : null
+  for (const o of orders) {
+    if (exitSide && o.side !== exitSide) continue // keep same-side (entry) orders
+    if (exitSide == null && o.type === 'market') continue // no position info: keep entries
+    const c = await cancelOrder(userId, mode, o.id)
+    if (c.status === 204 || c.status === 200) canceledExits += 1
+  }
+  const close = await closePosition(userId, mode, symbol)
+  return { close, canceledExits }
 }
 
 export async function cancelOrder(userId: string, mode: TradeMode, orderId: string) {

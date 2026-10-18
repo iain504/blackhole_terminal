@@ -393,7 +393,9 @@ export function TradeTicket({
 
       {isCrypto && (slPrice || tpPrice) && (
         <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
-          Crypto: SL/TP placed as separate exit orders, qty split 50/50 (no bracket support).
+          Crypto has no native bracket orders — the entry is placed alone and
+          TP/SL attach automatically the moment it fills (OCO-managed: when the
+          position closes, any surviving exit is cancelled).
         </p>
       )}
 

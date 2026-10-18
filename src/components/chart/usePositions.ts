@@ -18,6 +18,7 @@ export function useSymbolPositions(symbol: string) {
           mode: json.mode ?? 'paper',
           positions: json.positions || [],
           exits: json.exits || {},
+          pending: json.pending || [],
         })
       } else {
         setData(null)

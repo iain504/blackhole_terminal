@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { placeOrderWithExits, placeTrailingStop, resolveTradeMode, TradeMode } from '@/lib/trading'
+import { placeOrderWithExits, placeTrailingStop, resolveTradeMode, ensureCryptoOcoSupervisor, TradeMode } from '@/lib/trading'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface PlaceBody {
@@ -29,6 +29,8 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'symbol and side (buy/sell) required' }, { status: 400 })
     }
     const mode: TradeMode = await resolveTradeMode(user.id, body.mode)
+    // keep the crypto complex-order emulation running (OCO attach + cleanup)
+    ensureCryptoOcoSupervisor(user.id, mode)
     const qty = typeof body.qty === 'number' && body.qty > 0 ? body.qty : 0
     if (!qty && !(typeof body.notional === 'number' && body.notional > 0)) {
       return NextResponse.json({ error: 'qty (or notional) required' }, { status: 400 })
