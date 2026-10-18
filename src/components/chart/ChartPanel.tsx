@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
-  IChartApi, ISeriesApi, MouseEventParams,
+  IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
 import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS, Tab } from '@/store/terminal'
 import { useShallow } from 'zustand/react/shallow'
@@ -16,22 +16,43 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
+  Briefcase,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
+import { TradeTicket } from './TradeTicket'
+import { useSymbolPositions } from './usePositions'
+import { ExitInfo, normSym } from './trading-types'
 
 const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 
 type Hit =
   | { type: 'drawing'; id: string; part: 'whole' | 'point'; index?: number }
   | { type: 'alert'; id: string; part: 'whole' }
+  | { type: 'exit'; id: string; part: 'sl' | 'tp'; origPrice: number; exit: ExitInfo }
+  | { type: 'position'; id: string; part: 'whole'; origPrice: number }
+  | { type: 'chart'; part: 'whole' }
+
+/** Hits that exist on the canvas (everything except the synthetic chart-menu hit). */
+type SceneHit = Exclude<Hit, { type: 'chart' }>
 
 interface MenuState {
   x: number
   y: number
   hit: Hit
+  price?: number | null
+}
+
+interface DragState {
+  hit: SceneHit
+  x0: number
+  y0: number
+  orig: { time: number | null; price: number }[]
+  origPixels: ({ x: number; y: number } | null)[]
+  moved: boolean
 }
 
 const KIND_LABEL: Record<DrawingKind, string> = {
@@ -67,14 +88,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
-  const dragRef = useRef<{
-    hit: Hit
-    x0: number
-    y0: number
-    orig: { time: number | null; price: number }[]
-    origPixels: ({ x: number; y: number } | null)[]
-    moved: boolean
-  } | null>(null)
+  const dragRef = useRef<DragState | null>(null)
   const draftRef = useRef<{ kind: DrawingKind; p1: DrawingPoint; p2: DrawingPoint } | null>(null)
   const rafRef = useRef(0)
 
@@ -89,8 +103,20 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   const [showDrawings, setShowDrawings] = useState(true)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
-  const [editValue, setEditValue] = useState<{ type: 'drawing' | 'alert'; id: string; price: number } | null>(null)
+  const [editValue, setEditValue] = useState<{
+    type: 'drawing' | 'alert' | 'exit'; id: string; price: number; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }
+  } | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [tradeOpen, setTradeOpen] = useState(false)
+  const [ticketPrefill, setTicketPrefill] = useState<{ side?: 'buy' | 'sell'; price?: number } | null>(null)
+  const { toast } = useToast()
+
+  // trading positions + SL/TP exits for this symbol (polls every 15s)
+  const posData = useSymbolPositions(symbol)
+  const posRefresh = posData.refresh
+  const posRef = useRef(posData.data)
+  posRef.current = posData.data
+  const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
 
   const drawings = useTerminal(useShallow((s) => s.drawingsBySymbol[symbol] ?? EMPTY_DRAWINGS))
   const symbolAlerts = useTerminal(useShallow((s) => s.alerts.filter((a) => a.symbol === symbol)))
@@ -180,6 +206,70 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       for (const a of als) drawAlert(ctx, a, w)
     } else if (showDrawings) {
       for (const d of ds) drawDrawing(ctx, d, w, h, false)
+    }
+
+    // ---- position + SL/TP exit lines (trade assistance) ----
+    const posBundle = posRef.current
+    const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
+    const myExits = posBundle?.exits[normSym(symbol)]
+    if (myPos) {
+      const yEntry = yOf(myPos.avgEntry)
+      if (yEntry != null) {
+        ctx.save()
+        ctx.strokeStyle = '#e4e4e7'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([10, 4])
+        ctx.globalAlpha = 0.85
+        hlinePath(ctx, yEntry, w)
+        ctx.setLineDash([])
+        ctx.restore()
+        drawChip(ctx, w - 150, yEntry, `POS ${myPos.side === 'long' ? '+' : '-'}${myPos.qty} @ ${fmtPrice(myPos.avgEntry)}`, '#a1a1aa', false)
+      }
+    }
+    if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
+      const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
+      const ySl = yOf(slPrice)
+      if (ySl != null) {
+        ctx.save()
+        ctx.strokeStyle = '#f43f5e'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([7, 5])
+        ctx.globalAlpha = 0.95
+        hlinePath(ctx, ySl, w)
+        ctx.setLineDash([])
+        ctx.restore()
+        drawChip(ctx, w - 92, ySl, `SL ${fmtPrice(slPrice)}`, '#f43f5e', hoverRef.current?.startsWith('exit') ?? false)
+      }
+    }
+    if (myExits?.tp && myExits.tp.limitPrice != null) {
+      const yTp = yOf(myExits.tp.limitPrice)
+      if (yTp != null) {
+        ctx.save()
+        ctx.strokeStyle = '#22c55e'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([7, 5])
+        ctx.globalAlpha = 0.95
+        hlinePath(ctx, yTp, w)
+        ctx.setLineDash([])
+        ctx.restore()
+        drawChip(ctx, w - 92, yTp, `TP ${fmtPrice(myExits.tp.limitPrice)}`, '#22c55e', hoverRef.current?.startsWith('exit') ?? false)
+      }
+    }
+    // preview of the NEW sl/tp value while dragging (user asked explicitly)
+    const exDrag = exitDragRef.current
+    if (exDrag && exDrag.price != null) {
+      const yD = yOf(exDrag.price)
+      if (yD != null) {
+        ctx.save()
+        ctx.strokeStyle = exDrag.kind === 'sl' ? '#fb7185' : '#4ade80'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([3, 4])
+        ctx.globalAlpha = 1
+        hlinePath(ctx, yD, w)
+        ctx.setLineDash([])
+        ctx.restore()
+        drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+      }
     }
 
     // draft preview
@@ -348,7 +438,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
   // redraw when relevant state changes
   useEffect(() => {
     scheduleRedraw()
-  }, [drawings, symbolAlerts, showDrawings, drawingTool, activeColor, scheduleRedraw])
+  }, [drawings, symbolAlerts, showDrawings, drawingTool, activeColor, posData.data, scheduleRedraw])
 
   // ---------- hit testing ----------
   const distToSeg = (px: number, py: number, a: { x: number; y: number }, b: { x: number; y: number }) => {
@@ -361,10 +451,36 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy))
   }
 
-  const hitTest = useCallback((x: number, y: number): Hit | null => {
+  const hitTest = useCallback((x: number, y: number): SceneHit | null => {
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
     const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+
+    // trade lines take priority (position entry / SL / TP)
+    const posBundle = posRef.current
+    const myPos = posBundle?.positions.find((p) => normSym(p.symbol) === normSym(symbol))
+    const myExits = posBundle?.exits[normSym(symbol)]
+    if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
+      const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
+      if (myExits.sl.type !== 'trailing_stop') {
+        const yl = yOf(slPrice)
+        if (yl != null && Math.abs(y - yl) < 7) {
+          return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
+        }
+      }
+    }
+    if (myExits?.tp && myExits.tp.limitPrice != null) {
+      const yl = yOf(myExits.tp.limitPrice)
+      if (yl != null && Math.abs(y - yl) < 7) {
+        return { type: 'exit', id: myExits.tp.orderId, part: 'tp', origPrice: myExits.tp.limitPrice, exit: myExits.tp }
+      }
+    }
+    if (myPos && myPos.avgEntry > 0) {
+      const yl = yOf(myPos.avgEntry)
+      if (yl != null && Math.abs(y - yl) < 6) {
+        return { type: 'position', id: myPos.tradeSymbol, part: 'whole', origPrice: myPos.avgEntry }
+      }
+    }
 
     if (showDrawings) {
       for (let i = ds.length - 1; i >= 0; i--) {
@@ -477,6 +593,63 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     } catch { /* offline */ }
   }, [symbol, quote, addAlertLocal])
 
+  // ---------- trade assistance actions ----------
+  const patchExitPrice = useCallback(async (
+    info: ExitInfo, kind: 'sl' | 'tp', price: number,
+  ) => {
+    const body: Record<string, unknown> = {}
+    if (kind === 'tp') {
+      body.limit_price = price
+    } else {
+      body.stop_price = price
+      if (info.type === 'stop_limit' && info.stopPrice != null && info.limitPrice != null) {
+        // preserve the stop→limit offset of the original stop-limit order
+        const off = info.stopPrice - info.limitPrice
+        body.limit_price = Math.max(1e-9, price - off)
+      }
+    }
+    try {
+      const res = await fetch(`/api/trading/orders/${info.orderId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({ title: `${kind.toUpperCase()} updated to ${fmtPrice(price)}` })
+      } else {
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Update failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      void posRefresh()
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+    }
+  }, [posRefresh, toast])
+
+  const cancelExitOrder = useCallback(async (orderId: string) => {
+    await fetch(`/api/trading/orders/${orderId}`, { method: 'DELETE' }).catch(() => { /* offline */ })
+    toast({ title: 'Exit order cancelled' })
+    void posRefresh()
+  }, [posRefresh, toast])
+
+  const closePositionBySymbol = useCallback(async (tradeSymbol: string) => {
+    try {
+      const res = await fetch(`/api/trading/positions/${encodeURIComponent(tradeSymbol)}`, { method: 'DELETE' })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({ title: `Closing ${tradeSymbol}`, description: 'Market close submitted' })
+      } else {
+        toast({ title: 'Close failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Close failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      void posRefresh()
+    }
+  }, [posRefresh, toast])
+
   // ---------- pointer interaction ----------
   useEffect(() => {
     const el = containerRef.current
@@ -515,7 +688,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       }
 
       const hit = hitTest(x, y)
-      if (hit) {
+      if (hit && (hit.type === 'drawing' || hit.type === 'alert' || hit.type === 'exit')) {
         e.stopPropagation()
         e.preventDefault()
         setMenu(null)
@@ -527,11 +700,16 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           if (!d) return
           orig = d.points.map((p) => ({ ...p }))
           origPixels = orig.map((p) => pixelPoint(p))
-        } else {
+        } else if (hit.type === 'alert') {
           const a = st.alerts.find((aa) => aa.id === hit.id)
           if (!a) return
           orig = [{ time: null, price: a.price }]
           origPixels = [{ x: 0, y: yOf(a.price) ?? y }]
+        } else {
+          // exit line drag (SL/TP) — preview handled in onMove via exitDragRef
+          orig = [{ time: null, price: hit.origPrice }]
+          origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
+          exitDragRef.current = { kind: hit.part, price: hit.origPrice }
         }
         dragRef.current = { hit, x0: x, y0: y, orig, origPixels, moved: false }
 
@@ -543,6 +721,15 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           const dy = cy - drag.y0
           if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true
           const store = useTerminal.getState()
+          if (drag.hit.type === 'exit') {
+            const oy = drag.origPixels[0]?.y
+            if (oy != null) {
+              const np = priceAt(oy + dy)
+              exitDragRef.current = { kind: drag.hit.part, price: np }
+              scheduleRedraw()
+            }
+            return
+          }
           if (drag.hit.type === 'alert') {
             const oy = drag.origPixels[0]?.y
             if (oy != null) {
@@ -581,6 +768,15 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           const drag = dragRef.current
           dragRef.current = null
           el.style.cursor = ''
+          if (drag?.hit.type === 'exit') {
+            const d = exitDragRef.current
+            exitDragRef.current = null
+            scheduleRedraw()
+            if (drag.moved && d?.price != null) {
+              void patchExitPrice(drag.hit.exit, drag.hit.part, d.price)
+            }
+            return
+          }
           if (!drag || !drag.moved) {
             scheduleRedraw()
             return
@@ -589,7 +785,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           if (drag.hit.type === 'alert') {
             const a = store.alerts.find((aa) => aa.id === drag.hit.id)
             if (a) void patchAlert(a.id, { price: a.price })
-          } else {
+          } else if (drag.hit.type === 'drawing') {
             const d = (store.drawingsBySymbol[symbol] || []).find((dd) => dd.id === drag.hit.id)
             if (d) void patchDrawing(d.id, { points: d.points })
           }
@@ -633,17 +829,19 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     const onContextMenu = (e: MouseEvent) => {
       const { x, y } = rel(e)
       const hit = hitTest(x, y)
-      if (!hit) {
-        setMenu(null)
-        return // browser default menu
-      }
       e.preventDefault()
       e.stopPropagation()
-      setMenu({ x, y, hit })
+      if (hit) {
+        setMenu({ x, y, hit })
+        return
+      }
+      // empty chart: custom menu with price-aware actions (alert / trade / hline)
+      const price = priceAt(y)
+      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price })
     }
 
     const onDoubleClick = (e: MouseEvent) => {
-      // double-click empty space near an hline edits its value quickly
+      // double-click near a line edits its value quickly
       const { x, y } = rel(e)
       const hit = hitTest(x, y)
       if (!hit) return
@@ -651,7 +849,9 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       if (hit.type === 'alert') {
         const a = st.alerts.find((aa) => aa.id === hit.id)
         if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
-      } else {
+      } else if (hit.type === 'exit') {
+        setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+      } else if (hit.type === 'drawing') {
         const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
         if (d && d.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
       }
@@ -682,7 +882,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       el.removeEventListener('dblclick', onDoubleClick)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [hitTest, createDrawing, patchDrawing, patchAlert, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
+  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
 
   // ---------- chart lifecycle ----------
   useEffect(() => {
@@ -712,15 +912,37 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     })
     chartRef.current = chart
 
+    const seriesOptions = {
+      // keep position/SL/TP lines inside the visible price range
+      autoscaleInfoProvider: (base: () => { priceRange?: { minValue: number; maxValue: number }; margins?: unknown } | null) => {
+        const res = base()
+        const bundle = posRef.current
+        const ex = bundle?.exits[normSym(symbol)]
+        const vals: number[] = []
+        const p = bundle?.positions.find((pp) => normSym(pp.symbol) === normSym(symbol))
+        if (p && p.avgEntry > 0) vals.push(p.avgEntry)
+        if (ex?.sl && ex.sl.stopPrice != null) vals.push(ex.sl.stopPrice)
+        if (ex?.tp && ex.tp.limitPrice != null) vals.push(ex.tp.limitPrice)
+        if (vals.length === 0) return res
+        let min = res?.priceRange?.minValue ?? Math.min(...vals)
+        let max = res?.priceRange?.maxValue ?? Math.max(...vals)
+        for (const v of vals) {
+          min = Math.min(min, v)
+          max = Math.max(max, v)
+        }
+        return { priceRange: { minValue: min, maxValue: max } }
+      },
+    }
     let series: ISeriesApi<'Candlestick'> | ISeriesApi<'Line'>
     if (chartType === 'candles') {
       series = chart.addCandlestickSeries({
         upColor: '#22c55e', downColor: '#ef4444',
         borderUpColor: '#22c55e', borderDownColor: '#ef4444',
         wickUpColor: '#22c55e', wickDownColor: '#ef4444',
+        ...seriesOptions,
       })
     } else {
-      series = chart.addLineSeries({ color: '#22c55e', lineWidth: 2 })
+      series = chart.addLineSeries({ color: '#22c55e', lineWidth: 2, ...seriesOptions })
     }
     seriesRef.current = series
 
@@ -835,7 +1057,9 @@ export function ChartPanel({ tab }: { tab: Tab }) {
     void loadDrawings(symbol)
   }, [symbol, loadDrawings])
 
-  // quote polling (10s)
+  // quote polling (10s) — also feeds the live price into the last bar so the
+  // chart tracks the market between bar closes and re-autoscales (which keeps
+  // position/SL/TP lines in view)
   useEffect(() => {
     let alive = true
     const fetchQ = async () => {
@@ -848,7 +1072,25 @@ export function ChartPanel({ tab }: { tab: Tab }) {
         if (!res.ok || !alive) return
         const json = await res.json()
         const q = json.quotes?.[0]
-        if (q && alive) setQuote({ price: q.price, changePct: q.changePct, change: q.change })
+        if (q && alive) {
+          setQuote({ price: q.price, changePct: q.changePct, change: q.change })
+          const bars = barsRef.current
+          const s = seriesRef.current
+          if (bars.length > 0 && s && json.meta?.demo !== true) {
+            const lastB = bars[bars.length - 1]
+            const close = q.price as number
+            const high = Math.max(lastB.high, close)
+            const low = Math.min(lastB.low, close)
+            const bar = (
+              chartType === 'candles'
+                ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close }
+                : { time: lastB.time as UTCTimestamp, value: close }
+            ) as CandlestickData<Time> | LineData<Time>
+            s.update(bar)
+            barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
+            scheduleRedraw()
+          }
+        }
       } catch { /* offline */ }
     }
     fetchQ()
@@ -857,7 +1099,7 @@ export function ChartPanel({ tab }: { tab: Tab }) {
       alive = false
       clearInterval(timer)
     }
-  }, [symbol])
+  }, [symbol, chartType, scheduleRedraw])
 
   const up = (quote?.changePct ?? 0) >= 0
   const last = legend
@@ -919,21 +1161,23 @@ export function ChartPanel({ tab }: { tab: Tab }) {
               title={
                 !demoReason || demoReason === 'no-keys'
                   ? 'Demo data — add your Alpaca API keys in Settings → Test keys'
-                  : demoReason.startsWith('alpaca-http-40')
+                  : demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
                     ? 'Alpaca rejected the saved keys — check them in Settings'
                     : `Alpaca request failed (${demoReason}) — will retry`
               }
               className={
-                demoReason && demoReason.startsWith('alpaca-http-40')
+                demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
                   ? 'border-rose-500/40 text-[10px] text-rose-400'
                   : 'border-amber-500/40 text-[10px] text-amber-400'
               }
             >
               {!demoReason || demoReason === 'no-keys'
                 ? 'demo'
-                : demoReason.startsWith('alpaca-http-40')
+                : demoReason === 'alpaca-http-401' || demoReason === 'alpaca-http-403'
                   ? 'keys rejected'
-                  : 'data error'}
+                  : demoReason === 'alpaca-http-429'
+                    ? 'rate limited'
+                    : 'data error'}
             </Badge>
           )}
           {quote && (
@@ -949,6 +1193,22 @@ export function ChartPanel({ tab }: { tab: Tab }) {
 
       {/* drawing toolbar — semi-transparent so values behind stay visible (Task 14 #4) */}
       <div className="absolute left-2 top-12 z-30 flex flex-col gap-0.5 rounded-lg border border-zinc-800/80 bg-zinc-900/60 p-1 opacity-40 backdrop-blur-sm transition-opacity hover:opacity-100 focus-within:opacity-100">
+        <button
+          title="Trade ticket — buy/sell with SL/TP/trailing (paper or live)"
+          aria-label="Open trade ticket"
+          aria-pressed={tradeOpen}
+          onClick={() => {
+            setTicketPrefill(null)
+            setTradeOpen((v) => !v)
+          }}
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            tradeOpen ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',
+          )}
+        >
+          <Briefcase className="h-3.5 w-3.5" />
+        </button>
+        <div className="mx-1 my-0.5 h-px bg-zinc-800" />
         {(
           [
             { tool: 'cursor' as const, icon: MousePointer2, label: 'Cursor (pan/zoom)' },
@@ -1029,13 +1289,27 @@ export function ChartPanel({ tab }: { tab: Tab }) {
 
       {/* context menu */}
       {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} container={containerRef.current} symbol={symbol}
+        posData={posData.data}
         onAddAlert={(price) => void addAlertAtPrice(price)}
+        onAddHline={(price) => {
+          void createDrawing('hline', [{ time: null, price }])
+        }}
+        onTrade={(side, price) => {
+          setTicketPrefill({ side, price })
+          setTradeOpen(true)
+        }}
+        onOpenTicket={() => {
+          setTicketPrefill(null)
+          setTradeOpen(true)
+        }}
         onEditValue={(hit) => {
           const st = useTerminal.getState()
           if (hit.type === 'alert') {
             const a = st.alerts.find((aa) => aa.id === hit.id)
             if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
-          } else {
+          } else if (hit.type === 'exit') {
+            setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+          } else if (hit.type === 'drawing') {
             const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
             if (d?.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
           }
@@ -1044,6 +1318,9 @@ export function ChartPanel({ tab }: { tab: Tab }) {
         onDeleteDrawing={deleteDrawing}
         onPatchAlert={patchAlert}
         onDeleteAlert={deleteAlert}
+        onPatchExit={(info, kind, price) => void patchExitPrice(info, kind, price)}
+        onCancelExit={(orderId) => void cancelExitOrder(orderId)}
+        onClosePosition={(tradeSymbol) => void closePositionBySymbol(tradeSymbol)}
       />}
 
       {/* edit value popover */}
@@ -1053,12 +1330,25 @@ export function ChartPanel({ tab }: { tab: Tab }) {
           onCancel={() => setEditValue(null)}
           onSave={(price) => {
             if (editValue.type === 'alert') void patchAlert(editValue.id, { price })
-            else {
+            else if (editValue.type === 'exit' && editValue.exit) {
+              void patchExitPrice(editValue.exit.info, editValue.exit.kind, price)
+            } else {
               const d = (useTerminal.getState().drawingsBySymbol[symbol] || []).find((dd) => dd.id === editValue.id)
               if (d) void patchDrawing(d.id, { points: d.points.map((p, i) => (i === 0 ? { ...p, price } : p)) })
             }
             setEditValue(null)
           }}
+        />
+      )}
+
+      {/* trade ticket (paper / live via Alpaca Trading API) */}
+      {tradeOpen && (
+        <TradeTicket
+          symbol={symbol}
+          livePrice={quote?.price ?? null}
+          prefill={ticketPrefill}
+          onClose={() => setTradeOpen(false)}
+          onPlaced={() => void posData.refresh()}
         />
       )}
 
@@ -1073,22 +1363,33 @@ export function ChartPanel({ tab }: { tab: Tab }) {
 
 // ---------- context menu ----------
 function ContextMenu({
-  menu, onClose, container, symbol,
-  onAddAlert, onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
+  menu, onClose, container, symbol, posData,
+  onAddAlert, onAddHline, onTrade, onOpenTicket,
+  onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
+  onPatchExit, onCancelExit, onClosePosition,
 }: {
   menu: MenuState
   onClose: () => void
   container: HTMLElement | null
   symbol: string
+  posData: { positions: { symbol: string; tradeSymbol: string; qty: number; side: string; avgEntry: number }[]; exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> } | null
   onAddAlert: (price: number) => void
-  onEditValue: (hit: Hit) => void
+  onAddHline: (price: number) => void
+  onTrade: (side: 'buy' | 'sell', price?: number) => void
+  onOpenTicket: () => void
+  onEditValue: (hit: SceneHit) => void
   onPatchDrawing: (id: string, patch: { color?: string }) => Promise<void>
   onDeleteDrawing: (id: string) => Promise<void>
   onPatchAlert: (id: string, patch: Record<string, unknown>) => Promise<void>
   onDeleteAlert: (id: string) => Promise<void>
+  onPatchExit: (info: ExitInfo, kind: 'sl' | 'tp', price: number) => void
+  onCancelExit: (orderId: string) => void
+  onClosePosition: (tradeSymbol: string) => void
 }) {
-  const symDrawing = menu.hit.type === 'drawing' ? (useTerminal.getState().drawingsBySymbol[symbol] || []).find((d) => d.id === menu.hit.id) : null
-  const alert = menu.hit.type === 'alert' ? useTerminal.getState().alerts.find((a) => a.id === menu.hit.id) : null
+  const symDrawing = menu.hit.type === 'drawing' ? menu.hit : null
+  const alertHit = menu.hit.type === 'alert' ? menu.hit : null
+  const alert = alertHit ? useTerminal.getState().alerts.find((a) => a.id === alertHit.id) : null
+  const symDrawingData = symDrawing ? (useTerminal.getState().drawingsBySymbol[symbol] || []).find((d) => d.id === symDrawing.id) : null
 
   useEffect(() => {
     const close = () => onClose()
@@ -1104,9 +1405,10 @@ function ContextMenu({
   const w = container.clientWidth
   const h = container.clientHeight
   const left = Math.min(menu.x + 4, w - 230)
-  const top = Math.min(menu.y + 4, h - 300)
+  const top = Math.min(menu.y + 4, h - 320)
+  const price = menu.price ?? null
 
-  if (menu.hit.type === 'alert' && alert) {
+  if (menu.hit.type === 'alert' && alert && alertHit) {
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -1124,7 +1426,7 @@ function ContextMenu({
             onClose()
           }}
         />
-        <MenuItem label="✏️ Edit value…" onClick={() => { onEditValue(menu.hit); onClose() }} />
+        <MenuItem label="✏️ Edit value…" onClick={() => { onEditValue(alertHit); onClose() }} />
         <MenuItem
           label={alert.direction === 'above' ? '▲ Trigger when rising above' : '▼ Trigger when falling below'}
           onClick={() => {
@@ -1142,8 +1444,9 @@ function ContextMenu({
     )
   }
 
-  if (menu.hit.type === 'drawing' && symDrawing) {
-    const d = symDrawing
+  if (menu.hit.type === 'drawing' && symDrawing && symDrawingData) {
+    const d = symDrawingData
+    const drawingHit = symDrawing
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -1164,7 +1467,7 @@ function ContextMenu({
           />
         )}
         {d.kind === 'hline' && (
-          <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(menu.hit); onClose() }} />
+          <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(drawingHit); onClose() }} />
         )}
         <ColorRow
           active={d.color}
@@ -1172,6 +1475,91 @@ function ContextMenu({
         />
         <div className="my-1 h-px bg-zinc-800" />
         <MenuItem label="🗑 Delete drawing" danger onClick={() => { void onDeleteDrawing(d.id); onClose() }} />
+      </div>
+    )
+  }
+
+  if (menu.hit.type === 'exit') {
+    const hit = menu.hit
+    const label = hit.part === 'sl' ? 'Stop loss' : 'Take profit'
+    return (
+      <div
+        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+        style={{ left, top }}
+        onPointerDown={(e) => e.stopPropagation()}
+        role="menu"
+      >
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          {label} · {fmtPrice(hit.origPrice)} <span className="text-zinc-600">({hit.exit.type})</span>
+        </div>
+        <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(hit); onClose() }} />
+        <MenuItem
+          label="🧾 Trade ticket…"
+          onClick={() => { onOpenTicket(); onClose() }}
+        />
+        <div className="my-1 h-px bg-zinc-800" />
+        <MenuItem label={`🗑 Cancel ${hit.part.toUpperCase()} order`} danger onClick={() => { onCancelExit(hit.exit.orderId); onClose() }} />
+      </div>
+    )
+  }
+
+  if (menu.hit.type === 'position') {
+    const hit = menu.hit
+    const pos = posData?.positions.find((p) => p.tradeSymbol === hit.id)
+    return (
+      <div
+        className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+        style={{ left, top }}
+        onPointerDown={(e) => e.stopPropagation()}
+        role="menu"
+      >
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          Position {pos ? `${pos.side === 'long' ? '+' : '-'}${pos.qty} @ ${fmtPrice(pos.avgEntry)}` : hit.id}
+        </div>
+        <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
+        <MenuItem
+          label={pos?.side === 'long' ? '🔴 Sell to close (market)' : '🟢 Buy to close (market)'}
+          danger
+          onClick={() => { onClosePosition(hit.id); onClose() }}
+        />
+      </div>
+    )
+  }
+
+  if (menu.hit.type === 'chart') {
+    return (
+      <div
+        className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
+        style={{ left, top }}
+        onPointerDown={(e) => e.stopPropagation()}
+        role="menu"
+      >
+        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+          {symbol}{price != null ? ` · ${fmtPrice(price)}` : ''}
+        </div>
+        {price != null && (
+          <MenuItem
+            label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add price alert at {fmtPrice(price)}</span>}
+            onClick={() => { onAddAlert(price); onClose() }}
+          />
+        )}
+        {price != null && (
+          <MenuItem label="─ Horizontal line here" onClick={() => { onAddHline(price); onClose() }} />
+        )}
+        <div className="my-1 h-px bg-zinc-800" />
+        {price != null && (
+          <MenuItem
+            label={<span className="text-emerald-400">🟢 Buy {symbol} (market)</span>}
+            onClick={() => { onTrade('buy', price); onClose() }}
+          />
+        )}
+        {price != null && (
+          <MenuItem
+            label={<span className="text-rose-400">🔴 Sell {symbol} (market)</span>}
+            onClick={() => { onTrade('sell', price); onClose() }}
+          />
+        )}
+        <MenuItem label="🧾 Trade ticket…" onClick={() => { onOpenTicket(); onClose() }} />
       </div>
     )
   }

@@ -121,6 +121,65 @@ export function TerminalRoot() {
     }
   }, [user, toast])
 
+  // Order-fill reaction: poll recent fills, fire toast + sound (trade feature)
+  useEffect(() => {
+    if (!user) return
+    let stopped = false
+    const KEY = 'tt:lastFillAt'
+    if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, new Date().toISOString())
+    const beep = () => {
+      try {
+        const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+        const ctx = new Ctor()
+        const notes = [880, 1174.7, 1568]
+        notes.forEach((f, i) => {
+          const o = ctx.createOscillator()
+          const g = ctx.createGain()
+          o.type = 'sine'
+          o.frequency.value = f
+          const t0 = ctx.currentTime + i * 0.13
+          g.gain.setValueAtTime(0.0001, t0)
+          g.gain.exponentialRampToValueAtTime(0.14, t0 + 0.02)
+          g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.24)
+          o.connect(g)
+          g.connect(ctx.destination)
+          o.start(t0)
+          o.stop(t0 + 0.26)
+        })
+        setTimeout(() => void ctx.close().catch(() => {}), 1200)
+      } catch { /* audio unavailable */ }
+    }
+    const tick = async () => {
+      const since = localStorage.getItem(KEY) || new Date().toISOString()
+      try {
+        const res = await fetch(`/api/trading/fills?since=${encodeURIComponent(since)}`)
+        if (!res.ok) return
+        const json = await res.json()
+        // advance the marker even when nothing new (or trading not configured)
+        localStorage.setItem(KEY, new Date().toISOString())
+        if (json.configured === false) return
+        const fills = (json.fills || []) as { id: string; symbol: string; side: string; qty: number; price: number | null; type: string }[]
+        if (fills.length > 0 && !stopped) {
+          for (const f of fills) {
+            toast({
+              title: `💼 ${f.side === 'buy' ? 'Bought' : 'Sold'} ${f.qty} ${f.symbol}`,
+              description: f.price ? `Filled @ ${f.price} · ${f.type}` : `Filled · ${f.type}`,
+            })
+          }
+          beep()
+          window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+        }
+      } catch { /* offline */ }
+    }
+    const timer = setInterval(tick, 12000)
+    const t0 = setTimeout(tick, 2500)
+    return () => {
+      stopped = true
+      clearInterval(timer)
+      clearTimeout(t0)
+    }
+  }, [user, toast])
+
   if (!hydrated) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-zinc-400">
@@ -172,7 +231,7 @@ export function TerminalRoot() {
 function BadgeDemoInline() {
   const { demo, reason } = useDemoMeta()
   if (!demo) return null
-  const rejected = Boolean(reason && reason.startsWith('alpaca-http-40'))
+  const rejected = reason === 'alpaca-http-401' || reason === 'alpaca-http-403'
   return (
     <Badge
       variant="outline"

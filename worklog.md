@@ -213,3 +213,29 @@ Stage Summary:
 - Saving keys now: auto-verifies against Alpaca, gives loud feedback, and every panel (chart, footer, watchlist via polling) switches to live data without reload.
 - Invalid keys are now explicitly labeled "keys rejected" (rose) instead of ambiguous "demo".
 - Telegram test endpoint 404 fixed. No schema changes; no other behavior changed for valid-keys path.
+
+---
+Task ID: 18
+Agent: main (Z.ai Code)
+Task: "test key ok but chart says key rejected" + missing bars bug + trade assistance (paper/live orders, SL/TP lines with drag, fill notifications) + tab remove confirm + missing features rediscovery
+
+Work Log:
+- BUG 1 root cause (keys rejected + missing bars): getBars sent `adjustment=splits` — Alpaca's enum is `split`; the API returned HTTP 400 `invalid adjustment: splits`, which (a) silently fell back to demo bars ("missing bars up to today") and (b) mapped to alpaca-http-40x → misleading "keys rejected" badge. Fixed to `adjustment=split`; verified all TFs (1m/5m/15m/1h/1D) return live bars up to now with the user's demo keys.
+- Badge logic fixed: only alpaca-http-401/403 shows "keys rejected" (rose); 429 shows "rate limited"; others "data error" (both chart badge + footer).
+- Added 4H timeframe to TIMEFRAMES (user expected it).
+- BUG 2 found during verification: crypto quotes were ALWAYS simulated — crypto snapshots response nests under {"snapshots": {...}} unlike stocks (flat). Unwrapped in getQuotes; crypto quote now real (81578.229 verified, meta.demo=false).
+- Stored the user's provided demo keys (encrypted) into their account so live data + trading work immediately.
+- Trading backend (src/lib/trading.ts + /api/trading/*): paper/live modes (paper-api vs api.alpaca.markets), account/positions/open/closed orders, placeOrderWithExits (stocks → bracket; crypto → separate exits with 0.99 fee-buffer + 50/50 split because Alpaca crypto rejects advanced classes and reserves balance per open sell), replaceOrder (PATCH creates replacement with NEW id — documented), cancelOrder, closePosition, fills endpoint for notifications. tradeMode persisted in settings.
+- Verified Alpaca behaviors experimentally with user's paper keys before coding: bracket works for stocks, crypto stop type invalid (stop_limit ok), "cannot replace order in accepted status", insufficient-balance on second full-qty exit (drove the fee-buffer fix).
+- Trade UI: TradeTicket component (paper/live toggle persisted, buy/sell, qty, market/limit, SL/TP, trailing % for stocks, equity display, error surfacing); briefcase button in chart toolbar; right-click empty chart menu (Add price alert @ price / Horizontal line / Buy / Sell / Trade ticket — solves "right click price alert not found"); right-click on position/SL/TP lines (edit value, cancel order, close position).
+- Chart: POS/SL/TP dashed lines with chips ([POS qty @ entry], [SL], [TP]) drawn on overlay; SL/TP drag with dashed "new SL/TP" preview line; on drop PATCHes the order and refreshes (id changes handled); autoscaleInfoProvider includes entry/SL/TP so lines stay in view; live quote feeds the last bar (chart tracks market between closes).
+- Fill reaction: 12s fills poller in TerminalRoot → toast "💼 Bought/Sold ..." + WebAudio 3-tone beep + positions refresh.
+- Tab remove: visible × + AlertDialog confirm ("will be removed from your saved layout. Drawings and alerts are kept.").
+- Browser-verified end-to-end with user's paper keys: right-click alert created (bell counter 1); BTC/USD paper buy 0.005 filled @ 81638 with SL 88000 + TP 105000 orders; fill toast fired; POS/SL/TP lines rendered; SL dragged → stop_limit replaced (88000 → 86000 verified on Alpaca + chart chip zoom); tab confirm dialog shown and cancelled. Left the BTC paper position + one AAPL alert in place so the user can see the features live.
+- Known limits: stock bracket entries won't fill until market opens (Mon 09:30 ET) — order placement still works; trailing % stocks-only (Alpaca crypto rejects trailing_stop); crypto SL/TP split 50/50 documented in ticket note.
+
+Stage Summary:
+- Two data-layer bugs fixed (adjustment=split; crypto snapshots unwrap) — both were silently degrading to demo data.
+- Full trade assistance shipped: ticket + right-click trading + bracket/OCO-style exits + draggable SL/TP lines + fill notifications.
+- All features user thought were missing (FIB retracement, price alerts, right-click alert) verified present and now more discoverable via the right-click menu.
+- User's demo keys stored encrypted; paper position BTC/USD 0.005 @ 81638 with SL 86000 / TP 105000 left open as a live example.

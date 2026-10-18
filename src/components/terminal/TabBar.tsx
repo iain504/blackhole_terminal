@@ -1,6 +1,7 @@
 'use client'
 
 // Top bar: local tabs (chart / calendar / heat map) + add-tab menu + account controls.
+import { useState } from 'react'
 import { useTerminal, TabType } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
@@ -9,6 +10,10 @@ import { Button } from '@/components/ui/button'
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuLabel, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 
 const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart }> = {
@@ -34,6 +39,7 @@ export function TabBar({
   const user = useTerminal((s) => s.user)
   const alerts = useTerminal((s) => s.alerts)
   const activeAlerts = alerts.filter((a) => a.status === 'active').length
+  const [confirmClose, setConfirmClose] = useState<string | null>(null)
 
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' })
@@ -72,11 +78,14 @@ export function TabBar({
               </button>
               {tabs.length > 1 && (
                 <button
-                  className="rounded p-0.5 text-zinc-500 opacity-0 transition-opacity hover:bg-zinc-700 hover:text-zinc-200 focus:opacity-100 group-hover:opacity-100"
-                  onClick={() => closeTab(t.id)}
-                  aria-label={`Close ${title} tab`}
+                  className="rounded p-0.5 text-zinc-500 transition-opacity hover:bg-rose-500/20 hover:text-rose-400 focus:opacity-100 md:opacity-60 md:group-hover:opacity-100"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setConfirmClose(t.id)
+                  }}
+                  aria-label={`Remove ${title} tab`}
                 >
-                  <X className="h-3 w-3" />
+                  <X className="h-3.5 w-3.5" />
                 </button>
               )}
             </div>
@@ -144,6 +153,30 @@ export function TabBar({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+
+      {/* confirm before removing a tab (layout action) */}
+      <AlertDialog open={confirmClose != null} onOpenChange={(o) => !o && setConfirmClose(null)}>
+        <AlertDialogContent className="border-zinc-800 bg-zinc-900">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-zinc-100">Remove this tab?</AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              “{confirmClose ? (() => { const t = tabs.find((x) => x.id === confirmClose); return t ? (t.type === 'chart' ? t.symbol : TYPE_META[t.type].label) : '' })() : ''}” will be removed from your saved layout. Drawings and alerts are kept.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-rose-600 text-white hover:bg-rose-500"
+              onClick={() => {
+                if (confirmClose) closeTab(confirmClose)
+                setConfirmClose(null)
+              }}
+            >
+              Remove tab
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </header>
   )
 }

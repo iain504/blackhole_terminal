@@ -11,6 +11,7 @@ interface UserSettings {
   alpacaSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
+  tradeMode?: string
 }
 
 // GET /api/settings — masked values + availability flags
@@ -30,6 +31,7 @@ export async function GET() {
         tokenSet: Boolean(s?.telegramTokenEnc),
         chatId: s?.telegramChatId || '',
       },
+      tradeMode: s?.tradeMode === 'live' ? 'live' : 'paper',
     })
   } catch (e) {
     return handleError(e)
@@ -41,6 +43,7 @@ interface PutBody {
   alpacaSecret?: string
   telegramToken?: string
   telegramChatId?: string
+  tradeMode?: string
 }
 
 // PUT /api/settings — update private credentials (stored encrypted, never returned)
@@ -61,6 +64,9 @@ export async function PUT(req: Request) {
     }
     if (typeof body.telegramChatId === 'string') {
       s.telegramChatId = body.telegramChatId.trim()
+    }
+    if (body.tradeMode === 'paper' || body.tradeMode === 'live') {
+      s.tradeMode = body.tradeMode
     }
     await db.user.update({
       where: { id: user.id },

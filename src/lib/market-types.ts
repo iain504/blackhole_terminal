@@ -1,6 +1,6 @@
 // Shared market data types used by both API routes and client components.
 
-export type Timeframe = '1m' | '5m' | '15m' | '1h' | '1D' | '1W' | '1M'
+export type Timeframe = '1m' | '5m' | '15m' | '1h' | '4h' | '1D' | '1W' | '1M'
 
 export interface Bar {
   time: number // unix seconds (UTC), bar open time
@@ -99,6 +99,7 @@ export const TIMEFRAMES: Record<Timeframe, { alpaca: string; seconds: number; ba
   '5m': { alpaca: '5Min', seconds: 300, barCount: 2000, label: '5m' },
   '15m': { alpaca: '15Min', seconds: 900, barCount: 1600, label: '15m' },
   '1h': { alpaca: '1Hour', seconds: 3600, barCount: 2000, label: '1H' },
+  '4h': { alpaca: '4Hour', seconds: 14400, barCount: 1000, label: '4H' },
   '1D': { alpaca: '1Day', seconds: 86400, barCount: 1500, label: '1D' },
   '1W': { alpaca: '1Week', seconds: 604800, barCount: 520, label: '1W' },
   '1M': { alpaca: '1Month', seconds: 2592000, barCount: 240, label: '1M' },

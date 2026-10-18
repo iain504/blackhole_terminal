@@ -233,10 +233,11 @@ export async function getBars(
     return { bars, demo: false }
   }
 
-  // Stocks API: v2/stocks/bars
+  // Stocks API: v2/stocks/bars — adjustment enum is `split` (NOT `splits`;
+  // `splits` returns HTTP 400 and silently pushed the whole chart to demo data).
   const { data: raw, status } = await alpacaFetch<{ bars: Record<string, AlpacaBar[]> }>(
     `/v2/stocks/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${tf.alpaca}&start=${startIso}&end=${endIso}` +
-    `&limit=${Math.min(tf.barCount + 50, 10000)}&adjustment=splits&feed=iex`,
+    `&limit=${Math.min(tf.barCount + 50, 10000)}&adjustment=split&feed=iex`,
     keys,
   )
   if (!raw) {
@@ -327,7 +328,8 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
     for (let i = 0; i < cryptos.length; i += 15) {
       const chunk = cryptos.slice(i, i + 15)
       jobs.push((async () => {
-        const { data: raw, status } = await alpacaFetch<Record<string, CryptoSnapshot>>(
+        // NOTE: crypto snapshots nest under `snapshots` (stocks are flat)
+        const { data: raw, status } = await alpacaFetch<{ snapshots?: Record<string, CryptoSnapshot> }>(
           `/v1beta3/crypto/us/snapshots?symbols=${encodeURIComponent(chunk.join(','))}`,
           keys,
         )
@@ -335,8 +337,9 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
           lastStatus = status
           return
         }
+        const map = raw.snapshots ?? (raw as unknown as Record<string, CryptoSnapshot>)
         for (const s of chunk) {
-          const q = snapshotToQuote(s, raw[s])
+          const q = snapshotToQuote(s, map[s])
           if (q) quotes.push(q)
         }
       })())
