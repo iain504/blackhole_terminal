@@ -1,0 +1,72 @@
+import { NextResponse } from 'next/server'
+import { Prisma } from '@prisma/client'
+import { db } from '@/lib/db'
+import { requireUser } from '@/lib/auth'
+import { encrypt, decrypt, maskKey } from '@/lib/crypt'
+import { readJson, handleError } from '@/lib/api-helpers'
+
+interface UserSettings {
+  alpacaKeyIdEnc?: string
+  alpacaSecretEnc?: string
+  telegramTokenEnc?: string
+  telegramChatId?: string
+}
+
+// GET /api/settings — masked values + availability flags
+export async function GET() {
+  try {
+    const user = await requireUser()
+    const dbUser = await db.user.findUnique({ where: { id: user.id } })
+    const s = (dbUser?.settings as UserSettings | null) || null
+    const envAlpaca = Boolean(process.env.APCA_API_KEY_ID && process.env.APCA_API_SECRET_KEY)
+    return NextResponse.json({
+      alpaca: {
+        keyIdMasked: s?.alpacaKeyIdEnc ? maskKey(decrypt(s.alpacaKeyIdEnc) || '') : '',
+        secretSet: Boolean(s?.alpacaSecretEnc),
+        serverKeysPresent: envAlpaca,
+      },
+      telegram: {
+        tokenSet: Boolean(s?.telegramTokenEnc),
+        chatId: s?.telegramChatId || '',
+      },
+    })
+  } catch (e) {
+    return handleError(e)
+  }
+}
+
+interface PutBody {
+  alpacaKeyId?: string
+  alpacaSecret?: string
+  telegramToken?: string
+  telegramChatId?: string
+}
+
+// PUT /api/settings — update private credentials (stored encrypted, never returned)
+export async function PUT(req: Request) {
+  try {
+    const user = await requireUser()
+    const body = await readJson<PutBody>(req)
+    const dbUser = await db.user.findUnique({ where: { id: user.id } })
+    const s = ((dbUser?.settings as UserSettings | null) || {}) as Record<string, unknown>
+    if (typeof body.alpacaKeyId === 'string' && body.alpacaKeyId.trim()) {
+      s.alpacaKeyIdEnc = encrypt(body.alpacaKeyId.trim())
+    }
+    if (typeof body.alpacaSecret === 'string' && body.alpacaSecret.trim()) {
+      s.alpacaSecretEnc = encrypt(body.alpacaSecret.trim())
+    }
+    if (typeof body.telegramToken === 'string' && body.telegramToken.trim()) {
+      s.telegramTokenEnc = encrypt(body.telegramToken.trim())
+    }
+    if (typeof body.telegramChatId === 'string') {
+      s.telegramChatId = body.telegramChatId.trim()
+    }
+    await db.user.update({
+      where: { id: user.id },
+      data: { settings: s as unknown as Prisma.InputJsonValue },
+    })
+    return NextResponse.json({ ok: true })
+  } catch (e) {
+    return handleError(e)
+  }
+}

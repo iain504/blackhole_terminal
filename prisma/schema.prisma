@@ -1,0 +1,66 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  totpSecret   String
+  settings     Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Watchlist {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  color     String   @default("#22c55e")
+  sortOrder Int      @default(0)
+  items     Json     @default("[]")
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Layout {
+  userId    String   @id
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+model Drawing {
+  id        String   @id @default(cuid())
+  userId    String
+  symbol    String
+  kind      String
+  points    Json
+  color     String   @default("#2962ff")
+  width     Int      @default(2)
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId, symbol])
+}
+
+model Alert {
+  id          String    @id @default(cuid())
+  userId      String
+  symbol      String
+  price       Float
+  direction   String    @default("above")
+  color       String    @default("#f59e0b")
+  status      String    @default("active")
+  note        String?
+  lastSide    String?
+  triggeredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([userId, status])
+}
