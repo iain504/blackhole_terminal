@@ -297,3 +297,22 @@ Stage Summary:
 - New files: public/hero-blackhole.png, src/components/landing/LandingPage.tsx; changed: src/app/page.tsx (view switch), src/components/terminal/TerminalRoot.tsx (onExit + footer Home), src/app/layout.tsx (metadata).
 - Terminal itself unchanged (tabs/charts/console all intact post-login).
 
+---
+Task ID: 21
+Agent: Z.ai Code (main)
+Task: Earnings from yfinance + TradingView-style event symbols on the chart y-axis — earnings [E] and news ⚡ for the charted symbol.
+
+Work Log:
+- Spike: sandbox reaches Yahoo; quoteSummary needs cookie+crumb (fc.yahoo.com 404-but-sets-cookies → /v1/test/getcrumb → ?crumb=). Verified AAPL returns calendarEvents (next earnings) + earningsHistory (4 past quarters with EPS actual/estimate).
+- NEW src/lib/yahoo.ts: yfinance-equivalent flow in Node — session cookie+crumb with 30min cache + one-shot refresh retry on 401/403/404; getYahooEarnings(symbol) → past quarters (quarter.raw, epsActual/epsEstimate) + next upcoming date; in-memory cache 6h TTL, stale-while-error 7d; returns null when Yahoo unavailable.
+- Markers route rebuilt (/api/market/markers): parallel getMarkers (Alpaca news + headline-derived earnings) + getYahooEarnings; earnings merged BY DAY with yfinance winning and Alpaca only filling gaps; demo/sim Alpaca earnings NEVER mixed with real Yahoo ones (alpacaUsable = !mk.demo || yahoo===null); crypto pairs → no earnings (source 'crypto'). Response adds newsItems {ts,title} (tooltip data), earningsInfo {ts,epsActual,epsEstimate,upcoming}, earningsSource. Fixed import slip (isCryptoSymbol lives in market-types, not alpaca) that 500'd the first compile.
+- ChartPanel: old series.setMarkers below-bar markers REMOVED — icons now pinned to the right price scale (y-axis), drawn on the existing overlay canvas in renderOverlay: amber [E] pill (27x15) and fuchsia-ringed ⚡ circle at y = priceToCoordinate(close of the bar in effect at the event; upcoming earnings → last bar, lifted 17px so the current-price tag stays readable); icons only when the event bar is inside the visible time range; sorted + 16px collision stacking, clamped above the time axis; hover via pointer-move hit rects (axisIconsRef) → bright highlight + canvas tooltip (date, "upcoming", EPS actual/est, or news headline wrapped to 240px); news capped at 10 evenly-spaced items (index-based step — old minGap spacing collapsed to 1 marker on long histories); markersRef cleared on chart teardown (no stale-symbol icons).
+- Verified live: SPCX 1D shows 3 [E] (Mar/Jun quarters + upcoming Oct 20 lifted above 146.37 price tag) + ⚡ stack; 1W remaps correctly; AAPL 1W shows 4 quarterly [E]s + upcoming + ⚡s; hover tooltips confirmed ("Earnings · 30 Jun 2026 · EPS -0.09 (est …)", "News · 15 Oct 2026 — <headline>"); API check: AAPL/TSLA/SPCX source=yfinance, BTC/USD=crypto(no earnings); mobile 390x844 renders icons + price tag intact.
+- lint 0 errors; dev.log clean since the import fix (markers 200s ~240ms).
+
+Stage Summary:
+- Earnings now come from yfinance (real quarterly dates + EPS + next upcoming), Alpaca headlines only as gap-filler.
+- [E]/⚡ are TradingView-style icons ON the y-axis (not below-bar markers), with hover tooltips, collision stacking, visible-range gating and mobile support.
+- Files: src/lib/yahoo.ts (new), src/app/api/market/markers/route.ts, src/lib/market-types.ts (MarkerData.newsItems), src/lib/alpaca.ts (newsItems), src/components/chart/ChartPanel.tsx (axis icons + tooltips), scripts-tmp/gen-totp.mjs (test helper).
+
+

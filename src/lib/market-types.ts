@@ -38,6 +38,8 @@ export interface NewsItem {
 export interface MarkerData {
   earnings: number[] // unix seconds
   news: number[] // unix seconds
+  /** news with headlines (for y-axis marker tooltips) */
+  newsItems?: { ts: number; title: string }[]
 }
 
 export interface HeatSymbol {

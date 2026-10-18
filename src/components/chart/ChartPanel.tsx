@@ -3,7 +3,8 @@
 // Interactive chart: lightweight-charts + transparent overlay canvas for
 // drawings (hline/vline/trend/fib) and alert lines. Lines stay draggable &
 // resizable after drawing, with right-click context menus (Task 14 #1/#4,
-// Task 16 #4/#5/#6). Earnings [E] + news ⚡ markers on the time axis.
+// Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the PRICE
+// SCALE (y-axis), TradingView-style.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
@@ -144,6 +145,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // OHLC legend: written directly to these DOM nodes from the crosshair handler
   // (no React state — see note in the chart lifecycle effect)
   const legendRef = useRef<HTMLDivElement>(null)
+
+  // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Alpaca) — TradingView
+  // style icons pinned to the right price scale at the event bar's close price
+  const markersRef = useRef<{
+    earnings: { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]
+    news: { ts: number; title?: string }[]
+  }>({ earnings: [], news: [] })
+  // icon hit rects (rebuilt each renderOverlay pass, used for hover tooltips)
+  const axisIconsRef = useRef<{ kind: 'e' | 'n'; x: number; y: number; w: number; h: number; tip: string }[]>([])
   const symEsc = symbol.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   const tfLabelEsc = TIMEFRAMES[tf].label.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
@@ -298,6 +308,147 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.setLineDash([])
         ctx.restore()
         drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+      }
+    }
+
+    // ---- y-axis event icons: earnings [E] (yfinance) + news ⚡ (TradingView-style) ----
+    const chartApi = chartRef.current
+    const mk = markersRef.current
+    axisIconsRef.current = []
+    if (chartApi && (mk.earnings.length > 0 || mk.news.length > 0) && barsRef.current.length > 0) {
+      const psW = chartApi.priceScale('right').width()
+      const tAxisH = chartApi.timeScale().height()
+      const bars = barsRef.current
+      const vis = chartApi.timeScale().getVisibleRange()
+      const visFrom = vis ? Number(vis.from) : null
+      const visTo = vis ? Number(vis.to) : null
+      const cx = w - psW / 2
+      const yMin = 13
+      const yMax = Math.max(yMin + 1, h - tAxisH - 10)
+
+      // bar in effect at the event moment (upcoming events → last bar)
+      const barAt = (ts: number): Bar | null => {
+        if (ts < bars[0].time) return null
+        if (ts >= bars[bars.length - 1].time) return bars[bars.length - 1]
+        let lo = 0
+        let hi = bars.length - 1
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1
+          if (bars[mid].time <= ts) lo = mid
+          else hi = mid - 1
+        }
+        return bars[lo]
+      }
+      const fmtDay = (ts: number) =>
+        new Date(ts * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+
+      type AxisIcon = { kind: 'e' | 'n'; rawY: number; tip: string; atLast?: boolean }
+      const icons: AxisIcon[] = []
+      const lastBarTime = bars[bars.length - 1].time
+      for (const e of mk.earnings) {
+        const bar = barAt(e.ts)
+        if (!bar) continue
+        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
+        const y = yOf(bar.close)
+        if (y == null) continue
+        const epsBits =
+          e.epsActual != null
+            ? ` · EPS ${e.epsActual}${e.epsEstimate != null ? ` (est ${e.epsEstimate})` : ''}`
+            : ''
+        icons.push({ kind: 'e', rawY: y, tip: `Earnings · ${fmtDay(e.ts)}${e.upcoming ? ' · upcoming' : ''}${epsBits}`, atLast: bar.time === lastBarTime })
+      }
+      for (const n of mk.news) {
+        const bar = barAt(n.ts)
+        if (!bar) continue
+        if (visFrom != null && visTo != null && (bar.time < visFrom || bar.time > visTo)) continue
+        const y = yOf(bar.close)
+        if (y == null) continue
+        icons.push({ kind: 'n', rawY: y, tip: `News · ${fmtDay(n.ts)}${n.title ? ` — ${n.title}` : ''}`, atLast: bar.time === lastBarTime })
+      }
+
+      // icons pinned to the last bar sit on the current-price label — lift them
+      // above it so the price tag stays readable
+      for (const ic of icons) {
+        if (ic.atLast) ic.rawY -= 17
+      }
+
+      // resolve vertical collisions (min 16px gap), then clamp into the pane
+      icons.sort((a, b) => a.rawY - b.rawY)
+      for (let i = 1; i < icons.length; i++) {
+        if (icons[i].rawY - icons[i - 1].rawY < 16) icons[i].rawY = icons[i - 1].rawY + 16
+      }
+      const hoverIdx = hoverRef.current?.startsWith('axis:') ? parseInt(hoverRef.current.slice(5), 10) : -1
+
+      icons.forEach((ic, i) => {
+        const y = Math.min(yMax, Math.max(yMin, ic.rawY))
+        const highlighted = i === hoverIdx
+        ctx.save()
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        if (ic.kind === 'e') {
+          const bw = 27
+          const bh = 15
+          ctx.fillStyle = 'rgba(24,24,27,0.92)'
+          ctx.strokeStyle = highlighted ? '#fde047' : '#f59e0b'
+          ctx.lineWidth = highlighted ? 1.6 : 1
+          ctx.beginPath()
+          ctx.roundRect(cx - bw / 2, y - bh / 2, bw, bh, 4)
+          ctx.fill()
+          ctx.stroke()
+          ctx.fillStyle = highlighted ? '#fde047' : '#fbbf24'
+          ctx.font = `${highlighted ? '600 ' : ''}9px ui-monospace, monospace`
+          ctx.fillText('[E]', cx, y + 0.5)
+        } else {
+          ctx.fillStyle = 'rgba(24,24,27,0.92)'
+          ctx.strokeStyle = highlighted ? '#f0abfc' : 'rgba(232,121,249,0.55)'
+          ctx.lineWidth = highlighted ? 1.6 : 1
+          ctx.beginPath()
+          ctx.arc(cx, y, 7.5, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.stroke()
+          ctx.font = '10px sans-serif'
+          ctx.fillText('⚡', cx, y + 0.5)
+        }
+        ctx.restore()
+        axisIconsRef.current.push({ kind: ic.kind, x: w - psW - 5, y: y - 9, w: psW + 10, h: 18, tip: ic.tip })
+      })
+
+      // tooltip for the hovered axis icon
+      if (hoverIdx >= 0 && hoverIdx < axisIconsRef.current.length) {
+        const hit = axisIconsRef.current[hoverIdx]
+        ctx.save()
+        ctx.font = '10px ui-sans-serif, system-ui'
+        const maxW = 240
+        const words = hit.tip.split(' ')
+        const lines: string[] = []
+        let line = ''
+        for (const wd of words) {
+          const cand = line ? `${line} ${wd}` : wd
+          if (ctx.measureText(cand).width > maxW && line) {
+            lines.push(line)
+            line = wd
+          } else line = cand
+        }
+        if (line) lines.push(line)
+        const tw = Math.min(maxW, ...lines.map((l) => ctx.measureText(l).width)) + 14
+        const th = lines.length * 14 + 9
+        const tx = w - psW - tw - 12
+        const ty = Math.min(yMax, Math.max(yMin, hit.y + hit.h / 2)) - th / 2
+        ctx.fillStyle = 'rgba(9,9,11,0.96)'
+        ctx.strokeStyle = 'rgba(113,113,122,0.6)'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.roundRect(tx, ty, tw, th, 5)
+        ctx.fill()
+        ctx.stroke()
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'top'
+        lines.forEach((l, li) => {
+          ctx.fillStyle = li === 0 && hit.kind === 'e' ? '#fbbf24' : li === 0 && hit.kind === 'n' ? '#e879f9' : '#d4d4d8'
+          ctx.font = `${li === 0 ? '600 ' : ''}10px ui-sans-serif, system-ui`
+          ctx.fillText(l, tx + 7, ty + 5 + li * 14)
+        })
+        ctx.restore()
       }
     }
 
@@ -853,12 +1004,21 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         return
       }
       const hit = hitTest(x, y)
-      const newHover = hit ? `${hit.type}:${hit.id}` : null
+      // y-axis event icons ([E]/⚡) hover — hit rects come from the last overlay pass
+      let axisIdx = -1
+      if (!hit && chartRef.current) {
+        const cw = containerRef.current?.clientWidth ?? 0
+        const psW = chartRef.current.priceScale('right').width()
+        if (psW > 0 && x >= cw - psW - 8) {
+          axisIdx = axisIconsRef.current.findIndex((r) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+        }
+      }
+      const newHover = hit ? `${hit.type}:${hit.id}` : axisIdx >= 0 ? `axis:${axisIdx}` : null
       if (newHover !== hoverRef.current) {
         hoverRef.current = newHover
         scheduleRedraw()
       }
-      el.style.cursor = hit ? (hit.part === 'point' ? 'nwse-resize' : 'grab') : ''
+      el.style.cursor = hit ? (hit.part === 'point' ? 'nwse-resize' : 'grab') : axisIdx >= 0 ? 'pointer' : ''
     }
 
     const onPointerLeave = () => {
@@ -1104,7 +1264,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           chart.timeScale().setVisibleLogicalRange({ from, to: clean.length + 6 })
         }
 
-        // markers: earnings [E] + news ⚡ (Task 16 #7/#8)
+        // y-axis event markers: earnings [E] (yfinance) + news ⚡ (Task 20)
         if (clean.length > 0) {
           try {
             const from = clean[0].time
@@ -1112,23 +1272,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const mres = await fetch(`/api/market/markers?symbol=${encodeURIComponent(symbol)}&from=${from}&to=${lastT}`)
             if (mres.ok && !cancelled) {
               const mj = await mres.json()
-              type Mk = { time: UTCTimestamp; position: 'belowBar'; color: string; shape: 'square' | 'circle'; text: string; id: string }
-              const markers: Mk[] = []
-              for (const t of (mj.earnings as number[]) || []) {
-                if (t <= lastT) markers.push({ time: t as UTCTimestamp, position: 'belowBar', color: '#f59e0b', shape: 'square', text: 'E', id: `e${t}` })
-              }
-              // space news markers so they don't clutter the axis; drop future ones
-              const rawNews = ((mj.news as number[]) || []).filter((t: number) => t <= lastT).sort((a: number, b: number) => a - b)
-              const minGap = Math.max(3600, Math.floor((lastT - from) / 25))
-              const spacedNews: number[] = []
-              for (const t of rawNews) {
-                if (spacedNews.length === 0 || t - spacedNews[spacedNews.length - 1] >= minGap) spacedNews.push(t)
-              }
-              for (const t of spacedNews.slice(0, 14)) {
-                markers.push({ time: t as UTCTimestamp, position: 'belowBar', color: '#e879f9', shape: 'circle', text: '⚡', id: `n${t}` })
-              }
-              markers.sort((a, b) => a.time - b.time)
-              if (series.setMarkers) series.setMarkers(markers)
+              const earnings = ((mj.earningsInfo as { ts: number; epsActual?: number | null; epsEstimate?: number | null; upcoming?: boolean }[]) || [])
+                .filter((e) => e.ts <= lastT || e.upcoming)
+              // cap news markers (~14) evenly across the fetched window so the
+              // axis stays readable regardless of news frequency
+              const rawNews = ((mj.newsItems as { ts: number; title?: string }[]) || [])
+                .filter((n) => n.ts <= lastT)
+                .sort((a, b) => a.ts - b.ts)
+              const step = Math.max(1, Math.ceil(rawNews.length / 10))
+              const spacedNews = rawNews.filter((_, i) => i % step === 0)
+              markersRef.current = { earnings, news: spacedNews.slice(0, 10) }
             }
           } catch { /* markers optional */ }
         }
@@ -1155,6 +1308,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       chartRef.current = null
       seriesRef.current = null
       barsRef.current = []
+      markersRef.current = { earnings: [], news: [] }
+      axisIconsRef.current = []
     }
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw])
 

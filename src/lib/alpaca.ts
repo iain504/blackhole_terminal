@@ -496,5 +496,13 @@ export async function getMarkers(symbol: string, from: number, to: number, userI
   }
   // crypto has no earnings — drop for crypto symbols
   const finalEarnings = isCryptoSymbol(symbol) ? [] : earnings
-  return { earnings: finalEarnings, news: news.slice(0, 40), demo: false }
+  return {
+    earnings: finalEarnings,
+    news: news.slice(0, 40),
+    newsItems: raw.news
+      .map((n) => ({ ts: Math.floor(new Date(n.created_at).getTime() / 1000), title: n.headline }))
+      .filter((n) => news.includes(n.ts))
+      .slice(0, 40),
+    demo: false,
+  }
 }
