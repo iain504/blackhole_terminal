@@ -857,3 +857,25 @@ Work Log:
 Stage Summary:
 - The terminal now has a strategy bot: any RSI/MACD condition (same crossing engine as alarms) can auto-place a market BUY/SELL with TP/SL — TP/SL as absolute prices or % offsets resolved from the live quote at fire time — as a one-shot or a repeating rule. Stocks get native Alpaca brackets; crypto entries flow through the existing OCO supervisor for exit attach on fill. Firing is race-safe (claim-then-place) and runs both from the 20s client poll and a server-side supervisor, so rules execute even with no browser open; every fire (or failure with the broker's exact error) lands in the drawer, a toast, the console log, and Telegram.
 - Both bug classes found by E2E (pct-unit mismatch, mutation-before-check dead engine) are fixed and the full chain was verified live end-to-end on Alpaca paper for the stock bracket path, the repeat path, the one-shot path, and the crypto % path, then the account was restored to its pre-test state.
+---
+Task ID: 45
+Agent: Z.ai Code (main)
+Task: "add below two — 1) show a predict profit when drag tp, show it between tp and entry price. 2) show a predict lose when drag sl, show it between sl and entry price."
+
+Work Log:
+- IMPLEMENTATION (all in src/components/chart/ChartPanel.tsx, overlay-canvas only, no API changes):
+  - New drawPlChip helper: bold 11px monospace chip rendering `+$X (+Y%)` / `-$X (-Y%)`, sign-colored (green rgba(34,197,94,.95) for profit / red rgba(244,63,94,.95) for loss, dark text), horizontally CENTERED on the chart width and drawn at the vertical MIDPOINT between the dragged line and the entry price.
+  - Exit-line drag + ghost [+TP]/[+SL] drag (exitDragRef preview block): P/L baseline is the live position (myPos.avgEntry / |qty| / side) — perUnit = price−entry for long, entry−price for short, total = perUnit×|qty|, pct = perUnit/entry×100. Drawn only while dragging (exDrag.price != null) and only when both the dragged line and the entry are on-screen.
+  - Pending-order TP/SL drag: pendingDragRef extended with `pl` context {entry: pending limitPrice, qty, side} frozen at drag start (hit.pending); onMove preserves it; entry drags (part 'whole') carry no pl → no chip. Same sign math (sell pending = entry−price).
+  - Sign coloring is VALUE-based, not kind-based: dragging a TP past the entry flips the chip to red (locking a loss), dragging an SL past the entry flips to green (profit lock) — matches "predict profit/lose" semantics in all directions.
+- E2E (agent-browser via gateway :81, trader session, real mouse drags on the overlay canvas; line y-positions found by pixel-scanning the canvas for the exact line/chip colors):
+  - SPCX short 10 @ 150.528 (live user exits TP 141.52 / SL 148.58): TP drag down → green "+$354.58 (+23.56%)" chip centered between entry and the "new TP 115.07" preview line — math exact ((150.528−115.07)×10). SL drag up → red "-$268.02 (-17.81%)" (new SL 177.33) ✓; SL dragged below entry → flips green "+$278.23 (+18.48%)" (new SL 122.71) ✓. Screenshots: screens-tmp/pl-drag-tp-profit.png, pl-drag-sl-loss.png, pl-drag-sl-profit.png (baseline: pl-drag-baseline.png).
+  - MCD pending bracket (BUY 10 limit 239.02, planned TP 245.24 / SL 236.88): pending-TP drag up → green "+$467.72 (+19.57%)" (new TP 285.79); below entry → red "-$470.99 (-19.70%)" (new TP 191.92). Screenshots: pl-drag-pend-tp.png, pl-drag-pend-tp-neg.png.
+  - NO MUTATION: every drag released back at the start price (no-op PATCH short-circuit) — verified after each: SPCX exits still TP 141.52 / SL 148.58 (qty −10), MCD pending still lim 239.02 / TP 245.24 / SL 236.88.
+  - CLEANUP: my extra chart tab (SPCX→MCD, created for testing + its price-scale zoom) removed via the confirm dialog — tab bar back to the user's exact layout (TSLA, Heat Map, Economic Calendar, Positions); watchlist verified untouched in DB (6 items, SPCX pre-existing); my chart drags left the account state byte-identical.
+  - Console: only the pre-existing ~15 empty pageerror events + pre-existing Radix DialogContent aria warning; dev.log clean; lint clean.
+- Files: src/components/chart/ChartPanel.tsx (drawPlChip, exitDrag preview + pendingDrag preview blocks, pendingDragRef type + drag-start/onMove plumbing).
+
+Stage Summary:
+- While dragging any TP line (position exit, ghost-create, or pending bracket leg) the chart now shows a centered, sign-colored predicted-profit chip vertically between the dragged line and the entry price; SL drags show the predicted-loss chip the same way. Values are qty- and side-aware (short/long, buy/sell) and match the position math to the cent; the chip flips color automatically when a drag crosses the entry (loss-locked TP / profit-locked SL).
+- Verified live end-to-end with real mouse drags on both a filled position (SPCX short) and a pending bracket (MCD), all four sign/direction combinations, with zero account mutation and the user's layout fully restored.

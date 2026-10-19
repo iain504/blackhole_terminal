@@ -237,8 +237,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const posRef = useRef(posData.data)
   posRef.current = posData.data
   const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
-  // pending-order drag (entry / planned TP / planned SL of an unfilled order)
-  const pendingDragRef = useRef<{ part: 'entry' | 'tp' | 'sl'; price: number | null } | null>(null)
+  // pending-order drag (entry / planned TP / planned SL of an unfilled order).
+  // `pl` freezes the P/L baseline (entry limit, qty, side) at drag start so the
+  // predicted profit/loss chip can be drawn between the line and its entry.
+  const pendingDragRef = useRef<{ part: 'entry' | 'tp' | 'sl'; price: number | null; pl?: { entry: number; qty: number; side: string } } | null>(null)
   // ghost [+TP]/[+SL] chip rects (rebuilt each overlay pass, hit-tested to
   // let the user DRAG a new exit out of the position line)
   const ghostChipRectsRef = useRef<{ part: 'sl' | 'tp'; x: number; y: number; w: number; h: number }[]>([])
@@ -853,6 +855,17 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.setLineDash([])
         ctx.restore()
         drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+        // predicted P/L (user spec): profit for TP / loss for SL, drawn BETWEEN
+        // the dragged line and the position's entry price, sign-colored
+        if (myPos && myPos.avgEntry > 0 && Math.abs(myPos.qty) > 0) {
+          const yEntry = yOf(myPos.avgEntry)
+          if (yEntry != null) {
+            const perUnit = myPos.side === 'short' ? myPos.avgEntry - exDrag.price : exDrag.price - myPos.avgEntry
+            const total = perUnit * Math.abs(myPos.qty)
+            const pct = (perUnit / myPos.avgEntry) * 100
+            drawPlChip(ctx, w, (yD + yEntry) / 2, total, pct)
+          }
+        }
       }
     }
     // preview of the NEW pending entry/TP/SL while dragging (drops → PATCH)
@@ -871,6 +884,17 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.restore()
         const label = pDrag.part === 'entry' ? 'ENTRY' : pDrag.part.toUpperCase()
         drawChip(ctx, w - 122, yD, `new ${label} ${fmtPrice(pDrag.price)}`, color, true)
+        // predicted P/L for a dragged pending TP/SL — baseline is the pending
+        // order's entry (limit) price, frozen at drag start
+        if ((pDrag.part === 'tp' || pDrag.part === 'sl') && pDrag.pl && pDrag.pl.entry > 0 && pDrag.pl.qty > 0) {
+          const yEntryP = yOf(pDrag.pl.entry)
+          if (yEntryP != null) {
+            const perUnit = pDrag.pl.side === 'sell' ? pDrag.pl.entry - pDrag.price : pDrag.price - pDrag.pl.entry
+            const total = perUnit * pDrag.pl.qty
+            const pct = (perUnit / pDrag.pl.entry) * 100
+            drawPlChip(ctx, w, (yD + yEntryP) / 2, total, pct)
+          }
+        }
       }
     }
 
@@ -1162,6 +1186,30 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.fillText(text, x + 6, by + 11.5)
     ctx.restore()
     return { x, y: by, w: bw, h: bh }
+  }
+
+  /** Predicted P/L chip while dragging TP/SL (user spec): a bold, sign-colored
+   * label ("+$245.00 (+2.3%)" green / "-$120.00 (-1.5%)" red) drawn vertically
+   * BETWEEN the dragged line and the entry price, horizontally centered. */
+  function drawPlChip(ctx: CanvasRenderingContext2D, chartW: number, y: number, total: number, pct: number) {
+    const positive = total >= 0
+    const money = Math.abs(total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    const text = `${positive ? '+' : '-'}$${money} (${pct >= 0 ? '+' : '-'}${Math.abs(pct).toFixed(2)}%)`
+    ctx.save()
+    ctx.font = 'bold 11px ui-monospace, monospace'
+    const bw = ctx.measureText(text).width + 14
+    const bh = 18
+    const x = Math.round((chartW - bw) / 2)
+    const by = Math.round(y) - bh / 2
+    ctx.globalAlpha = 0.95
+    ctx.fillStyle = positive ? 'rgba(34,197,94,0.95)' : 'rgba(244,63,94,0.95)'
+    ctx.beginPath()
+    ctx.roundRect(x, by, bw, bh, 4)
+    ctx.fill()
+    ctx.globalAlpha = 1
+    ctx.fillStyle = '#09090b'
+    ctx.fillText(text, x + 7, by + 13)
+    ctx.restore()
   }
 
   /** Outline-style chip for a MISSING exit ("[+TP]"/"[+SL]"); its RIGHT edge
@@ -1756,7 +1804,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           // pending entry / planned TP/SL line drag — relative move like exits
           orig = [{ time: null, price: hit.origPrice }]
           origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
-          pendingDragRef.current = { part: hit.part === 'whole' ? 'entry' : hit.part, price: hit.origPrice }
+          pendingDragRef.current = {
+            part: hit.part === 'whole' ? 'entry' : hit.part,
+            price: hit.origPrice,
+            // P/L baseline for the predicted profit/loss chip (TP/SL drags only)
+            pl: hit.part !== 'whole' && hit.pending.limitPrice != null
+              ? { entry: hit.pending.limitPrice, qty: Math.abs(hit.pending.qty), side: hit.pending.side }
+              : undefined,
+          }
         } else {
           // ghost [+TP]/[+SL] chip — dragging it CREATES the exit at the drop
           // price (starts from the suggested ±5% level, follows the cursor)
@@ -1791,7 +1846,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const oy = drag.origPixels[0]?.y
             if (oy != null) {
               const np = priceAt(oy + dy)
-              pendingDragRef.current = { part: drag.hit.part === 'whole' ? 'entry' : drag.hit.part, price: np }
+              pendingDragRef.current = { part: drag.hit.part === 'whole' ? 'entry' : drag.hit.part, price: np, pl: pendingDragRef.current?.pl }
               scheduleRedraw()
             }
             return
