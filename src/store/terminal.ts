@@ -13,14 +13,17 @@ export interface SessionUser {
 export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions'
 
 // Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
-// '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid.
-export type GridLayoutId = '1' | '2h' | '2v' | '3s' | '4'
+// '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid, '6' 3×2 grid,
+// '8' 4×2 grid.
+export type GridLayoutId = '1' | '2h' | '2v' | '3s' | '4' | '6' | '8'
 export const GRID_LAYOUTS: { id: GridLayoutId; label: string; short: string; panes: number }[] = [
   { id: '1', label: 'Single chart', short: '1', panes: 1 },
   { id: '2h', label: '2 charts — side by side', short: '2×1', panes: 2 },
   { id: '2v', label: '2 charts — stacked', short: '1×2', panes: 2 },
   { id: '3s', label: '3 charts — one wide + two', short: '3', panes: 3 },
   { id: '4', label: '4 charts — grid', short: '2×2', panes: 4 },
+  { id: '6', label: '6 charts — grid', short: '3×2', panes: 6 },
+  { id: '8', label: '8 charts — grid', short: '4×2', panes: 8 },
 ]
 
 export interface Pane {

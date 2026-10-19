@@ -1,22 +1,29 @@
-// Yahoo Finance earnings dates (same data the python `yfinance` lib exposes:
-// quoteSummary modules `calendarEvents` + `earningsHistory`).
+// Yahoo Finance upcoming-earnings date (same data the python `yfinance` lib
+// exposes via quoteSummary module `calendarEvents`).
+//
+// WHY ONLY THE UPCOMING DATE: Yahoo's `earningsHistory` "quarter" field holds
+// FISCAL QUARTER-END dates (e.g. TSLA 2025-09-30), NOT announcement dates —
+// drawing those on the x-axis put [E] markers 3-4 weeks off the real report
+// days ("many wrong dates" bug). Real announcement dates are not available
+// keylessly (v8 chart events removed by Yahoo, earnings sub-endpoint 404s), so
+// historical earnings markers come from Alpaca *report-day* news instead
+// (strict regex in alpaca.ts) — and only ever REAL dates are shown.
+//
 // Yahoo requires a cookie + crumb for quoteSummary — this mirrors the
 // yfinance flow: GET fc.yahoo.com (sets A1/A3 cookies) → GET /v1/test/getcrumb
-// → call quoteSummary with ?crumb=...
-// Results are cached in local memory (earnings change rarely).
+// → call quoteSummary with ?crumb=... Results are cached in local memory.
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 export interface YahooEarningsEvent {
-  ts: number // unix seconds (report date, UTC midnight-ish)
-  epsActual?: number | null
-  epsEstimate?: number | null
+  ts: number // unix seconds (report date/time, UTC-ish)
   upcoming?: boolean
 }
 
 export interface YahooEarnings {
-  events: YahooEarningsEvent[]
+  /** next consensus earnings date (null when Yahoo has none) */
+  upcoming: YahooEarningsEvent | null
   source: 'yfinance'
 }
 
@@ -69,7 +76,7 @@ async function getSession(force = false): Promise<YahooSession> {
   return sessionPromise
 }
 
-// ---- earnings cache (memory) ----
+// ---- upcoming-earnings cache (memory) ----
 const CACHE_TTL = 6 * 60 * 60 * 1000 // 6h
 const STALE_TTL = 7 * 24 * 60 * 60 * 1000 // serve stale for 7d if live fetch fails
 const cache = new Map<string, { data: YahooEarnings; at: number }>()
@@ -80,15 +87,7 @@ interface QuoteSummaryResp {
       calendarEvents?: {
         earnings?: {
           earningsDate?: { raw?: number; fmt?: string }[]
-          isEarningsDateEstimate?: boolean
         }
-      }
-      earningsHistory?: {
-        history?: {
-          quarter?: { raw?: number; fmt?: string }
-          epsActual?: { raw?: number }
-          epsEstimate?: { raw?: number }
-        }[]
       }
     }[]
     error?: { description?: string } | null
@@ -97,7 +96,7 @@ interface QuoteSummaryResp {
 
 async function fetchEarningsLive(symbol: string): Promise<YahooEarnings> {
   const s = await getSession()
-  const modules = encodeURIComponent('calendarEvents,earningsHistory')
+  const modules = encodeURIComponent('calendarEvents')
   const call = async (sess: YahooSession) => {
     const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
       symbol,
@@ -117,34 +116,19 @@ async function fetchEarningsLive(symbol: string): Promise<YahooEarnings> {
   const r = json.quoteSummary?.result?.[0]
   if (!r) throw new Error('yahoo quoteSummary empty')
 
-  const events: YahooEarningsEvent[] = []
-  const seenDays = new Set<string>()
-  const push = (e: YahooEarningsEvent) => {
-    if (!Number.isFinite(e.ts)) return
-    const key = new Date(e.ts * 1000).toISOString().slice(0, 10)
-    if (seenDays.has(key)) return
-    seenDays.add(key)
-    events.push(e)
-  }
-  // past quarters (most recent first) — quarter.raw = report date
-  for (const h of r.earningsHistory?.history ?? []) {
-    const ts = h.quarter?.raw
-    if (!ts) continue
-    push({
-      ts: Math.floor(ts),
-      epsActual: h.epsActual?.raw ?? null,
-      epsEstimate: h.epsEstimate?.raw ?? null,
-    })
-  }
   // next upcoming earnings (earningsDate[0] = consensus estimate)
   const up = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw
+  let upcoming: YahooEarningsEvent | null = null
   if (up && up * 1000 > Date.now() - 86400 * 1000) {
-    push({ ts: Math.floor(up), upcoming: true })
+    upcoming = { ts: Math.floor(up), upcoming: true }
   }
-  return { events: events.sort((a, b) => a.ts - b.ts), source: 'yfinance' }
+  return { upcoming, source: 'yfinance' }
 }
 
-/** Earnings dates for a symbol (past quarters + next upcoming), yfinance-style. Returns null when Yahoo is unavailable. */
+/**
+ * Next upcoming earnings date for a symbol (yfinance calendarEvents).
+ * Returns null when Yahoo is unavailable or has no upcoming date.
+ */
 export async function getYahooEarnings(symbol: string): Promise<YahooEarnings | null> {
   const key = symbol.toUpperCase()
   const hit = cache.get(key)

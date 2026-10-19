@@ -3,6 +3,7 @@
 // Quote panel: current symbol snapshot (price, change, OHLC, volume, range).
 import { useEffect, useState } from 'react'
 import { fmtPrice, isCryptoSymbol } from '@/lib/market-types'
+import { subscribeStream } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Bitcoin, TrendingUp } from 'lucide-react'
@@ -45,6 +46,35 @@ export function QuotePanel({ symbol }: { symbol: string }) {
       clearInterval(timer)
     }
   }, [symbol])
+
+  // stream ticks: live price between the 10s REST refreshes — recomputes
+  // change vs the REST-known prev close and folds in stream day-OHLC/volume
+  // (crypto miniTicker carries o/h/l/v; stock trades only carry the price)
+  useEffect(
+    () =>
+      subscribeStream([symbol], (t) => {
+        setState((prev) => {
+          const base = prev?.key === symbol ? prev.q : null
+          if (!base) return prev
+          const change = t.p - base.prevClose
+          return {
+            key: symbol,
+            q: {
+              ...base,
+              price: t.p,
+              change,
+              changePct: base.prevClose ? (change / base.prevClose) * 100 : base.changePct,
+              open: t.o ?? base.open,
+              high: Math.max(t.h ?? base.high, t.p),
+              low: Math.min(t.l ?? base.low, t.p),
+              volume: t.v ?? base.volume,
+              ts: t.t,
+            },
+          }
+        })
+      }),
+    [symbol],
+  )
 
   const up = (q?.changePct ?? 0) >= 0
 

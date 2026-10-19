@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, Watchlist } from '@/store/terminal'
 import { fmtPrice } from '@/lib/market-types'
+import { subscribeStream } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -96,6 +97,29 @@ export function WatchlistPanel() {
       alive = false
       clearInterval(timer)
     }
+  }, [itemsKey])
+
+  // stream ticks: patch prices in real time between the 10s REST refreshes
+  // (crypto streams from Binance; stocks from Alpaca when keys exist, else sim)
+  useEffect(() => {
+    if (!itemsKey) return
+    return subscribeStream(itemsKey.split(','), (t) => {
+      setQuotes((prev) => {
+        const row = prev[t.s]
+        if (!row) return prev
+        const prevClose = row.price - row.change // implied by the last REST row
+        const change = t.p - prevClose
+        return {
+          ...prev,
+          [t.s]: {
+            ...row,
+            price: t.p,
+            change,
+            changePct: prevClose ? (change / prevClose) * 100 : row.changePct,
+          },
+        }
+      })
+    })
   }, [itemsKey])
 
   // live symbol prediction: query the Alpaca-backed universe as the user types

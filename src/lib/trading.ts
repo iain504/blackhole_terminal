@@ -191,6 +191,8 @@ export interface TradingOrder {
   legs: TradingOrder[] | null
   client_order_id?: string
   asset_class?: string
+  /** 'simple' | 'bracket' | 'oco' | 'oto' (Alpaca v2 order class) */
+  order_class?: string
 }
 
 // ---------- API wrappers ----------

@@ -229,6 +229,58 @@ function ChartGrid({ tab }: { tab: Tab }) {
           </Panel>
         </PanelGroup>
       )
+    case '6':
+      return (
+        <PanelGroup direction="vertical" className="h-full">
+          <Panel defaultSize={50} minSize={20}>
+            <PanelGroup direction="horizontal" className="h-full">
+              <Panel defaultSize={33.4} minSize={15}>{pane(0)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={33.3} minSize={15}>{pane(1)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={33.3} minSize={15}>{pane(2)}</Panel>
+            </PanelGroup>
+          </Panel>
+          {handle('vertical')}
+          <Panel defaultSize={50} minSize={20}>
+            <PanelGroup direction="horizontal" className="h-full">
+              <Panel defaultSize={33.4} minSize={15}>{pane(3)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={33.3} minSize={15}>{pane(4)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={33.3} minSize={15}>{pane(5)}</Panel>
+            </PanelGroup>
+          </Panel>
+        </PanelGroup>
+      )
+    case '8':
+      return (
+        <PanelGroup direction="vertical" className="h-full">
+          <Panel defaultSize={50} minSize={20}>
+            <PanelGroup direction="horizontal" className="h-full">
+              <Panel defaultSize={25} minSize={12}>{pane(0)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(1)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(2)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(3)}</Panel>
+            </PanelGroup>
+          </Panel>
+          {handle('vertical')}
+          <Panel defaultSize={50} minSize={20}>
+            <PanelGroup direction="horizontal" className="h-full">
+              <Panel defaultSize={25} minSize={12}>{pane(4)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(5)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(6)}</Panel>
+              {handle('horizontal')}
+              <Panel defaultSize={25} minSize={12}>{pane(7)}</Panel>
+            </PanelGroup>
+          </Panel>
+        </PanelGroup>
+      )
     case '1':
     default:
       return pane(0)

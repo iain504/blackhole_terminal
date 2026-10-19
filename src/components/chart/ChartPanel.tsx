@@ -28,6 +28,7 @@ import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, PendingOrderInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
+import { subscribeStream, StreamTick } from '@/lib/stream-client'
 
 const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 
@@ -107,6 +108,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
+  const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
   const feedStateRef = useRef('')
@@ -120,7 +122,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [demoReason, setDemoReason] = useState<string | undefined>(undefined)
   const [settingsVer, setSettingsVer] = useState(0)
   const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
-  const [quote, setQuote] = useState<{ price: number; changePct: number; change: number } | null>(null)
+  const [quote, setQuote] = useState<{ price: number; changePct: number; change: number; prevClose?: number } | null>(null)
+  // streaming ticks (stream-service socket.io): badge + pending-tick bookkeeping
+  const liveAtRef = useRef(0)
+  const [liveBadge, setLiveBadge] = useState<'live' | 'sim' | null>(null)
+  const pendingTickRef = useRef<StreamTick | null>(null)
   const [showDrawings, setShowDrawings] = useState(true)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
@@ -1735,6 +1741,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       lastValueVisible: false,
       priceLineVisible: false,
     })
+    volSeriesRef.current = vol
     chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
 
     chart.subscribeCrosshairMove((param: MouseEventParams) => {
@@ -1924,6 +1931,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           chart.timeScale().setVisibleLogicalRange({ from, to: clean.length + 6 })
         }
 
+        // bars are on screen — dismiss loading NOW and let the [E]/⚡ markers
+        // fill in asynchronously (their paginated news scan must never block
+        // the first paint of the chart)
+        setLoading(false)
+        scheduleRedraw()
+
         // x-axis event markers: earnings [E] (yfinance) + news ⚡ (Task 20)
         if (clean.length > 0) {
           try {
@@ -1943,11 +1956,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               const step = Math.max(1, Math.ceil(rawNews.length / 16))
               const spacedNews = rawNews.filter((_, i) => i % step === 0)
               markersRef.current = { earnings, news: spacedNews.slice(0, 16) }
+              scheduleRedraw()
             }
           } catch { /* markers optional */ }
         }
-        setLoading(false)
-        scheduleRedraw()
       } catch {
         if (!cancelled) setLoading(false)
       }
@@ -1975,6 +1987,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // scroll-back pagination probes (Task 28 #1)
       bars: () => barsRef.current.length,
       oldestBarTime: () => barsRef.current[0]?.time ?? null,
+      lastBarTime: () => barsRef.current[barsRef.current.length - 1]?.time ?? null,
+      lastBar: () => {
+        const b = barsRef.current[barsRef.current.length - 1]
+        return b ? { ...b } : null
+      },
       firstVisibleTime: () => {
         try {
           const r = chart.timeScale().getVisibleRange()
@@ -1993,6 +2010,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
+      volSeriesRef.current = null
       barsRef.current = []
       markersRef.current = { earnings: [], news: [] }
       axisIconsRef.current = []
@@ -2004,9 +2022,86 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     void loadDrawings(symbol)
   }, [symbol, loadDrawings])
 
-  // quote polling (10s) — also feeds the live price into the last bar so the
-  // chart tracks the market between bar closes and re-autoscales (which keeps
-  // position/SL/TP lines in view)
+  // ---------- live streaming ticks (stream-service via socket.io) ----------
+  // Applies a stream tick to the chart: mutate the last bar intra-period, or
+  // ROLL A NEW BAR once the tick's timestamp crosses the bar boundary (the
+  // chart previously stayed pinned on one bar forever between reloads).
+  const applyTick = (t: StreamTick) => {
+    liveAtRef.current = Date.now()
+    setLiveBadge(t.demo ? 'sim' : 'live')
+    const bars = barsRef.current
+    const s = seriesRef.current
+    if (bars.length === 0 || !s) return
+    const lastB = bars[bars.length - 1]
+    const tfSec = TIMEFRAMES[tf].seconds
+    const aligned = Math.floor(t.t / tfSec) * tfSec
+    if (aligned > lastB.time) {
+      const nb: Bar = {
+        time: aligned,
+        open: lastB.close,
+        high: Math.max(lastB.close, t.p),
+        low: Math.min(lastB.close, t.p),
+        close: t.p,
+        volume: 0,
+      }
+      barsRef.current = [...bars, nb]
+      const upd =
+        chartType === 'candles'
+          ? { time: nb.time as UTCTimestamp, open: nb.open, high: nb.high, low: nb.low, close: nb.close }
+          : { time: nb.time as UTCTimestamp, value: nb.close }
+      s.update(upd as CandlestickData<Time> | LineData<Time>)
+      volSeriesRef.current?.update({ time: nb.time as UTCTimestamp, value: 0, color: 'rgba(34,197,94,0.35)' })
+      scheduleRedraw()
+    } else if (lastB.close !== t.p || t.p > lastB.high || t.p < lastB.low) {
+      const high = Math.max(lastB.high, t.p)
+      const low = Math.min(lastB.low, t.p)
+      const bar =
+        chartType === 'candles'
+          ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close: t.p }
+          : { time: lastB.time as UTCTimestamp, value: t.p }
+      s.update(bar as CandlestickData<Time> | LineData<Time>)
+      barsRef.current = [...bars.slice(0, -1), { ...lastB, close: t.p, high, low }]
+      scheduleRedraw()
+    }
+    // header quote — recompute change vs the REST-known previous close
+    setQuote((q) => {
+      if (!q) return q
+      const change = q.prevClose != null ? t.p - q.prevClose : q.change
+      const changePct = q.prevClose ? (change / q.prevClose) * 100 : q.changePct
+      return { ...q, price: t.p, change, changePct }
+    })
+  }
+  const applyTickRef = useRef(applyTick)
+  applyTickRef.current = applyTick
+
+  // coalesce stream bursts to ≤4 renders/s per pane (8-pane grids stay smooth)
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const t = pendingTickRef.current
+      if (t) {
+        pendingTickRef.current = null
+        applyTickRef.current(t)
+      }
+      // expire the LIVE/SIM badge when the stream goes quiet (>6s)
+      if (liveAtRef.current && Date.now() - liveAtRef.current > 6000 && !pendingTickRef.current) {
+        liveAtRef.current = 0
+        setLiveBadge((b) => (b == null ? b : null))
+      }
+    }, 250)
+    return () => clearInterval(iv)
+  }, [])
+
+  // subscribe this pane's symbol to the shared stream socket
+  useEffect(() => {
+    pendingTickRef.current = null
+    return subscribeStream([symbol], (t) => {
+      pendingTickRef.current = t
+    })
+  }, [symbol])
+
+  // quote polling (10s) — REST fallback that keeps prevClose/OHLC fresh while
+  // the websocket stream provides the fast price path (skipped while ticks
+  // are flowing so a cached REST snapshot never yanks the streamed price back)
   useEffect(() => {
     let alive = true
     const fetchQ = async () => {
@@ -2020,22 +2115,32 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const json = await res.json()
         const q = json.quotes?.[0]
         if (q && alive) {
-          setQuote({ price: q.price, changePct: q.changePct, change: q.change })
-          const bars = barsRef.current
-          const s = seriesRef.current
-          if (bars.length > 0 && s && json.meta?.demo !== true) {
-            const lastB = bars[bars.length - 1]
-            const close = q.price as number
-            const high = Math.max(lastB.high, close)
-            const low = Math.min(lastB.low, close)
-            const bar = (
-              chartType === 'candles'
-                ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close }
-                : { time: lastB.time as UTCTimestamp, value: close }
-            ) as CandlestickData<Time> | LineData<Time>
-            s.update(bar)
-            barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
-            scheduleRedraw()
+          const fresh = liveAtRef.current && Date.now() - liveAtRef.current < 8000
+          if (!fresh) {
+            setQuote({ price: q.price, changePct: q.changePct, change: q.change, prevClose: q.prevClose })
+            const bars = barsRef.current
+            const s = seriesRef.current
+            if (bars.length > 0 && s && json.meta?.demo !== true) {
+              const lastB = bars[bars.length - 1]
+              const close = q.price as number
+              const high = Math.max(lastB.high, close)
+              const low = Math.min(lastB.low, close)
+              const bar = (
+                chartType === 'candles'
+                  ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close }
+                  : { time: lastB.time as UTCTimestamp, value: close }
+              ) as CandlestickData<Time> | LineData<Time>
+              s.update(bar)
+              barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
+              scheduleRedraw()
+            }
+          } else {
+            // stream is live — only refresh the prev-close anchor + change basis
+            setQuote((prev) =>
+              prev
+                ? { ...prev, prevClose: q.prevClose }
+                : { price: q.price, changePct: q.changePct, change: q.change, prevClose: q.prevClose },
+            )
           }
         }
       } catch { /* offline */ }
@@ -2114,6 +2219,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           </button>
         </div>
         <div className="ml-auto flex items-center gap-2 pr-1">
+          {liveBadge && (
+            <span
+              title={liveBadge === 'live' ? 'Streaming live prices (websocket)' : 'Simulated ticks — no live data feed for this symbol'}
+              className={cn(
+                'inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-semibold',
+                liveBadge === 'live' ? 'border-emerald-500/40 text-emerald-400' : 'border-amber-500/40 text-amber-400',
+              )}
+            >
+              <span className={cn('h-1.5 w-1.5 rounded-full', liveBadge === 'live' ? 'animate-pulse bg-emerald-400' : 'bg-amber-400')} />
+              {liveBadge === 'live' ? 'LIVE' : 'SIM'}
+            </span>
+          )}
           {demo && (
             <Badge
               variant="outline"

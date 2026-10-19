@@ -5,8 +5,16 @@
 // Falls back to Alpaca crypto (if keys exist) and finally the demo simulator.
 import { Bar, Quote, Timeframe, TIMEFRAMES } from './market-types'
 
-const BASE = 'https://api.binance.com'
+// Primary REST host + public market-data mirror. api.binance.com intermittently
+// answers HTTP 418/429 (IP rate-limit waves in datacenter ranges) — the mirror
+// `data-api.binance.vision` serves the SAME public market-data paths with laxer
+// limits, so every request falls over to it before giving up.
+const BASES = ['https://api.binance.com', 'https://data-api.binance.vision']
 const TIMEOUT_MS = 6000
+// sticky working base (short TTL so the primary is re-tried periodically)
+let activeBase = BASES[0]
+let activeBaseAt = 0
+const BASE_STICKY_MS = 10 * 60 * 1000
 
 /** 'BTC/USD' -> 'BTCUSDT' (Binance quotes USD pairs as USDT), 'ETH/EUR' -> 'ETHEUR'. */
 export function toBinanceSymbol(symbol: string): string | null {
@@ -17,25 +25,38 @@ export function toBinanceSymbol(symbol: string): string | null {
 }
 
 async function binanceFetch<T>(path: string): Promise<T | null> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
-  try {
-    const res = await fetch(`${BASE}${path}`, {
-      signal: controller.signal,
-      cache: 'no-store',
-      headers: { accept: 'application/json' },
-    })
-    if (!res.ok) {
-      console.error(`Binance ${path} -> HTTP ${res.status}`)
-      return null
+  // start from the sticky base (re-try the primary every 10min) and fall over
+  // to the remaining bases on rate-limit / hard errors
+  const bases = Date.now() - activeBaseAt < BASE_STICKY_MS
+    ? [activeBase, ...BASES.filter((b) => b !== activeBase)]
+    : [...BASES]
+  for (const base of bases) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+    try {
+      const res = await fetch(`${base}${path}`, {
+        signal: controller.signal,
+        cache: 'no-store',
+        headers: { accept: 'application/json' },
+      })
+      if (!res.ok) {
+        // 4xx that won't change with another host (bad symbol etc.) — stop early
+        console.error(`Binance ${base}${path} -> HTTP ${res.status}`)
+        if (res.status >= 400 && res.status < 500 && res.status !== 418 && res.status !== 429) return null
+        continue
+      }
+      const data = (await res.json()) as T
+      activeBase = base
+      activeBaseAt = Date.now()
+      return data
+    } catch (e) {
+      console.error(`Binance ${base}${path} failed:`, e instanceof Error ? e.message : e)
+      continue
+    } finally {
+      clearTimeout(timer)
     }
-    return (await res.json()) as T
-  } catch (e) {
-    console.error(`Binance ${path} failed:`, e instanceof Error ? e.message : e)
-    return null
-  } finally {
-    clearTimeout(timer)
   }
+  return null
 }
 
 // ---------------- in-memory caches (shared per server instance) -------------

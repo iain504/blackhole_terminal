@@ -510,7 +510,19 @@ export async function getNews(symbol: string | null, limit: number, userId?: str
 
 // ---------- Markers (earnings via news scan + news timestamps) ----------
 
-const EARNINGS_RE = /earnings|reports q[1-4]|quarterly results|q[1-4] (results|report|earnings)|fiscal.*(results|earnings)|reports (fourth|first|second|third)-?quarter/i
+// STRICT report-day phrasing only: matches headlines actually PUBLISHED on an
+// earnings announcement day ("Tesla Posts Huge Q2 EPS Miss", "ACME Reports
+// First Quarter 2026 Results", "XYZ Announces Q3 Earnings"). Loose "earnings"
+// matching used to fire on previews/analysis ("What to expect from earnings",
+// "Alphabet's Q2 Earnings—Why Wall Street's Frosty Reaction…") — planting fake
+// [E] markers on random news days ("many wrong dates" bug).
+const EARNINGS_REPORT_RE =
+  /\b(?:reports?|posts?|announces?|releases?)\b[^.|]{0,60}?\b(?:first|second|third|fourth|q[1-4])\b[^.|]{0,40}?\b(?:quarter(?:ly)?|results|earnings|eps|financial results)\b|\b(?:first|second|third|fourth)[\s-]?quarter(?:ly)?\s+(?:20\d{2}\s+)?(?:financial\s+)?results\b/i
+// Preview/analysis/scheduling chatter that must NEVER count as a report-day
+// headline even when it contains a report verb ("Announces webcast for Q2
+// earnings call", "What to expect from Q3 earnings", "set to report…").
+const EARNINGS_NEG_RE =
+  /\bpreview|webcast|conference call|earnings call|scheduled?|to report|will report|set to|what to expect|what to watch|ahead of|outlook|forecast|estimates\b/i
 
 export async function getMarkers(symbol: string, from: number, to: number, userId?: string): Promise<MarkerData & DemoMeta> {
   const keys = await getAlpacaKeys(userId)
@@ -529,21 +541,40 @@ export async function getMarkers(symbol: string, from: number, to: number, userI
   })
   if (!isCryptoSymbol(symbol)) params.set('symbols', symbol)
   else params.delete('symbols') // crypto news not symbol-filterable; use all
-  const { data: raw, status } = await alpacaFetch<{ news: AlpacaNewsItem[] }>(`/v1beta1/news?${params.toString()}`, keys)
-  if (!raw || !raw.news) {
+  // PAGINATE the news scan (bounded): report-day headlines for PAST quarters
+  // sit deep in the feed for high-volume symbols — 50 items only reaches a
+  // few weeks back. 8 pages × 50 = 400 headlines ≈ real past [E] days for
+  // most symbols while keeping the marker fetch bounded.
+  const MAX_PAGES = 8
+  const allNews: AlpacaNewsItem[] = []
+  let token: string | undefined = undefined
+  let status = 200
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const url = `/v1beta1/news?${params.toString()}${token ? `&page_token=${encodeURIComponent(token)}` : ''}`
+    const { data, status: st } = await alpacaFetch<{ news: AlpacaNewsItem[]; next_page_token?: string }>(url, keys)
+    if (!data) {
+      status = st
+      break
+    }
+    status = st
+    allNews.push(...(data.news ?? []))
+    token = data.next_page_token
+    if (!token) break
+  }
+  if (allNews.length === 0) {
     return demoResult(
       (reason) => ({ ...simMarkers(symbol, from, to), demo: true, reason }),
-      !raw ? (status === 0 ? 'alpaca-error' : (`alpaca-http-${status}` as DemoReason)) : 'empty',
+      status === 0 ? 'alpaca-error' : status !== 200 ? (`alpaca-http-${status}` as DemoReason) : 'empty',
     )
   }
   const earnings: number[] = []
   const news: number[] = []
   const seen = new Set<string>()
-  for (const n of raw.news) {
+  for (const n of allNews) {
     const ts = Math.floor(new Date(n.created_at).getTime() / 1000)
     if (ts < from || ts > to) continue
     news.push(ts)
-    if (EARNINGS_RE.test(n.headline)) {
+    if (EARNINGS_REPORT_RE.test(n.headline) && !EARNINGS_NEG_RE.test(n.headline)) {
       const key = new Date(ts * 1000).toISOString().slice(0, 10)
       if (!seen.has(key)) {
         seen.add(key)
@@ -553,12 +584,14 @@ export async function getMarkers(symbol: string, from: number, to: number, userI
   }
   // crypto has no earnings — drop for crypto symbols
   const finalEarnings = isCryptoSymbol(symbol) ? [] : earnings
+  const newsSorted = [...news].sort((a, b) => b - a)
   return {
     earnings: finalEarnings,
-    news: news.slice(0, 40),
-    newsItems: raw.news
+    news: newsSorted.slice(0, 40),
+    newsItems: allNews
       .map((n) => ({ ts: Math.floor(new Date(n.created_at).getTime() / 1000), title: n.headline }))
       .filter((n) => news.includes(n.ts))
+      .sort((a, b) => b.ts - a.ts)
       .slice(0, 40),
     demo: false,
   }
