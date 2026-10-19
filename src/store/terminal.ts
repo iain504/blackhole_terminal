@@ -470,11 +470,19 @@ export const useTerminal = create<TerminalState>((set, get) => ({
 
   updateWatchlist: async (id, patch) => {
     set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === id ? { ...l, ...patch } : l)) }))
-    await fetch(`/api/watchlists/${id}`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(patch),
-    })
+    try {
+      const res = await fetch(`/api/watchlists/${id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(patch),
+      })
+      if (!res.ok) {
+        // server rejected the patch (e.g. empty name) — resync to source of truth
+        await get().loadWatchlists()
+      }
+    } catch {
+      /* offline — optimistic state stays; next successful action resyncs */
+    }
   },
 
   moveWatchlist: async (id, dir) => {

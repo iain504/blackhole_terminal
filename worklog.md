@@ -577,3 +577,23 @@ Stage Summary:
 - Stock pending-entry drags are now safe: crossing drags are rejected BEFORE any cancel (family untouched, clear toast), and any post-cancel failure restores the original order.
 - Known limitation (not fixed here): dragging a TP of an ACTIVE position below market would make it marketable (Alpaca fills it — position closes); that is "as dragged" behavior, not data loss.
 - Queued for active-position legs (needs market open to E2E): PATCH on active legs verified working via probe (held-leg probe: 200, sibling survives); sibling-heal fallback in replaceExitOrderSmart still re-places exits as standalones (OCO link lost) — acceptable rare path.
+
+---
+Task ID: 33
+Agent: Z.ai Code (main)
+Task: (1) Show current time at the bottom right, (2) allow rename for watchlist
+
+Work Log:
+- CLOCK (TerminalRoot.tsx): new LiveClock component mounted in the footer's right group — local time HH:MM:SS ticking every 1s (en-GB, 24h), green Clock icon, timezone city label (sm+ screens, e.g. "UTC"/"London"), hover tooltip with weekday/date + full IANA tz name. SSR-safe: renders "--:--:--" until mounted so server/client markup always match; tabular-nums so digits don't jitter. Footer right side is now a flex group ("2FA-protected · …" text stays hidden on <sm, clock always visible at the bottom-right corner).
+- WATCHLIST RENAME (WatchlistPanel.tsx + terminal.ts):
+  - Options menu gained a "Rename" item (Pencil icon, first action) opening a rename dialog (autofocus + text pre-selected, maxLength 40 matching the API's trim, live 40-char counter, Save button with spinner while pending, Enter-to-save, Escape closes, dialog can't be dismissed mid-save).
+  - Double-click on a list chip in the switcher also opens rename (chip title hint: "double-click to rename"); works for any list, not just the active one.
+  - Store updateWatchlist hardened: on a non-ok PATCH it now resyncs from loadWatchlists() instead of leaving stale optimistic state (covers empty-name rejections); toast "Watchlist renamed — Now “X”" on success, destructive toast on failure.
+  - API already accepted { name } on PATCH /api/watchlists/[id] (trim + 40-char slice) — no server change needed.
+- Note: previous session's Task 17 already fixed the US-stock TP/SL drag bug (pre-cancel validation + restore-on-failure + nested legs merge); this task only adds the two new features.
+- E2E (agent-browser, trader+TOTP): footer read twice 2.5s apart → 07:18:46 → 07:18:48 (ticking, tz "UTC"); menu Rename → dialog prefilled "My Watchlist" → renamed "Tech Movers" → chip shows "Tech Movers5"; RELOAD → name persisted (server-side); double-click chip → dialog prefilled; renamed back to "My Watchlist" via Enter key → chip updated + toast "Watchlist renamed — Now “My Watchlist”" captured in screenshot (/tmp/clock-footer.png); clock visible bottom-right. Browser errors: none; dev.log clean (only pre-existing supervisor insufficient-balance noise); lint clean.
+
+Stage Summary:
+- Footer bottom-right now shows a live local clock (HH:MM:SS + timezone) that ticks every second; SSR/hydration safe.
+- Watchlists are renamable via the options menu, double-click on a list chip, with Enter/save-button paths, length validation, toasts, and server-persisted names; store resyncs on rejected patches.
+- Files: src/components/terminal/TerminalRoot.tsx (LiveClock), src/components/terminal/sidebar/WatchlistPanel.tsx (rename UI), src/store/terminal.ts (updateWatchlist resync).

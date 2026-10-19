@@ -1,7 +1,7 @@
 'use client'
 
 // Terminal root: auth gate, tab bar, 5s layout autosave, alert engine polling.
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, SessionUser } from '@/store/terminal'
 import AuthForms from '@/components/auth/AuthForms'
 import SettingsDialog from '@/components/settings/SettingsDialog'
@@ -11,7 +11,7 @@ import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
 import { useToast } from '@/hooks/use-toast'
-import { BellRing, Home, Loader2, Settings2 } from 'lucide-react'
+import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { fmtPrice } from '@/lib/market-types'
@@ -241,9 +241,44 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
             {useTerminal.getState().tabs.length > 0 && <BadgeDemoInline />}
           </span>
         </span>
-        <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
+        <span className="flex items-center gap-3">
+          <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
+          <LiveClock />
+        </span>
       </footer>
     </div>
+  )
+}
+
+// Ticking local clock for the footer (updates every second).
+// Renders a placeholder until mounted so SSR/CSR markup always matches.
+function LiveClock() {
+  const [now, setNow] = useState<Date | null>(null)
+  useEffect(() => {
+    setNow(new Date())
+    const timer = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(timer)
+  }, [])
+  const tz = useMemo(() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local'
+    } catch {
+      return 'Local'
+    }
+  }, [])
+  const city = tz.includes('/') ? tz.split('/').pop()!.replace(/_/g, ' ') : tz
+  const time = now
+    ? now.toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : '--:--:--'
+  return (
+    <span
+      className="flex items-center gap-1.5 tabular-nums text-zinc-300"
+      title={now ? `${now.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' })} ${time} · ${tz}` : tz}
+    >
+      <Clock className="h-3 w-3 text-emerald-500" aria-hidden="true" />
+      <span>{time}</span>
+      <span className="hidden text-[9px] uppercase tracking-wider text-zinc-600 sm:inline">{city}</span>
+    </span>
   )
 }
 

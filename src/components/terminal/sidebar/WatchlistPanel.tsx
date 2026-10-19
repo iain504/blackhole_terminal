@@ -18,7 +18,7 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2 } from 'lucide-react'
+import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil } from 'lucide-react'
 
 const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
 
@@ -57,6 +57,10 @@ export function WatchlistPanel() {
   const [suggOpen, setSuggOpen] = useState(false)
   const [suggIdx, setSuggIdx] = useState(-1)
   const [suggLoading, setSuggLoading] = useState(false)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [renameTargetId, setRenameTargetId] = useState<string | null>(null)
+  const [renameName, setRenameName] = useState('')
+  const [renaming, setRenaming] = useState(false)
   const listRef = useRef<HTMLDivElement>(null)
   const suggDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
   const inputBoxRef = useRef<HTMLDivElement>(null)
@@ -180,6 +184,33 @@ export function WatchlistPanel() {
     setCreateOpen(false)
   }
 
+  const openRename = (l: Watchlist) => {
+    setRenameTargetId(l.id)
+    setRenameName(l.name)
+    setRenameOpen(true)
+  }
+
+  const submitRename = async () => {
+    if (!renameTargetId) return
+    const name = renameName.trim()
+    if (!name) return
+    const original = lists.find((l) => l.id === renameTargetId)
+    if (original && name === original.name) {
+      setRenameOpen(false)
+      return
+    }
+    try {
+      setRenaming(true)
+      await updateWatchlist(renameTargetId, { name })
+      toast({ title: 'Watchlist renamed', description: `Now “${name}”.` })
+      setRenameOpen(false)
+    } catch {
+      toast({ title: 'Rename failed', description: 'Could not save the new name — please try again.', variant: 'destructive' })
+    } finally {
+      setRenaming(false)
+    }
+  }
+
   const sorted = useMemo(() => [...lists].sort((a, b) => a.sortOrder - b.sortOrder), [lists])
 
   return (
@@ -190,6 +221,8 @@ export function WatchlistPanel() {
           <button
             key={l.id}
             onClick={() => setActiveWatchlist(l.id)}
+            onDoubleClick={() => openRename(l)}
+            title={`${l.name} — double-click to rename`}
             className={cn(
               'flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors',
               l.id === list?.id ? 'border-zinc-600 bg-zinc-800 text-zinc-100' : 'border-transparent text-zinc-400 hover:bg-zinc-800/60',
@@ -219,6 +252,9 @@ export function WatchlistPanel() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="border-zinc-800 bg-zinc-900 text-xs">
+                <DropdownMenuItem className="gap-2" onClick={() => openRename(list)}>
+                  <Pencil className="h-3.5 w-3.5" /> Rename
+                </DropdownMenuItem>
                 <DropdownMenuItem className="gap-2" onClick={() => void moveWatchlist(list.id, -1)}>
                   <ChevronUp className="h-3.5 w-3.5" /> Move up
                 </DropdownMenuItem>
@@ -389,6 +425,39 @@ export function WatchlistPanel() {
           <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" onClick={() => void create()}>
             Create list
           </Button>
+        </DialogContent>
+      </Dialog>
+
+      {/* rename dialog */}
+      <Dialog open={renameOpen} onOpenChange={(o) => { if (!renaming) setRenameOpen(o) }}>
+        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+          <DialogHeader>
+            <DialogTitle className="text-sm text-zinc-100">Rename watchlist</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={renameName}
+            maxLength={40}
+            onChange={(e) => setRenameName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && renameName.trim()) void submitRename() }}
+            onFocus={(e) => e.target.select()}
+            placeholder="List name"
+            aria-label="New watchlist name"
+            className="border-zinc-800 bg-zinc-950 text-sm"
+          />
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] text-zinc-600">{renameName.trim().length}/40</span>
+            <Button
+              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+              disabled={!renameName.trim() || renaming}
+              onClick={() => void submitRename()}
+            >
+              <span className="flex items-center gap-1.5">
+                {renaming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                Save name
+              </span>
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
     </div>
