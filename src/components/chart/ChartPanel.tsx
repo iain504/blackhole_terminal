@@ -125,7 +125,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number; prevClose?: number } | null>(null)
   // streaming ticks (stream-service socket.io): badge + pending-tick bookkeeping
   const liveAtRef = useRef(0)
-  const [liveBadge, setLiveBadge] = useState<'live' | 'sim' | null>(null)
+  const [liveBadge, setLiveBadge] = useState<'live' | null>(null)
   const pendingTickRef = useRef<StreamTick | null>(null)
   const [showDrawings, setShowDrawings] = useState(true)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
@@ -2034,7 +2034,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // chart previously stayed pinned on one bar forever between reloads).
   const applyTick = (t: StreamTick) => {
     liveAtRef.current = Date.now()
-    setLiveBadge(t.demo ? 'sim' : 'live')
+    setLiveBadge('live') // every streamed tick is REAL — the SIM generator was permanently removed
     const bars = barsRef.current
     const s = seriesRef.current
     if (bars.length === 0 || !s) return
@@ -2088,7 +2088,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         pendingTickRef.current = null
         applyTickRef.current(t)
       }
-      // expire the LIVE/SIM badge when the stream goes quiet (>6s)
+      // expire the LIVE badge when the stream goes quiet (>6s)
       if (liveAtRef.current && Date.now() - liveAtRef.current > 6000 && !pendingTickRef.current) {
         liveAtRef.current = 0
         setLiveBadge((b) => (b == null ? b : null))
@@ -2227,14 +2227,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         <div className="ml-auto flex items-center gap-2 pr-1">
           {liveBadge && (
             <span
-              title={liveBadge === 'live' ? 'Streaming live prices (websocket)' : 'Simulated ticks — no live data feed for this symbol'}
-              className={cn(
-                'inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-semibold',
-                liveBadge === 'live' ? 'border-emerald-500/40 text-emerald-400' : 'border-amber-500/40 text-amber-400',
-              )}
+              title="Streaming live prices (websocket)"
+              className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-400"
             >
-              <span className={cn('h-1.5 w-1.5 rounded-full', liveBadge === 'live' ? 'animate-pulse bg-emerald-400' : 'bg-amber-400')} />
-              {liveBadge === 'live' ? 'LIVE' : 'SIM'}
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+              LIVE
             </span>
           )}
           {demo && (

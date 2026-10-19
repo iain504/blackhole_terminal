@@ -8,12 +8,13 @@
 //   │          All browser tabs/panes/watchlists multiplex over that single connection.
 //   │          Keys are resolved server-side from the user's session cookie via Next
 //   │          /api/stream/keys — the browser NEVER sees keys.
-//   └─ DEMO:   symbols without a live upstream (no keys / auth failed / slot busy /
-//   │          over the 30-symbol cap / binance down) get simulated mean-reverting ticks
-//   │          so the UI still streams (demo flag on the tick → SIM badge)
+//   └─ NO SIM: symbols without a live upstream (no keys / auth failed / slot busy /
+//              over the 30-symbol cap / binance down) simply DO NOT stream — the
+//              simulated-tick generator was permanently removed (a trading terminal
+//              must never fabricate prices); REST polling remains the fallback.
 //   ▶ 'sub'   { symbols: string[] }    subscribe (refcounted)
 //   ▶ 'unsub' { symbols: string[] }
-//   ◀ 'tick'  { s, p, t, o?, h?, l?, v?, demo? }   throttled ≤ 5 msgs/s per symbol
+//   ◀ 'tick'  { s, p, t, o?, h?, l?, v? }   throttled ≤ 5 msgs/s per symbol
 import { createServer } from 'http'
 import { Server, Socket } from 'socket.io'
 
@@ -22,7 +23,6 @@ const NEXT_BASE = 'http://localhost:3000'
 const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
 const ALPACA_WS = 'wss://stream.data.alpaca.markets/v2/iex'
 const FLUSH_MS = 200 // per-symbol emit throttle → ≤5 msgs/s
-const DEMO_TICK_MS = 1200
 const KEY_CACHE_MS = 60_000
 const QUOTE_TIMEOUT_MS = 4000
 // Alpaca market data: ONE concurrent websocket per key (2nd → error 406/403)
@@ -66,7 +66,6 @@ function release(syms: string[]): string[] {
   return removed
 }
 const desiredCrypto = () => [...refcounts.keys()].filter(isCrypto)
-const desiredStocks = () => [...refcounts.keys()].filter((s) => !isCrypto(s))
 
 // ------------------------------ tick fan-out -------------------------------
 interface Tick {
@@ -77,7 +76,6 @@ interface Tick {
   h?: number
   l?: number
   v?: number
-  demo?: boolean
 }
 const latest = new Map<string, Tick>()
 setInterval(() => {
@@ -150,7 +148,7 @@ function alpacaConnect(conn: AlpacaConn) {
           const code = Number(m.code ?? 0)
           console.error(`[alpaca] error ${code}: ${m.msg}`)
           if (code === 401 || code === 402) {
-            // bad keys — don't hammer; demo ticks for 10 min
+            // bad keys — don't hammer; retry after the 10-min cooldown
             conn.failed = true
             conn.failedReason = 'keys'
             failedKeys.set(conn.keys.keyId, Date.now())
@@ -160,15 +158,15 @@ function alpacaConnect(conn: AlpacaConn) {
             // for market data streams. If you try to open more than 1
             // connection at the same time, you may receive a 406 or 403."
             // Another client (or a stale process) holds the slot → do NOT
-            // reconnect-spam. Cool down, keep sockets on simulated ticks and
-            // retry quietly when the cooldown elapses.
+            // reconnect-spam. Cool down and retry quietly when it elapses.
             conn.failed = true
             conn.failedReason = 'slot'
             slotCooldown.set(conn.keys.keyId, Date.now())
             try { ws.close() } catch { /* noop */ }
           } else if (code === 407 || code === 409) {
             // subscription rate/symbol limit (free plan: 30 symbols/conn):
-            // keep what already streams; uncovered symbols get demo ticks.
+            // keep what already streams; uncovered symbols stay quiet
+            // (REST polling covers them — never simulate).
             conn.capped = true
           }
         }
@@ -200,7 +198,7 @@ function alpacaSync(conn: AlpacaConn) {
     for (const s of socketSyms.get(sock) ?? []) if (!isCrypto(s)) conn.wanted.add(s)
   }
   // respect the per-connection symbol cap (free plan) — extra symbols stay
-  // uncovered and the demo simulator keeps them moving instead of erroring
+  // uncovered and simply do not stream (REST polling covers them)
   const cap = conn.capped ? 0 : Math.max(0, ALPACA_SYMBOL_CAP - conn.subscribed.size)
   const add = [...conn.wanted].filter((s) => !conn.subscribed.has(s)).slice(0, cap)
   const rem = [...conn.subscribed].filter((s) => !conn.wanted.has(s))
@@ -351,72 +349,10 @@ setInterval(() => {
   }
 }, 30000)
 
-// ------------------------------ demo simulator -----------------------------
-const demoState = new Map<string, { p: number; anchor: number }>()
-const anchorsFetched = new Set<string>()
-
-function gauss(): number {
-  const u = Math.max(Math.random(), 1e-9)
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random())
-}
-
-async function fetchAnchors(syms: string[]) {
-  const need = syms.filter((s) => !anchorsFetched.has(s))
-  if (need.length === 0) return
-  for (let i = 0; i < need.length; i += 25) {
-    const chunk = need.slice(i, i + 25)
-    try {
-      const res = await fetch(`${NEXT_BASE}/api/market/quote`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ symbols: chunk }),
-        signal: AbortSignal.timeout(QUOTE_TIMEOUT_MS),
-      })
-      if (!res.ok) continue
-      const json = (await res.json()) as { quotes?: { symbol: string; price: number }[] }
-      for (const q of json.quotes ?? []) {
-        if (Number.isFinite(q.price) && q.price > 0) {
-          demoState.set(q.symbol, { p: q.price, anchor: q.price })
-          anchorsFetched.add(q.symbol)
-        }
-      }
-    } catch { /* offline — anchor defaults below */ }
-  }
-}
-
-// which symbols need simulated ticks (no live upstream covering them).
-// Coverage is PER SYMBOL: an authed-but-capped conn leaves its extra symbols
-// to the demo simulator instead of leaving them frozen.
-function symbolsNeedingDemo(): string[] {
-  const out: string[] = []
-  const covered = new Set<string>()
-  for (const c of alpacaConns.values()) {
-    if (c.authed && !c.failed && c.ws?.readyState === WebSocket.OPEN) {
-      for (const s of c.subscribed) covered.add(s)
-    }
-  }
-  for (const s of desiredStocks()) if (!covered.has(s)) out.push(s)
-  if (!binanceUp) out.push(...desiredCrypto())
-  return out
-}
-
-setInterval(async () => {
-  const syms = symbolsNeedingDemo()
-  if (syms.length > 0) void fetchAnchors(syms)
-  for (const s of syms) {
-    let st = demoState.get(s)
-    if (!st) {
-      st = { p: 100, anchor: 100 }
-      demoState.set(s, st)
-    }
-    const vol = st.p * 0.0006
-    st.p = Math.max(st.p + gauss() * vol + (st.anchor - st.p) * 0.02, 0.0001)
-    pushTick({ s, p: st.p, t: Math.floor(Date.now() / 1000), demo: true })
-  }
-}, DEMO_TICK_MS)
-
-// refresh demo anchors periodically so simulated walks stay near reality
-setInterval(() => anchorsFetched.clear(), 5 * 60 * 1000)
+// NOTE: the simulated-tick ("SIM") generator was PERMANENTLY REMOVED by user
+// request — this service only ever forwards REAL ticks from Binance/Alpaca.
+// Symbols without live upstream coverage simply produce no ticks; the client
+// falls back to its REST polling.
 
 // ------------------------------ key resolution -----------------------------
 const keyCache = new Map<string, { keys: AlpacaKeys | null; at: number }>()
@@ -434,7 +370,7 @@ async function keysForCookie(cookieHeader: string | undefined): Promise<AlpacaKe
       const j = (await res.json()) as { keyId?: string; secret?: string }
       if (j.keyId && j.secret) keys = { keyId: j.keyId, secret: j.secret }
     }
-  } catch { /* offline → demo */ }
+  } catch { /* offline */ }
   keyCache.set(cacheKey, { keys, at: Date.now() })
   if (keyCache.size > 500) {
     const now = Date.now()
@@ -467,7 +403,8 @@ io.on('connection', (socket: Socket) => {
       if (!binanceWs) binanceConnect()
       else binanceSync()
     }
-    // stocks → the socket's bound alpaca upstream (if any), else demo ticks
+    // stocks → the socket's bound alpaca upstream (if any); without one the
+    // symbols stay quiet (client-side REST polling is the fallback)
     if (syms.some((s) => !isCrypto(s))) {
       const conn = [...alpacaConns.values()].find((c) => c.sockets.has(socket))
       if (conn) alpacaSync(conn)
@@ -508,12 +445,12 @@ io.on('connection', (socket: Socket) => {
   })
 
   // keys resolve asynchronously — bind the socket to its (single) Alpaca
-  // upstream when they arrive (until then its stock symbols get demo ticks)
+  // upstream when they arrive (until then its stock symbols do not stream)
   void keysForCookie(cookieHeader).then((keys) => {
     console.log('[conn]', socket.id, 'keys:', Boolean(keys))
     if (!keys || keysFailedRecently(keys)) return
     if (slotFailedRecently(keys)) {
-      console.log('[alpaca] connection slot busy for these keys — socket stays on simulated ticks for now')
+      console.log('[alpaca] connection slot busy for these keys — no stock upstream for now')
       return
     }
     const conn = getOrCreateAlpacaConn(keys)

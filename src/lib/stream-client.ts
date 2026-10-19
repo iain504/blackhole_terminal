@@ -3,7 +3,9 @@
 // One shared connection for the whole app; subscriptions are refcounted per
 // symbol so 8 chart panes + watchlist + quote panel all multiplex over a
 // single websocket. Ticks arrive as `tick` events carrying an array of
-// { s, p, t, o?, h?, l?, v?, demo? } (demo:true = simulated upstream).
+// { s, p, t, o?, h?, l?, v? } — REAL upstream ticks only (the simulated-tick
+// "SIM" generator was permanently removed; symbols without a live upstream
+// simply produce no ticks and REST polling stays the fallback).
 //
 // NOTE: the socket is created lazily on the FIRST subscribe (client-side
 // only) and sends the session cookie (withCredentials) so the stream service
@@ -19,7 +21,6 @@ export interface StreamTick {
   h?: number
   l?: number
   v?: number
-  demo?: boolean
 }
 
 type TickHandler = (t: StreamTick) => void

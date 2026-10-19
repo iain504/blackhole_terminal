@@ -1,9 +1,9 @@
 'use client'
 
 // Quote panel: current symbol snapshot (price, change, OHLC, volume, range).
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { fmtPrice, isCryptoSymbol } from '@/lib/market-types'
-import { subscribeStream, isStreamConnected } from '@/lib/stream-client'
+import { subscribeStream } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Bitcoin, TrendingUp } from 'lucide-react'
@@ -23,13 +23,16 @@ interface FullQuote {
 export function QuotePanel({ symbol }: { symbol: string }) {
   const [state, setState] = useState<{ key: string; q: FullQuote } | null>(null)
   const q = state?.key === symbol ? state.q : null
+  const tickAtRef = useRef(0) // last REAL stream tick for this symbol (0 = none)
 
   useEffect(() => {
     let alive = true
     let n = 0
+    tickAtRef.current = 0 // symbol changed — freshness starts over
+    const streaming = () => Date.now() - tickAtRef.current < 8000
     const fetchQ = async () => {
       if (document.hidden) return // background tab — save the API budget
-      if (isStreamConnected() && ++n % 3 !== 1) return // stream live → reconcile every 30s
+      if (streaming() && ++n % 3 !== 1) return // live ticks flowing → reconcile every 30s
       try {
         const res = await fetch('/api/market/quote', {
           method: 'POST',
@@ -39,7 +42,17 @@ export function QuotePanel({ symbol }: { symbol: string }) {
         if (!res.ok || !alive) return
         const json = await res.json()
         const quote = json.quotes?.[0]
-        if (quote && alive) setState({ key: symbol, q: quote })
+        if (quote && alive) {
+          if (streaming()) {
+            // stream is primary — only refresh the prev-close anchor so a
+            // cached REST snapshot never yanks the live price backwards
+            setState((prev) =>
+              prev?.key === symbol ? { key: symbol, q: { ...prev.q, prevClose: quote.prevClose } } : prev,
+            )
+          } else {
+            setState({ key: symbol, q: quote })
+          }
+        }
       } catch { /* offline */ }
     }
     fetchQ()
@@ -57,10 +70,12 @@ export function QuotePanel({ symbol }: { symbol: string }) {
 
   // stream ticks: live price between the 10s REST refreshes — recomputes
   // change vs the REST-known prev close and folds in stream day-OHLC/volume
-  // (crypto miniTicker carries o/h/l/v; stock trades only carry the price)
+  // (crypto miniTicker carries o/h/l/v; stock trades only carry the price).
+  // REAL ticks only — the simulated-tick generator is permanently disabled.
   useEffect(
     () =>
       subscribeStream([symbol], (t) => {
+        tickAtRef.current = Date.now()
         setState((prev) => {
           const base = prev?.key === symbol ? prev.q : null
           if (!base) return prev

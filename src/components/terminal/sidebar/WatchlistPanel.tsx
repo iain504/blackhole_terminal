@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, Watchlist } from '@/store/terminal'
 import { fmtPrice } from '@/lib/market-types'
-import { subscribeStream, isStreamConnected } from '@/lib/stream-client'
+import { subscribeStream } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -71,31 +71,51 @@ export function WatchlistPanel() {
 
   // REST quotes are the reconciliation BACKSTOP for the live stream. The whole
   // list costs ONE batched request (server-side Alpaca snapshots endpoint;
-  // 200 req/min plan limit → 6 req/min here, far under it). While the stream
-  // is connected we only reconcile every ~30s and skip entirely while the page
-  // is hidden; a hidden→visible switch refreshes immediately.
+  // 200 req/min plan limit → 6 req/min here, far under it). The cadence is
+  // TICK-AWARE, not socket-aware: only when EVERY symbol actually received a
+  // fresh stream tick (≤8s ago) do we drop to a ~30s reconcile; symbols
+  // without a live upstream keep the full 10s poll (no simulated ticks exist
+  // anymore). Skips entirely while the page is hidden; a hidden→visible
+  // switch refreshes immediately.
   const itemsKey = list?.items.join(',') ?? ''
+  const tickAtRef = useRef<Map<string, number>>(new Map())
   useEffect(() => {
     if (!itemsKey) return
     let alive = true
     let n = 0
+    const syms = itemsKey.split(',')
+    tickAtRef.current.clear() // symbol set changed — freshness starts over
+    const streamFresh = (s: string, now: number) => {
+      const at = tickAtRef.current.get(s)
+      return at != null && now - at < 8000
+    }
     const fetchQ = async () => {
       if (document.hidden) return // background tab — save the API budget
-      if (isStreamConnected() && ++n % 3 !== 1) return // stream live → reconcile every 30s
+      const now = Date.now()
+      if (syms.every((s) => streamFresh(s, now)) && ++n % 3 !== 1) return // whole list streaming → reconcile every 30s
       try {
         const res = await fetch('/api/market/quote', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ symbols: itemsKey.split(',') }),
+          body: JSON.stringify({ symbols: syms }),
         })
         if (!res.ok || !alive) return
         const json = await res.json()
         if (!alive) return
+        const at = Date.now()
         const next: Record<string, QuoteRow> = {}
         for (const q of json.quotes || []) {
+          if (streamFresh(q.symbol, at)) continue // a cached REST snapshot must not yank a live tick backwards
           next[q.symbol] = { symbol: q.symbol, price: q.price, change: q.change, changePct: q.changePct }
         }
-        setQuotes(next)
+        setQuotes((prev) => {
+          const merged: Record<string, QuoteRow> = { ...next }
+          for (const s of syms) {
+            // rows with a fresh live tick keep their streamed value
+            if (!merged[s] && prev[s] && streamFresh(s, at)) merged[s] = prev[s]
+          }
+          return merged
+        })
       } catch { /* offline */ }
     }
     fetchQ()
@@ -113,10 +133,12 @@ export function WatchlistPanel() {
 
   // stream ticks: the PRIMARY price source between REST reconciliations
   // (crypto streams from Binance; stocks from the one shared Alpaca websocket
-  // when keys work, else honest sim ticks)
+  // when the keys pass its data-stream auth — simulated ticks are PERMANENTLY
+  // disabled: symbols without a live upstream fall back to the 10s REST poll)
   useEffect(() => {
     if (!itemsKey) return
     return subscribeStream(itemsKey.split(','), (t) => {
+      tickAtRef.current.set(t.s, Date.now())
       setQuotes((prev) => {
         const row = prev[t.s]
         if (!row) return prev
