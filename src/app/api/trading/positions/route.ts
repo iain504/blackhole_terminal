@@ -116,17 +116,24 @@ export async function GET(req: Request) {
     // Map open exit orders (SL/TP legs) onto positions by symbol.
     const exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> = {}
     const byTradeSym = new Map(rows.map((r) => [normSymbol(r.tradeSymbol), r]))
-    const visit = (o: TradingOrder) => {
-      // `held` legs ride a PENDING (unfilled) entry family — they are not
-      // exits of an open position (their parent hasn't filled). Skipping them
-      // keeps a separate pending bracket on the same symbol from overwriting
-      // the position's real exits (legs are visible via the nested merge).
-      if (o.status === 'held') return
+    const visit = (o: TradingOrder, parent?: TradingOrder) => {
+      // `held` legs of a PENDING (unfilled) ENTRY family are not exits of an
+      // open position (their parent hasn't filled) — a held leg OPPOSITE its
+      // parent's side marks exactly that case. But a held leg on the SAME
+      // side as its parent is the armed sibling of a live OCO EXIT (Alpaca
+      // keeps the stop_loss leg `held` while the take_profit leg works) — it
+      // IS a real exit of the position and must be shown (the "OCO SL
+      // invisible in the Positions tab" bug).
+      if (o.status === 'held' && (!parent || parent.side !== o.side)) return
       const key = normSymbol(o.symbol)
       if (byTradeSym.has(key)) {
         const bucket = exits[key] || {}
-        const sideOppositeLong = o.side === 'sell'
-        if ((o.type === 'stop' || o.type === 'stop_limit' || o.type === 'trailing_stop') && sideOppositeLong) {
+        // exits ride the side OPPOSITE the position: a long exits with SELL
+        // orders, a SHORT exits with BUY orders (side-aware fix — a short's
+        // buy-side TP/SL used to be invisible)
+        const posSide = byTradeSym.get(key)!.side
+        const isExitSide = posSide === 'short' ? o.side === 'buy' : o.side === 'sell'
+        if ((o.type === 'stop' || o.type === 'stop_limit' || o.type === 'trailing_stop') && isExitSide) {
           bucket.sl = {
             orderId: o.id,
             kind: 'sl',
@@ -137,7 +144,7 @@ export async function GET(req: Request) {
             side: o.side,
             type: o.type,
           }
-        } else if (o.type === 'limit' && sideOppositeLong) {
+        } else if (o.type === 'limit' && isExitSide) {
           bucket.tp = {
             orderId: o.id,
             kind: 'tp',
@@ -154,7 +161,7 @@ export async function GET(req: Request) {
     }
     for (const o of orders) {
       visit(o)
-      for (const leg of o.legs || []) visit(leg)
+      for (const leg of o.legs || []) visit(leg, o)
     }
 
     // ---- pending (unfilled) ENTRY orders for the chart ----

@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { placeOrderWithExits, placeTrailingStop, resolveTradeMode, ensureCryptoOcoSupervisor, TradeMode } from '@/lib/trading'
+import {
+  placeOrderWithExits, placeTrailingStop, resolveTradeMode, ensureCryptoOcoSupervisor,
+  friendlyExitQtyError, TradeMode,
+} from '@/lib/trading'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface PlaceBody {
@@ -58,7 +61,7 @@ export async function POST(req: Request) {
       const errBody = r.data as { code?: number; message?: string } | null
       if (!r.data || r.error || errBody?.code != null) {
         return NextResponse.json(
-          { error: r.error || errBody?.message || 'Trailing stop failed', status: r.status },
+          { error: friendlyExitQtyError(r.error || errBody?.message || 'Trailing stop failed'), status: r.status },
           { status: r.status || 502 },
         )
       }
@@ -76,7 +79,7 @@ export async function POST(req: Request) {
       stop_loss: body.stop_loss,
     })
     if (r.results.length === 0 && r.errors.length > 0) {
-      return NextResponse.json({ error: r.errors[0], mode }, { status: 422 })
+      return NextResponse.json({ error: friendlyExitQtyError(r.errors[0]), mode }, { status: 422 })
     }
     return NextResponse.json({ mode, orders: r.results, errors: r.errors, splitNote: r.splitNote })
   } catch (e) {

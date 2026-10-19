@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { attachExitsToPosition, resolveTradeMode } from '@/lib/trading'
+import { attachExitsToPosition, friendlyExitQtyError, resolveTradeMode } from '@/lib/trading'
 import { handleError, readJson } from '@/lib/api-helpers'
 
 interface AttachBody {
@@ -31,7 +31,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ symbol:
     }
     const r = await attachExitsToPosition(user.id, mode, symbol, exits)
     if (r.results.length === 0) {
-      return NextResponse.json({ error: r.errors.join('; ') || 'Attach failed' }, { status: 502 })
+      return NextResponse.json({ error: friendlyExitQtyError(r.errors.join('; ') || 'Attach failed') }, { status: 502 })
     }
     return NextResponse.json({
       mode,

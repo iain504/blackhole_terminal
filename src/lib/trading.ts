@@ -193,6 +193,10 @@ export interface TradingOrder {
   asset_class?: string
   /** 'simple' | 'bracket' | 'oco' | 'oto' (Alpaca v2 order class) */
   order_class?: string
+  /** bracket/OCO family id — legs of one family share it with the parent */
+  group_id?: string | null
+  /** 'entry' | 'take_profit' | 'stop_loss' (role inside the family) */
+  group_role?: string | null
 }
 
 // ---------- API wrappers ----------
@@ -459,6 +463,13 @@ function supervisedSet(): Set<string> {
   return g.__ttOcoSupervised
 }
 
+/** Stock bracket parents already leg-healed (one-shot) — survives hot reloads. */
+function healedSet(): Set<string> {
+  const g = globalThis as { __ttOcoHealed?: Set<string> }
+  if (!g.__ttOcoHealed) g.__ttOcoHealed = new Set<string>()
+  return g.__ttOcoHealed
+}
+
 /**
  * Start the OCO supervisor for a (user, mode) pair (idempotent). One cycle
  * every 6s: (a) cancel managed exit legs whose position is gone (OCO
@@ -525,6 +536,61 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
       } else {
         attachWarnSig.delete(o.id)
         console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
+      }
+    }
+
+    // (c) STOCK bracket leg-heal: a filled bracket parent whose exit legs are
+    // ALL canceled leaves a NAKED position. Verified live 2026-10 (ECHO): a
+    // PATCH-replace of a partially filled parent races its own cancel — the
+    // original fills after being superseded, Alpaca cancels the legs instead
+    // of activating them, and the replacement can fail + reverse. Re-attach
+    // the planned exits once, within a short window after the fill so
+    // deliberate later cancels are respected; never fight exits that already
+    // exist (the user may have re-added them manually).
+    const HEAL_WINDOW_MS = 15 * 60 * 1000
+    const nowMs = Date.now()
+    for (const o of orders) {
+      if (isCrypto(o) || o.status !== 'filled') continue
+      if (String(o.order_class || '') !== 'bracket' && o.group_role !== 'entry') continue
+      const filledAt = o.filled_at ? Date.parse(o.filled_at) : NaN
+      if (!Number.isFinite(filledAt) || nowMs - filledAt > HEAL_WINDOW_MS) continue
+      const family = orders.filter((x) => x.group_id && x.group_id === o.group_id && x.id !== o.id)
+      if (family.length === 0) continue
+      if (family.some((l) => OCO_OPEN_STATUSES.includes(l.status))) continue // legs alive
+      const tpLeg = family.find((l) => l.group_role === 'take_profit')
+      const slLeg = family.find((l) => l.group_role === 'stop_loss')
+      const tp = tpLeg ? parseFloat(tpLeg.limit_price || '') : NaN
+      const sl = slLeg ? parseFloat(slLeg.stop_price || '') : NaN
+      if (!Number.isFinite(tp) && !Number.isFinite(sl)) continue
+      const healKey = `${userId}|${mode}|${o.id}`
+      if (healedSet().has(healKey)) continue
+      if (!posSet.has(norm(o.symbol))) {
+        healedSet().add(healKey) // position gone — nothing to protect
+        continue
+      }
+      const openNow = await getOpenOrders(userId, mode, o.symbol)
+      const rows: TradingOrder[] = Array.isArray(openNow.data) ? openNow.data : []
+      const exitSide = o.side === 'buy' ? 'sell' : 'buy'
+      const hasExit = rows.some(
+        (x) =>
+          norm(x.symbol) === norm(o.symbol) &&
+          x.side === exitSide &&
+          OCO_OPEN_STATUSES.includes(x.status) &&
+          x.status !== 'held',
+      )
+      if (hasExit) {
+        healedSet().add(healKey) // already protected manually — respect it
+        continue
+      }
+      const r = await attachExitsToPosition(userId, mode, o.symbol, {
+        tp: Number.isFinite(tp) ? tp : undefined,
+        sl: Number.isFinite(sl) ? sl : undefined,
+      })
+      healedSet().add(healKey)
+      if (r.results.length > 0) {
+        console.log(`[oco] healed naked position ${o.symbol} from filled bracket ${o.id} (tp=${tp} sl=${sl})`)
+      } else {
+        console.warn(`[oco] leg-heal failed for ${o.symbol} (${o.id}):`, r.errors.join('; '))
       }
     }
   } catch (e) {
@@ -785,15 +851,29 @@ export interface ReplaceEntryResult {
 
 const ENTRY_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
 
-/** Poll the order until the async cancel lands (buying power frees up). */
+/**
+ * Poll the order until the async cancel lands (buying power frees up).
+ * Alpaca cancels are ASYNC and can take seconds while the market keeps
+ * filling the order (verified live 2026-10: a bracket cancel took >5s) —
+ * poll up to ~5s so callers that re-place right after don't double-position.
+ */
 async function waitUntilCanceled(userId: string, host: TradeMode, orderId: string): Promise<void> {
-  for (let i = 0; i < 4; i++) {
-    await new Promise((res) => setTimeout(res, 350))
+  for (let i = 0; i < 10; i++) {
+    await new Promise((res) => setTimeout(res, 500))
     const r = await tradeFetch<TradingOrder>(userId, host, `/v2/orders/${orderId}`)
     const s = String(r.data?.status || '')
     if (['canceled', 'cancelled', 'expired', 'rejected'].includes(s)) return
     if (!r.data) return // gone / unreachable — best effort
   }
+}
+
+/** Alpaca error text for "the position qty is already reserved by open exits". */
+export function friendlyExitQtyError(msg: string): string {
+  if (!/insufficient qty available for order/i.test(msg)) return msg
+  return (
+    msg +
+    ' — your open TP/SL exit orders reserve the position quantity. Cancel the existing exit first, or use the position row\u2019s [+TP]/[+SL] buttons (they rebuild both exits as one OCO).'
+  )
 }
 
 /**
@@ -949,7 +1029,27 @@ export async function replacePendingEntrySmart(
   const touchesLegs = patch.tp != null || patch.sl != null
   const isBracketParent =
     String(orig.order_class || '') === 'bracket' || (orig.legs?.length ?? 0) > 0
-  if (!addsLeg && !managedCrypto && !(isBracketParent && touchesLegs)) {
+  // A PARTIALLY FILLED order must NEVER take the direct-PATCH replace path:
+  // Alpaca's replace asynchronously cancels the working order and mirrors its
+  // fills onto the replacement. Verified live 2026-10 (ECHO bracket, entry
+  // drag at 7/10 filled): the original's remaining shares filled BEFORE the
+  // cancel landed, Alpaca canceled the family's TP/SL legs instead of
+  // activating them, and the replacement failed + reversed — a NAKED
+  // position. Route the edit through the controlled cancel+re-place below.
+  const filledQty0 = parseFloat(orig.filled_qty) || 0
+  const partiallyFilled = filledQty0 > 0
+  if (partiallyFilled) {
+    const samePx = (a: number | null | undefined, b: number | null | undefined) =>
+      a != null && b != null && Math.abs(a - b) < 1e-9
+    const noop =
+      (patch.limit_price == null || samePx(newLimit, origLimit0)) &&
+      (patch.tp == null || samePx(patch.tp, curTp0)) &&
+      (patch.sl == null || samePx(patch.sl, curSl0))
+    if (noop) {
+      return { data: orig, status: 200, mode: host, method: 'replace', note: 'Order already at this value' }
+    }
+  }
+  if (!addsLeg && !managedCrypto && !partiallyFilled && !(isBracketParent && touchesLegs)) {
     const body: Record<string, unknown> = {}
     if (patch.limit_price != null && newLimit != null) body.limit_price = fmtPx(newLimit, crypto)
     if (origHasTp) body.take_profit = { limit_price: fmtPx(curTp!, crypto) }
@@ -998,24 +1098,77 @@ export async function replacePendingEntrySmart(
     }
   }
 
-  // 3) cancel + re-place (plan change on crypto, new leg, or rejected PATCH)
+  // 3) cancel + re-place (plan change on crypto, new leg, rejected PATCH, or
+  // a PARTIALLY FILLED order — never direct-PATCH those, see above)
   const cancelRes = await cancelOrder(userId, host, orderId)
   if (cancelRes.status !== 204 && cancelRes.status !== 200 && cancelRes.status !== 404) {
     return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode: host, method: 'cancel-replace' }
   }
   if (cancelRes.status !== 404) await waitUntilCanceled(userId, host, orderId)
 
-  const remaining = (parseFloat(orig.qty) || 0) - (parseFloat(orig.filled_qty) || 0)
-  if (!(remaining > 0)) {
-    return { data: null, status: 200, mode: host, method: 'cancel-replace', note: 'Entry filled — nothing re-placed' }
+  // Re-read the order AFTER the cancel lands: a fill can race the cancel
+  // (verified live), so the pre-cancel filled_qty can understate reality.
+  let filledQty = filledQty0
+  const finalRes = await tradeFetch<TradingOrder>(userId, host, `/v2/orders/${orderId}`)
+  if (finalRes.data) {
+    const fq = parseFloat(finalRes.data.filled_qty)
+    if (Number.isFinite(fq) && fq > filledQty) filledQty = fq
+    if (String(finalRes.data.status) === 'filled') filledQty = parseFloat(finalRes.data.qty) || filledQty
   }
+  const remaining = (parseFloat(orig.qty) || 0) - filledQty
   const wantTp = patch.tp ?? curTp
   const wantSl = patch.sl ?? curSl
   const hadPlan = Boolean(plan) || (orig.legs?.length ?? 0) > 0 || patch.tp != null || patch.sl != null
-  const buildPlaceBody = (limit: number | null, tp: number | null, sl: number | null): Record<string, unknown> => {
+
+  // Protect the shares that ALREADY filled before the cancel landed — they
+  // left the pending family behind, and with it their TP/SL legs. Skipped
+  // when exits are already open (legs may have activated in a fill race;
+  // never fight orders that exist).
+  const protectFilledPortion = async (): Promise<string | undefined> => {
+    if (!(filledQty > 0) || !hadPlan) return undefined
+    const openNow = await getOpenOrders(userId, host, orig.symbol)
+    const rows: TradingOrder[] = Array.isArray(openNow.data) ? openNow.data : []
+    const normSym = (s: string) => s.replace('/', '').toUpperCase()
+    const exitSide = orig.side === 'buy' ? 'sell' : 'buy'
+    const hasExit = rows.some(
+      (o) =>
+        normSym(o.symbol) === normSym(orig.symbol) &&
+        o.side === exitSide &&
+        OCO_OPEN_STATUSES.includes(o.status) &&
+        o.status !== 'held',
+    )
+    if (hasExit) return undefined
+    if (isCrypto) {
+      const pseudoEntry: TradingOrder = { ...orig, filled_qty: String(filledQty), status: 'filled' }
+      const errs = await placeCryptoExitLegs(userId, host, pseudoEntry, wantTp ?? undefined, wantSl ?? undefined)
+      return errs.length ? errs.join('; ') : undefined
+    }
+    const r = await attachExitsToPosition(userId, host, orig.symbol, {
+      tp: wantTp ?? undefined,
+      sl: wantSl ?? undefined,
+    })
+    return r.results.length ? undefined : r.errors.join('; ') || 'exit attach failed'
+  }
+
+  if (!(remaining > 0)) {
+    // fully filled while the cancel was in flight — protect, re-place nothing
+    const warn = await protectFilledPortion()
+    return {
+      data: null,
+      status: 200,
+      mode: host,
+      method: 'cancel-replace',
+      note: warn
+        ? `Entry filled during edit — exits attach failed: ${warn}`
+        : hadPlan
+          ? 'Entry filled during edit — exits attached'
+          : 'Entry filled — nothing re-placed',
+    }
+  }
+  const buildPlaceBody = (limit: number | null, tp: number | null, sl: number | null, qty: number): Record<string, unknown> => {
     const b: Record<string, unknown> = {
       symbol: orig.symbol,
-      qty: String(remaining),
+      qty: String(qty),
       side: orig.side,
       type: orig.type,
       time_in_force: orig.time_in_force || 'gtc',
@@ -1039,7 +1192,7 @@ export async function replacePendingEntrySmart(
 
   const r2 = await tradeFetch<TradingOrder>(userId, host, '/v2/orders', {
     method: 'POST',
-    body: JSON.stringify(buildPlaceBody(newLimit, wantTp, wantSl)),
+    body: JSON.stringify(buildPlaceBody(newLimit, wantTp, wantSl, remaining)),
   })
   if (!(r2.data && (r2.data as TradingOrder).id)) {
     // The family is ALREADY canceled (Alpaca cascades a parent cancel to both
@@ -1048,20 +1201,29 @@ export async function replacePendingEntrySmart(
     // replacement (validation, transient error) can never lose the exits.
     const rr = await tradeFetch<TradingOrder>(userId, host, '/v2/orders', {
       method: 'POST',
-      body: JSON.stringify(buildPlaceBody(origLimit0, origTp0, origSl0)),
+      body: JSON.stringify(buildPlaceBody(origLimit0, origTp0, origSl0, remaining)),
     })
+    const warn = await protectFilledPortion()
+    const warnSuffix = warn ? ` — filled shares left unprotected: ${warn}` : ''
     if (rr.data && (rr.data as TradingOrder).id) {
       return {
         data: rr.data,
         status: 200,
         mode: host,
         method: 'cancel-replace',
-        note: `Change rejected (${r2.error || 'unknown'}) — original order restored`,
+        note: `Change rejected (${r2.error || 'unknown'}) — original order restored${warnSuffix}`,
       }
     }
-    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode: host, method: 'cancel-replace' }
+    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}${warnSuffix}`, mode: host, method: 'cancel-replace' }
   }
-  return { data: r2.data, status: r2.status, mode: host, method: 'cancel-replace' }
+  const warn = await protectFilledPortion()
+  return {
+    data: r2.data,
+    status: r2.status,
+    mode: host,
+    method: 'cancel-replace',
+    note: warn ? `Filled shares could not be protected separately: ${warn}` : undefined,
+  }
 }
 
 /**
@@ -1117,12 +1279,21 @@ export interface AttachExitsResult {
  * Attach a TP and/or SL to an open position — the chart's "+TP"/"+SL" chip
  * drag and the Positions-tab add buttons land here.
  *
- * Stocks (verified against the paper API 2026-10):
+ * Stocks (verified against the paper API 2026-10, the "manual SL fails with
+ * insufficient qty after a manual TP" bug):
  * - order_class=oco REQUIRES take_profit.limit_price AND stop_loss.stop_price
  *   AND an existing position to exit (without one: "oco orders must be exit
  *   orders"; parent must be type=limit). With both legs requested we send the
- *   documented OCO exit body and FALL BACK to separate legs on rejection.
- * - A single leg is a plain limit (TP) / stop (SL) order on the full position.
+ *   documented OCO exit body.
+ * - Two SEPARATE exit orders can never coexist: every exit-side order
+ *   reserves qty_available, so leg #2 is rejected with "insufficient qty
+ *   available for order". When an exit already exists we therefore CANCEL it
+ *   and rebuild BOTH legs as a single OCO (the linked-pair form Alpaca's own
+ *   bracket children use) — adding an SL to a position that has a TP (or
+ *   editing either one) works without ever over-reserving.
+ * - qty_available "0" is a REAL zero (fully reserved) and must not fall back
+ *   to the full qty — the falsy `||` chain used to bypass the guard and send
+ *   an order Alpaca was guaranteed to reject.
  * Crypto: ALL advanced order classes are rejected — place split exit legs
  * (50/50 qty, 0.99 fee factor) directly against the position, tagged with a
  * `ttp-` client_order_id (ignored by the OCO supervisor's `tte-` cleanup).
@@ -1142,7 +1313,7 @@ export async function attachExitsToPosition(
   if (!posRes.data) {
     return { results: [], errors: [posRes.error && posRes.error !== 'not found' ? posRes.error : 'Position not found'] }
   }
-  const pos = posRes.data
+  let pos: TradingPosition = posRes.data
   // crypto-ness comes from the POSITION (callers pass either symbol form —
   // the chart sends the trade symbol BTCUSD, whose crypto-ness the route
   // cannot infer from a slash)
@@ -1151,48 +1322,123 @@ export async function attachExitsToPosition(
   const orderSymbol = pos.symbol
   // long position -> sell exits; short position -> buy exits
   const exitSide = pos.side === 'short' ? 'buy' : 'sell'
-  const qtyAvail = parseFloat(pos.qty_available) || parseFloat(pos.qty) || 0
-  if (!(qtyAvail > 0)) return { results: [], errors: ['position has no available qty'] }
+  // qty_available "0" is a real zero (fully reserved by open exits) — NEVER
+  // fall back to the full qty on a falsy check
+  const availOf = (p: TradingPosition): number => {
+    const v = Number.parseFloat(p.qty_available)
+    return Number.isFinite(v) ? v : Number.parseFloat(p.qty) || 0
+  }
 
   const results: TradingOrder[] = []
   const errors: string[] = []
   const post = (body: Record<string, unknown>) =>
     tradeFetch<TradingOrder>(userId, mode, '/v2/orders', { method: 'POST', body: JSON.stringify(body) })
-  const legQty = (n: number) => String(parseFloat((n * (isCrypto ? 0.99 : 1)).toFixed(8)))
 
   if (!isCrypto) {
-    if (hasTp && hasSl) {
+    const normSym = (s: string) => s.replace('/', '').toUpperCase()
+    const isOpen = (s: string) => OCO_OPEN_STATUSES.includes(s)
+    const openRes = await getOpenOrders(userId, mode, tSym)
+    const rows: TradingOrder[] = Array.isArray(openRes.data) ? openRes.data : []
+    // exits of THIS position (skip `held` legs — they ride a still-pending
+    // entry family and hold no qty of the open position)
+    const exitsHere = rows.filter(
+      (o) => normSym(o.symbol) === normSym(tSym) && o.side === exitSide && isOpen(o.status) && o.status !== 'held',
+    )
+    const existingTp = exitsHere.find((o) => o.type === 'limit')
+    const existingSl = exitsHere.find((o) => o.type === 'stop' || o.type === 'stop_limit')
+    const existingTrail = exitsHere.find((o) => o.type === 'trailing_stop')
+    if (existingTrail) {
+      // an OCO cannot carry a trailing leg — refuse instead of tearing down
+      // the user's trailing stop
+      return {
+        results: [],
+        errors: ['Position already has a trailing stop — cancel it first, then attach a plain TP/SL'],
+      }
+    }
+    // cancel the existing plain exits so the reservation frees up; snapshots
+    // allow a restore if the rebuild fails (never leave the user worse off)
+    const oldExits = [existingTp, existingSl].filter((o): o is TradingOrder => Boolean(o))
+    for (const o of oldExits) {
+      const c = await cancelOrder(userId, mode, o.id)
+      if (c.status === 204 || c.status === 200 || c.status === 404) continue
+      errors.push(`Could not cancel the existing ${o.type} exit: ${c.error || c.status}`)
+    }
+    if (errors.length > 0) return { results, errors }
+    if (oldExits.length > 0) {
+      for (const o of oldExits) await waitUntilCanceled(userId, mode, o.id)
+      // re-read the position — the freed reservation may change qty_available
+      const pos2 = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tSym)}`)
+      if (pos2.data) pos = pos2.data
+    }
+    const qtyAvail = availOf(pos)
+    if (!(qtyAvail > 0)) {
+      // something ELSE still reserves the position — restore what we canceled
+      for (const o of oldExits) {
+        const body = exitBodyFrom(o, {})
+        if (body) await post(body)
+      }
+      return {
+        results,
+        errors: ['Position has no available qty — another open order is reserving it (restore attempted)'],
+      }
+    }
+
+    const restoreOld = async () => {
+      for (const o of oldExits) {
+        const body = exitBodyFrom(o, {})
+        if (body) await post(body)
+      }
+    }
+
+    // Adding ONE leg while the SIBLING exists must rebuild BOTH as a single
+    // OCO: separate legs can never coexist (qty reservation), and canceling
+    // the old exit without re-placing it would strip the protection it
+    // provided (the "+SL removed my TP" bug). The sibling price comes from
+    // the canceled snapshot.
+    const sibTp = existingTp ? parseFloat(existingTp.limit_price || '') : NaN
+    const sibSl = existingSl ? parseFloat(existingSl.stop_price || '') : NaN
+    const tpPx = hasTp ? exits.tp! : Number.isFinite(sibTp) ? sibTp : undefined
+    const slPx = hasSl ? exits.sl! : Number.isFinite(sibSl) ? sibSl : undefined
+
+    if (tpPx != null && slPx != null) {
       const r = await post({
         symbol: orderSymbol,
         qty: String(qtyAvail),
         side: exitSide,
         type: 'limit',
         time_in_force: 'gtc',
-        limit_price: fmtPx(exits.tp!),
+        limit_price: fmtPx(tpPx),
         order_class: 'oco',
-        take_profit: { limit_price: fmtPx(exits.tp!) },
-        stop_loss: { stop_price: fmtPx(exits.sl!) },
+        take_profit: { limit_price: fmtPx(tpPx) },
+        stop_loss: { stop_price: fmtPx(slPx) },
       })
       if (r.data && (r.data as TradingOrder).id) {
         return { results: [r.data], errors, oco: true }
       }
-      errors.push(`OCO rejected, placing legs separately: ${r.error || 'failed'}`)
+      await restoreOld()
+      errors.push(`OCO rejected: ${r.error || 'failed'}`)
+      return { results, errors }
     }
-    if (hasTp) {
+    if (tpPx != null) {
       const r = await post({
         symbol: orderSymbol, qty: String(qtyAvail), side: exitSide, type: 'limit',
-        time_in_force: 'gtc', limit_price: fmtPx(exits.tp!),
+        time_in_force: 'gtc', limit_price: fmtPx(tpPx),
       })
       if (r.data && (r.data as TradingOrder).id) results.push(r.data)
-      else errors.push(`TP: ${r.error || 'failed'}`)
-    }
-    if (hasSl) {
+      else {
+        await restoreOld()
+        errors.push(`TP: ${r.error || 'failed'}`)
+      }
+    } else if (slPx != null) {
       const r = await post({
         symbol: orderSymbol, qty: String(qtyAvail), side: exitSide, type: 'stop',
-        time_in_force: 'gtc', stop_price: fmtPx(exits.sl!),
+        time_in_force: 'gtc', stop_price: fmtPx(slPx),
       })
       if (r.data && (r.data as TradingOrder).id) results.push(r.data)
-      else errors.push(`SL: ${r.error || 'failed'}`)
+      else {
+        await restoreOld()
+        errors.push(`SL: ${r.error || 'failed'}`)
+      }
     }
     return { results, errors }
   }
@@ -1203,8 +1449,13 @@ export async function attachExitsToPosition(
   // against qty_available, so a full-size first leg would make attaching the
   // second one impossible (502 insufficient balance). Legs may be attached
   // independently in any order.
-  const posQty = parseFloat(pos.qty) || qtyAvail
-  const qty = legQty(Math.min(qtyAvail, posQty / 2))
+  const legQty = (n: number) => String(parseFloat((n * 0.99).toFixed(8)))
+  const qtyAvail = availOf(pos)
+  const posQty = Number.parseFloat(pos.qty) || qtyAvail
+  const qty = legQty(Math.max(0, Math.min(qtyAvail, posQty / 2)))
+  if (!(parseFloat(qty) > 0)) {
+    return { results, errors: ['Position has no available qty — open exit orders reserve the balance'] }
+  }
   const coidBase = `ttp-${Math.random().toString(36).slice(2, 8)}`
   if (hasTp) {
     const r = await post({
