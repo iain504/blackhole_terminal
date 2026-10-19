@@ -10,6 +10,7 @@ import { ChartWorkspace } from './ChartWorkspace'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
+import { StrategyDrawer } from './StrategyDrawer'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -28,6 +29,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const { toast } = useToast()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [alertsOpen, setAlertsOpen] = useState(false)
+  const [strategiesOpen, setStrategiesOpen] = useState(false)
   const meFetched = useRef(false)
 
   const loadUserData = useCallback(async (u: SessionUser) => {
@@ -42,7 +44,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     if (!useTerminal.getState().activeTabId) {
       useTerminal.setState({ activeTabId: useTerminal.getState().tabs[0].id })
     }
-    await Promise.all([store.loadWatchlists(), store.loadAlerts()])
+    await Promise.all([store.loadWatchlists(), store.loadAlerts(), store.loadStrategies()])
   }, [])
 
   // Session check on mount
@@ -122,6 +124,39 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     }
     check()
     const timer = setInterval(check, 30000)
+    return () => {
+      stopped = true
+      clearInterval(timer)
+    }
+  }, [user, toast])
+
+  // Strategy-bot polling (Task 44) — every 20s; server also self-evaluates
+  useEffect(() => {
+    if (!user) return
+    let stopped = false
+    const check = async () => {
+      try {
+        const res = await fetch('/api/strategies/check', { method: 'POST' })
+        if (!res.ok) return
+        const json = await res.json()
+        const fired = (json.fired || []) as { id: string; symbol: string; action: string; ok: boolean; message: string }[]
+        if (fired.length > 0 && !stopped) {
+          for (const f of fired) {
+            toast({
+              title: f.ok ? `🤖 Strategy fired: ${f.symbol}` : `🤖 Strategy FAILED: ${f.symbol}`,
+              description: f.message,
+              variant: f.ok ? undefined : 'destructive',
+            })
+            ttLog('strategy', `🤖 ${f.symbol} ${f.message}`, f.ok ? 'ok' : 'warn')
+          }
+          window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+        }
+        // always refresh — rules also change server-side (failures, supervisor fires)
+        if (!stopped) useTerminal.getState().loadStrategies()
+      } catch { /* offline */ }
+    }
+    check()
+    const timer = setInterval(check, 20000)
     return () => {
       stopped = true
       clearInterval(timer)
@@ -218,6 +253,8 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         onOpenSettings={() => setSettingsOpen(true)}
         alertsOpen={alertsOpen}
         setAlertsOpen={setAlertsOpen}
+        strategiesOpen={strategiesOpen}
+        setStrategiesOpen={setStrategiesOpen}
       />
       <main className="flex min-h-0 flex-1 flex-col">
         <ActiveTabContent />
@@ -225,6 +262,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       <ConsoleDrawer />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
+      {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
       {/* footer stays glued to bottom on short viewports */}
       <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
         <span className="flex min-w-0 items-center">

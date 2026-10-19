@@ -110,6 +110,31 @@ export interface Alert {
   createdAt: string
 }
 
+/** Conditional ("complex") order rule — IF indicator condition THEN buy/sell + TP/SL. */
+export interface Strategy {
+  id: string
+  symbol: string
+  kind: 'rsi' | 'macd' | string
+  /** rsi: cross_above | cross_below · macd: bull_cross | bear_cross | cross_above | cross_below */
+  condition: string
+  level: number
+  timeframe: string
+  params: { period?: number; fast?: number; slow?: number; signal?: number } | null
+  action: 'buy' | 'sell' | string
+  qty: number
+  tpMode: 'none' | 'price' | 'pct' | string
+  tpValue: number | null
+  slMode: 'none' | 'price' | 'pct' | string
+  slValue: number | null
+  repeat: boolean
+  status: 'armed' | 'paused' | 'placing' | 'triggered' | 'failed' | string
+  lastSide: string | null
+  triggeredAt: string | null
+  orderId: string | null
+  fireNote: string | null
+  createdAt: string
+}
+
 export interface LayoutBlob {
   v: 1
   tabs: Tab[]
@@ -195,6 +220,14 @@ interface TerminalState {
   addAlertLocal: (a: Alert) => void
   patchAlertLocal: (id: string, patch: Partial<Alert>) => void
   removeAlertLocal: (id: string) => void
+
+  // strategy bot (conditional orders)
+  strategies: Strategy[]
+  strategiesLoaded: boolean
+  loadStrategies: () => Promise<void>
+  addStrategyLocal: (s: Strategy) => void
+  patchStrategyLocal: (id: string, patch: Partial<Strategy>) => void
+  removeStrategyLocal: (id: string) => void
 }
 
 const DEFAULT_TAB: Omit<Tab, 'id'> = { type: 'chart', symbol: 'AAPL', timeframe: '1D' }
@@ -618,6 +651,26 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   patchAlertLocal: (id, patch) =>
     set((s) => ({ alerts: s.alerts.map((a) => (a.id === id ? { ...a, ...patch } : a)) })),
   removeAlertLocal: (id) => set((s) => ({ alerts: s.alerts.filter((a) => a.id !== id) })),
+
+  // ---- strategy bot (conditional orders) ----
+  strategies: [],
+  strategiesLoaded: false,
+
+  loadStrategies: async () => {
+    try {
+      const res = await fetch('/api/strategies')
+      if (!res.ok) return
+      const json = await res.json()
+      set({ strategies: (json.strategies as Strategy[]) || [], strategiesLoaded: true })
+    } catch {
+      /* offline */
+    }
+  },
+
+  addStrategyLocal: (r) => set((s) => ({ strategies: [r, ...s.strategies] })),
+  patchStrategyLocal: (id, patch) =>
+    set((s) => ({ strategies: s.strategies.map((r) => (r.id === id ? { ...r, ...patch } : r)) })),
+  removeStrategyLocal: (id) => set((s) => ({ strategies: s.strategies.filter((r) => r.id !== id) })),
 }))
 
 // helper (non-hook)

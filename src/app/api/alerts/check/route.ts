@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
-import { getQuotes, getBars } from '@/lib/alpaca'
-import { rsi as rsiCalc, macd as macdCalc } from '@/lib/indicators'
+import { getQuotes } from '@/lib/alpaca'
 import { sendTelegram, handleError } from '@/lib/api-helpers'
 import { Bar, Timeframe, TIMEFRAMES } from '@/lib/market-types'
+import { barsFor } from '@/lib/bars-cache'
+import { evalIndicatorSignal, isCross, IndicatorParams } from '@/lib/indicator-eval'
 
 interface UserSettings {
   telegramTokenEnc?: string
@@ -24,87 +25,20 @@ interface AlertRow {
   lastSide: string | null
 }
 
-interface IndicatorParams {
-  period?: number
-  fast?: number
-  slow?: number
-  signal?: number
-}
-
-interface IndEval {
-  side: 'above' | 'below'
-  value: number
-  message: string
-}
-
-/** Bars cache — the check endpoint is polled by EVERY open tab every 30s;
- * a short TTL collapses concurrent polls for the same series into one fetch. */
-const barsCache = new Map<string, { bars: Bar[]; demo: boolean; at: number }>()
-const BARS_TTL_MS = 20000
-
-async function barsFor(symbol: string, tf: Timeframe, userId: string) {
-  const key = `${symbol}|${tf}`
-  const hit = barsCache.get(key)
-  if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit
-  const res = await getBars(symbol, tf, userId)
-  const entry = { bars: res.bars, demo: Boolean(res.demo), at: Date.now() }
-  barsCache.set(key, entry)
-  return entry
-}
-
-const tfLabel = (tf: string) => TIMEFRAMES[tf as Timeframe]?.label ?? tf
-
 /**
- * Evaluate one indicator alert against the bar series (chronological; the last
- * bar is the forming bar, so `last` tracks live while `prev` is the last CLOSED
- * bar). Returns the current side + a human message, or null when there is not
- * enough data.
+ * Evaluate one indicator alert against the bar series — thin wrapper over the
+ * shared engine (same semantics as the strategy bot).
  */
 function evalIndicator(a: AlertRow, bars: Bar[]): IndEval | null {
-  const closes = bars.map((b) => b.close)
-  if (a.kind === 'rsi') {
-    const period = Number((a.params as IndicatorParams | null)?.period) || 14
-    const series = rsiCalc(closes, period)
-    const last = series[series.length - 1]
-    const prev = series[series.length - 2]
-    if (last == null || prev == null) return null
-    const level = a.price
-    const side: 'above' | 'below' = last > level ? 'above' : 'below'
-    return {
-      side,
-      value: last,
-      message: `RSI(${period}) crossed ${a.direction === 'above' ? 'above' : 'below'} ${level} — now ${last.toFixed(1)} · ${tfLabel(a.timeframe)}`,
-    }
-  }
-  // ---- macd ----
-  const p = (a.params as IndicatorParams | null) || {}
-  const fast = Number(p.fast) || 12
-  const slow = Number(p.slow) || 26
-  const signal = Number(p.signal) || 9
-  const m = macdCalc(closes, fast, slow, signal)
-  const lastM = m.macd[m.macd.length - 1]
-  const prevM = m.macd[m.macd.length - 2]
-  const label = `MACD(${fast},${slow},${signal})`
-  if (a.condition === 'bull_cross' || a.condition === 'bear_cross') {
-    const lastS = m.signal[m.signal.length - 1]
-    const prevS = m.signal[m.signal.length - 2]
-    if (lastM == null || prevM == null || lastS == null || prevS == null) return null
-    const side: 'above' | 'below' = lastM > lastS ? 'above' : 'below'
-    return {
-      side,
-      value: lastM,
-      message: `${label} ${a.condition === 'bull_cross' ? 'bullish' : 'bearish'} crossover — macd ${lastM.toFixed(4)} ${side === 'above' ? '>' : '<'} signal ${lastS.toFixed(4)} · ${tfLabel(a.timeframe)}`,
-    }
-  }
-  // cross_above / cross_below a fixed level (default zero line)
-  if (lastM == null || prevM == null) return null
-  const level = a.price
-  const side: 'above' | 'below' = lastM > level ? 'above' : 'below'
-  return {
-    side,
-    value: lastM,
-    message: `${label} crossed ${a.direction === 'above' ? 'above' : 'below'} ${level} — now ${lastM.toFixed(4)} · ${tfLabel(a.timeframe)}`,
-  }
+  return evalIndicatorSignal(
+    a.kind === 'macd' ? 'macd' : 'rsi',
+    a.condition,
+    a.direction === 'below' ? 'below' : 'above',
+    a.price,
+    a.timeframe,
+    (a.params as IndicatorParams | null) || null,
+    bars,
+  )
 }
 
 // POST /api/alerts/check — poll engine: evaluate active alarms against live
@@ -195,10 +129,7 @@ export async function POST() {
       for (const a of list) {
         const ev = evalIndicator(a, entry.bars)
         if (!ev) continue
-        const crossed =
-          a.direction === 'above'
-            ? ev.side === 'above' && a.lastSide !== 'above'
-            : ev.side === 'below' && a.lastSide !== 'below'
+        const crossed = isCross(a.direction === 'below' ? 'below' : 'above', ev.side, a.lastSide)
         if (crossed && a.lastSide != null) {
           await db.alert.update({
             where: { id: a.id },

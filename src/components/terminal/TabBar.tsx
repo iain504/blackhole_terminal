@@ -7,7 +7,7 @@ import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
-  PanelsTopLeft, Crosshair, Check, Layers,
+  PanelsTopLeft, Crosshair, Check, Layers, Bot,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -31,10 +31,14 @@ export function TabBar({
   onOpenSettings,
   alertsOpen,
   setAlertsOpen,
+  strategiesOpen,
+  setStrategiesOpen,
 }: {
   onOpenSettings: () => void
   alertsOpen: boolean
   setAlertsOpen: (v: boolean) => void
+  strategiesOpen: boolean
+  setStrategiesOpen: (v: boolean) => void
 }) {
   const tabs = useTerminal((s) => s.tabs)
   const activeTabId = useTerminal((s) => s.activeTabId)
@@ -45,6 +49,8 @@ export function TabBar({
   const user = useTerminal((s) => s.user)
   const alerts = useTerminal((s) => s.alerts)
   const activeAlerts = alerts.filter((a) => a.status === 'active').length
+  const strategies = useTerminal((s) => s.strategies)
+  const armedStrategies = strategies.filter((r) => r.status === 'armed').length
   const [confirmClose, setConfirmClose] = useState<string | null>(null)
 
   // ---- tab drag-and-drop reorder (Task 28 #2) ----
@@ -244,6 +250,24 @@ export function TabBar({
 
       {/* account cluster */}
       <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          variant="ghost"
+          size="icon"
+          className={cn(
+            'relative h-7 w-7 text-zinc-400 hover:text-zinc-100',
+            strategiesOpen && 'bg-violet-500/15 text-violet-300',
+          )}
+          onClick={() => setStrategiesOpen(!strategiesOpen)}
+          aria-label="Strategy orders"
+          title="Strategy orders — IF indicator condition THEN buy/sell with TP/SL"
+        >
+          <Bot className="h-4 w-4" />
+          {armedStrategies > 0 && (
+            <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-violet-500 px-0.5 text-[9px] font-bold text-zinc-950">
+              {armedStrategies}
+            </span>
+          )}
+        </Button>
         <Button
           variant="ghost"
           size="icon"

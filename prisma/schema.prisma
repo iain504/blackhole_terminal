@@ -81,6 +81,51 @@ model Alert {
   @@index([userId, status])
 }
 
+// Conditional ("complex") orders — the strategy bot: WHEN an indicator
+// condition fires, place a market BUY/SELL with optional TP/SL (bracket).
+// The condition half reuses the indicator-alarm semantics (crossing memory);
+// the action half reuses the bracket plumbing (placeOrderWithExits).
+model StrategyRule {
+  id        String  @id @default(cuid())
+  userId    String
+  symbol    String
+  // ---- condition: kind 'rsi' | 'macd' ----
+  kind      String
+  // rsi: 'cross_above'|'cross_below' (level 0-100);
+  // macd: 'bull_cross'|'bear_cross'|'cross_above'|'cross_below' (line vs level)
+  condition String
+  level     Float
+  // bar timeframe the indicator is computed on: '1m'..'1M'
+  timeframe String  @default("1D")
+  // rsi {period} · macd {fast,slow,signal}
+  params    Json
+  // ---- action ----
+  action    String // 'buy' | 'sell'
+  qty       Float
+  // TP/SL: 'none' | 'price' (absolute) | 'pct' (PERCENT offset from the live
+  // quote at fire time, 2 = 2% — applied on the profit side for TP and the
+  // loss side for SL, relative to the action direction)
+  tpMode    String  @default("none")
+  tpValue   Float?
+  slMode    String  @default("none")
+  slValue   Float?
+  // one-shot (status ends 'triggered') or repeat (re-arms with fresh crossing
+  // memory after every fire)
+  repeat    Boolean @default(false)
+  // ---- state: armed | paused | placing | triggered | failed ----
+  status    String  @default("armed")
+  // crossing memory (same semantics as indicator alarms): null until the first
+  // check records the side — only a genuine crossing afterwards fires
+  lastSide  String?
+  triggeredAt DateTime?
+  orderId   String?
+  // human message of the last fire (success detail or the broker error)
+  fireNote  String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, status])
+}
+
 // Economic-calendar event alarms. Events have no stable id upstream, so the
 // key is "<ISO time>|<currency>|<title>" (same derivation on the client).
 model CalendarAlarm {
