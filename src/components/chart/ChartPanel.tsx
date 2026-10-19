@@ -13,15 +13,22 @@ import {
 import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS } from '@/store/terminal'
 import { useShallow } from 'zustand/react/shallow'
 import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
+import {
+  computeOverlays, computeRsi, computeMacd, stripMargins, indicatorsActive,
+  loadIndicators, saveIndicators, normalizeIndicators, DEFAULT_INDICATORS,
+  type IndicatorSettings, type LinePoint,
+} from '@/lib/indicators'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Switch } from '@/components/ui/switch'
 import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
-  Briefcase,
+  Briefcase, Sigma,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -74,6 +81,58 @@ const KIND_LABEL: Record<DrawingKind, string> = {
 
 const EMPTY_DRAWINGS: Drawing[] = []
 
+// ---- technical indicators (SMA / EMA / Bollinger / RSI / MACD) ----
+const MACD_HIST_UP = 'rgba(34,197,94,0.55)'
+const MACD_HIST_DOWN = 'rgba(239,68,68,0.55)'
+
+/** lightweight-charts series for every ENABLED indicator (slots optional). */
+interface IndSeriesBundle {
+  settings: IndicatorSettings
+  /** last computed value per slot (E2E probe / debug) */
+  lastPts: Record<string, number | null>
+  sma?: ISeriesApi<'Line'>
+  ema?: ISeriesApi<'Line'>
+  bbU?: ISeriesApi<'Line'>
+  bbM?: ISeriesApi<'Line'>
+  bbL?: ISeriesApi<'Line'>
+  rsi?: ISeriesApi<'Line'>
+  macdLine?: ISeriesApi<'Line'>
+  macdSig?: ISeriesApi<'Line'>
+  macdHist?: ISeriesApi<'Histogram'>
+}
+
+/** Tiny numeric field for indicator params — commits on blur/Enter. Remounts
+ *  when the (clamped) canonical value changes so out-of-range input snaps back. */
+function NumField({ label, value, min, max, step, onCommit }: {
+  label: string
+  value: number
+  min: number
+  max: number
+  step?: number
+  onCommit: (v: number) => void
+}) {
+  return (
+    <Input
+      key={value}
+      type="number"
+      defaultValue={value}
+      min={min}
+      max={max}
+      step={step}
+      aria-label={label}
+      className="h-6 w-14 border-zinc-800 bg-zinc-900 px-1.5 text-right text-[11px] tabular-nums text-zinc-200"
+      onBlur={(e) => {
+        const v = Number(e.target.value)
+        if (e.target.value !== '' && Number.isFinite(v)) onCommit(v)
+        else e.target.value = String(value)
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+      }}
+    />
+  )
+}
+
 export interface ChartPanelProps {
   symbol: string
   timeframe: Timeframe
@@ -109,6 +168,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
   const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
+  const indSeriesRef = useRef<IndSeriesBundle | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
   const feedStateRef = useRef('')
@@ -121,6 +181,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [demo, setDemo] = useState(false)
   const [demoReason, setDemoReason] = useState<string | undefined>(undefined)
   const [settingsVer, setSettingsVer] = useState(0)
+  // technical indicators (persisted globally in localStorage)
+  const [ind, setIndState] = useState<IndicatorSettings>(() => loadIndicators())
+  const [indDataVer, setIndDataVer] = useState(0) // bumped whenever bars change
+  const [indOpen, setIndOpen] = useState(false)
   const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number; prevClose?: number } | null>(null)
   // streaming ticks (stream-service socket.io): badge + pending-tick bookkeeping
@@ -189,6 +253,83 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const onChanged = () => setSettingsVer((v) => v + 1)
     window.addEventListener('tt:settings-changed', onChanged)
     return () => window.removeEventListener('tt:settings-changed', onChanged)
+  }, [])
+
+  // ---------- indicators: shared helpers ----------
+  // Merge + clamp + persist an indicator-settings change (identity swap drives
+  // the series lifecycle / data effects).
+  const setInd = useCallback((fn: (prev: IndicatorSettings) => IndicatorSettings) => {
+    setIndState((prev) => {
+      const next = normalizeIndicators(fn(prev))
+      saveIndicators(next)
+      return next
+    })
+  }, [])
+
+  // Full (re)fill of every enabled indicator series from barsRef — called on
+  // bars reload / config change, NOT per tick.
+  const fillIndData = useCallback((b: IndSeriesBundle) => {
+    const bars = barsRef.current
+    if (bars.length === 0) return
+    const asL = (pts: LinePoint[]) => pts.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }))
+    const put = (ser: ISeriesApi<'Line'> | undefined, pts: LinePoint[] | undefined, slot: string) => {
+      if (!ser) return
+      const arr = pts ?? []
+      ser.setData(asL(arr))
+      b.lastPts[slot] = arr.length > 0 ? arr[arr.length - 1].value : null
+    }
+    const s = b.settings
+    const ov = computeOverlays(bars, s)
+    put(b.sma, ov.sma, 'sma')
+    put(b.ema, ov.ema, 'ema')
+    put(b.bbU, ov.bbUpper, 'bbU')
+    put(b.bbM, ov.bbMid, 'bbM')
+    put(b.bbL, ov.bbLower, 'bbL')
+    if (b.rsi) put(b.rsi, computeRsi(bars, s.rsi.period), 'rsi')
+    if (b.macdHist) {
+      const m = computeMacd(bars, s.macd.fast, s.macd.slow, s.macd.signal)
+      put(b.macdLine, m.macd, 'macd')
+      put(b.macdSig, m.signal, 'sig')
+      b.macdHist.setData(m.hist.map((h) => ({ time: h.time as UTCTimestamp, value: h.value, color: h.rising ? MACD_HIST_UP : MACD_HIST_DOWN })))
+      b.lastPts['hist'] = m.hist.length > 0 ? m.hist[m.hist.length - 1].value : null
+    }
+  }, [])
+
+  // Update ONLY the last point of each enabled indicator after a live tick or
+  // REST quote refresh mutated the last bar (O(n) recompute, a few calls per
+  // second per pane at most).
+  const updateIndicatorsLast = useCallback(() => {
+    const b = indSeriesRef.current
+    const bars = barsRef.current
+    if (!b || bars.length === 0) return
+    const lastT = bars[bars.length - 1].time
+    const s = b.settings
+    const updLine = (ser: ISeriesApi<'Line'> | undefined, pts: LinePoint[] | undefined, slot: string) => {
+      if (!ser || !pts || pts.length === 0) return
+      const p = pts[pts.length - 1]
+      if (p.time !== lastT) return // warm-up gap — full fill happens on reload
+      ser.update({ time: p.time as UTCTimestamp, value: p.value })
+      b.lastPts[slot] = p.value
+    }
+    const ov = computeOverlays(bars, s)
+    updLine(b.sma, ov.sma, 'sma')
+    updLine(b.ema, ov.ema, 'ema')
+    updLine(b.bbU, ov.bbUpper, 'bbU')
+    updLine(b.bbM, ov.bbMid, 'bbM')
+    updLine(b.bbL, ov.bbLower, 'bbL')
+    if (b.rsi) updLine(b.rsi, computeRsi(bars, s.rsi.period), 'rsi')
+    if (b.macdHist) {
+      const m = computeMacd(bars, s.macd.fast, s.macd.slow, s.macd.signal)
+      updLine(b.macdLine, m.macd, 'macd')
+      updLine(b.macdSig, m.signal, 'sig')
+      if (m.hist.length > 0) {
+        const h = m.hist[m.hist.length - 1]
+        if (h.time === lastT) {
+          b.macdHist.update({ time: h.time as UTCTimestamp, value: h.value, color: h.rising ? MACD_HIST_UP : MACD_HIST_DOWN })
+          b.lastPts['hist'] = h.value
+        }
+      }
+    }
   }, [])
 
   // ---------- coordinate helpers ----------
@@ -1764,6 +1905,29 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           const upBar = c >= o
           const col = upBar ? 'text-emerald-400' : 'text-rose-400'
           const volTxt = volBar?.value != null ? `Vol ${(volBar.value / 1e6).toFixed(2)}M` : ''
+          // indicator readouts at the hovered bar (values straight from series data)
+          const ib = indSeriesRef.current
+          let indHtml = ''
+          if (ib) {
+            const rv = (ser?: ISeriesApi<'Line'> | ISeriesApi<'Histogram'>) => {
+              if (!ser) return undefined
+              const d = param.seriesData.get(ser as ISeriesApi<'Line'>) as { value?: number } | undefined
+              return d?.value
+            }
+            const parts: string[] = []
+            const push = (color: string, label: string, v: number | undefined) => {
+              if (v != null && Number.isFinite(v)) parts.push(`<span class="tabular-nums" style="color:${color}">${label} ${fmtPrice(v)}</span>`)
+            }
+            const st = ib.settings
+            if (ib.sma) push('#f59e0b', `SMA${st.sma.period}`, rv(ib.sma))
+            if (ib.ema) push('#a78bfa', `EMA${st.ema.period}`, rv(ib.ema))
+            if (ib.bbU) push('#e879f9', `BB${st.bb.period},${st.bb.mult}`, rv(ib.bbM))
+            if (ib.rsi) push('#f472b6', `RSI${st.rsi.period}`, rv(ib.rsi))
+            if (ib.macdLine) push('#f59e0b', 'MACD', rv(ib.macdLine))
+            if (ib.macdSig) push('#a78bfa', 'sig', rv(ib.macdSig))
+            if (ib.macdHist) push('#a1a1aa', 'hist', rv(ib.macdHist))
+            indHtml = parts.length > 0 ? `<div class="mt-0.5 flex flex-wrap gap-x-2">${parts.join('')}</div>` : ''
+          }
           leg.innerHTML =
             `<div><span class="font-semibold text-zinc-100">${symEsc}</span>` +
             `<span class="text-zinc-500"> · ${tfLabelEsc} · </span>` +
@@ -1771,7 +1935,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             `<span class="text-zinc-500"> H</span><span class="${col}"> ${fmtPrice(bar.high ?? c)}</span>` +
             `<span class="text-zinc-500"> L</span><span class="${col}"> ${fmtPrice(bar.low ?? c)}</span>` +
             `<span class="text-zinc-500"> C</span><span class="${col}"> ${fmtPrice(c)}</span></div>` +
-            (volTxt ? `<div class="text-zinc-500">${volTxt}</div>` : '')
+            (volTxt ? `<div class="text-zinc-500">${volTxt}</div>` : '') + indHtml
           leg.classList.remove('hidden')
         }
       }
@@ -1833,6 +1997,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           color: b.close >= b.open ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.35)',
         })),
       )
+      // bars changed → indicator series refill (initial load / scroll-back)
+      setIndDataVer((v) => v + 1)
     }
     const loadOlder = async () => {
       const bars = barsRef.current
@@ -1992,6 +2158,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       yOf,
       // scroll-back pagination probes (Task 28 #1)
       bars: () => barsRef.current.length,
+      ind: () => {
+        const b = indSeriesRef.current
+        if (!b) return null
+        const slots = Object.entries(b)
+          .filter(([k, v]) => k !== 'settings' && k !== 'lastPts' && v != null)
+          .map(([k]) => k)
+        return { slots, lastPts: { ...b.lastPts } }
+      },
+      indScales: () => {
+        const probe = (id: string) => {
+          try { return chart.priceScale(id).options().scaleMargins ?? null } catch { return null }
+        }
+        return { right: probe('right'), vol: probe('vol'), rsi: probe('rsi'), macd: probe('macd') }
+      },
       oldestBarTime: () => barsRef.current[0]?.time ?? null,
       lastBarTime: () => barsRef.current[barsRef.current.length - 1]?.time ?? null,
       lastBar: () => {
@@ -2022,6 +2202,81 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       axisIconsRef.current = []
     }
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw])
+
+  // ---------- technical indicators: series lifecycle ----------
+  // lightweight-charts v4 has no real multi-pane support: SMA/EMA/BB are line
+  // overlays on the price scale, RSI/MACD are dedicated price scales squeezed
+  // into stacked bottom strips (price · volume · RSI · MACD). This effect owns
+  // series creation/destroy on config or chart change; the effect after it
+  // refills DATA whenever bars change. Declared AFTER the chart effect so a
+  // live chart always exists when it runs.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    const s = ind
+
+    const destroyBundle = (b: IndSeriesBundle | null) => {
+      indSeriesRef.current = null
+      if (!b) return
+      for (const ser of [b.sma, b.ema, b.bbU, b.bbM, b.bbL, b.rsi, b.macdLine, b.macdSig, b.macdHist]) {
+        if (!ser) continue
+        try { chart.removeSeries(ser) } catch { /* chart already disposed */ }
+      }
+    }
+    destroyBundle(indSeriesRef.current)
+    // restore chart-creation margins (the config below overrides when needed)
+    try {
+      chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.1, bottom: 0.24 } })
+      chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
+    } catch { /* chart disposed */ }
+
+    const bundle: IndSeriesBundle = { settings: s, lastPts: {} }
+    const overlayOpts = { lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false } as const
+    try {
+      if (s.sma.enabled) bundle.sma = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, ...overlayOpts })
+      if (s.ema.enabled) bundle.ema = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, ...overlayOpts })
+      if (s.bb.enabled) {
+        bundle.bbU = chart.addLineSeries({ color: 'rgba(232,121,249,0.8)', lineWidth: 1, ...overlayOpts })
+        bundle.bbM = chart.addLineSeries({ color: 'rgba(232,121,249,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, ...overlayOpts })
+        bundle.bbL = chart.addLineSeries({ color: 'rgba(232,121,249,0.8)', lineWidth: 1, ...overlayOpts })
+      }
+      if (s.rsi.enabled) {
+        bundle.rsi = chart.addLineSeries({
+          priceScaleId: 'rsi', color: '#f472b6', lineWidth: 1, ...overlayOpts,
+          autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
+        })
+        bundle.rsi.createPriceLine({ price: 70, color: 'rgba(113,113,122,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' })
+        bundle.rsi.createPriceLine({ price: 30, color: 'rgba(113,113,122,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' })
+      }
+      if (s.macd.enabled) {
+        bundle.macdHist = chart.addHistogramSeries({ priceScaleId: 'macd', lastValueVisible: false, priceLineVisible: false })
+        bundle.macdLine = chart.addLineSeries({ priceScaleId: 'macd', color: '#f59e0b', lineWidth: 1, ...overlayOpts })
+        bundle.macdSig = chart.addLineSeries({ priceScaleId: 'macd', color: '#a78bfa', lineWidth: 1, ...overlayOpts })
+        bundle.macdLine.createPriceLine({ price: 0, color: 'rgba(113,113,122,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' })
+      }
+      // squeeze price/volume upward when oscillator strips are enabled
+      if (s.rsi.enabled || s.macd.enabled) {
+        const m = stripMargins(s.rsi.enabled, s.macd.enabled)
+        chart.priceScale('right').applyOptions({ scaleMargins: m.price })
+        chart.priceScale('vol').applyOptions({ scaleMargins: m.vol })
+        if (m.rsi) chart.priceScale('rsi').applyOptions({ scaleMargins: m.rsi })
+        if (m.macd) chart.priceScale('macd').applyOptions({ scaleMargins: m.macd })
+      }
+      indSeriesRef.current = bundle
+      fillIndData(bundle)
+    } catch { /* chart disposed mid-setup */ }
+
+    return () => {
+      destroyBundle(indSeriesRef.current)
+    }
+  }, [symbol, tf, chartType, settingsVer, ind, fillIndData])
+
+  // indicators: refill data whenever bars change (initial load / scroll-back
+  // prepend) — series lifecycle is owned by the effect above
+  useEffect(() => {
+    const b = indSeriesRef.current
+    if (b) fillIndData(b)
+  }, [ind, indDataVer, fillIndData])
 
   // load drawings for this symbol
   useEffect(() => {
@@ -2058,6 +2313,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       s.update(upd as CandlestickData<Time> | LineData<Time>)
       volSeriesRef.current?.update({ time: nb.time as UTCTimestamp, value: 0, color: 'rgba(34,197,94,0.35)' })
       scheduleRedraw()
+      updateIndicatorsLast()
     } else if (lastB.close !== t.p || t.p > lastB.high || t.p < lastB.low) {
       const high = Math.max(lastB.high, t.p)
       const low = Math.min(lastB.low, t.p)
@@ -2068,6 +2324,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       s.update(bar as CandlestickData<Time> | LineData<Time>)
       barsRef.current = [...bars.slice(0, -1), { ...lastB, close: t.p, high, low }]
       scheduleRedraw()
+      updateIndicatorsLast()
     }
     // header quote — recompute change vs the REST-known previous close
     setQuote((q) => {
@@ -2139,6 +2396,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               s.update(bar)
               barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
               scheduleRedraw()
+              updateIndicatorsLast()
             }
           } else {
             // stream is live — only refresh the prev-close anchor + change basis
@@ -2160,6 +2418,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   }, [symbol, chartType, scheduleRedraw])
 
   const up = (quote?.changePct ?? 0) >= 0
+  const indActiveCount = indicatorsActive(ind)
 
   return (
     <div
@@ -2223,6 +2482,95 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           >
             <LineIcon className="h-3.5 w-3.5" />
           </button>
+        </div>
+        <div className="pointer-events-auto">
+          <Popover open={indOpen} onOpenChange={setIndOpen}>
+            <PopoverTrigger asChild>
+              <button
+                className={cn(
+                  'flex h-7 items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900/80 px-2 text-[11px] font-medium transition-colors',
+                  indActiveCount > 0 ? 'text-emerald-400' : 'text-zinc-400 hover:text-zinc-200',
+                )}
+                aria-label="Indicators"
+                title="Indicators"
+              >
+                <Sigma className="h-3.5 w-3.5" />
+                ƒx
+                {indActiveCount > 0 && (
+                  <Badge variant="outline" className="ml-0.5 border-emerald-500/40 px-1 text-[9px] text-emerald-400">
+                    {indActiveCount}
+                  </Badge>
+                )}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" sideOffset={6} className="w-72 border-zinc-800 bg-zinc-950/95 p-3 text-xs text-zinc-200 backdrop-blur-sm">
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Indicators</span>
+                <button
+                  className="text-[10px] text-zinc-500 transition-colors hover:text-zinc-300"
+                  onClick={() => setInd(() => DEFAULT_INDICATORS)}
+                >
+                  Reset
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                  <Switch checked={ind.sma.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, enabled: v } }))} aria-label="Toggle SMA" />
+                  <span className="font-medium text-amber-500">SMA</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-zinc-500">
+                  length
+                  <NumField label="SMA length" value={ind.sma.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, period: v } }))} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                  <Switch checked={ind.ema.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, enabled: v } }))} aria-label="Toggle EMA" />
+                  <span className="font-medium text-violet-400">EMA</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-zinc-500">
+                  length
+                  <NumField label="EMA length" value={ind.ema.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, period: v } }))} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                  <Switch checked={ind.bb.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, enabled: v } }))} aria-label="Toggle Bollinger Bands" />
+                  <span className="font-medium text-fuchsia-400">Bollinger Bands</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-zinc-500">
+                  length
+                  <NumField label="BB length" value={ind.bb.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, period: v } }))} />
+                  mult
+                  <NumField label="BB standard deviation multiplier" value={ind.bb.mult} min={0.5} max={10} step={0.5} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, mult: v } }))} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                  <Switch checked={ind.rsi.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, enabled: v } }))} aria-label="Toggle RSI" />
+                  <span className="font-medium text-pink-400">RSI</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-zinc-500">
+                  length
+                  <NumField label="RSI length" value={ind.rsi.period} min={2} max={200} onCommit={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, period: v } }))} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+                <div className="flex items-center gap-2">
+                  <Switch checked={ind.macd.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, enabled: v } }))} aria-label="Toggle MACD" />
+                  <span className="font-medium text-amber-500">MACD</span>
+                </div>
+                <div className="flex items-center gap-1.5 text-zinc-500">
+                  fast
+                  <NumField label="MACD fast" value={ind.macd.fast} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, fast: v } }))} />
+                  slow
+                  <NumField label="MACD slow" value={ind.macd.slow} min={2} max={400} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, slow: v } }))} />
+                  signal
+                  <NumField label="MACD signal" value={ind.macd.signal} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, signal: v } }))} />
+                </div>
+              </div>
+            </PopoverContent>
+          </Popover>
         </div>
         <div className="ml-auto flex items-center gap-2 pr-1">
           {liveBadge && (
