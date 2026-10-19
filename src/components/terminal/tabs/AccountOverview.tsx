@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from 
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
-type Range = 'hour' | 'day' | 'week' | 'month' | 'year'
+type Range = 'today' | 'hour' | 'day' | 'week' | 'month' | 'year'
 
 interface AccountInfo {
   accountNumber?: string | null
@@ -51,6 +51,7 @@ interface ModeState {
 interface HistoryPoint { t: number; eq: number; pl: number | null; plPct: number | null }
 
 const RANGES: { key: Range; label: string }[] = [
+  { key: 'today', label: 'Today' },
   { key: 'hour', label: 'Hour' },
   { key: 'day', label: 'Day' },
   { key: 'week', label: 'Week' },
@@ -68,10 +69,10 @@ export default function AccountOverview() {
     paper: { account: null, loaded: false },
     live: { account: null, loaded: false },
   })
-  const [range, setRange] = useState<Range>('day')
+  const [range, setRange] = useState<Range>('today')
   const [chartMode, setChartMode] = useState<Mode>('paper')
-  const [history, setHistory] = useState<{ range: Range; mode: Mode; points: HistoryPoint[]; error?: string; loaded: boolean; timeframe?: string }>({
-    range: 'day', mode: 'paper', points: [], loaded: false,
+  const [history, setHistory] = useState<{ range: Range; mode: Mode; points: HistoryPoint[]; error?: string; loaded: boolean; timeframe?: string; fallback?: string }>({
+    range: 'today', mode: 'paper', points: [], loaded: false,
   })
   const [refreshing, setRefreshing] = useState(false)
 
@@ -90,19 +91,26 @@ export default function AccountOverview() {
     return { paper, live }
   }, [])
 
+  // the browser's UTC offset so "Today" is sliced to the user's local midnight
+  const histUrl = useCallback(
+    (r: Range, m: Mode) =>
+      `/api/trading/portfolio/history?mode=${m}&range=${r}&tzOffset=${new Date().getTimezoneOffset()}`,
+    [],
+  )
+
   const refreshHistory = useCallback(async (r: Range, m: Mode) => {
     try {
-      const res = await fetch(`/api/trading/portfolio/history?mode=${m}&range=${r}`)
+      const res = await fetch(histUrl(r, m))
       const json = await res.json().catch(() => null)
       if (res.ok && json) {
-        setHistory({ range: r, mode: m, points: json.points || [], error: json.error, loaded: true, timeframe: json.timeframe })
+        setHistory({ range: r, mode: m, points: json.points || [], error: json.error, loaded: true, timeframe: json.timeframe, fallback: json.fallback })
       } else {
         setHistory({ range: r, mode: m, points: [], error: json?.error || `HTTP ${res.status}`, loaded: true })
       }
     } catch {
       setHistory({ range: r, mode: m, points: [], error: 'network error', loaded: true })
     }
-  }, [])
+  }, [histUrl])
 
   useEffect(() => {
     let alive = true
@@ -132,11 +140,11 @@ export default function AccountOverview() {
     let alive = true
     void (async () => {
       try {
-        const res = await fetch(`/api/trading/portfolio/history?mode=${chartMode}&range=${range}`)
+        const res = await fetch(histUrl(range, chartMode))
         const json = await res.json().catch(() => null)
         if (!alive) return
         if (res.ok && json) {
-          setHistory({ range, mode: chartMode, points: json.points || [], error: json.error, loaded: true, timeframe: json.timeframe })
+          setHistory({ range, mode: chartMode, points: json.points || [], error: json.error, loaded: true, timeframe: json.timeframe, fallback: json.fallback })
         } else {
           setHistory({ range, mode: chartMode, points: [], error: json?.error || `HTTP ${res.status}`, loaded: true })
         }
@@ -149,7 +157,7 @@ export default function AccountOverview() {
       alive = false
       clearInterval(t)
     }
-  }, [range, chartMode, refreshHistory])
+  }, [range, chartMode, refreshHistory, histUrl])
 
   const refreshAll = () => {
     setRefreshing(true)
@@ -203,7 +211,15 @@ export default function AccountOverview() {
               </button>
             ))}
           </div>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-1">
+            {!historyStale && history.fallback === 'last-session' && (
+              <span
+                className="rounded border border-amber-500/40 px-1 py-px text-[9px] uppercase tracking-wide text-amber-400"
+                title="No equity change since midnight yet (weekend/holiday or flat market) — showing the most recent session"
+              >
+                last session
+              </span>
+            )}
             <Button
               variant="ghost"
               size="icon"
@@ -394,7 +410,7 @@ function EquityChart({ points, loaded, error, range }: {
 
   const fmtTime = (t: number) => {
     const d = new Date(t * 1000)
-    if (range === 'hour' || range === 'day') {
+    if (range === 'today' || range === 'hour' || range === 'day') {
       return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
     }
     if (range === 'year') {

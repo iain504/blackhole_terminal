@@ -597,3 +597,18 @@ Stage Summary:
 - Footer bottom-right now shows a live local clock (HH:MM:SS + timezone) that ticks every second; SSR/hydration safe.
 - Watchlists are renamable via the options menu, double-click on a list chip, with Enter/save-button paths, length validation, toasts, and server-persisted names; store resyncs on rejected patches.
 - Files: src/components/terminal/TerminalRoot.tsx (LiveClock), src/components/terminal/sidebar/WatchlistPanel.tsx (rename UI), src/store/terminal.ts (updateWatchlist resync).
+
+---
+Task ID: 34
+Agent: Z.ai Code (main)
+Task: Equity chart — add a "Today" range (see today's equity)
+
+Work Log:
+- LIVE API FIND: Alpaca's 1D portfolio-history period returns the LAST SESSION's grid (verified: Fri 04:00–20:00 ET = 08:00Z–00:00Z), NOT a trailing 24h — so a strict "since local midnight" slice is EMPTY on weekends/holidays (probed live on a Sunday: 0 points). The naive version would have made the new default tab look broken.
+- API (portfolio/history/route.ts, refactored): COMBOS gained `today: [1D@1Min, 1D@5Min]`; client passes `tzOffset` (Date#getTimezoneOffset minutes, clamped ±840) and the route slices to `localMidnightSec(tz)` (epoch of the USER's midnight — verified formula). Point-building + combo-trying extracted into build()/tryCombos() helpers; `today` with <2 points automatically FALLS BACK to the last session (COMBOS.day) and the response carries `fallback: 'last-session'`; no-keys path preserved through both passes.
+- UI (AccountOverview.tsx): Range union + RANGES gained 'today' (first tab) and it's now the DEFAULT; both fetch sites use a histUrl() helper that appends tzOffset; fmtTime treats 'today' like hour/day (HH:MM axis); history state carries `fallback` and the equity header shows an amber "last session" badge (tooltip: "No equity change since midnight yet (weekend/holiday or flat market) — showing the most recent session") only when the current range/mode isn't stale.
+- E2E (agent-browser, trader+TOTP, Sunday): API probed with tzOffset 0 / -60 / +780 → all 193 pts, fallback:'last-session', tf 5Min (correct — Friday ends before any of those midnights); Positions tab: Today tab is default-pressed, "LAST SESSION" badge visible, curve renders Fri session 08:00→00:00 with headline $10,000.00 +$0.00; regression: clicked Hour / Week / Year / Today → each becomes aria-pressed and chart re-fetches; browser errors none; dev.log clean (only pre-existing live-mode 401 noise); lint clean. On a weekday the midnight slice will engage automatically (Monday 00:00 local → today's premarket+session at 1Min resolution).
+- Files: src/app/api/trading/portfolio/history/route.ts (today range + tz slice + fallback, refactor), src/components/terminal/tabs/AccountOverview.tsx (Today tab, tzOffset param, fallback badge).
+
+Stage Summary:
+- The equity chart now opens on "Today": since-local-midnight equity at 1Min resolution in the user's own timezone, with an honest automatic last-session fallback (amber "LAST SESSION" hint) whenever today has no data yet — weekends/holidays never show an empty default chart. All previous ranges verified unregressed.
