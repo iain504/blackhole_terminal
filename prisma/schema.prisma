@@ -53,11 +53,27 @@ model Alert {
   id          String    @id @default(cuid())
   userId      String
   symbol      String
+  // kind: 'price' (legacy price alarm) | 'rsi' | 'macd' (indicator alarms)
+  kind        String    @default("price")
+  // price: the trigger level (price alerts) — for rsi: the 0-100 level,
+  // for macd cross_above/cross_below: the macd-line level (0 = zero line)
   price       Float
+  // 'above' | 'below' — crossing direction (macd crossovers map bull→above, bear→below)
   direction   String    @default("above")
+  // macd conditions: 'bull_cross' (macd crosses above signal) | 'bear_cross' |
+  // 'cross_above' | 'cross_below' (macd line vs `price` level). rsi/price: null
+  condition   String?
+  // bar timeframe the indicator is computed on (rsi/macd only): '1m'..'1M'
+  timeframe   String    @default("1D")
+  // indicator params: rsi {period} · macd {fast,slow,signal}
+  params      Json?
   color       String    @default("#f59e0b")
   status      String    @default("active")
   note        String?
+  // crossing memory: last side of the value vs the level ('above'/'below').
+  // price alerts seed the opposite side (legacy behavior); indicator alerts
+  // start null — the first check records the side WITHOUT triggering so only
+  // genuine crossings fire
   lastSide    String?
   triggeredAt DateTime?
   createdAt   DateTime  @default(now())

@@ -507,7 +507,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
-    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+    // indicator alarms (RSI/MACD) have no price level — they live in the
+    // Alerts drawer only, never drawn/hittable as price lines
+    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered' && (a.kind ?? 'price') === 'price')
 
     // ---- indicator strip chrome (TradingView-style pane titles + axis) ----
     // lightweight-charts v4 has no real panes: RSI/MACD live on hidden price
@@ -1256,7 +1258,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const hitTest = useCallback((x: number, y: number): SceneHit | null => {
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
-    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+    const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered' && (a.kind ?? 'price') === 'price')
 
     // trade lines take priority (pending orders / position entry / SL / TP)
     const posBundle = posRef.current
@@ -1420,6 +1422,34 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
     } catch { /* offline */ }
   }, [symbol, quote, addAlertLocal])
+
+  // one-click indicator alarm from the chart's right-click menu — carries the
+  // indicator config CURRENTLY shown on this chart and its timeframe
+  const addIndicatorAlarm = useCallback(async (req: {
+    kind: 'rsi' | 'macd'
+    label: string
+    params: Record<string, number>
+    direction?: 'above' | 'below'
+    price?: number
+    condition?: string
+  }) => {
+    try {
+      const res = await fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ symbol, timeframe: tf, ...req }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.alert) {
+        addAlertLocal(json.alert)
+        toast({ title: `🔔 ${req.kind.toUpperCase()} alarm created`, description: `${req.label} · ${symbol}` })
+      } else {
+        toast({ title: 'Alarm failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Alarm failed', description: 'Network error', variant: 'destructive' })
+    }
+  }, [symbol, tf, addAlertLocal, toast])
 
   // ---------- trade assistance actions ----------
   const patchExitPrice = useCallback(async (
@@ -2948,7 +2978,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       {/* context menu */}
       {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} container={containerRef.current} symbol={symbol}
         posData={posData.data}
+        indicators={ind}
+        timeframe={tf}
         onAddAlert={(price) => void addAlertAtPrice(price)}
+        onAddIndicatorAlarm={(req) => void addIndicatorAlarm(req)}
         onAddHline={(price) => {
           void createDrawing('hline', [{ time: null, price }])
         }}
@@ -3053,8 +3086,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
 // ---------- context menu ----------
 function ContextMenu({
-  menu, onClose, container, symbol, posData,
-  onAddAlert, onAddHline, onTrade, onOpenTicket,
+  menu, onClose, container, symbol, posData, indicators, timeframe,
+  onAddAlert, onAddIndicatorAlarm, onAddHline, onTrade, onOpenTicket,
   onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
   onPatchExit, onAddExit, onCancelExit, onCancelPending, onClosePosition,
 }: {
@@ -3063,7 +3096,10 @@ function ContextMenu({
   container: HTMLElement | null
   symbol: string
   posData: { positions: { symbol: string; tradeSymbol: string; qty: number; side: string; avgEntry: number }[]; exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> } | null
+  indicators: IndicatorSettings
+  timeframe: Timeframe
   onAddAlert: (price: number) => void
+  onAddIndicatorAlarm: (req: { kind: 'rsi' | 'macd'; label: string; params: Record<string, number>; direction?: 'above' | 'below'; price?: number; condition?: string }) => void
   onAddHline: (price: number) => void
   onTrade: (side: 'buy' | 'sell', price?: number) => void
   onOpenTicket: () => void
@@ -3334,6 +3370,50 @@ function ContextMenu({
             label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add price alert at {fmtPrice(price)}</span>}
             onClick={() => { onAddAlert(price); onClose() }}
           />
+        )}
+        {(indicators.rsi.enabled || indicators.macd.enabled) && (
+          <>
+            <div className="my-1 h-px bg-zinc-800" />
+            {indicators.rsi.enabled && (
+              <>
+                <MenuItem
+                  label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses above 70</span>}
+                  onClick={() => {
+                    onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses above 70`, params: { period: indicators.rsi.period }, direction: 'above', price: 70 })
+                    onClose()
+                  }}
+                />
+                <MenuItem
+                  label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses below 30</span>}
+                  onClick={() => {
+                    onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses below 30`, params: { period: indicators.rsi.period }, direction: 'below', price: 30 })
+                    onClose()
+                  }}
+                />
+              </>
+            )}
+            {indicators.macd.enabled && (
+              <>
+                <MenuItem
+                  label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bull crossover</span>}
+                  onClick={() => {
+                    const m = indicators.macd
+                    onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bull crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bull_cross' })
+                    onClose()
+                  }}
+                />
+                <MenuItem
+                  label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bear crossover</span>}
+                  onClick={() => {
+                    const m = indicators.macd
+                    onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bear crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bear_cross' })
+                    onClose()
+                  }}
+                />
+              </>
+            )}
+            <div className="px-3 pb-1 text-[10px] text-zinc-600">alarms use this chart's timeframe ({TIMEFRAMES[timeframe]?.label ?? timeframe}) and indicator settings</div>
+          </>
         )}
         {price != null && (
           <MenuItem label="─ Horizontal line here" onClick={() => { onAddHline(price); onClose() }} />

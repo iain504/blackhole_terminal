@@ -249,7 +249,7 @@ export function TabBar({
           size="icon"
           className="relative h-7 w-7 text-zinc-400 hover:text-zinc-100"
           onClick={() => setAlertsOpen(!alertsOpen)}
-          aria-label="Price alerts"
+          aria-label="Alerts"
         >
           <BellRing className="h-4 w-4" />
           {activeAlerts > 0 && (

@@ -93,8 +93,16 @@ export type AddSymbolResult = { ok: true } | { ok: false; reason: 'invalid' | 'd
 export interface Alert {
   id: string
   symbol: string
+  kind: 'price' | 'rsi' | 'macd' | string
+  /** trigger level: price / RSI level / MACD cross level */
   price: number
   direction: 'above' | 'below' | string
+  /** macd conditions: bull_cross | bear_cross | cross_above | cross_below */
+  condition: string | null
+  /** bar timeframe the indicator is computed on (rsi/macd) */
+  timeframe: string
+  /** rsi {period} · macd {fast,slow,signal} */
+  params: { period?: number; fast?: number; slow?: number; signal?: number } | null
   color: string
   status: 'active' | 'paused' | 'triggered' | string
   note: string | null

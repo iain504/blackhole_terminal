@@ -2,7 +2,7 @@
 
 // Terminal root: auth gate, tab bar, 5s layout autosave, alert engine polling.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useTerminal, SessionUser } from '@/store/terminal'
+import { useTerminal, SessionUser, Alert } from '@/store/terminal'
 import AuthForms from '@/components/auth/AuthForms'
 import SettingsDialog from '@/components/settings/SettingsDialog'
 import { TabBar } from './TabBar'
@@ -14,8 +14,10 @@ import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Input } from '@/components/ui/input'
 import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
+import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
 
 export function TerminalRoot({ onExit }: { onExit?: () => void }) {
@@ -111,9 +113,9 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         for (const t of json.triggered) {
           toast({
             title: `🔔 Alert: ${t.symbol}`,
-            description: `Price is ${t.direction === 'above' ? 'above' : 'below'} ${t.target} — now ${t.price}`,
+            description: t.message || `Price is ${t.direction === 'above' ? 'above' : 'below'} ${t.target} — now ${t.price}`,
           })
-          ttLog('alerts', `🔔 ${t.symbol} ${t.direction} ${t.target} — now ${t.price}`, 'warn')
+          ttLog('alerts', `🔔 ${t.symbol} ${t.message || `${t.direction} ${t.target} — now ${t.price}`}`, 'warn')
         }
         if (!stopped) useTerminal.getState().loadAlerts()
       } catch { /* offline */ }
@@ -346,10 +348,107 @@ function ActiveTabContent() {
   return <ChartWorkspace key={active.id} tab={active} />
 }
 
+const ALERT_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M'] as const
+const TF_LABEL: Record<string, string> = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1D': '1D', '1W': '1W', '1M': '1M' }
+
+/** One-line human summary of an alarm (any kind) for the list. */
+function alertSummary(a: Alert): string {
+  if (a.kind === 'rsi') {
+    return `RSI(${a.params?.period ?? 14}) crosses ${a.direction === 'above' ? 'above' : 'below'} ${a.price} · ${TF_LABEL[a.timeframe] ?? a.timeframe}`
+  }
+  if (a.kind === 'macd') {
+    const p = a.params ?? {}
+    const base = `MACD(${p.fast ?? 12},${p.slow ?? 26},${p.signal ?? 9})`
+    const cond =
+      a.condition === 'bull_cross' ? 'bullish crossover'
+      : a.condition === 'bear_cross' ? 'bearish crossover'
+      : a.condition === 'cross_above' ? `crosses above ${a.price}`
+      : a.condition === 'cross_below' ? `crosses below ${a.price}`
+      : 'crossover'
+    return `${base} ${cond} · ${TF_LABEL[a.timeframe] ?? a.timeframe}`
+  }
+  return `${a.direction === 'above' ? '≥' : '≤'} ${fmtPrice(a.price)}`
+}
+
 function AlertsDrawer({ onClose }: { onClose: () => void }) {
   const alerts = useTerminal((s) => s.alerts)
+  const addAlertLocal = useTerminal((s) => s.addAlertLocal)
   const patchAlertLocal = useTerminal((s) => s.patchAlertLocal)
   const removeAlertLocal = useTerminal((s) => s.removeAlertLocal)
+  const activeTab = useTerminal((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0])
+
+  // ---- creation form state ----
+  const [kind, setKind] = useState<'price' | 'rsi' | 'macd'>('rsi')
+  const [symbol, setSymbol] = useState('')
+  const [tf, setTf] = useState('1D')
+  // price alarm fields
+  const [price, setPrice] = useState('')
+  const [dir, setDir] = useState<'above' | 'below'>('above')
+  // rsi fields
+  const [rsiPeriod, setRsiPeriod] = useState('14')
+  const [rsiLevel, setRsiLevel] = useState('70')
+  // macd fields
+  const [fast, setFast] = useState('12')
+  const [slow, setSlow] = useState('26')
+  const [signal, setSignal] = useState('9')
+  const [cond, setCond] = useState<'bull_cross' | 'bear_cross' | 'cross_above' | 'cross_below'>('bull_cross')
+  const [macdLevel, setMacdLevel] = useState('0')
+  const [creating, setCreating] = useState(false)
+  const symTouched = useRef(false)
+
+  // prefill symbol/timeframe from the active chart tab (once)
+  useEffect(() => {
+    if (symTouched.current) return
+    if (activeTab?.symbol) {
+      setSymbol(activeTab.symbol)
+      if (activeTab.timeframe) setTf(activeTab.timeframe)
+    }
+  }, [activeTab?.symbol, activeTab?.timeframe])
+
+  // RSI level default flips with the direction (70 overbought / 30 oversold)
+  const flipRsiLevel = (d: 'above' | 'below') => {
+    setDir(d)
+    if (!symTouched.current || rsiLevel === '70' || rsiLevel === '30') setRsiLevel(d === 'above' ? '70' : '30')
+  }
+
+  const create = async () => {
+    const sym = symbol.trim().toUpperCase()
+    if (!sym) return
+    setCreating(true)
+    try {
+      const body: Record<string, unknown> =
+        kind === 'price'
+          ? {
+              symbol: sym, kind, price: parseFloat(price),
+              direction: dir, color: '#f59e0b',
+            }
+          : kind === 'rsi'
+            ? {
+                symbol: sym, kind, price: parseFloat(rsiLevel),
+                direction: dir, timeframe: tf,
+                params: { period: parseInt(rsiPeriod, 10) }, color: '#f472b6',
+              }
+            : {
+                symbol: sym, kind, condition: cond, timeframe: tf,
+                price: parseFloat(macdLevel) || 0,
+                params: { fast: parseInt(fast, 10), slow: parseInt(slow, 10), signal: parseInt(signal, 10) },
+                color: '#f59e0b',
+              }
+      const res = await fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.alert) {
+        addAlertLocal(json.alert as Alert)
+      } else {
+        ttLog('alerts', `Create alarm failed: ${json?.error || res.status}`, 'warn')
+      }
+    } catch { /* offline */ } finally {
+      setCreating(false)
+    }
+  }
 
   const toggle = async (id: string, status: string) => {
     const next = status === 'paused' ? 'active' : 'paused'
@@ -365,22 +464,157 @@ function AlertsDrawer({ onClose }: { onClose: () => void }) {
     await fetch(`/api/alerts/${id}`, { method: 'DELETE' })
   }
 
+  const formValid =
+    kind === 'price'
+      ? Number.isFinite(parseFloat(price)) && parseFloat(price) > 0 && symbol.trim().length > 0
+      : kind === 'rsi'
+        ? Number.isFinite(parseFloat(rsiLevel)) && parseFloat(rsiLevel) > 0 && symbol.trim().length > 0
+        : cond === 'cross_above' || cond === 'cross_below'
+          ? Number.isFinite(parseFloat(macdLevel)) && symbol.trim().length > 0
+          : symbol.trim().length > 0
+
   return (
-    <div className="fixed inset-0 z-50" role="dialog" aria-label="Price alerts">
+    <div className="fixed inset-0 z-50" role="dialog" aria-label="Alerts">
       <button className="absolute inset-0 bg-black/50" onClick={onClose} aria-label="Close alerts" />
       <div className="absolute right-3 top-12 w-[340px] max-w-[calc(100vw-24px)] rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl">
         <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 text-sm font-medium">
           <span className="flex items-center gap-2">
-            <BellRing className="h-4 w-4 text-amber-400" /> Price alerts
+            <BellRing className="h-4 w-4 text-amber-400" /> Alerts
           </span>
           <Button variant="ghost" size="sm" onClick={onClose} className="h-7 px-2 text-xs">
             Close
           </Button>
         </div>
-        <div className="max-h-[50vh] overflow-y-auto p-2">
+
+        {/* ---- new alarm form ---- */}
+        <div className="border-b border-zinc-800 p-2.5">
+          <div className="mb-2 flex items-center gap-1.5">
+            {(['price', 'rsi', 'macd'] as const).map((k) => (
+              <button
+                key={k}
+                onClick={() => setKind(k)}
+                aria-pressed={kind === k}
+                className={cn(
+                  'rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-wide transition-colors',
+                  kind === k
+                    ? k === 'rsi'
+                      ? 'bg-pink-500/15 text-pink-300'
+                      : k === 'macd'
+                        ? 'bg-amber-500/15 text-amber-300'
+                        : 'bg-emerald-500/15 text-emerald-300'
+                    : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300',
+                )}
+              >
+                {k}
+              </button>
+            ))}
+            <Input
+              value={symbol}
+              onChange={(e) => { symTouched.current = true; setSymbol(e.target.value.toUpperCase()) }}
+              placeholder="SYMBOL"
+              aria-label="Alarm symbol"
+              className="ml-auto h-7 w-[110px] border-zinc-700 bg-zinc-950 text-xs uppercase"
+            />
+          </div>
+
+          {kind === 'price' && (
+            <div className="flex items-center gap-1.5">
+              <select
+                value={dir}
+                onChange={(e) => setDir(e.target.value as 'above' | 'below')}
+                aria-label="Trigger direction"
+                className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+              >
+                <option value="above">crosses above</option>
+                <option value="below">falls below</option>
+              </select>
+              <Input
+                type="number" step="any" value={price}
+                onChange={(e) => setPrice(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && formValid && void create()}
+                placeholder="Price" aria-label="Alert price"
+                className="h-7 flex-1 border-zinc-700 bg-zinc-950 text-xs"
+              />
+            </div>
+          )}
+
+          {kind === 'rsi' && (
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <label className="text-[10px] uppercase tracking-wider text-zinc-500">Len</label>
+                <Input
+                  type="number" value={rsiPeriod} min={2} max={200}
+                  onChange={(e) => setRsiPeriod(e.target.value)}
+                  aria-label="RSI period"
+                  className="h-7 w-14 border-zinc-700 bg-zinc-950 text-xs"
+                />
+                <select
+                  value={dir}
+                  onChange={(e) => flipRsiLevel(e.target.value as 'above' | 'below')}
+                  aria-label="RSI trigger direction"
+                  className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+                >
+                  <option value="above">crosses above</option>
+                  <option value="below">crosses below</option>
+                </select>
+                <Input
+                  type="number" step="any" value={rsiLevel} min={1} max={99}
+                  onChange={(e) => setRsiLevel(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && formValid && void create()}
+                  aria-label="RSI level"
+                  className="h-7 w-16 border-zinc-700 bg-zinc-950 text-xs"
+                />
+              </div>
+              <TfRow tf={tf} setTf={setTf} />
+            </div>
+          )}
+
+          {kind === 'macd' && (
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] uppercase tracking-wider text-zinc-500">F/S/G</span>
+                <Input type="number" value={fast} min={1} onChange={(e) => setFast(e.target.value)} aria-label="MACD fast" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+                <Input type="number" value={slow} min={2} onChange={(e) => setSlow(e.target.value)} aria-label="MACD slow" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+                <Input type="number" value={signal} min={1} onChange={(e) => setSignal(e.target.value)} aria-label="MACD signal" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+                <select
+                  value={cond}
+                  onChange={(e) => setCond(e.target.value as typeof cond)}
+                  aria-label="MACD condition"
+                  className="h-7 min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+                >
+                  <option value="bull_cross">bull crossover</option>
+                  <option value="bear_cross">bear crossover</option>
+                  <option value="cross_above">crosses above</option>
+                  <option value="cross_below">crosses below</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {(cond === 'cross_above' || cond === 'cross_below') && (
+                  <Input
+                    type="number" step="any" value={macdLevel}
+                    onChange={(e) => setMacdLevel(e.target.value)}
+                    aria-label="MACD level"
+                    className="h-7 w-20 border-zinc-700 bg-zinc-950 text-xs"
+                  />
+                )}
+                <TfRow tf={tf} setTf={setTf} right />
+              </div>
+            </div>
+          )}
+
+          <Button
+            size="sm" disabled={!formValid || creating} onClick={() => void create()}
+            className="mt-2 h-7 w-full bg-amber-500 text-xs text-zinc-950 hover:bg-amber-400"
+          >
+            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : '🔔 Create alarm'}
+          </Button>
+        </div>
+
+        {/* ---- alarm list ---- */}
+        <div className="max-h-[45vh] overflow-y-auto p-2">
           {alerts.length === 0 && (
             <p className="px-2 py-6 text-center text-xs text-zinc-500">
-              No alerts yet — right-click the chart to add one.
+              No alarms yet — create one above or right-click the chart.
             </p>
           )}
           {alerts.map((a) => (
@@ -388,9 +622,7 @@ function AlertsDrawer({ onClose }: { onClose: () => void }) {
               <div className="flex min-w-0 items-center gap-2">
                 <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: a.color }} />
                 <span className="font-medium text-zinc-200">{a.symbol}</span>
-                <span className="text-zinc-400">
-                  {a.direction === 'above' ? '≥' : '≤'} {fmtPrice(a.price)}
-                </span>
+                <span className="truncate text-zinc-400">{alertSummary(a)}</span>
                 <Badge
                   variant="outline"
                   className={
@@ -416,11 +648,35 @@ function AlertsDrawer({ onClose }: { onClose: () => void }) {
           ))}
         </div>
         <div className="border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
-          Alerts are checked every 30s · Telegram notifications via Settings
+          Checked every 30s · indicator alarms fire on a real crossing of the chosen timeframe · Telegram via Settings
           <span className="ml-1 inline-flex items-center align-middle">
             <Settings2 className="h-3 w-3" />
           </span>
         </div>
+      </div>
+    </div>
+  )
+}
+
+/** Timeframe selector row for indicator alarms. */
+function TfRow({ tf, setTf, right }: { tf: string; setTf: (v: string) => void; right?: boolean }) {
+  return (
+    <div className={cn('flex items-center gap-1', right && 'ml-auto')}>
+      <label className="text-[10px] uppercase tracking-wider text-zinc-500">TF</label>
+      <div className="flex overflow-hidden rounded border border-zinc-700" role="radiogroup" aria-label="Timeframe">
+        {ALERT_TFS.map((t) => (
+          <button
+            key={t}
+            onClick={() => setTf(t)}
+            aria-pressed={tf === t}
+            className={cn(
+              'px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+              tf === t ? 'bg-zinc-700 text-zinc-100' : 'bg-zinc-950 text-zinc-500 hover:text-zinc-300',
+            )}
+          >
+            {TF_LABEL[t]}
+          </button>
+        ))}
       </div>
     </div>
   )
