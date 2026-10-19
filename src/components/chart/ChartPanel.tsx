@@ -92,6 +92,9 @@ const fmtVolCompact = (v: number) =>
   : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K`
   : v.toFixed(0)
 
+/** Sign-prefixed value for MACD axis chips / strip titles. */
+const fmtSigned = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+
 /** lightweight-charts series for every ENABLED indicator (slots optional). */
 interface IndSeriesBundle {
   settings: IndicatorSettings
@@ -177,8 +180,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const indSeriesRef = useRef<IndSeriesBundle | null>(null)
   // strip layout (fractions of pane height) for the overlay-canvas chrome —
-  // separators + VOL/RSI/MACD pane titles drawn by renderOverlay
-  const indStripsRef = useRef<{ volTop: number; rsiTop: number | null; macdTop: number | null } | null>(null)
+  // separators, VOL/RSI/MACD pane titles and the right-axis value chips are
+  // all derived from these margins (v4 overlay scales draw no axis labels of
+  // their own, and the main price scale's labels bleed into the strips)
+  const indStripsRef = useRef<{
+    price: { top: number; bottom: number }
+    vol: { top: number; bottom: number }
+    rsi?: { top: number; bottom: number }
+    macd?: { top: number; bottom: number }
+  } | null>(null)
+  // crosshair snapshot for the strip axis chips (RSI/MACD/vol value that
+  // follows the cursor while it is inside a strip); null when not hovering
+  const crossInfoRef = useRef<{ y: number; vol: number | null; rsi: number | null; macd: number | null } | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
   const feedStateRef = useRef('')
@@ -496,12 +509,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const ds = st.drawingsBySymbol[symbol] || []
     const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
 
-    // ---- indicator strip chrome (TradingView-style pane titles) ----
+    // ---- indicator strip chrome (TradingView-style pane titles + axis) ----
     // lightweight-charts v4 has no real panes: RSI/MACD live on hidden price
     // scales squeezed into stacked bottom strips. Draw hairline separators
     // between the strips and each strip's title + last value at its top-left,
-    // so oscillators read as real sub-panes. Drawn FIRST — everything else
-    // (drawings, chips, zones) renders on top.
+    // so oscillators read as real sub-panes. On the right axis the main price
+    // scale's labels bleed into the strip regions (extrapolated noise) while
+    // overlay scales draw NO labels of their own — so cover that column inside
+    // the strips and render proper oscillator labels: RSI 70/30 + last-value
+    // chip, MACD zero line + last-value chip (chips follow the crosshair while
+    // it is inside a strip). Drawn FIRST — everything else renders on top.
     {
       const strips = indStripsRef.current
       const chartApiS = chartRef.current
@@ -514,7 +531,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         ctx.save()
         ctx.strokeStyle = 'rgba(63,63,70,0.5)'
         ctx.lineWidth = 1
-        for (const f of [strips.volTop, strips.rsiTop, strips.macdTop]) {
+        for (const f of [strips.vol.top, strips.rsi?.top, strips.macd?.top]) {
           if (f == null || f <= 0.02 || f >= 1) continue
           const y = Math.round(f * paneH) + 0.5
           ctx.beginPath()
@@ -538,23 +555,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }
         // volume strip title + last bar volume
         const lastVol = barsRef.current.length > 0 ? barsRef.current[barsRef.current.length - 1].volume : null
-        const volX = stripLabel(strips.volTop, 'VOL', '#71717a')
+        const volX = stripLabel(strips.vol.top, 'VOL', '#71717a')
         if (lastVol != null && Number.isFinite(lastVol) && lastVol > 0) {
-          stripValue(volX, strips.volTop, fmtVolCompact(lastVol), '#a1a1aa')
+          stripValue(volX, strips.vol.top, fmtVolCompact(lastVol), '#a1a1aa')
         }
         // rsi strip title + last value
-        if (strips.rsiTop != null && ibS) {
-          const rTop = strips.rsiTop
-          const xR = stripLabel(rTop, `RSI ${ibS.settings.rsi.period}`, '#f472b6')
+        if (strips.rsi && ibS) {
+          const xR = stripLabel(strips.rsi.top, `RSI ${ibS.settings.rsi.period}`, '#f472b6')
           const rv = ibS.lastPts.rsi
-          if (rv != null && Number.isFinite(rv)) stripValue(xR, rTop, rv.toFixed(2), '#f9a8d4')
+          if (rv != null && Number.isFinite(rv)) stripValue(xR, strips.rsi.top, rv.toFixed(2), '#f9a8d4')
         }
         // macd strip title + last macd/signal/histogram values
-        if (strips.macdTop != null && ibS) {
-          const mTop = strips.macdTop
+        if (strips.macd && ibS) {
           const mSet = ibS.settings.macd
-          let xm = stripLabel(mTop, `MACD ${mSet.fast} ${mSet.slow} ${mSet.signal}`, '#f59e0b')
-          const fmtSigned = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+          let xm = stripLabel(strips.macd.top, `MACD ${mSet.fast} ${mSet.slow} ${mSet.signal}`, '#f59e0b')
           const segs: [number | null | undefined, string][] = [
             [ibS.lastPts.macd, '#fbbf24'],
             [ibS.lastPts.sig, '#c4b5fd'],
@@ -563,9 +577,92 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           for (const [v, color] of segs) {
             if (v == null || !Number.isFinite(v)) continue
             const txt = fmtSigned(v)
-            stripValue(xm, mTop, txt, color)
+            stripValue(xm, strips.macd.top, txt, color)
             xm += ctx.measureText(txt).width + 6
           }
+        }
+
+        // ---- right axis inside the strips ----
+        let axisW = 0
+        try { axisW = chartApiS.priceScale('right').width() } catch { /* disposed */ }
+        if (axisW > 0) {
+          const x0 = w - axisW
+          const coverTop = Math.round(strips.vol.top * paneH)
+          ctx.fillStyle = '#09090b'
+          ctx.fillRect(x0, coverTop, axisW, Math.round(paneH) - coverTop)
+          ctx.textBaseline = 'middle'
+          const axisLabel = (y: number, txt: string, color: string) => {
+            ctx.font = '10px ui-monospace, monospace'
+            ctx.fillStyle = color
+            ctx.textAlign = 'right'
+            ctx.fillText(txt, w - 5, Math.round(y) + 0.5)
+          }
+          const chip = (y: number, txt: string, color: string, topPx: number, botPx: number) => {
+            ctx.font = '600 10px ui-monospace, monospace'
+            const tw = ctx.measureText(txt).width + 10
+            const th = 16
+            const cy = Math.max(topPx + th / 2 + 1, Math.min(botPx - th / 2 - 1, y))
+            const cx = x0 + axisW - tw - 3
+            ctx.fillStyle = 'rgba(9,9,11,0.92)'
+            ctx.strokeStyle = color
+            ctx.lineWidth = 1
+            ctx.beginPath()
+            ctx.roundRect(cx, Math.round(cy - th / 2), tw, th, 3)
+            ctx.fill()
+            ctx.stroke()
+            ctx.fillStyle = color
+            ctx.textAlign = 'center'
+            ctx.fillText(txt, cx + tw / 2, Math.round(cy) + 0.5)
+          }
+          const stripBox = (m: { top: number; bottom: number }) => ({ a: m.top * paneH, b: (1 - m.bottom) * paneH })
+          const pxOf = (ser: ISeriesApi<'Line'> | undefined, price: number): number | null => {
+            if (!ser) return null
+            try { const y = ser.priceToCoordinate(price); return y == null ? null : Number(y) } catch { return null }
+          }
+          const ci = crossInfoRef.current
+          const crossY = ci ? ci.y : null
+          // chips are collected first so guide labels close to a chip can be
+          // skipped (the chip would cover them anyway)
+          type AxisChip = { y: number; txt: string; color: string; topPx: number; botPx: number }
+          const chips: AxisChip[] = []
+          // volume strip: crosshair value chip only (no static labels)
+          {
+            const vb = stripBox(strips.vol)
+            if (crossY != null && crossY >= vb.a && crossY <= vb.b && ci && ci.vol != null && ci.vol > 0) {
+              chips.push({ y: crossY, txt: fmtVolCompact(ci.vol), color: '#a1a1aa', topPx: vb.a, botPx: vb.b })
+            }
+          }
+          // rsi strip: 70/30 guide labels + value chip (crosshair value wins)
+          if (strips.rsi && ibS?.rsi) {
+            const rb = stripBox(strips.rsi)
+            const y70 = pxOf(ibS.rsi, 70)
+            const y30 = pxOf(ibS.rsi, 30)
+            const lastRsi = ibS.lastPts.rsi
+            if (crossY != null && crossY >= rb.a && crossY <= rb.b && ci && ci.rsi != null && Number.isFinite(ci.rsi)) {
+              const vy = pxOf(ibS.rsi, ci.rsi) ?? crossY
+              chips.push({ y: vy, txt: ci.rsi.toFixed(2), color: '#f472b6', topPx: rb.a, botPx: rb.b })
+            } else if (lastRsi != null && Number.isFinite(lastRsi)) {
+              const ly = pxOf(ibS.rsi, lastRsi)
+              if (ly != null) chips.push({ y: ly, txt: lastRsi.toFixed(2), color: '#f472b6', topPx: rb.a, botPx: rb.b })
+            }
+            if (y70 != null && !chips.some((c) => Math.abs(c.y - y70) < 10)) axisLabel(y70, '70', '#71717a')
+            if (y30 != null && !chips.some((c) => Math.abs(c.y - y30) < 10)) axisLabel(y30, '30', '#71717a')
+          }
+          // macd strip: zero-line label + value chip (crosshair value wins)
+          if (strips.macd && ibS?.macdLine) {
+            const mb = stripBox(strips.macd)
+            const zy = pxOf(ibS.macdLine, 0)
+            const lastMacd = ibS.lastPts.macd
+            if (crossY != null && crossY >= mb.a && crossY <= mb.b && ci && ci.macd != null && Number.isFinite(ci.macd)) {
+              const vy = pxOf(ibS.macdLine, ci.macd) ?? crossY
+              chips.push({ y: vy, txt: fmtSigned(ci.macd), color: '#fbbf24', topPx: mb.a, botPx: mb.b })
+            } else if (lastMacd != null && Number.isFinite(lastMacd)) {
+              const ly = pxOf(ibS.macdLine, lastMacd)
+              if (ly != null) chips.push({ y: ly, txt: fmtSigned(lastMacd), color: '#fbbf24', topPx: mb.a, botPx: mb.b })
+            }
+            if (zy != null && !chips.some((c) => Math.abs(c.y - zy) < 10)) axisLabel(zy, '0', '#71717a')
+          }
+          for (const c of chips) chip(c.y, c.txt, c.color, c.topPx, c.botPx)
         }
         ctx.restore()
       }
@@ -1979,6 +2076,32 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     chart.subscribeCrosshairMove((param: MouseEventParams) => {
       const bar = param.seriesData.get(series) as { open?: number; high?: number; low?: number; close?: number; value?: number } | undefined
       const volBar = param.seriesData.get(vol) as { value?: number } | undefined
+      // stash strip-relevant values for the overlay-canvas axis chips (the
+      // RSI/MACD value chip follows the cursor while it is inside its strip)
+      {
+        const stripsC = indStripsRef.current
+        const ibC = indSeriesRef.current
+        let paneHC = 0
+        try { paneHC = chart.paneSize().height } catch { /* disposed */ }
+        const wasInStrips = !!crossInfoRef.current && !!stripsC && paneHC > 0 && crossInfoRef.current.y >= stripsC.vol.top * paneHC
+        if (param.point && stripsC && ibC) {
+          const rvC = (ser?: ISeriesApi<'Line'> | ISeriesApi<'Histogram'>) => {
+            if (!ser) return null
+            const d = param.seriesData.get(ser as ISeriesApi<'Line'>) as { value?: number } | undefined
+            return d?.value != null && Number.isFinite(d.value) ? d.value : null
+          }
+          crossInfoRef.current = {
+            y: param.point.y,
+            vol: volBar?.value != null ? volBar.value : null,
+            rsi: rvC(ibC.rsi),
+            macd: rvC(ibC.macdLine),
+          }
+        } else {
+          crossInfoRef.current = null
+        }
+        const nowInStrips = !!crossInfoRef.current && paneHC > 0 && crossInfoRef.current.y >= stripsC!.vol.top * paneHC
+        if (nowInStrips || wasInStrips) scheduleRedraw() // axis chips must track the cursor
+      }
       // update the OHLC legend by writing the DOM directly — a setState here
       // re-rendered the whole ChartPanel on EVERY mouse move (visibly janky,
       // multiplied by every pane in multi-chart grids)
@@ -2314,7 +2437,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.1, bottom: 0.24 } })
       chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
     } catch { /* chart disposed */ }
-    indStripsRef.current = { volTop: 0.82, rsiTop: null, macdTop: null }
+    indStripsRef.current = { price: { top: 0.1, bottom: 0.24 }, vol: { top: 0.82, bottom: 0 } }
 
     const bundle: IndSeriesBundle = { settings: s, lastPts: {} }
     const overlayOpts = { lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false } as const
@@ -2347,13 +2470,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         chart.priceScale('vol').applyOptions({ scaleMargins: m.vol })
         if (m.rsi) chart.priceScale('rsi').applyOptions({ scaleMargins: m.rsi })
         if (m.macd) chart.priceScale('macd').applyOptions({ scaleMargins: m.macd })
-        indStripsRef.current = {
-          volTop: m.vol.top,
-          rsiTop: m.rsi?.top ?? null,
-          macdTop: m.macd?.top ?? null,
-        }
+        indStripsRef.current = { price: m.price, vol: m.vol, rsi: m.rsi, macd: m.macd }
       } else {
-        indStripsRef.current = { volTop: 0.82, rsiTop: null, macdTop: null }
+        indStripsRef.current = { price: { top: 0.1, bottom: 0.24 }, vol: { top: 0.82, bottom: 0 } }
       }
       indSeriesRef.current = bundle
       fillIndData(bundle)

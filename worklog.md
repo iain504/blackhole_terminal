@@ -754,3 +754,22 @@ Stage Summary:
 - E2E (agent-browser, TSLA 1D): all-5-on state renders 4 stacked strips (price · VOL · RSI · MACD) with separators + live title values; __ttDbg.ind() probe sane & self-consistent (BB upper/mid/lower symmetric: 390.43/370.38/350.33; macd−signal=hist: 1.48−3.52=−2.05); toggling RSI+MACD off collapses strips, price/vol expand, badge ƒx 5→3; re-enable restores; settings persisted across reload (localStorage tt.indicators.v1); crosshair legend shows per-bar readouts incl. RSI14/MACD/sig/hist at hovered bar; console + page errors clean.
 - Screenshots: screens-tmp/ind-polish-all.png (all on), ind-popover.png / ind-popover2.png (popover before/after width fix), ind-osc-off.png (strips collapsed), ind-final.png (restored, crosshair dots visible).
 - Backlog unchanged (pending-order drag, Position tab, hline drag, bars left-scroll pagination, TabBar reorder, right-click-at-mouse order, TP/SL 5% default, Console trades list, heatmap/calendar dark theme, SPCX/NASDAQ universe fallback).
+
+---
+Task ID: 40b
+Agent: Z.ai Code (main)
+Task: User follow-up on Task 40 polish — "when i turn on RSI, i cannot see the value on the right" (screenshot showed main-price-scale labels (260.00…180.00) bleeding into the RSI strip and no RSI values on the right axis).
+
+Work Log:
+- Root cause: lightweight-charts v4 overlay price scales (rsi/macd) draw NO axis labels of their own, while the main right price scale renders extrapolated price labels across the full pane height — including the oscillator strip regions (noise).
+- Fix (all in ChartPanel.tsx overlay canvas chrome):
+  - indStripsRef reshaped to full margin objects {price, vol, rsi?, macd?}; lifecycle effect stores stripMargins() output (or creation defaults).
+  - Right axis inside strips: cover the axis column from vol strip top to pane bottom with chart background, then draw proper labels — RSI "70"/"30" guides + pink last-value chip; MACD "0" (zero-line) label + amber last-value chip; values positioned via series.priceToCoordinate() (exact, respects autoscale/strip margins).
+  - Crosshair-following chips: new crossInfoRef stashed from the existing crosshairMoved handler (y + vol/rsi/macd values at the hovered bar); while the cursor is inside a strip the chip shows the HOVERED bar's value anchored at that value's own y (priceToCoordinate, fallback cursor y); volume strip gets a zinc value chip; scheduleRedraw() fires only on strip enter/exit/inside to keep mousemove cheap.
+  - Anti-overlap: chips collected first; a guide label within 10px of a chip is skipped (chip would cover it).
+- Verification (agent-browser, TSLA 1D): axis shows 70/30 + pink chip (RSI) and amber chip (MACD); hovering RSI strip shows hovered-bar value 47.14 in the chip matching legend "RSI14 47.14"; volume strip chip 835.4K; price-noise labels gone from strips; price-region axis untouched (440…280). Lint clean; console + dev.log clean.
+- NOTE (pre-existing, not ours): ~15 EMPTY pageerror events fire during initial page load; reproduced with changes git-stashed (same count) → unrelated to indicators; nothing accumulates after load; console shows nothing. Left as-is, flagged for future investigation.
+
+Stage Summary:
+- RSI/MACD strips now have TradingView-style right-axis readouts: guide labels (70/30, 0) + colored last-value chips + crosshair-following chips inside strips. User-reported issue resolved.
+- Screenshots: screens-tmp/ind-axis-1.png (static chips), ind-axis-hover2.png / ind-axis-zoom2.png (crosshair chip on RSI value, 30 visible), ind-vol-hover.png (vol chip), ind-axis-nohover.png (static state).
