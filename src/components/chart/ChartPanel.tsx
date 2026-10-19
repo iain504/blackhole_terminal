@@ -136,6 +136,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
   const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
+  // Bumping this REMOUNTS the trade ticket. The ticket intentionally keeps its
+  // state while open (stays open after placing an order), but its prefill is
+  // only read on mount — so a right-click "Sell limit @ …" while the ticket
+  // was already open used to be silently ignored ("didn't pop up"). A key
+  // change forces a fresh mount with the new prefill.
+  const [ticketSeq, setTicketSeq] = useState(0)
   const { toast } = useToast()
 
   // trading positions + SL/TP exits for this symbol (polls every 15s)
@@ -2365,10 +2371,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         onTrade={(side, price) => {
           // right-click price => limit order AT that price
           setTicketPrefill({ side, price, type: 'limit' })
+          setTicketSeq((s) => s + 1) // remount: apply prefill even if already open
           setTradeOpen(true)
         }}
         onOpenTicket={() => {
           setTicketPrefill(null)
+          setTicketSeq((s) => s + 1) // fresh blank ticket
           setTradeOpen(true)
         }}
         onEditValue={(hit) => {
@@ -2441,6 +2449,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       {/* trade ticket (paper / live via Alpaca Trading API) */}
       {tradeOpen && (
         <TradeTicket
+          key={ticketSeq}
           symbol={symbol}
           livePrice={quote?.price ?? null}
           prefill={ticketPrefill}

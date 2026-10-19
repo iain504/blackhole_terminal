@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Bell, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -94,7 +94,8 @@ export default function CalendarTab() {
       const data = (await res.json()) as { events?: CalEvent[]; source?: CalendarSource }
       const evs = Array.isArray(data.events) ? data.events : []
       setEvents(evs)
-      setSource(data.source === 'forexfactory' ? 'forexfactory' : 'sample')
+      // tolerate mirror-specific sources ('forexfactory-xml' / '-json')
+      setSource(data.source?.startsWith('forexfactory') ? 'forexfactory' : 'sample')
       // register any NEW countries/currencies that appeared, keep the user's
       // exclusions untouched
       setCountrySel((prev) => {
@@ -109,9 +110,12 @@ export default function CalendarTab() {
     }
   }, [])
 
-  // Initial load + auto-refresh every 10 minutes
+  // Initial load + auto-refresh every 10 minutes.
+  // OPENING the tab always pulls FRESH ForexFactory data first (the server's
+  // 15-min cache is bypassed via ?fresh=1) so the list is up to date before
+  // it is shown — the skeleton covers the fetch.
   useEffect(() => {
-    void refresh()
+    void refresh(true)
     const id = setInterval(() => void refresh(), REFRESH_INTERVAL_MS)
     return () => clearInterval(id)
   }, [refresh])
@@ -224,6 +228,21 @@ export default function CalendarTab() {
     return Array.from(groups.entries())
   }, [filtered])
 
+  // Red "released" divider (the line the user asked for): the FIRST event
+  // whose time is still in the future. The red line renders right before its
+  // row — everything ABOVE it has been released, everything BELOW is still
+  // upcoming. Computed over the FILTERED days so it always sits next to a
+  // visible row; moves automatically as the 15s clock ticks.
+  const lineEvent = useMemo(() => {
+    for (const [, list] of days) {
+      for (const ev of list) {
+        const t = new Date(ev.time).getTime()
+        if (!Number.isNaN(t) && t >= now) return ev
+      }
+    }
+    return null
+  }, [days, now])
+
   const today = dayKey(new Date())
   const hasData = events.length > 0
   const filtersActive = impSel.size !== IMP_ALL.length || countrySel.size < countryOptions.length
@@ -261,10 +280,10 @@ export default function CalendarTab() {
         <Button
           variant="ghost"
           size="icon"
-          onClick={() => void refresh()}
+          onClick={() => void refresh(true)}
           disabled={loading}
           aria-label="Refresh economic calendar"
-          title="Refresh"
+          title="Refresh (fetches the latest ForexFactory data)"
           className="size-7 text-zinc-400 hover:text-zinc-100"
         >
           <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} aria-hidden="true" />
@@ -372,7 +391,7 @@ export default function CalendarTab() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => void refresh()}
+              onClick={() => void refresh(true)}
               className="border-zinc-700 bg-zinc-900 text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
             >
               <RefreshCw className="size-3.5" aria-hidden="true" />
@@ -410,7 +429,7 @@ export default function CalendarTab() {
         {/* One section per day */}
         {!error &&
           hasData &&
-          days.map(([key, dayEvents]) => {
+          days.map(([key, dayEvents], di) => {
             const headerDate = new Date(dayEvents[0].time)
             const label = formatDayHeader(headerDate)
             const isToday = key === today
@@ -451,88 +470,93 @@ export default function CalendarTab() {
                       const key = eventKey(ev)
                       const alarmOn = alarms.has(key)
                       return (
-                        <tr
-                          key={`${ev.time}-${ev.country}-${ev.event}-${i}`}
-                          className={cn(
-                            'border-b border-zinc-800/50 transition-colors',
-                            high
-                              ? 'bg-red-500/[0.04] hover:bg-red-500/10'
-                              : 'hover:bg-zinc-800/40',
-                            past && 'opacity-60',
-                          )}
-                        >
-                          <td className="whitespace-nowrap px-3 py-1.5 font-mono text-zinc-400">
-                            {formatTime(ev.time)}
-                          </td>
-                          <td className="px-2 py-1.5">
-                            <Badge
-                              variant="outline"
-                              className="h-5 border-zinc-700 bg-zinc-800/70 px-1.5 font-mono text-[10px] tracking-wide text-zinc-300"
-                            >
-                              {ev.country || '—'}
-                            </Badge>
-                          </td>
-                          <td className="px-2 py-1.5">
-                            <span
-                              className="inline-flex items-center"
-                              title={`${IMPORTANCE_LABEL[imp]} importance`}
-                            >
-                              <span
-                                className={cn('size-1.5 rounded-full', IMPORTANCE_DOT[imp])}
-                                aria-hidden="true"
-                              />
-                              <span className="sr-only">{IMPORTANCE_LABEL[imp]} importance</span>
-                            </span>
-                          </td>
-                          <td className={cn('px-2 py-1.5', high ? 'font-medium text-zinc-100' : 'text-zinc-300')}>
-                            <div className="flex items-center gap-1.5">
-                              {/* event alarm — grey (off, default) / amber (on) */}
-                              <button
-                                type="button"
-                                onClick={() => toggleAlarm(key, !alarmOn)}
-                                aria-pressed={alarmOn}
-                                aria-label={
-                                  alarmOn
-                                    ? `Disable alarm for ${ev.event}`
-                                    : `Set alarm for ${ev.event}`
-                                }
-                                title={
-                                  alarmOn
-                                    ? 'Alarm on — click to disable'
-                                    : 'Set an alarm for this event'
-                                }
-                                className={cn(
-                                  '-ml-1 shrink-0 rounded p-1 transition-colors',
-                                  alarmOn
-                                    ? 'text-amber-400 hover:text-amber-300'
-                                    : 'text-zinc-600 hover:text-zinc-400',
-                                )}
-                              >
-                                <Bell
-                                  className={cn('size-3.5', alarmOn && 'fill-amber-400/40')}
-                                  aria-hidden="true"
-                                />
-                              </button>
-                              <span className="min-w-0">{ev.event}</span>
-                            </div>
-                          </td>
-                          <td
+                        <Fragment key={`${ev.time}-${ev.country}-${ev.event}-${i}`}>
+                          {/* red divider — everything ABOVE has been released */}
+                          {lineEvent === ev && <NowLineRow />}
+                          <tr
                             className={cn(
-                              'px-2 py-1.5 font-mono',
-                              ev.actual ? 'font-medium text-emerald-500' : 'text-zinc-600',
+                              'border-b border-zinc-800/50 transition-colors',
+                              high
+                                ? 'bg-red-500/[0.04] hover:bg-red-500/10'
+                                : 'hover:bg-zinc-800/40',
+                              past && 'opacity-60',
                             )}
                           >
-                            {ev.actual ?? '—'}
-                          </td>
-                          <td className="hidden px-2 py-1.5 font-mono text-zinc-400 md:table-cell">
-                            {ev.forecast ?? <span className="text-zinc-600">—</span>}
-                          </td>
-                          <td className="hidden px-2 py-1.5 font-mono text-zinc-400 md:table-cell">
-                            {ev.prior ?? <span className="text-zinc-600">—</span>}
-                          </td>
-                        </tr>
+                            <td className="whitespace-nowrap px-3 py-1.5 font-mono text-zinc-400">
+                              {formatTime(ev.time)}
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <Badge
+                                variant="outline"
+                                className="h-5 border-zinc-700 bg-zinc-800/70 px-1.5 font-mono text-[10px] tracking-wide text-zinc-300"
+                              >
+                                {ev.country || '—'}
+                              </Badge>
+                            </td>
+                            <td className="px-2 py-1.5">
+                              <span
+                                className="inline-flex items-center"
+                                title={`${IMPORTANCE_LABEL[imp]} importance`}
+                              >
+                                <span
+                                  className={cn('size-1.5 rounded-full', IMPORTANCE_DOT[imp])}
+                                  aria-hidden="true"
+                                />
+                                <span className="sr-only">{IMPORTANCE_LABEL[imp]} importance</span>
+                              </span>
+                            </td>
+                            <td className={cn('px-2 py-1.5', high ? 'font-medium text-zinc-100' : 'text-zinc-300')}>
+                              <div className="flex items-center gap-1.5">
+                                {/* event alarm — grey (off, default) / amber (on) */}
+                                <button
+                                  type="button"
+                                  onClick={() => toggleAlarm(key, !alarmOn)}
+                                  aria-pressed={alarmOn}
+                                  aria-label={
+                                    alarmOn
+                                      ? `Disable alarm for ${ev.event}`
+                                      : `Set alarm for ${ev.event}`
+                                  }
+                                  title={
+                                    alarmOn
+                                      ? 'Alarm on — click to disable'
+                                      : 'Set an alarm for this event'
+                                  }
+                                  className={cn(
+                                    '-ml-1 shrink-0 rounded p-1 transition-colors',
+                                    alarmOn
+                                      ? 'text-amber-400 hover:text-amber-300'
+                                      : 'text-zinc-600 hover:text-zinc-400',
+                                  )}
+                                >
+                                  <Bell
+                                    className={cn('size-3.5', alarmOn && 'fill-amber-400/40')}
+                                    aria-hidden="true"
+                                  />
+                                </button>
+                                <span className="min-w-0">{ev.event}</span>
+                              </div>
+                            </td>
+                            <td
+                              className={cn(
+                                'px-2 py-1.5 font-mono',
+                                ev.actual ? 'font-medium text-emerald-500' : 'text-zinc-600',
+                              )}
+                            >
+                              {ev.actual ?? '—'}
+                            </td>
+                            <td className="hidden px-2 py-1.5 font-mono text-zinc-400 md:table-cell">
+                              {ev.forecast ?? <span className="text-zinc-600">—</span>}
+                            </td>
+                            <td className="hidden px-2 py-1.5 font-mono text-zinc-400 md:table-cell">
+                              {ev.prior ?? <span className="text-zinc-600">—</span>}
+                            </td>
+                          </tr>
+                        </Fragment>
                       )
                     })}
+                    {/* no upcoming events left — mark where the released ones end */}
+                    {lineEvent === null && di === days.length - 1 && <NowLineRow />}
                   </tbody>
                 </table>
               </section>
@@ -549,5 +573,25 @@ export default function CalendarTab() {
         <span className="hidden sm:inline">Auto-refreshes every 10 min</span>
       </footer>
     </div>
+  )
+}
+
+/** Red horizontal divider marking where released events end ("now" line). */
+function NowLineRow() {
+  return (
+    <tr title="Events above this line have been released — events below are still upcoming">
+      <td colSpan={7} className="px-0 py-0">
+        <div className="flex items-center" aria-hidden="true">
+          <span className="h-px flex-1 bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.6)]" />
+          <span className="mx-2 my-0.5 rounded-sm bg-red-500/15 px-1.5 py-px text-[9px] font-bold uppercase tracking-widest text-red-400">
+            Now
+          </span>
+          <span className="h-px flex-1 bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.6)]" />
+        </div>
+        <span className="sr-only">
+          Released events end here. Events below this line have not been released yet.
+        </span>
+      </td>
+    </tr>
   )
 }

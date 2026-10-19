@@ -187,10 +187,15 @@ async function fetchJson(): Promise<CalendarEvent[]> {
 export async function getEconomicCalendar(
   opts?: { fresh?: boolean },
 ): Promise<{ events: CalendarEvent[]; live: boolean; source?: string }> {
-  // fresh=1 skips the 15-min cache read — used when a watched event time just
-  // passed so the freshly published "actual" value shows up immediately.
-  if (!opts?.fresh && cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
-    return { events: cache.events, live: cache.live }
+  // fresh=1 skips the 15-min cache read — the calendar tab sends it on every
+  // open so the user always sees the latest ForexFactory data.
+  const nowMs = Date.now()
+  if (cache && nowMs - cache.fetchedAt < CACHE_TTL_MS) {
+    // Even a fresh request reuses a VERY young cache: rapid tab open/close
+    // must not hammer the feed (it rate-limits aggressively).
+    if (!opts?.fresh || nowMs - cache.fetchedAt < 60_000) {
+      return { events: cache.events, live: cache.live }
+    }
   }
   // 1) XML mirror (currently the one that works) 2) JSON mirror 3) sample
   for (const [fn, source] of [[fetchXml, 'forexfactory-xml'], [fetchJson, 'forexfactory-json']] as const) {
@@ -202,6 +207,9 @@ export async function getEconomicCalendar(
       console.error(`Calendar feed ${source} failed:`, e instanceof Error ? e.message : e)
     }
   }
+  // The live fetch failed — serve the PREVIOUS data (even if stale) rather
+  // than degrading to the sample schedule on every feed hiccup.
+  if (cache) return { events: cache.events, live: cache.live }
   const events = sampleCalendar()
   cache = { events, fetchedAt: Date.now(), live: false }
   return { events, live: false, source: 'sample' }

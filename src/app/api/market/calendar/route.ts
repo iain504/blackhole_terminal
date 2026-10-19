@@ -3,8 +3,11 @@ import { getEconomicCalendar } from '@/lib/calendar'
 import { handleError } from '@/lib/api-helpers'
 
 // GET /api/market/calendar[?fresh=1] — weekly economic events (ForexFactory XML/JSON mirror, bundled fallback).
-// fresh=1 bypasses the 15-minute server cache (used right after a watched
-// event's time passes so the published "actual" value shows up immediately).
+// fresh=1 bypasses the 15-minute server cache (the calendar tab sends it on
+// every open so the user always sees the latest data before it is shown).
+// NOTE: the lib reports the specific mirror ('forexfactory-xml' / '-json') —
+// normalize to the client-facing 'forexfactory' here, otherwise the UI shows
+// a "Sample data" badge for perfectly live data.
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url)
@@ -12,7 +15,8 @@ export async function GET(req: Request) {
     const { events, live, source } = await getEconomicCalendar({ fresh })
     return NextResponse.json({
       events,
-      source: live ? (source ?? 'forexfactory') : 'sample',
+      source: live ? 'forexfactory' : 'sample',
+      detail: source,
     })
   } catch (e) {
     return handleError(e)
