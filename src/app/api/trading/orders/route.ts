@@ -18,7 +18,9 @@ interface PlaceBody {
 }
 
 // POST /api/trading/orders — place entry (market/limit) with optional SL/TP,
-// or a trailing-stop exit when trail_percent is given.
+// or a trailing-stop when trail_percent is given (side is used AS-IS: a SELL
+// trailing stop trails BELOW the price — exit/protection for a long — and a
+// BUY trailing stop trails ABOVE — short entry/cover).
 export async function POST(req: Request) {
   try {
     const user = await getSessionUser()
@@ -36,17 +38,29 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'qty (or notional) required' }, { status: 400 })
     }
 
-    // Trailing-stop exit order (close side) — stocks only.
+    // Trailing-stop order — stocks only (Alpaca crypto rejects trailing_stop).
+    // The side is NOT flipped: the order is exactly the side the user picked
+    // (the ticket used to silently turn a "Buy" into a SELL trailing stop).
     if (typeof body.trail_percent === 'number' && body.trail_percent > 0) {
-      const exitSide = body.side === 'buy' ? 'sell' : 'buy'
+      if (symbol.includes('/')) {
+        return NextResponse.json({ error: 'Trailing stops are not supported for crypto — use a stop_limit SL instead' }, { status: 422 })
+      }
       const r = await placeTrailingStop(user.id, mode, {
         symbol,
-        side: exitSide,
+        side: body.side,
         qty,
         trail_percent: body.trail_percent,
       })
-      if (!r.data) {
-        return NextResponse.json({ error: r.error || 'Trailing stop failed', status: r.status }, { status: r.status || 502 })
+      // tradeFetch puts the PARSED ERROR BODY (e.g. {code:40310000,message:
+      // "cannot open a short sell while a long buy order is open"}) into
+      // `data` on non-2xx — a bare truthiness check would report a rejected
+      // trailing stop as success (200 with the error inside orders[]).
+      const errBody = r.data as { code?: number; message?: string } | null
+      if (!r.data || r.error || errBody?.code != null) {
+        return NextResponse.json(
+          { error: r.error || errBody?.message || 'Trailing stop failed', status: r.status },
+          { status: r.status || 502 },
+        )
       }
       return NextResponse.json({ mode, orders: [r.data], errors: [] })
     }

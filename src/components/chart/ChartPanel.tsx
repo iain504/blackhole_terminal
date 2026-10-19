@@ -125,7 +125,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [editValue, setEditValue] = useState<{
-    type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
+    type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; pctMode?: boolean; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
   } | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
@@ -437,15 +437,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
       const ySl = yOf(slPrice)
       if (ySl != null) {
+        // trailing stops ratchet — label the percent, not the (stale) stop
+        const isTrail = myExits.sl.type === 'trailing_stop'
         ctx.save()
         ctx.strokeStyle = '#f43f5e'
         ctx.lineWidth = 1.5
-        ctx.setLineDash([7, 5])
+        ctx.setLineDash(isTrail ? [2, 4] : [7, 5])
         ctx.globalAlpha = 0.95
         hlinePath(ctx, ySl, w)
         ctx.setLineDash([])
         ctx.restore()
-        drawChip(ctx, w - 92, ySl, `SL ${fmtPrice(slPrice)}`, '#f43f5e', hoverRef.current?.startsWith('exit') ?? false)
+        drawChip(
+          ctx,
+          w - 92,
+          ySl,
+          isTrail ? `SL trail ${myExits.sl.trailPercent ?? '?'}%` : `SL ${fmtPrice(slPrice)}`,
+          '#f43f5e',
+          hoverRef.current?.startsWith('exit') ?? false,
+        )
       }
     }
     if (myExits?.tp && myExits.tp.limitPrice != null) {
@@ -939,11 +948,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
     if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
-      if (myExits.sl.type !== 'trailing_stop') {
-        const yl = yOf(slPrice)
-        if (yl != null && Math.abs(y - yl) < 7) {
-          return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
-        }
+      const yl = yOf(slPrice)
+      if (yl != null && Math.abs(y - yl) < 7) {
+        // trailing stops are hittable too (menu / double-click → trail %);
+        // their drag is a no-op (no fixed price)
+        return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
       }
     }
     if (myExits?.tp && myExits.tp.limitPrice != null) {
@@ -1081,6 +1090,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const patchExitPrice = useCallback(async (
     info: ExitInfo, kind: 'sl' | 'tp', price: number, attempt = 0,
   ) => {
+    if (info.type === 'trailing_stop') {
+      // a trailing stop has no fixed price — Alpaca ratchets stop_price itself;
+      // only the trail % is editable (patchExitTrailPct)
+      toast({ title: 'Trailing stop has no fixed price', description: 'Change the trail % instead (right-click → Change trail %).', variant: 'destructive' })
+      void posRefresh()
+      return
+    }
     const body: Record<string, unknown> = {
       // the mode the position was loaded from — without it the route falls
       // back to the stored preference and can PATCH the WRONG host (paper vs
@@ -1138,6 +1154,43 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // a cancel+re-place replace churns server-side for ~2s — a second
       // refresh heals any gap state the first refresh raced (lines must never
       // stay missing after a move)
+      window.setTimeout(() => {
+        void posRefresh()
+        window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+      }, 2500)
+    }
+  }, [posData.data?.mode, posRefresh, toast, symbol])
+
+  // change the trail % of a trailing-stop exit — the line's stop_price ratchets
+  // with the price (Alpaca recomputes it), so the percent is the editable knob
+  const patchExitTrailPct = useCallback(async (info: ExitInfo, pct: number, attempt = 0) => {
+    try {
+      const res = await fetch(`/api/trading/orders/${info.orderId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: posData.data?.mode, crypto: symbol.includes('/'), trail_percent: pct }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({ title: `Trail % updated to ${pct}%` })
+      } else if (attempt === 0 && (res.status === 404 || res.status === 409)) {
+        // STALE-ID HEAL (same as patchExitPrice): retry once on the current id
+        const fresh = await fetch(`/api/trading/positions?symbol=${encodeURIComponent(symbol)}`)
+          .then((r) => r.json()).catch(() => null)
+        const cur = fresh?.exits?.[normSym(symbol)]?.sl
+        if (cur?.orderId && cur.orderId !== info.orderId) {
+          await patchExitTrailPct(cur, pct, 1)
+          return
+        }
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      } else {
+        toast({ title: 'Update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Update failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      void posRefresh()
+      window.dispatchEvent(new CustomEvent('tt:positions-changed'))
       window.setTimeout(() => {
         void posRefresh()
         window.dispatchEvent(new CustomEvent('tt:positions-changed'))
@@ -1327,6 +1380,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           orig = [{ time: null, price: a.price }]
           origPixels = [{ x: 0, y: yOf(a.price) ?? y }]
         } else if (hit.type === 'exit') {
+          if (hit.exit.type === 'trailing_stop') {
+            return // no fixed price — dragging a trailing stop is meaningless
+          }
           // exit line drag (SL/TP) — preview handled in onMove via exitDragRef
           orig = [{ time: null, price: hit.origPrice }]
           origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
@@ -1542,7 +1598,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const a = st.alerts.find((aa) => aa.id === hit.id)
         if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
       } else if (hit.type === 'exit') {
-        setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+        if (hit.exit.type === 'trailing_stop') {
+          // trailing stop: edit the trail PERCENT, not a fixed price
+          setEditValue({ type: 'exit', id: hit.id, price: hit.exit.trailPercent ?? 5, pctMode: true, exit: { info: hit.exit, kind: hit.part } })
+        } else {
+          setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+        }
       } else if (hit.type === 'pending') {
         setEditValue({
           type: 'pending',
@@ -2199,7 +2260,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const a = st.alerts.find((aa) => aa.id === hit.id)
             if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
           } else if (hit.type === 'exit') {
-            setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+            if (hit.exit.type === 'trailing_stop') {
+              // trailing stop: edit the trail PERCENT, not a fixed price
+              setEditValue({ type: 'exit', id: hit.id, price: hit.exit.trailPercent ?? 5, pctMode: true, exit: { info: hit.exit, kind: hit.part } })
+            } else {
+              setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
+            }
           } else if (hit.type === 'pending') {
             setEditValue({
               type: 'pending',
@@ -2235,11 +2301,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       {editValue && (
         <EditValuePopover
           value={editValue.price}
+          label={editValue.pctMode ? 'Set trail % (stop distance from price)' : undefined}
           onCancel={() => setEditValue(null)}
           onSave={(price) => {
             if (editValue.type === 'alert') void patchAlert(editValue.id!, { price })
             else if (editValue.type === 'exit' && editValue.exit) {
-              void patchExitPrice(editValue.exit.info, editValue.exit.kind, price)
+              if (editValue.pctMode) void patchExitTrailPct(editValue.exit.info, price)
+              else void patchExitPrice(editValue.exit.info, editValue.exit.kind, price)
             } else if (editValue.type === 'pending' && editValue.pending) {
               void patchPendingOrder(editValue.pending, editValue.part === 'tp' ? 'tp' : editValue.part === 'sl' ? 'sl' : 'entry', price)
             } else if (editValue.type === 'ghost' && (editValue.part === 'tp' || editValue.part === 'sl')) {
@@ -2441,6 +2509,7 @@ function ContextMenu({
   if (menu.hit.type === 'exit') {
     const hit = menu.hit
     const label = hit.part === 'sl' ? 'Stop loss' : 'Take profit'
+    const isTrail = hit.exit.type === 'trailing_stop'
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -2449,9 +2518,14 @@ function ContextMenu({
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-          {label} · {fmtPrice(hit.origPrice)} <span className="text-zinc-600">({hit.exit.type})</span>
+          {isTrail ? `${label} · trail ${hit.exit.trailPercent ?? '?'}%` : `${label} · ${fmtPrice(hit.origPrice)}`}
+          {!isTrail && <span className="text-zinc-600"> ({hit.exit.type})</span>}
         </div>
-        <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(hit); onClose() }} />
+        {isTrail ? (
+          <MenuItem label="✏️ Change trail %…" onClick={() => { onEditValue(hit); onClose() }} />
+        ) : (
+          <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(hit); onClose() }} />
+        )}
         <MenuItem
           label="🧾 Trade ticket…"
           onClick={() => { onOpenTicket(); onClose() }}
@@ -2606,13 +2680,13 @@ function ColorRow({ active, onPick }: { active: string; onPick: (c: string) => v
   )
 }
 
-function EditValuePopover({ value, onSave, onCancel }: { value: number; onSave: (v: number) => void; onCancel: () => void }) {
+function EditValuePopover({ value, onSave, onCancel, label }: { value: number; onSave: (v: number) => void; onCancel: () => void; label?: string }) {
   const [v, setV] = useState(String(value))
   return (
     <div className="absolute inset-0 z-50 flex items-center justify-center">
       <button className="absolute inset-0 bg-black/40" onClick={onCancel} aria-label="Cancel" />
       <div className="relative w-64 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
-        <p className="mb-2 text-xs font-medium text-zinc-300">Set value</p>
+        <p className="mb-2 text-xs font-medium text-zinc-300">{label || 'Set value'}</p>
         <Input
           autoFocus
           type="number"

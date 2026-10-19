@@ -869,6 +869,9 @@ export async function replacePendingEntrySmart(
   const origLimit0 = num(orig.limit_price)
   const origTp0 = num(exitLegs.find((l) => l.type === 'limit')?.limit_price) ?? plan?.tp ?? null
   const origSl0 = num(exitLegs.find((l) => l.type === 'stop' || l.type === 'stop_limit')?.stop_price) ?? plan?.sl ?? null
+  // the order's ACTUAL current values (pre-patch) — used to verify "not changed"
+  const curTp0 = origTp0
+  const curSl0 = origSl0
   // current TP/SL: requested patch wins, else the parent's legs, else the plan
   const curTp =
     patch.tp ??
@@ -933,8 +936,18 @@ export async function replacePendingEntrySmart(
     }
   }
 
-  // 2) direct PATCH (limit change and/or leg price updates, no new legs)
-  if (!addsLeg && !managedCrypto) {
+  // 2) direct PATCH — ONLY for entry-field changes (or orders without legs).
+  // Verified live 2026-10 (queued bracket parent, market closed): Alpaca
+  // APPLIES limit/qty changes but SILENTLY DROPS take_profit/stop_loss
+  // changes sent on the parent, and a leg-ONLY patch 422s with the
+  // misleading "order parameters are not changed" even when the values
+  // differ. So any leg change on a bracket parent MUST go through the
+  // cancel+re-place rebuild below, or it never lands (the "second SL/TP
+  // drag does nothing" bug).
+  const touchesLegs = patch.tp != null || patch.sl != null
+  const isBracketParent =
+    String(orig.order_class || '') === 'bracket' || (orig.legs?.length ?? 0) > 0
+  if (!addsLeg && !managedCrypto && !(isBracketParent && touchesLegs)) {
     const body: Record<string, unknown> = {}
     if (patch.limit_price != null && newLimit != null) body.limit_price = fmtPx(newLimit, crypto)
     if (origHasTp) body.take_profit = { limit_price: fmtPx(curTp!, crypto) }
@@ -948,11 +961,38 @@ export async function replacePendingEntrySmart(
         return { data: r.data, status: r.status, mode: host, method: 'replace' }
       }
       if (r.status === 422 && String(r.error || '').includes('not changed')) {
-        return { data: orig, status: 200, mode: host, method: 'replace', note: 'Order already at this value' }
+        // only a genuine no-op when EVERY requested value already equals the
+        // order's current value — Alpaca also emits this message for changes
+        // it refuses to apply (e.g. leg-only patch on a queued bracket),
+        // which must fall through to the cancel+re-place rebuild
+        const samePx = (a: number | null | undefined, b: number | null | undefined) =>
+          a != null && b != null && Math.abs(a - b) < 1e-9
+        const noop =
+          (patch.limit_price == null || samePx(newLimit, origLimit0)) &&
+          (patch.tp == null || samePx(patch.tp, curTp0)) &&
+          (patch.sl == null || samePx(patch.sl, curSl0))
+        if (noop) {
+          return { data: orig, status: 200, mode: host, method: 'replace', note: 'Order already at this value' }
+        }
       }
-      // real rejection → cancel+re-place below
+      // real rejection (or a fake "not changed") → cancel+re-place below
     } else {
       return { data: null, status: 400, error: 'nothing to change', mode: host }
+    }
+  }
+
+  // 2b) pure leg no-op on a rebuilt order (bracket parent or managed crypto
+  // plan): the requested TP/SL already equals the current level — don't churn
+  // a cancel+re-place cycle for nothing (the chart would flash its lines).
+  // The leg values may live in the parent's legs OR the ttb- plan.
+  if (touchesLegs && patch.limit_price == null && (isBracketParent || managedCrypto)) {
+    const samePx = (a: number | null | undefined, b: number | null | undefined) =>
+      a != null && b != null && Math.abs(a - b) < 1e-9
+    const unchanged =
+      (patch.tp == null || samePx(patch.tp, curTp0)) &&
+      (patch.sl == null || samePx(patch.sl, curSl0))
+    if (unchanged) {
+      return { data: orig, status: 200, mode: host, method: 'replace', note: 'Order already at this value' }
     }
   }
 

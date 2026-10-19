@@ -57,6 +57,9 @@ export function TradeTicket({
 
   const isCrypto = isCryptoTradeSymbol(symbol)
   const refPrice = livePrice ?? 0
+  // trailing stop mode: when set, the order IS the trailing stop (no entry
+  // bracket) and SL/TP are ignored
+  const trailActive = Number.isFinite(parseFloat(trailPct)) && parseFloat(trailPct) > 0
 
   // load saved trade mode + default TP/SL percent when opened / mode toggles
   useEffect(() => {
@@ -119,12 +122,23 @@ export function TradeTicket({
       }
       body.limit_price = lp
     }
-    const sl = parseFloat(slPrice)
-    const tp = parseFloat(tpPrice)
-    if (!Number.isNaN(sl) && sl > 0) body.stop_loss = sl
-    if (!Number.isNaN(tp) && tp > 0) body.take_profit = tp
     const tr = parseFloat(trailPct)
-    if (!Number.isNaN(tr) && tr > 0) body.trail_percent = tr
+    if (!Number.isNaN(tr) && tr > 0) {
+      // TRAILING STOP: the order is the trailing stop itself (side as chosen —
+      // SELL trails below / BUY trails above). SL/TP are not part of it.
+      if (isCrypto) {
+        toast({ title: 'Trailing stops are not supported for crypto', description: 'Use the SL field — it places a stop_limit exit.', variant: 'destructive' })
+        return
+      }
+      delete body.type
+      delete body.limit_price
+      body.trail_percent = tr
+    } else {
+      const sl = parseFloat(slPrice)
+      const tp = parseFloat(tpPrice)
+      if (!Number.isNaN(sl) && sl > 0) body.stop_loss = sl
+      if (!Number.isNaN(tp) && tp > 0) body.take_profit = tp
+    }
     setSubmitting(true)
     try {
       const res = await fetch('/api/trading/orders', {
@@ -138,16 +152,24 @@ export function TradeTicket({
       }
       const errs: string[] = json.errors || []
       const oid = json.orders?.[0]?.id
-      toast({
-        title: `${side === 'buy' ? '🟢 Buy' : '🔴 Sell'} order submitted (${json.mode || mode})`,
-        description: [
-          `${q} ${symbol} ${orderType}`,
-          json.splitNote,
-          ...errs,
-          oid ? `#${String(oid).slice(0, 8)}` : '',
-        ].filter(Boolean).join(' · '),
-        variant: errs.length ? 'destructive' : 'default',
-      })
+      if (trailActive) {
+        toast({
+          title: `🎯 Trailing stop submitted (${json.mode || mode})`,
+          description: [`${side.toUpperCase()} ${q} ${symbol} · trail ${tr}%`, oid ? `#${String(oid).slice(0, 8)}` : '', ...errs].filter(Boolean).join(' · '),
+          variant: errs.length ? 'destructive' : 'default',
+        })
+      } else {
+        toast({
+          title: `${side === 'buy' ? '🟢 Buy' : '🔴 Sell'} order submitted (${json.mode || mode})`,
+          description: [
+            `${q} ${symbol} ${orderType}`,
+            json.splitNote,
+            ...errs,
+            oid ? `#${String(oid).slice(0, 8)}` : '',
+          ].filter(Boolean).join(' · '),
+          variant: errs.length ? 'destructive' : 'default',
+        })
+      }
       window.dispatchEvent(new CustomEvent('tt:positions-changed'))
       onPlaced()
       // keep the ticket open for follow-up trades; reset protective inputs
@@ -166,7 +188,7 @@ export function TradeTicket({
     } finally {
       setSubmitting(false)
     }
-  }, [qty, mode, symbol, side, orderType, limitPrice, slPrice, tpPrice, trailPct, toast, onPlaced])
+  }, [qty, mode, symbol, side, orderType, limitPrice, slPrice, tpPrice, trailPct, trailActive, isCrypto, toast, onPlaced])
 
   const est = refPrice * (parseFloat(qty) || 0)
 
@@ -296,7 +318,7 @@ export function TradeTicket({
         )}
         <div className="col-span-1">
           <div className="flex items-center justify-between">
-            <Label htmlFor="tt-sl" className="text-[10px] text-zinc-400">Stop loss</Label>
+            <Label htmlFor="tt-sl" className={cn('text-[10px]', trailActive ? 'text-zinc-600' : 'text-zinc-400')}>Stop loss{trailActive ? ' (off)' : ''}</Label>
             <div className="flex items-center gap-0.5">
               <input
                 aria-label="Stop loss percent"
@@ -324,18 +346,19 @@ export function TradeTicket({
             type="number"
             min="0"
             step="any"
-            value={slPrice}
+            value={trailActive ? '' : slPrice}
             onChange={(e) => {
               setSlPrice(e.target.value)
               setSlTouched(true)
             }}
-            placeholder="none"
-            className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
+            disabled={trailActive}
+            placeholder={trailActive ? 'trailing stop active' : 'none'}
+            className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs disabled:opacity-50"
           />
         </div>
         <div className="col-span-1">
           <div className="flex items-center justify-between">
-            <Label htmlFor="tt-tp" className="text-[10px] text-zinc-400">Take profit</Label>
+            <Label htmlFor="tt-tp" className={cn('text-[10px]', trailActive ? 'text-zinc-600' : 'text-zinc-400')}>Take profit{trailActive ? ' (off)' : ''}</Label>
             <div className="flex items-center gap-0.5">
               <input
                 aria-label="Take profit percent"
@@ -363,19 +386,20 @@ export function TradeTicket({
             type="number"
             min="0"
             step="any"
-            value={tpPrice}
+            value={trailActive ? '' : tpPrice}
             onChange={(e) => {
               setTpPrice(e.target.value)
               setTpTouched(true)
             }}
-            placeholder="none"
-            className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
+            disabled={trailActive}
+            placeholder={trailActive ? 'trailing stop active' : 'none'}
+            className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs disabled:opacity-50"
           />
         </div>
         {!isCrypto && (
           <div className="col-span-2">
             <Label htmlFor="tt-trail" className="text-[10px] text-zinc-400">
-              Trailing stop % <span className="text-zinc-600">(exit order, ignores SL/TP)</span>
+              Trailing stop % <span className="text-zinc-600">{trailActive ? '— order IS the trailing stop' : '(optional)'}</span>
             </Label>
             <Input
               id="tt-trail"
@@ -387,6 +411,14 @@ export function TradeTicket({
               placeholder="e.g. 1.5"
               className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
             />
+            {trailActive && (
+              <p className="mt-1 text-[10px] leading-snug text-amber-400/90">
+                {side === 'sell'
+                  ? 'SELL trailing stop — follows the price DOWN (exits / protects a long).'
+                  : 'BUY trailing stop — follows the price UP (exits / opens a short).'}
+                SL/TP ignored while this is set.
+              </p>
+            )}
           </div>
         )}
       </div>
@@ -413,7 +445,9 @@ export function TradeTicket({
         )}
       >
         {submitting && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}
-        {side === 'buy' ? 'Buy' : 'Sell'} {qty || '—'} {symbol} · {mode}
+        {trailActive
+          ? `🎯 Trailing stop ${side.toUpperCase()} ${qty || '—'} ${symbol} · ${mode}`
+          : `${side === 'buy' ? 'Buy' : 'Sell'} ${qty || '—'} ${symbol} · ${mode}`}
       </Button>
 
       <p className="mt-1.5 text-[10px] leading-snug text-zinc-600">
