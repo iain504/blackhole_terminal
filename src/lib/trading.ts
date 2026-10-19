@@ -1294,6 +1294,11 @@ export interface AttachExitsResult {
  * - qty_available "0" is a REAL zero (fully reserved) and must not fall back
  *   to the full qty — the falsy `||` chain used to bypass the guard and send
  *   an order Alpaca was guaranteed to reject.
+ * - SHORT positions are the OPPOSITE (verified live 2026-10: SPCX short
+ *   reports qty="-10", qty_available="0"): their exits are BUY orders that
+ *   reserve buying power, NEVER the position qty. The exit size is |qty| —
+ *   gating on qty_available used to refuse EVERY short-side attach with
+ *   "Position has no available qty" (the user's drag/+SL bug).
  * Crypto: ALL advanced order classes are rejected — place split exit legs
  * (50/50 qty, 0.99 fee factor) directly against the position, tagged with a
  * `ttp-` client_order_id (ignored by the OCO supervisor's `tte-` cleanup).
@@ -1367,10 +1372,20 @@ export async function attachExitsToPosition(
     if (oldExits.length > 0) {
       for (const o of oldExits) await waitUntilCanceled(userId, mode, o.id)
       // re-read the position — the freed reservation may change qty_available
-      const pos2 = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tSym)}`)
-      if (pos2.data) pos = pos2.data
+      // (only LONG exits are SELL orders that reserve it; a short's
+      // qty_available stays "0" no matter what is canceled)
+      if (pos.side !== 'short') {
+        const pos2 = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tSym)}`)
+        if (pos2.data) pos = pos2.data
+      }
     }
-    const qtyAvail = availOf(pos)
+    // Exit capacity is SIDE-AWARE:
+    // - LONG: qty_available (open SELL exits reserve it; "0" = fully reserved)
+    // - SHORT: |qty| — exits are BUY orders reserving buying power, never the
+    //   position qty (Alpaca reports qty_available "0" for shorts)
+    const qtyAvail = pos.side === 'short'
+      ? Math.abs(Number.parseFloat(pos.qty) || 0)
+      : availOf(pos)
     if (!(qtyAvail > 0)) {
       // something ELSE still reserves the position — restore what we canceled
       for (const o of oldExits) {
@@ -1450,8 +1465,10 @@ export async function attachExitsToPosition(
   // second one impossible (502 insufficient balance). Legs may be attached
   // independently in any order.
   const legQty = (n: number) => String(parseFloat((n * 0.99).toFixed(8)))
-  const qtyAvail = availOf(pos)
-  const posQty = Number.parseFloat(pos.qty) || qtyAvail
+  // shorts would carry a negative qty — Alpaca crypto is long-only, but stay
+  // defensive: capacity is |qty| clamped by what is still unreserved
+  const qtyAvail = Math.abs(availOf(pos))
+  const posQty = Math.abs(Number.parseFloat(pos.qty) || 0) || qtyAvail
   const qty = legQty(Math.max(0, Math.min(qtyAvail, posQty / 2)))
   if (!(parseFloat(qty) > 0)) {
     return { results, errors: ['Position has no available qty — open exit orders reserve the balance'] }
