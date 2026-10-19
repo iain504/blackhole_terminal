@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, Watchlist } from '@/store/terminal'
 import { fmtPrice } from '@/lib/market-types'
-import { subscribeStream } from '@/lib/stream-client'
+import { subscribeStream, isStreamConnected } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -69,12 +69,19 @@ export function WatchlistPanel() {
 
   const list: Watchlist | undefined = lists.find((l) => l.id === activeId) || lists[0]
 
-  // fetch quotes for this list every 10s
+  // REST quotes are the reconciliation BACKSTOP for the live stream. The whole
+  // list costs ONE batched request (server-side Alpaca snapshots endpoint;
+  // 200 req/min plan limit → 6 req/min here, far under it). While the stream
+  // is connected we only reconcile every ~30s and skip entirely while the page
+  // is hidden; a hidden→visible switch refreshes immediately.
   const itemsKey = list?.items.join(',') ?? ''
   useEffect(() => {
     if (!itemsKey) return
     let alive = true
+    let n = 0
     const fetchQ = async () => {
+      if (document.hidden) return // background tab — save the API budget
+      if (isStreamConnected() && ++n % 3 !== 1) return // stream live → reconcile every 30s
       try {
         const res = await fetch('/api/market/quote', {
           method: 'POST',
@@ -93,14 +100,20 @@ export function WatchlistPanel() {
     }
     fetchQ()
     const timer = setInterval(fetchQ, 10000)
+    const onVis = () => {
+      if (!document.hidden) void fetchQ()
+    }
+    document.addEventListener('visibilitychange', onVis)
     return () => {
       alive = false
       clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVis)
     }
   }, [itemsKey])
 
-  // stream ticks: patch prices in real time between the 10s REST refreshes
-  // (crypto streams from Binance; stocks from Alpaca when keys exist, else sim)
+  // stream ticks: the PRIMARY price source between REST reconciliations
+  // (crypto streams from Binance; stocks from the one shared Alpaca websocket
+  // when keys work, else honest sim ticks)
   useEffect(() => {
     if (!itemsKey) return
     return subscribeStream(itemsKey.split(','), (t) => {

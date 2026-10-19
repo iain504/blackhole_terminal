@@ -2,13 +2,15 @@
 //
 // Browser ──socket.io (path '/', port 3030, via Caddy ?XTransformPort=3030)──▶ this service
 //   ├─ CRYPTO: one shared Binance websocket (free, keyless) → 24h miniTicker ≈ 1 tick/s/symbol
-//   ├─ STOCKS: Alpaca v2 iex websocket per key-set (keys resolved server-side from
-//   │          the user's session cookie via Next /api/stream/keys — the browser
-//   │          NEVER sees keys) → trades stream
-//   └─ DEMO:   symbols without a live upstream (no keys / auth failed / binance down)
-//              get simulated mean-reverting ticks so the UI still streams
-//
-// Protocol (socket.io):
+//   ├─ STOCKS: EXACTLY ONE Alpaca v2 iex websocket per account (Alpaca allows ONE concurrent
+//   │          market-data connection per key — a 2nd gets error 406/403 "connection limit
+//   │          exceeded"; the free plan also caps 30 subscribed symbols per websocket).
+//   │          All browser tabs/panes/watchlists multiplex over that single connection.
+//   │          Keys are resolved server-side from the user's session cookie via Next
+//   │          /api/stream/keys — the browser NEVER sees keys.
+//   └─ DEMO:   symbols without a live upstream (no keys / auth failed / slot busy /
+//   │          over the 30-symbol cap / binance down) get simulated mean-reverting ticks
+//   │          so the UI still streams (demo flag on the tick → SIM badge)
 //   ▶ 'sub'   { symbols: string[] }    subscribe (refcounted)
 //   ▶ 'unsub' { symbols: string[] }
 //   ◀ 'tick'  { s, p, t, o?, h?, l?, v?, demo? }   throttled ≤ 5 msgs/s per symbol
@@ -23,6 +25,10 @@ const FLUSH_MS = 200 // per-symbol emit throttle → ≤5 msgs/s
 const DEMO_TICK_MS = 1200
 const KEY_CACHE_MS = 60_000
 const QUOTE_TIMEOUT_MS = 4000
+// Alpaca market data: ONE concurrent websocket per key (2nd → error 406/403)
+// and the free/IEX plan caps 30 subscribed symbols per connection.
+const ALPACA_SYMBOL_CAP = 30
+const SLOT_COOLDOWN_MS = 2 * 60_000
 
 const isCrypto = (s: string) => s.includes('/')
 
@@ -97,6 +103,8 @@ interface AlpacaConn {
   subscribed: Set<string>
   authed: boolean
   failed: boolean
+  failedReason: 'keys' | 'slot' | null
+  capped: boolean // symbol cap reached — stop growing subscriptions
   backoff: number
   reconnectTimer: ReturnType<typeof setTimeout> | null
 }
@@ -127,6 +135,9 @@ function alpacaConnect(conn: AlpacaConn) {
         if (type === 'success' && m.msg === 'authenticated') {
           conn.authed = true
           conn.failed = false
+          conn.failedReason = null
+          conn.capped = false
+          slotCooldown.delete(conn.keys.keyId)
           conn.subscribed.clear()
           alpacaSync(conn)
         } else if (type === 't') {
@@ -139,9 +150,26 @@ function alpacaConnect(conn: AlpacaConn) {
           const code = Number(m.code ?? 0)
           console.error(`[alpaca] error ${code}: ${m.msg}`)
           if (code === 401 || code === 402) {
-            conn.failed = true // bad keys → demo ticks for bound sockets
+            // bad keys — don't hammer; demo ticks for 10 min
+            conn.failed = true
+            conn.failedReason = 'keys'
             failedKeys.set(conn.keys.keyId, Date.now())
             try { ws.close() } catch { /* noop */ }
+          } else if (code === 403 || code === 406) {
+            // Alpaca docs: "Each account is limited to 1 concurrent connection
+            // for market data streams. If you try to open more than 1
+            // connection at the same time, you may receive a 406 or 403."
+            // Another client (or a stale process) holds the slot → do NOT
+            // reconnect-spam. Cool down, keep sockets on simulated ticks and
+            // retry quietly when the cooldown elapses.
+            conn.failed = true
+            conn.failedReason = 'slot'
+            slotCooldown.set(conn.keys.keyId, Date.now())
+            try { ws.close() } catch { /* noop */ }
+          } else if (code === 407 || code === 409) {
+            // subscription rate/symbol limit (free plan: 30 symbols/conn):
+            // keep what already streams; uncovered symbols get demo ticks.
+            conn.capped = true
           }
         }
       }
@@ -171,7 +199,10 @@ function alpacaSync(conn: AlpacaConn) {
   for (const sock of conn.sockets) {
     for (const s of socketSyms.get(sock) ?? []) if (!isCrypto(s)) conn.wanted.add(s)
   }
-  const add = [...conn.wanted].filter((s) => !conn.subscribed.has(s))
+  // respect the per-connection symbol cap (free plan) — extra symbols stay
+  // uncovered and the demo simulator keeps them moving instead of erroring
+  const cap = conn.capped ? 0 : Math.max(0, ALPACA_SYMBOL_CAP - conn.subscribed.size)
+  const add = [...conn.wanted].filter((s) => !conn.subscribed.has(s)).slice(0, cap)
   const rem = [...conn.subscribed].filter((s) => !conn.wanted.has(s))
   if (add.length) {
     ws.send(JSON.stringify({ action: 'listen', trades: add, quotes: add }))
@@ -181,6 +212,32 @@ function alpacaSync(conn: AlpacaConn) {
     ws.send(JSON.stringify({ action: 'unsubscribe', trades: rem, quotes: rem }))
     for (const s of rem) conn.subscribed.delete(s)
   }
+}
+
+/** Close an upstream for good (no listeners left / orphaned). */
+function teardownConn(conn: AlpacaConn) {
+  if (conn.reconnectTimer) {
+    clearTimeout(conn.reconnectTimer)
+    conn.reconnectTimer = null
+  }
+  conn.authed = false
+  try { conn.ws?.close() } catch { /* noop */ }
+  conn.ws = null
+  alpacaConns.delete(conn.keys.keyId)
+}
+
+/**
+ * Alpaca permits ONE market-data websocket per key: every socket listens
+ * through exactly ONE conn. Binding removes the socket from any previous conn
+ * and immediately tears that conn down when orphaned (frees the account's
+ * connection slot — e.g. right after the user rotates their API keys).
+ */
+function bindSocketToConn(socket: Socket, conn: AlpacaConn) {
+  for (const other of [...alpacaConns.values()]) {
+    if (other === conn) continue
+    if (other.sockets.delete(socket) && other.sockets.size === 0) teardownConn(other)
+  }
+  conn.sockets.add(socket)
 }
 
 // ------------------------------ Binance upstream ---------------------------
@@ -327,11 +384,18 @@ async function fetchAnchors(syms: string[]) {
   }
 }
 
-// which symbols need simulated ticks (no live upstream covering them)
+// which symbols need simulated ticks (no live upstream covering them).
+// Coverage is PER SYMBOL: an authed-but-capped conn leaves its extra symbols
+// to the demo simulator instead of leaving them frozen.
 function symbolsNeedingDemo(): string[] {
   const out: string[] = []
-  const stocksLive = [...alpacaConns.values()].some((c) => c.authed && !c.failed && c.ws?.readyState === WebSocket.OPEN)
-  if (!stocksLive) out.push(...desiredStocks())
+  const covered = new Set<string>()
+  for (const c of alpacaConns.values()) {
+    if (c.authed && !c.failed && c.ws?.readyState === WebSocket.OPEN) {
+      for (const s of c.subscribed) covered.add(s)
+    }
+  }
+  for (const s of desiredStocks()) if (!covered.has(s)) out.push(s)
   if (!binanceUp) out.push(...desiredCrypto())
   return out
 }
@@ -428,13 +492,12 @@ io.on('connection', (socket: Socket) => {
       release([...set])
       socketSyms.delete(socket)
     }
-    for (const conn of alpacaConns.values()) {
+    for (const conn of [...alpacaConns.values()]) {
       conn.sockets.delete(socket)
       if (conn.sockets.size === 0) {
-        // nobody bound → tear the upstream down
-        if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer)
-        try { conn.ws?.close() } catch { /* noop */ }
-        alpacaConns.delete(conn.keys.keyId)
+        // nobody bound → tear the upstream down (frees Alpaca's single
+        // connection slot for this account immediately)
+        teardownConn(conn)
       } else alpacaSync(conn)
     }
     if (refcounts.size === 0 && binanceWs) {
@@ -444,13 +507,17 @@ io.on('connection', (socket: Socket) => {
     }
   })
 
-  // keys resolve asynchronously — bind the socket to its Alpaca upstream when
-  // they arrive (until then its stock symbols get demo ticks)
+  // keys resolve asynchronously — bind the socket to its (single) Alpaca
+  // upstream when they arrive (until then its stock symbols get demo ticks)
   void keysForCookie(cookieHeader).then((keys) => {
     console.log('[conn]', socket.id, 'keys:', Boolean(keys))
     if (!keys || keysFailedRecently(keys)) return
+    if (slotFailedRecently(keys)) {
+      console.log('[alpaca] connection slot busy for these keys — socket stays on simulated ticks for now')
+      return
+    }
     const conn = getOrCreateAlpacaConn(keys)
-    conn.sockets.add(socket)
+    bindSocketToConn(socket, conn)
     alpacaConnect(conn)
     alpacaSync(conn)
   })
@@ -461,6 +528,42 @@ function keysFailedRecently(keys: AlpacaKeys): boolean {
   const at = failedKeys.get(keys.keyId)
   return at != null && Date.now() - at < 10 * 60 * 1000
 }
+
+// 406/403 — another client holds Alpaca's single market-data connection slot.
+// Cool down instead of reconnect-spamming; retried automatically below.
+const slotCooldown = new Map<string, number>()
+function slotFailedRecently(keys: AlpacaKeys): boolean {
+  const at = slotCooldown.get(keys.keyId)
+  return at != null && Date.now() - at < SLOT_COOLDOWN_MS
+}
+
+// Safety net: never keep an upstream Alpaca websocket with no listeners
+// (e.g. a socket rebound to new keys would otherwise orphan the old conn and
+// eat the account's only connection slot).
+setInterval(() => {
+  for (const conn of [...alpacaConns.values()]) {
+    if (conn.sockets.size === 0) teardownConn(conn)
+  }
+}, 30_000)
+
+// A busy connection slot usually frees when the other client disconnects —
+// retry quietly after the cooldown without waiting for a fresh page load.
+setInterval(() => {
+  for (const conn of [...alpacaConns.values()]) {
+    if (
+      conn.failed &&
+      conn.failedReason === 'slot' &&
+      conn.sockets.size > 0 &&
+      Date.now() - (slotCooldown.get(conn.keys.keyId) ?? 0) >= SLOT_COOLDOWN_MS
+    ) {
+      console.log('[alpaca] connection-slot cooldown elapsed — retrying')
+      conn.failed = false
+      conn.failedReason = null
+      conn.backoff = 1000
+      alpacaConnect(conn)
+    }
+  }
+}, 60_000)
 
 function getOrCreateAlpacaConn(keys: AlpacaKeys): AlpacaConn {
   let conn = alpacaConns.get(keys.keyId)
@@ -473,6 +576,8 @@ function getOrCreateAlpacaConn(keys: AlpacaKeys): AlpacaConn {
       subscribed: new Set(),
       authed: false,
       failed: false,
+      failedReason: null,
+      capped: false,
       backoff: 1000,
       reconnectTimer: null,
     }

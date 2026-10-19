@@ -3,7 +3,7 @@
 // Quote panel: current symbol snapshot (price, change, OHLC, volume, range).
 import { useEffect, useState } from 'react'
 import { fmtPrice, isCryptoSymbol } from '@/lib/market-types'
-import { subscribeStream } from '@/lib/stream-client'
+import { subscribeStream, isStreamConnected } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Bitcoin, TrendingUp } from 'lucide-react'
@@ -26,7 +26,10 @@ export function QuotePanel({ symbol }: { symbol: string }) {
 
   useEffect(() => {
     let alive = true
+    let n = 0
     const fetchQ = async () => {
+      if (document.hidden) return // background tab — save the API budget
+      if (isStreamConnected() && ++n % 3 !== 1) return // stream live → reconcile every 30s
       try {
         const res = await fetch('/api/market/quote', {
           method: 'POST',
@@ -41,9 +44,14 @@ export function QuotePanel({ symbol }: { symbol: string }) {
     }
     fetchQ()
     const timer = setInterval(fetchQ, 10000)
+    const onVis = () => {
+      if (!document.hidden) void fetchQ()
+    }
+    document.addEventListener('visibilitychange', onVis)
     return () => {
       alive = false
       clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVis)
     }
   }, [symbol])
 
