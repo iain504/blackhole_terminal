@@ -737,3 +737,20 @@ Stage Summary:
 - The terminal now has TradingView-style indicators on every chart pane: SMA + EMA + Bollinger Bands as price overlays (with live-tick updates and crosshair-legend values), RSI and MACD as dedicated oscillator strips squeezed under the volume, each with configurable periods persisted across sessions.
 - Architecture keeps the v4 single-pane constraint honest: overlays share the price scale, oscillators get their own margin-bounded scales; series lifecycle is config-owned, data refill is bars-owned, and live ticks update only the last point (cheap at ≤4 updates/s per pane, 8-pane grids included).
 - Indicator math is probed-verified against reference values (RSI Wilder classic 70.46, exact SMA/EMA/BB), and the whole flow is verified E2E on both crypto (streaming) and stocks (REST fallback) paths.
+
+---
+Task ID: 40
+Agent: Z.ai Code (main)
+Task: "polish it" — polish the just-added technical indicators (SMA / EMA / BB / RSI / MACD) that were implemented at the end of the previous session (src/lib/indicators.ts + ChartPanel series lifecycle/popover already existed).
+
+Work Log:
+- Recon: package.json (lightweight-charts 4.2.3, confirmed paneSize() exists in typings), full read of src/lib/indicators.ts and all indicator sections of ChartPanel.tsx (~3240 lines).
+- Strip chrome on overlay canvas (TradingView-style pane titles): added indStripsRef {volTop, rsiTop, macdTop} (fractions of pane height), set by the series-lifecycle effect from stripMargins() (or restored 0.82 defaults when no oscillators); renderOverlay now draws FIRST: hairline separators (rgba(63,63,70,0.5)) at every strip boundary + title/value labels at each strip's top-left — "VOL 1.04M" (zinc), "RSI 14 42.51" (pink #f472b6 / #f9a8d4), "MACD 12 26 9 +1.48 +3.52 -2.05" (amber title, values in macd/signal/hist series colors, sign-prefixed, monospace). pane height from chart.paneSize() with timeScale fallback; scheduleRedraw() added to the lifecycle effect so toggles repaint chrome immediately.
+- Crosshair markers: RSI / MACD line / MACD signal now show the hover dot (crosshairMarkerVisible: true after overlayOpts spread).
+- Indicators popover restructured: w-[320px], header INDICATORS+Reset, section captions OVERLAYS / OSCILLATORS, uniform rows (switch + colored name left, params right, BB & MACD params on a second right-aligned line → fixed "fast" label clipping), params wrapped in <label> for a11y, max-h-[70vh] overflow-y-auto, footer "Saved automatically · applies to every chart"; ƒx trigger button gets aria-expanded + open/active styling (border-zinc-700 bg-zinc-800).
+- Lint clean; dev.log clean.
+
+Stage Summary:
+- E2E (agent-browser, TSLA 1D): all-5-on state renders 4 stacked strips (price · VOL · RSI · MACD) with separators + live title values; __ttDbg.ind() probe sane & self-consistent (BB upper/mid/lower symmetric: 390.43/370.38/350.33; macd−signal=hist: 1.48−3.52=−2.05); toggling RSI+MACD off collapses strips, price/vol expand, badge ƒx 5→3; re-enable restores; settings persisted across reload (localStorage tt.indicators.v1); crosshair legend shows per-bar readouts incl. RSI14/MACD/sig/hist at hovered bar; console + page errors clean.
+- Screenshots: screens-tmp/ind-polish-all.png (all on), ind-popover.png / ind-popover2.png (popover before/after width fix), ind-osc-off.png (strips collapsed), ind-final.png (restored, crosshair dots visible).
+- Backlog unchanged (pending-order drag, Position tab, hline drag, bars left-scroll pagination, TabBar reorder, right-click-at-mouse order, TP/SL 5% default, Console trades list, heatmap/calendar dark theme, SPCX/NASDAQ universe fallback).

@@ -85,6 +85,13 @@ const EMPTY_DRAWINGS: Drawing[] = []
 const MACD_HIST_UP = 'rgba(34,197,94,0.55)'
 const MACD_HIST_DOWN = 'rgba(239,68,68,0.55)'
 
+/** Compact volume for the VOL strip title (12.4M / 842.1K / 13B). */
+const fmtVolCompact = (v: number) =>
+  v >= 1e9 ? `${(v / 1e9).toFixed(2)}B`
+  : v >= 1e6 ? `${(v / 1e6).toFixed(2)}M`
+  : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K`
+  : v.toFixed(0)
+
 /** lightweight-charts series for every ENABLED indicator (slots optional). */
 interface IndSeriesBundle {
   settings: IndicatorSettings
@@ -169,6 +176,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null>(null)
   const volSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const indSeriesRef = useRef<IndSeriesBundle | null>(null)
+  // strip layout (fractions of pane height) for the overlay-canvas chrome —
+  // separators + VOL/RSI/MACD pane titles drawn by renderOverlay
+  const indStripsRef = useRef<{ volTop: number; rsiTop: number | null; macdTop: number | null } | null>(null)
   const barsRef = useRef<Bar[]>([])
   const hoverRef = useRef<string | null>(null)
   const feedStateRef = useRef('')
@@ -485,6 +495,81 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
     const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered')
+
+    // ---- indicator strip chrome (TradingView-style pane titles) ----
+    // lightweight-charts v4 has no real panes: RSI/MACD live on hidden price
+    // scales squeezed into stacked bottom strips. Draw hairline separators
+    // between the strips and each strip's title + last value at its top-left,
+    // so oscillators read as real sub-panes. Drawn FIRST — everything else
+    // (drawings, chips, zones) renders on top.
+    {
+      const strips = indStripsRef.current
+      const chartApiS = chartRef.current
+      if (strips && chartApiS) {
+        let paneH = h
+        try {
+          const ps = chartApiS.paneSize()
+          if (ps && ps.height > 0) paneH = ps.height
+        } catch { /* fallback: keep full container height */ }
+        ctx.save()
+        ctx.strokeStyle = 'rgba(63,63,70,0.5)'
+        ctx.lineWidth = 1
+        for (const f of [strips.volTop, strips.rsiTop, strips.macdTop]) {
+          if (f == null || f <= 0.02 || f >= 1) continue
+          const y = Math.round(f * paneH) + 0.5
+          ctx.beginPath()
+          ctx.moveTo(0, y)
+          ctx.lineTo(w, y)
+          ctx.stroke()
+        }
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'top'
+        const ibS = indSeriesRef.current
+        const stripLabel = (yFrac: number, txt: string, color: string) => {
+          ctx.font = '600 10px ui-sans-serif, system-ui'
+          ctx.fillStyle = color
+          ctx.fillText(txt, 8, yFrac * paneH + 3)
+          return 8 + ctx.measureText(txt).width + 6
+        }
+        const stripValue = (x: number, yFrac: number, txt: string, color: string) => {
+          ctx.font = '10px ui-monospace, monospace'
+          ctx.fillStyle = color
+          ctx.fillText(txt, x, yFrac * paneH + 3)
+        }
+        // volume strip title + last bar volume
+        const lastVol = barsRef.current.length > 0 ? barsRef.current[barsRef.current.length - 1].volume : null
+        const volX = stripLabel(strips.volTop, 'VOL', '#71717a')
+        if (lastVol != null && Number.isFinite(lastVol) && lastVol > 0) {
+          stripValue(volX, strips.volTop, fmtVolCompact(lastVol), '#a1a1aa')
+        }
+        // rsi strip title + last value
+        if (strips.rsiTop != null && ibS) {
+          const rTop = strips.rsiTop
+          const xR = stripLabel(rTop, `RSI ${ibS.settings.rsi.period}`, '#f472b6')
+          const rv = ibS.lastPts.rsi
+          if (rv != null && Number.isFinite(rv)) stripValue(xR, rTop, rv.toFixed(2), '#f9a8d4')
+        }
+        // macd strip title + last macd/signal/histogram values
+        if (strips.macdTop != null && ibS) {
+          const mTop = strips.macdTop
+          const mSet = ibS.settings.macd
+          let xm = stripLabel(mTop, `MACD ${mSet.fast} ${mSet.slow} ${mSet.signal}`, '#f59e0b')
+          const fmtSigned = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+          const segs: [number | null | undefined, string][] = [
+            [ibS.lastPts.macd, '#fbbf24'],
+            [ibS.lastPts.sig, '#c4b5fd'],
+            [ibS.lastPts.hist, '#a1a1aa'],
+          ]
+          for (const [v, color] of segs) {
+            if (v == null || !Number.isFinite(v)) continue
+            const txt = fmtSigned(v)
+            stripValue(xm, mTop, txt, color)
+            xm += ctx.measureText(txt).width + 6
+          }
+        }
+        ctx.restore()
+      }
+    }
 
     if (st.drawingTool !== 'cursor' || draftRef.current) {
       // drawing hint strip
@@ -2229,6 +2314,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.1, bottom: 0.24 } })
       chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
     } catch { /* chart disposed */ }
+    indStripsRef.current = { volTop: 0.82, rsiTop: null, macdTop: null }
 
     const bundle: IndSeriesBundle = { settings: s, lastPts: {} }
     const overlayOpts = { lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false } as const
@@ -2242,7 +2328,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
       if (s.rsi.enabled) {
         bundle.rsi = chart.addLineSeries({
-          priceScaleId: 'rsi', color: '#f472b6', lineWidth: 1, ...overlayOpts,
+          priceScaleId: 'rsi', color: '#f472b6', lineWidth: 1, ...overlayOpts, crosshairMarkerVisible: true,
           autoscaleInfoProvider: () => ({ priceRange: { minValue: 0, maxValue: 100 } }),
         })
         bundle.rsi.createPriceLine({ price: 70, color: 'rgba(113,113,122,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' })
@@ -2250,8 +2336,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
       if (s.macd.enabled) {
         bundle.macdHist = chart.addHistogramSeries({ priceScaleId: 'macd', lastValueVisible: false, priceLineVisible: false })
-        bundle.macdLine = chart.addLineSeries({ priceScaleId: 'macd', color: '#f59e0b', lineWidth: 1, ...overlayOpts })
-        bundle.macdSig = chart.addLineSeries({ priceScaleId: 'macd', color: '#a78bfa', lineWidth: 1, ...overlayOpts })
+        bundle.macdLine = chart.addLineSeries({ priceScaleId: 'macd', color: '#f59e0b', lineWidth: 1, ...overlayOpts, crosshairMarkerVisible: true })
+        bundle.macdSig = chart.addLineSeries({ priceScaleId: 'macd', color: '#a78bfa', lineWidth: 1, ...overlayOpts, crosshairMarkerVisible: true })
         bundle.macdLine.createPriceLine({ price: 0, color: 'rgba(113,113,122,0.55)', lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: '' })
       }
       // squeeze price/volume upward when oscillator strips are enabled
@@ -2261,15 +2347,23 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         chart.priceScale('vol').applyOptions({ scaleMargins: m.vol })
         if (m.rsi) chart.priceScale('rsi').applyOptions({ scaleMargins: m.rsi })
         if (m.macd) chart.priceScale('macd').applyOptions({ scaleMargins: m.macd })
+        indStripsRef.current = {
+          volTop: m.vol.top,
+          rsiTop: m.rsi?.top ?? null,
+          macdTop: m.macd?.top ?? null,
+        }
+      } else {
+        indStripsRef.current = { volTop: 0.82, rsiTop: null, macdTop: null }
       }
       indSeriesRef.current = bundle
       fillIndData(bundle)
+      scheduleRedraw() // strips changed → repaint separators/titles immediately
     } catch { /* chart disposed mid-setup */ }
 
     return () => {
       destroyBundle(indSeriesRef.current)
     }
-  }, [symbol, tf, chartType, settingsVer, ind, fillIndData])
+  }, [symbol, tf, chartType, settingsVer, ind, fillIndData, scheduleRedraw])
 
   // indicators: refill data whenever bars change (initial load / scroll-back
   // prepend) — series lifecycle is owned by the effect above
@@ -2488,10 +2582,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             <PopoverTrigger asChild>
               <button
                 className={cn(
-                  'flex h-7 items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900/80 px-2 text-[11px] font-medium transition-colors',
-                  indActiveCount > 0 ? 'text-emerald-400' : 'text-zinc-400 hover:text-zinc-200',
+                  'flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors',
+                  indOpen
+                    ? 'border-zinc-700 bg-zinc-800 text-emerald-400'
+                    : indActiveCount > 0
+                      ? 'border-zinc-800 bg-zinc-900/80 text-emerald-400'
+                      : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-zinc-200',
                 )}
                 aria-label="Indicators"
+                aria-expanded={indOpen}
                 title="Indicators"
               >
                 <Sigma className="h-3.5 w-3.5" />
@@ -2503,8 +2602,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                 )}
               </button>
             </PopoverTrigger>
-            <PopoverContent align="start" sideOffset={6} className="w-72 border-zinc-800 bg-zinc-950/95 p-3 text-xs text-zinc-200 backdrop-blur-sm">
-              <div className="mb-1.5 flex items-center justify-between">
+            <PopoverContent align="start" sideOffset={6} className="max-h-[70vh] w-[320px] overflow-y-auto border-zinc-800 bg-zinc-950/95 p-2.5 text-xs text-zinc-200 backdrop-blur-sm">
+              <div className="flex items-center justify-between px-1.5 pb-1">
                 <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Indicators</span>
                 <button
                   className="text-[10px] text-zinc-500 transition-colors hover:text-zinc-300"
@@ -2513,61 +2612,82 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                   Reset
                 </button>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
-                <div className="flex items-center gap-2">
-                  <Switch checked={ind.sma.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, enabled: v } }))} aria-label="Toggle SMA" />
-                  <span className="font-medium text-amber-500">SMA</span>
-                </div>
-                <div className="flex items-center gap-1.5 text-zinc-500">
-                  length
-                  <NumField label="SMA length" value={ind.sma.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, period: v } }))} />
-                </div>
-              </div>
-              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
-                <div className="flex items-center gap-2">
-                  <Switch checked={ind.ema.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, enabled: v } }))} aria-label="Toggle EMA" />
-                  <span className="font-medium text-violet-400">EMA</span>
-                </div>
-                <div className="flex items-center gap-1.5 text-zinc-500">
-                  length
-                  <NumField label="EMA length" value={ind.ema.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, period: v } }))} />
+              <div className="px-1.5 pb-1 pt-0.5 text-[9px] font-semibold uppercase tracking-widest text-zinc-600">Overlays</div>
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Switch checked={ind.sma.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, enabled: v } }))} aria-label="Toggle SMA" />
+                    <span className="font-medium text-amber-500">SMA</span>
+                  </div>
+                  <label className="flex items-center gap-1.5 text-zinc-500">
+                    length
+                    <NumField label="SMA length" value={ind.sma.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, sma: { ...p.sma, period: v } }))} />
+                  </label>
                 </div>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Switch checked={ind.ema.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, enabled: v } }))} aria-label="Toggle EMA" />
+                    <span className="font-medium text-violet-400">EMA</span>
+                  </div>
+                  <label className="flex items-center gap-1.5 text-zinc-500">
+                    length
+                    <NumField label="EMA length" value={ind.ema.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, ema: { ...p.ema, period: v } }))} />
+                  </label>
+                </div>
+              </div>
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
                 <div className="flex items-center gap-2">
                   <Switch checked={ind.bb.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, enabled: v } }))} aria-label="Toggle Bollinger Bands" />
                   <span className="font-medium text-fuchsia-400">Bollinger Bands</span>
                 </div>
-                <div className="flex items-center gap-1.5 text-zinc-500">
-                  length
-                  <NumField label="BB length" value={ind.bb.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, period: v } }))} />
-                  mult
-                  <NumField label="BB standard deviation multiplier" value={ind.bb.mult} min={0.5} max={10} step={0.5} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, mult: v } }))} />
+                <div className="mt-1 flex items-center justify-end gap-3 text-zinc-500">
+                  <label className="flex items-center gap-1.5">
+                    length
+                    <NumField label="BB length" value={ind.bb.period} min={2} max={500} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, period: v } }))} />
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    mult
+                    <NumField label="BB standard deviation multiplier" value={ind.bb.mult} min={0.5} max={10} step={0.5} onCommit={(v) => setInd((p) => ({ ...p, bb: { ...p.bb, mult: v } }))} />
+                  </label>
                 </div>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
-                <div className="flex items-center gap-2">
-                  <Switch checked={ind.rsi.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, enabled: v } }))} aria-label="Toggle RSI" />
-                  <span className="font-medium text-pink-400">RSI</span>
-                </div>
-                <div className="flex items-center gap-1.5 text-zinc-500">
-                  length
-                  <NumField label="RSI length" value={ind.rsi.period} min={2} max={200} onCommit={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, period: v } }))} />
+              <div className="px-1.5 pb-1 pt-1.5 text-[9px] font-semibold uppercase tracking-widest text-zinc-600">Oscillators</div>
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Switch checked={ind.rsi.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, enabled: v } }))} aria-label="Toggle RSI" />
+                    <span className="font-medium text-pink-400">RSI</span>
+                  </div>
+                  <label className="flex items-center gap-1.5 text-zinc-500">
+                    length
+                    <NumField label="RSI length" value={ind.rsi.period} min={2} max={200} onCommit={(v) => setInd((p) => ({ ...p, rsi: { ...p.rsi, period: v } }))} />
+                  </label>
                 </div>
               </div>
-              <div className="flex items-center justify-between gap-2 rounded px-1 py-1.5 hover:bg-zinc-900/60">
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
                 <div className="flex items-center gap-2">
                   <Switch checked={ind.macd.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, enabled: v } }))} aria-label="Toggle MACD" />
                   <span className="font-medium text-amber-500">MACD</span>
                 </div>
-                <div className="flex items-center gap-1.5 text-zinc-500">
-                  fast
-                  <NumField label="MACD fast" value={ind.macd.fast} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, fast: v } }))} />
-                  slow
-                  <NumField label="MACD slow" value={ind.macd.slow} min={2} max={400} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, slow: v } }))} />
-                  signal
-                  <NumField label="MACD signal" value={ind.macd.signal} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, signal: v } }))} />
+                <div className="mt-1 flex items-center justify-end gap-2 text-zinc-500">
+                  <label className="flex items-center gap-1.5">
+                    fast
+                    <NumField label="MACD fast" value={ind.macd.fast} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, fast: v } }))} />
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    slow
+                    <NumField label="MACD slow" value={ind.macd.slow} min={2} max={400} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, slow: v } }))} />
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    signal
+                    <NumField label="MACD signal" value={ind.macd.signal} min={1} max={200} onCommit={(v) => setInd((p) => ({ ...p, macd: { ...p.macd, signal: v } }))} />
+                  </label>
                 </div>
+              </div>
+              <div className="mt-1 border-t border-zinc-800/80 px-1.5 pt-1.5 text-[10px] leading-4 text-zinc-600">
+                Saved automatically · applies to every chart
               </div>
             </PopoverContent>
           </Popover>
