@@ -117,6 +117,11 @@ export async function GET(req: Request) {
     const exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> = {}
     const byTradeSym = new Map(rows.map((r) => [normSymbol(r.tradeSymbol), r]))
     const visit = (o: TradingOrder) => {
+      // `held` legs ride a PENDING (unfilled) entry family — they are not
+      // exits of an open position (their parent hasn't filled). Skipping them
+      // keeps a separate pending bracket on the same symbol from overwriting
+      // the position's real exits (legs are visible via the nested merge).
+      if (o.status === 'held') return
       const key = normSymbol(o.symbol)
       if (byTradeSym.has(key)) {
         const bucket = exits[key] || {}

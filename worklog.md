@@ -543,3 +543,37 @@ Stage Summary:
 - Drag-to-modify (pending entry/TP/SL and position exits) verified end-to-end on the current build — the reported "both TP/SL disappeared" is not reproducible in current code; the user's tab was talking to a stale instance (hard refresh / reopen the preview tab picks up the fixed bundle).
 - Hardening shipped: pending levels autoscale into view, stale-order-id auto-retry for drag bursts, double-refresh after every replace, quiet wash-trade retry logging.
 - Files: src/components/chart/ChartPanel.tsx (autoscale + patchExitPrice/patchPendingOrder attempt param + delayed second refresh), src/lib/trading.ts (attachWarnSig log-once).
+
+---
+Task ID: 17
+Agent: main
+Task: Fix "SL/TP drag does not work — once moved, both TP/SL disappeared" (US stocks only, AAPL; crypto unaffected)
+
+Work Log:
+- Ground-truthed Alpaca paper API with live probes (scripts-tmp/probe-bracket.mjs + inline probes):
+  - PATCH on a bracket CHILD leg: 200, sibling leg survives (works).
+  - PATCH on a bracket PARENT in `accepted` status: 422 "cannot replace order in accepted status" -> EVERY stock pending-order drag falls to the cancel+re-place fallback.
+  - DELETE/cancel of a bracket parent cascades to the WHOLE family (parent + both legs die).
+  - Re-place POST after cancel is validated against the entry: TP must be >= base+0.01 (long) / <= base-0.01 (short), SL mirrored; a crossing drag 422s ("take_profit.limit_price must be >= base_price + 0.01") AFTER the family was already canceled -> both TP/SL lost. Crypto never hits this (plan rides in client_order_id, no Alpaca validation).
+  - Flat /v2/orders?status=open (nested=false) returns bracket parents with legs=null: pending TP/SL invisible after re-place (new parent has a random client_order_id, so the ttb- plan decode no longer applies) -> lines vanish even on SUCCESSFUL drags.
+- Reconstructed the user's session from paper order history (Oct 18 22:55-23:03 UTC): multiple cancel+re-place cycles; at 22:57:35 and 23:03:11 families canceled with NO re-place (crossing drags) — confirmed the total-loss mechanism.
+- Fixes in src/lib/trading.ts:
+  1. replacePendingEntrySmart: pre-validate the FINAL entry/TP/SL combo BEFORE any cancel (long: TP above entry, SL below; short mirrored) and reject crossing drags with actionable messages ("Take-profit must stay above the entry price (X) for a long entry — drag it above the entry line"), status 422, note "Rejected before cancel — order untouched".
+  2. replacePendingEntrySmart: restore-on-failure — if the re-place POST fails after cancel, re-post the ORIGINAL prices (buildPlaceBody(origLimit0, origTp0, origSl0)) and return "Change rejected (...) — original order restored" so a transient rejection can never lose the exits.
+  3. getOpenOrders: fetch flat AND nested=true in parallel, merge by id (nested wins when it carries legs) — bracket legs now always visible to callers (fixes (pend) TP/SL disappearing after a successful re-place).
+  4. closePositionFull: skip status=held orders (held legs ride a pending entry family; canceling them would strip the pending entry's exits).
+- src/app/api/trading/positions/route.ts: exits visit() skips status=held legs so a separate pending family on the same symbol can't overwrite a position's real exits.
+- Verified server-side via app API (login -> place AAPL bracket 325/380/300 -> drags): valid SL 300->315 (TP kept 380), valid entry 325->320 (legs kept), valid TP 380->395 (SL kept 300), crossing TP 380->320 rejected 422 with family intact (orderId unchanged), crossing SL rejected likewise. Crypto regression: BTC/USD plan entry SL 74000->75000 cancel-replace with plan re-encoded (TP preserved).
+- Browser E2E (agent-browser, session ttdrop): real UI login (trader + TOTP), AAPL chart, pixel-scanned the overlay canvas for the dashed TP (green #22c55e) / SL (rose #f43f5e) / entry (mint #34d399) lines:
+  - Drag TP 380 -> dropped at ~352: API shows tp=352.03, sl=300 preserved, both lines re-rendered (screenshot).
+  - Drag TP below entry: toast "Update failed — Take-profit must stay above the entry price (325)..." and BOTH lines intact (screenshot /tmp/crossing-toast.png).
+  - Drag SL 300 -> ~314.13: API sl=314.13, tp=352.03 preserved (screenshot).
+  - Drag SL above entry: toast "Stop-loss must stay below the entry price (325)...", lines intact.
+- bun run lint clean; dev.log shows no runtime errors from the new paths; paper account left with 0 open orders.
+
+Stage Summary:
+- Root cause was TWO stacked Alpaca behaviors: (a) bracket parents in accepted status refuse PATCH -> every stock drag takes cancel+re-place; (b) a crossing drag makes the re-place 422 AFTER the family cancel -> both legs lost; plus (c) flat order lists hide legs -> lines vanish even when the re-place succeeds.
+- Crypto was immune because its TP/SL plan is client-side encoded (no Alpaca validation) and its exits are standalone orders.
+- Stock pending-entry drags are now safe: crossing drags are rejected BEFORE any cancel (family untouched, clear toast), and any post-cancel failure restores the original order.
+- Known limitation (not fixed here): dragging a TP of an ACTIVE position below market would make it marketable (Alpaca fills it — position closes); that is "as dragged" behavior, not data loss.
+- Queued for active-position legs (needs market open to E2E): PATCH on active legs verified working via probe (held-leg probe: 200, sibling survives); sibling-heal fallback in replaceExitOrderSmart still re-places exits as standalones (OCO link lost) — acceptable rare path.

@@ -214,7 +214,26 @@ export async function getPositions(userId: string, mode: TradeMode) {
 
 export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: string) {
   const q = symbol ? `&symbols=${encodeURIComponent(symbol)}` : ''
-  return tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100${q}`)
+  // Alpaca hides bracket legs from the DEFAULT (nested=false) list: an open
+  // bracket parent comes back with legs=null, so pending-entry TP/SL (and any
+  // exit mapped from legs) is invisible to callers. The nested=true variant
+  // nests the legs under the parent — but a FILLED parent's ACTIVE legs only
+  // show in the flat list. Fetch BOTH and merge by id (nested wins when it
+  // carries legs) so both shapes are always covered.
+  const [flat, nested] = await Promise.all([
+    tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100${q}`),
+    tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100&nested=true${q}`),
+  ])
+  const flatRows: TradingOrder[] = Array.isArray(flat.data) ? flat.data : []
+  const nestedRows: TradingOrder[] = Array.isArray(nested.data) ? nested.data : []
+  if (nestedRows.length === 0) return flat
+  const byId = new Map<string, TradingOrder>()
+  for (const o of flatRows) byId.set(o.id, o)
+  for (const o of nestedRows) {
+    const prev = byId.get(o.id)
+    byId.set(o.id, !prev || (o.legs?.length ?? 0) > 0 ? o : prev)
+  }
+  return { ...flat, data: [...byId.values()] }
 }
 
 export async function getClosedOrders(userId: string, mode: TradeMode, limit = 30) {
@@ -780,9 +799,26 @@ async function waitUntilCanceled(userId: string, host: TradeMode, orderId: strin
  * (unfilled) entry order — the chart drag on the dashed entry / (pend)
  * TP / SL lines lands here.
  *
- * - STOCK bracket parents: a direct PATCH accepts limit_price plus
- *   take_profit/stop_loss bodies — both legs' prices are always sent so the
- *   untouched leg keeps its level.
+ * Verified against the paper API (2026-10, the "US-stock drag kills both
+ * TP/SL" bug):
+ * - Alpaca REFUSES a PATCH on a bracket parent in `accepted` status
+ *   (422 "cannot replace order in accepted status") — so EVERY stock
+ *   pending-order drag takes the cancel+re-place fallback below.
+ * - Canceling the parent cascades to the WHOLE family (parent + both legs).
+ * - The re-place POST is then validated by Alpaca against the entry price:
+ *   TP must be >= base+0.01 (long) / <= base-0.01 (short), SL mirrored.
+ *   A drag that crossed the entry made the POST 422 AFTER the family was
+ *   already canceled — both TP/SL lines vanished (crypto never hits this:
+ *   its plan rides in the client_order_id with no Alpaca-side validation).
+ *
+ * Therefore:
+ * - STOCK bracket parents: pre-validate the final entry/TP/SL combo BEFORE
+ *   any cancel and reject crossing drags with a clear message (the family
+ *   stays on the chart); a direct PATCH is still attempted first when the
+ *   order is in a replaceable state.
+ * - If the re-place POST fails for ANY reason after the cancel, the ORIGINAL
+ *   prices are re-posted (restore) so a transient rejection can never lose
+ *   the exits.
  * - CRYPTO managed entries (`ttb-` plan in client_order_id): ALWAYS cancel →
  *   wait → re-place with a freshly encoded plan. A direct PATCH replaces the
  *   order WITHOUT carrying the client_order_id over (verified live: the
@@ -791,8 +827,6 @@ async function waitUntilCanceled(userId: string, host: TradeMode, orderId: strin
  *   Re-placing keeps the REMAINING qty (a partially filled entry keeps its
  *   fill).
  * - Plain limit entries (no plan): direct PATCH on limit_price.
- * - Any direct-PATCH rejection falls back to cancel+re-place with a full
- *   body (mirrors replaceExitOrderSmart's strategy).
  */
 export async function replacePendingEntrySmart(
   userId: string,
@@ -831,6 +865,10 @@ export async function replacePendingEntrySmart(
     const n = parseFloat(v)
     return Number.isFinite(n) && n > 0 ? n : null
   }
+  // pre-drag prices (for the restore-on-failure re-post)
+  const origLimit0 = num(orig.limit_price)
+  const origTp0 = num(exitLegs.find((l) => l.type === 'limit')?.limit_price) ?? plan?.tp ?? null
+  const origSl0 = num(exitLegs.find((l) => l.type === 'stop' || l.type === 'stop_limit')?.stop_price) ?? plan?.sl ?? null
   // current TP/SL: requested patch wins, else the parent's legs, else the plan
   const curTp =
     patch.tp ??
@@ -850,6 +888,50 @@ export async function replacePendingEntrySmart(
   // crypto plan orders ALWAYS re-place: a direct PATCH drops the ttb-
   // client_order_id (verified live), losing the TP/SL plan entirely
   const managedCrypto = Boolean(plan)
+
+  // ---- STOCK bracket validation (BEFORE any cancel — this is the fix for
+  // the "drag kills both TP/SL" bug). Alpaca validates bracket legs against
+  // the entry price and the cancel+re-place fallback is UNAVOIDABLE for
+  // stock brackets (PATCH refused on accepted-status parents), so a crossing
+  // drag would cancel the family and then fail the re-place — total loss.
+  // Reject the drag up-front with an actionable message; nothing is canceled
+  // and the chart refresh restores the lines at their old prices.
+  const basePx = newLimit ?? (orig.type === 'stop_limit' || orig.type === 'stop' ? num(orig.stop_price) : null)
+  if (!crypto && basePx != null && (curTp != null || curSl != null)) {
+    const long = orig.side === 'buy'
+    const tick = 0.01
+    const entry = fmtPx(basePx, false)
+    if (curTp != null) {
+      const okTp = long ? curTp >= basePx + tick : curTp <= basePx - tick
+      if (!okTp) {
+        return {
+          data: null,
+          status: 422,
+          mode: host,
+          error: long
+            ? `Take-profit must stay above the entry price (${entry}) for a long entry — drag it above the entry line`
+            : `Take-profit must stay below the entry price (${entry}) for a short entry — drag it below the entry line`,
+          method: 'replace',
+          note: 'Rejected before cancel — order untouched',
+        }
+      }
+    }
+    if (curSl != null) {
+      const okSl = long ? curSl <= basePx - tick : curSl >= basePx + tick
+      if (!okSl) {
+        return {
+          data: null,
+          status: 422,
+          mode: host,
+          error: long
+            ? `Stop-loss must stay below the entry price (${entry}) for a long entry — drag it below the entry line`
+            : `Stop-loss must stay above the entry price (${entry}) for a short entry — drag it above the entry line`,
+          method: 'replace',
+          note: 'Rejected before cancel — order untouched',
+        }
+      }
+    }
+  }
 
   // 2) direct PATCH (limit change and/or leg price updates, no new legs)
   if (!addsLeg && !managedCrypto) {
@@ -885,35 +967,56 @@ export async function replacePendingEntrySmart(
   if (!(remaining > 0)) {
     return { data: null, status: 200, mode: host, method: 'cancel-replace', note: 'Entry filled — nothing re-placed' }
   }
-  const body: Record<string, unknown> = {
-    symbol: orig.symbol,
-    qty: String(remaining),
-    side: orig.side,
-    type: orig.type,
-    time_in_force: orig.time_in_force || 'gtc',
-  }
-  if (newLimit != null && (orig.type === 'limit' || orig.type === 'stop_limit')) {
-    body.limit_price = fmtPx(newLimit, crypto)
-  }
-  if (orig.type === 'stop' && curSl != null) body.stop_price = fmtPx(curSl, crypto)
   const wantTp = patch.tp ?? curTp
   const wantSl = patch.sl ?? curSl
   const hadPlan = Boolean(plan) || (orig.legs?.length ?? 0) > 0 || patch.tp != null || patch.sl != null
-  if (hadPlan) {
-    if (isCrypto) {
-      // re-encode the plan — the supervisor attaches legs from it on fill
-      body.client_order_id = encodePlanClientId(host, wantTp ?? null, wantSl ?? null)
-    } else {
-      body.order_class = 'bracket'
-      if (wantTp != null) body.take_profit = { limit_price: fmtPx(wantTp, false) }
-      if (wantSl != null) body.stop_loss = { stop_price: fmtPx(wantSl, false) }
+  const buildPlaceBody = (limit: number | null, tp: number | null, sl: number | null): Record<string, unknown> => {
+    const b: Record<string, unknown> = {
+      symbol: orig.symbol,
+      qty: String(remaining),
+      side: orig.side,
+      type: orig.type,
+      time_in_force: orig.time_in_force || 'gtc',
     }
+    if (limit != null && (orig.type === 'limit' || orig.type === 'stop_limit')) {
+      b.limit_price = fmtPx(limit, crypto)
+    }
+    if (orig.type === 'stop' && sl != null) b.stop_price = fmtPx(sl, crypto)
+    if (hadPlan) {
+      if (isCrypto) {
+        // re-encode the plan — the supervisor attaches legs from it on fill
+        b.client_order_id = encodePlanClientId(host, tp ?? null, sl ?? null)
+      } else {
+        b.order_class = 'bracket'
+        if (tp != null) b.take_profit = { limit_price: fmtPx(tp, false) }
+        if (sl != null) b.stop_loss = { stop_price: fmtPx(sl, false) }
+      }
+    }
+    return b
   }
+
   const r2 = await tradeFetch<TradingOrder>(userId, host, '/v2/orders', {
     method: 'POST',
-    body: JSON.stringify(body),
+    body: JSON.stringify(buildPlaceBody(newLimit, wantTp, wantSl)),
   })
   if (!(r2.data && (r2.data as TradingOrder).id)) {
+    // The family is ALREADY canceled (Alpaca cascades a parent cancel to both
+    // legs) — a failed re-place here used to be the "US-stock drag makes both
+    // TP/SL disappear" bug. Re-post the ORIGINAL prices so a rejected
+    // replacement (validation, transient error) can never lose the exits.
+    const rr = await tradeFetch<TradingOrder>(userId, host, '/v2/orders', {
+      method: 'POST',
+      body: JSON.stringify(buildPlaceBody(origLimit0, origTp0, origSl0)),
+    })
+    if (rr.data && (rr.data as TradingOrder).id) {
+      return {
+        data: rr.data,
+        status: 200,
+        mode: host,
+        method: 'cancel-replace',
+        note: `Change rejected (${r2.error || 'unknown'}) — original order restored`,
+      }
+    }
     return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode: host, method: 'cancel-replace' }
   }
   return { data: r2.data, status: r2.status, mode: host, method: 'cancel-replace' }
@@ -945,6 +1048,10 @@ export async function closePositionFull(
   for (const o of orders) {
     if (exitSide && o.side !== exitSide) continue // keep same-side (entry) orders
     if (exitSide == null && o.type === 'market') continue // no position info: keep entries
+    // `held` legs ride a PENDING (unfilled) entry family on this symbol —
+    // canceling them would strip the pending entry of its TP/SL plan (the
+    // nested merge now makes them visible here). Skip them.
+    if (o.status === 'held') continue
     const c = await cancelOrder(userId, mode, o.id)
     if (c.status === 204 || c.status === 200) canceledExits += 1
   }
