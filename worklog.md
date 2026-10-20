@@ -895,3 +895,27 @@ Work Log:
 Stage Summary:
 - The whole terminal configuration now travels in ONE JSON file: Settings → Config backup → Export/Import. Export carries layout, watchlists, alerts, strategy rules, drawings, calendar alarms, indicator settings, trading defaults AND the decrypted Alpaca/Telegram credentials (with an in-UI plaintext warning); import replaces exactly the sections present, sanitizes everything, re-arms alarms/rules fresh, merges settings instead of clobbering, and hard-reloads for a clean re-hydration. Partial files (e.g. settings-only) are safe; MACD zero/negative levels no longer dropped (bug found and fixed in E2E).
 - The user's live state was restored to the byte after testing (alerts by exact DB rows, indicators key absent, watchlists/layout/settings untouched).
+
+---
+Task ID: 47
+Agent: Z.ai Code (main)
+Task: "For Economic calendar, have your refresh to get the actual value from fxfactory after new released?" — verify/fix that the Economic Calendar fills the "Actual" column with values from ForexFactory after an event is released.
+
+Work Log:
+- Explored CalendarTab.tsx / api/market/calendar/route.ts / lib/calendar.ts. Client already had: fresh fetch on tab open, 10-min auto-refresh, a post-release chase poll (fresh=1 ~60s after next release, then ~90s), manual refresh button.
+- Root cause 1: the faireconomy mirrors (ff_calendar_thisweek.xml/.json) NEVER contain actual values (zero <actual> tags in the feed) — refreshing alone could never populate the Actual column.
+- Root cause 2 (bonus bug): XML feed date/time tags are UTC, but etToIso() read them as America/New_York wall time → every event displayed +4h late (CAD CPI 16:30Z instead of 12:30Z), shifting the red "Now" line and the release-chase trigger too. Verified against the JSON mirror's explicit -04:00 offsets.
+- Verified the FF website calendar page (www.forexfactory.com/calendar?day=octN.YYYY) publishes actuals, rows carry data-event-id, and the feed <url> tag carries a DIFFERENT id namespace (series vs occurrence) → id matching impossible; switched to composite key.
+- Discovered FF page renders in the requester's IP-geolocated timezone (embeds timezone_name: 'Asia/Hong_Kong'; day views group by that zone; verified Sunday-evening UTC events land on the Monday page). Server-side fetch() gets 403 (TLS fingerprinting) while curl passes → scrape shells out to curl via node:child_process execFile.
+- Implemented in src/lib/calendar.ts: curlGet() (curl-based GET with status parsing), fetchDayActuals(day) → { map: "<page-day>|<ccy>|<time>|<title>" → actual, tz } (handles time-group carryover on empty time cells, tag-strip + entity-decode, normPageTime 12h→24h), wallInTz() (Intl formatter cache), mergeActuals() (released events only), enrichActuals() (tz bootstrap from first page; past days scraped once per server lifetime via pastDaysDone; today re-scraped per guard: 60s fresh / 4-min background; ≤6 pages/cycle, sequential; failures stamped + retried later), getEconomicCalendar() now returns enriched events and caches the enriched copy.
+- parseFfXml: times now parsed as UTC (utcToIso), keeps event id (informational). market-types.ts: CalendarEvent gains optional id.
+- CalendarTab.tsx: chase first poll moved 90s→60s, comment updated; footer now reads "Auto-refreshes every 10 min · polls for actuals after each release". route.ts comment documents enrichment.
+- bun run lint: clean.
+- API verification: 23/27 released events have actuals (GDP q/y 4.5%, CAD CPI 0.1%, UK labor data, CNY LPR 3.00%/3.50%…); the 4 misses are All-Day/speech/text releases with no numeric actual (correct). Second call 5-13ms (cache). Only 8 calendar requests in the whole dev.log session — no storm.
+- E2E via agent-browser (gateway :81, trader + TOTP): Economic Calendar tab shows "Live — ForexFactory" badge, released rows in emerald actuals, red "NOW" line exactly between EUR Current Account (08:00, released) and German ZEW (09:00, upcoming), correct Europe/London times, footer updated. Zero page errors; console only benign HMR logs. Screenshots: screens-tmp/calendar-actuals.png, calendar-nowline.png. No layout/watchlist/DB pollution (no tabs changed).
+
+Stage Summary:
+- The calendar now genuinely refreshes actual values from ForexFactory after release: server enriches the Actual column from the FF calendar page (curl scrape, tz-aware day|ccy|time|title merge) on every fresh fetch, and the client chases each release with fresh polls (60s, then every 90s) until the value lands; 10-min auto-refresh covers the rest.
+- Fixed a latent +4h event-time bug (XML feed is UTC, not ET) — displayed times, the red Now line and chase timing are now correct.
+- Request budget bounded: past days scraped once per server lifetime; today at most 1 page per 60s (fresh) / 4 min (background).
+- Artifacts: src/lib/calendar.ts (rewritten scrape+merge), src/lib/market-types.ts (+id), src/components/terminal/tabs/CalendarTab.tsx (chase timing + footer), src/app/api/market/calendar/route.ts (comment). Screenshots in screens-tmp/.

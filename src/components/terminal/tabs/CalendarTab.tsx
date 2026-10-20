@@ -172,12 +172,14 @@ export default function CalendarTab() {
   }, [events])
 
   // When an event's time passes, its "actual" value is published shortly
-  // AFTERWARDS — schedule one fresh (cache-bypassing) fetch ~90s after the
-  // next upcoming event so the value updates without waiting for the 10-min
-  // cycle. The 10-min interval above still covers events nobody waits on.
+  // AFTERWARDS (the server enriches actuals from ForexFactory's calendar
+  // page on each fresh fetch) — poll fresh data a few times after the
+  // release: first ~60s in, then every ~90s for up to 8 minutes, stopping
+  // as soon as the value shows up. The 10-min interval above still covers
+  // events nobody waits on.
   useEffect(() => {
     if (nextEventTime == null) return
-    const wait = Math.min(nextEventTime + 90_000 - Date.now(), REFRESH_INTERVAL_MS)
+    const wait = Math.min(nextEventTime + 60_000 - Date.now(), REFRESH_INTERVAL_MS)
     if (wait <= 0) return
     const id = setTimeout(() => {
       void refresh(true)
@@ -570,7 +572,9 @@ export default function CalendarTab() {
           Times shown in your local timezone
           {filtersActive && hiddenCount > 0 ? ` · ${filtered.length} of ${events.length} events shown` : ''}
         </span>
-        <span className="hidden sm:inline">Auto-refreshes every 10 min</span>
+        <span className="hidden sm:inline">
+          Auto-refreshes every 10 min · polls for actuals after each release
+        </span>
       </footer>
     </div>
   )

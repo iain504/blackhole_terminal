@@ -68,6 +68,8 @@ export interface HeatmapResponse {
 }
 
 export interface CalendarEvent {
+  /** ForexFactory event id (parsed from the XML feed's <url> tag) — used to merge actual values scraped from the FF calendar page. */
+  id?: string
   time: string // ISO UTC
   country: string // currency / country code e.g. USD, EUR
   importance: 'high' | 'medium' | 'low' | string
