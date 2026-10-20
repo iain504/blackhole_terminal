@@ -28,7 +28,7 @@ import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
-  Briefcase, Sigma,
+  Briefcase, Sigma, Square, Type,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -81,6 +81,20 @@ const KIND_LABEL: Record<DrawingKind, string> = {
   vline: 'Vertical line',
   trend: 'Trend line',
   fib: 'Fib retracement',
+  rect: 'Rectangle',
+  text: 'Text',
+}
+
+/** font-size presets for the text annotation editor */
+const TEXT_SIZES = [10, 12, 14, 16, 18, 22, 28]
+
+/** read `meta.text` / `meta.fontSize` safely (meta is opaque Json) */
+function textMeta(meta: unknown): { text: string; fontSize: number } {
+  const m = (meta ?? null) as { text?: unknown; fontSize?: unknown } | null
+  return {
+    text: typeof m?.text === 'string' ? m.text : '',
+    fontSize: typeof m?.fontSize === 'number' && Number.isFinite(m.fontSize) ? m.fontSize : 14,
+  }
 }
 
 const EMPTY_DRAWINGS: Drawing[] = []
@@ -233,6 +247,17 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const pendingTickRef = useRef<StreamTick | null>(null)
   const [showDrawings, setShowDrawings] = useState(true)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
+  const activeColorRef = useRef(activeColor)
+  activeColorRef.current = activeColor
+  // text annotation editor — CREATE mode carries the clicked anchor point,
+  // EDIT mode carries the existing drawing id
+  const [textEdit, setTextEdit] = useState<{
+    text: string
+    fontSize: number
+    color: string
+    create?: { time: number | null; price: number; pane: DrawingPane }
+    target?: { id: string; symbol: string }
+  } | null>(null)
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [editValue, setEditValue] = useState<{
     type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; pctMode?: boolean; pane?: DrawingPane; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
@@ -261,6 +286,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // ghost [+TP]/[+SL] chip rects (rebuilt each overlay pass, hit-tested to
   // let the user DRAG a new exit out of the position line)
   const ghostChipRectsRef = useRef<{ part: 'sl' | 'tp'; x: number; y: number; w: number; h: number }[]>([])
+  // text annotation hit rects (rebuilt each overlay pass, keyed by drawing id —
+  // hitTest reads the exact measured text bounds from here)
+  const textHitRectsRef = useRef<Record<string, { x: number; y: number; w: number; h: number }>>({})
 
   // crosshair sync (multi-chart grid): refs so the chart lifecycle effect
   // always reads fresh values without re-creating the chart
@@ -742,10 +770,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const label =
         draftRef.current
           ? `${KIND_LABEL[draftRef.current.kind]}: click to set end point · Esc to cancel`
-          : `${KIND_LABEL[st.drawingTool as DrawingKind]}: click on the chart${st.drawingTool === 'trend' || st.drawingTool === 'fib' ? ' (2 clicks)' : ''}`
+          : `${KIND_LABEL[st.drawingTool as DrawingKind]}: click on the chart${st.drawingTool === 'trend' || st.drawingTool === 'fib' || st.drawingTool === 'rect' ? ' (2 clicks)' : ''}`
       ctx.fillText(label, 46, 84)
     }
 
+    // text annotation hit rects are rebuilt every pass (drawDrawing fills them)
+    textHitRectsRef.current = {}
     if (st.drawingTool === 'cursor') {
       if (showDrawings) for (const d of ds) drawDrawing(ctx, d, w, h, hoverRef.current === d.id || (dragRef.current?.hit.type === 'drawing' && dragRef.current.hit.id === d.id))
       for (const a of als) drawAlert(ctx, a, w)
@@ -1164,6 +1194,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       ctx.lineWidth = 1.5
       if (draft.kind === 'hline' && p1) hlinePath(ctx, p1.y, w)
       else if (draft.kind === 'vline' && p1) vlinePath(ctx, p1.x, h)
+      else if (draft.kind === 'rect' && p1 && p2) {
+        ctx.strokeRect(
+          Math.min(p1.x, p2.x),
+          Math.min(p1.y, p2.y),
+          Math.abs(p2.x - p1.x),
+          Math.abs(p2.y - p1.y),
+        )
+      }
       else if (p1 && p2) segPath(ctx, p1, p2, w, draft.kind === 'fib')
       ctx.restore()
     }
@@ -1262,6 +1300,43 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }
         dot(ctx, p1.x, p1.y, d.color, highlighted)
         dot(ctx, p2.x, p2.y, d.color, highlighted)
+      }
+    } else if (d.kind === 'rect') {
+      // two-corner rectangle: translucent fill + solid border, corner dots
+      const p1 = pixelPoint(d.points[0])
+      const p2 = pixelPoint(d.points[1])
+      if (p1 && p2) {
+        const x = Math.min(p1.x, p2.x)
+        const y = Math.min(p1.y, p2.y)
+        const rw = Math.abs(p2.x - p1.x)
+        const rh = Math.abs(p2.y - p1.y)
+        ctx.globalAlpha = 0.12
+        ctx.fillStyle = d.color
+        ctx.fillRect(x, y, rw, rh)
+        ctx.globalAlpha = 1
+        ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(rw), Math.round(rh))
+        dot(ctx, p1.x, p1.y, d.color, highlighted)
+        dot(ctx, p2.x, p2.y, d.color, highlighted)
+      }
+    } else if (d.kind === 'text') {
+      // text annotation: anchor pixel = BASELINE LEFT; content + font size in
+      // meta, color is the drawing color. Bounds are stashed for hit-testing.
+      const p = pixelPoint(d.points[0])
+      const { text: txt, fontSize: fs } = textMeta(d.meta)
+      if (p && txt) {
+        ctx.font = `600 ${fs}px ui-sans-serif, system-ui`
+        ctx.textBaseline = 'alphabetic'
+        ctx.fillStyle = d.color
+        ctx.fillText(txt, p.x, p.y)
+        const tw = ctx.measureText(txt).width
+        textHitRectsRef.current[d.id] = { x: p.x - 2, y: p.y - fs - 2, w: tw + 5, h: fs + 7 }
+        if (highlighted) {
+          ctx.setLineDash([3, 3])
+          ctx.lineWidth = 1
+          ctx.strokeStyle = d.color
+          ctx.strokeRect(p.x - 3, p.y - fs - 3, tw + 7, fs + 9)
+          ctx.setLineDash([])
+        }
       }
     }
     ctx.restore()
@@ -1468,7 +1543,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         } else if (d.kind === 'vline') {
           const xl = xOf(d.points[0]?.time ?? null)
           if (xl != null && Math.abs(x - xl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
-        } else {
+        } else if (d.kind === 'trend' || d.kind === 'fib') {
           const p1 = pixelPoint(d.points[0])
           const p2 = pixelPoint(d.points[1])
           if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
@@ -1488,6 +1563,34 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               }
             }
           }
+        } else if (d.kind === 'rect') {
+          // corner dots win, then the 4 EDGES (a filled rect body must NOT
+          // swallow clicks — only its outline is draggable)
+          const p1 = pixelPoint(d.points[0])
+          const p2 = pixelPoint(d.points[1])
+          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
+          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
+          if (p1 && p2) {
+            const x1 = Math.min(p1.x, p2.x)
+            const x2 = Math.max(p1.x, p2.x)
+            const y1 = Math.min(p1.y, p2.y)
+            const y2 = Math.max(p1.y, p2.y)
+            const edges: [{ x: number; y: number }, { x: number; y: number }][] = [
+              [{ x: x1, y: y1 }, { x: x2, y: y1 }],
+              [{ x: x1, y: y1 }, { x: x1, y: y2 }],
+              [{ x: x2, y: y2 }, { x: x2, y: y1 }],
+              [{ x: x2, y: y2 }, { x: x1, y: y2 }],
+            ]
+            for (const [a, b] of edges) {
+              if (distToSeg(x, y, a, b) < 6) return { type: 'drawing', id: d.id, part: 'whole' }
+            }
+          }
+        } else if (d.kind === 'text') {
+          // exact measured bounds from the last overlay pass
+          const r = textHitRectsRef.current[d.id]
+          if (r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+            return { type: 'drawing', id: d.id, part: 'whole' }
+          }
         }
       }
     }
@@ -1500,22 +1603,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   }, [symbol, showDrawings, xOf, yOf, yOfPane])
 
   // ---------- drawing persistence ----------
-  const createDrawing = useCallback(async (kind: DrawingKind, points: DrawingPoint[]) => {
+  const createDrawing = useCallback(async (kind: DrawingKind, points: DrawingPoint[], opts?: { meta?: Record<string, unknown> | null; color?: string }) => {
+    const color = opts?.color ?? activeColor
+    const meta = opts?.meta ?? null
     const optimistic: Drawing = {
       id: `tmp-${Date.now()}`,
       symbol,
       kind,
       points,
-      color: activeColor,
+      color,
       width: 2,
-      meta: null,
+      meta,
     }
     addDrawingLocal(optimistic)
     try {
       const res = await fetch('/api/drawings', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ symbol, kind, points, color: activeColor, width: 2 }),
+        body: JSON.stringify({ symbol, kind, points, color, width: 2, meta }),
       })
       if (res.ok) {
         const json = await res.json()
@@ -1525,7 +1630,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     } catch { /* offline — optimistic stays */ }
   }, [symbol, activeColor, addDrawingLocal, removeDrawingLocal])
 
-  const patchDrawing = useCallback(async (id: string, patch: { points?: DrawingPoint[]; color?: string }) => {
+  const patchDrawing = useCallback(async (id: string, patch: { points?: DrawingPoint[]; color?: string; meta?: Record<string, unknown> | null }) => {
     patchDrawingLocal(id, symbol, patch)
     await fetch(`/api/drawings/${id}`, {
       method: 'PATCH',
@@ -1877,6 +1982,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return
+      // a chart context menu is open — clicks INSIDE it must pass through.
+      // Without this, the capture-phase hitTest below eats the pointerdown
+      // whenever the menu item happens to overlap a drawing/line hit zone
+      // (e.g. a color swatch sitting on a rectangle edge) and the menu button
+      // never receives the click.
+      if (e.target instanceof Element && e.target.closest('[role="menu"]')) return
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
 
@@ -1892,6 +2003,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const pt: DrawingPoint = { time: t, price: p, pane }
         if (tool === 'hline' || tool === 'vline') {
           void createDrawing(tool, [pt])
+          setDrawingTool('cursor')
+        } else if (tool === 'text') {
+          // open the text editor anchored at the click (pane-aware: a text
+          // placed in the RSI strip holds an RSI level and follows the strip)
+          setTextEdit({ text: '', fontSize: 14, color: activeColorRef.current, create: { time: t, price: p, pane } })
           setDrawingTool('cursor')
         } else if (!draftRef.current) {
           draftRef.current = { kind: tool, p1: pt, p2: { ...pt } }
@@ -2190,6 +2306,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       } else if (hit.type === 'drawing') {
         const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
         if (d && d.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price, pane: d.points[0]?.pane ?? 'price' })
+        else if (d && d.kind === 'text') {
+          const tm = textMeta(d.meta)
+          setTextEdit({ text: tm.text, fontSize: tm.fontSize, color: d.color, target: { id: d.id, symbol } })
+        }
       }
     }
 
@@ -3115,6 +3235,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             { tool: 'vline' as const, icon: ArrowUpDown, label: 'Vertical line' },
             { tool: 'trend' as const, icon: TrendingUp, label: 'Trend line (2 clicks)' },
             { tool: 'fib' as const, icon: Ruler, label: 'Fib retracement (2 clicks)' },
+            { tool: 'rect' as const, icon: Square, label: 'Rectangle (2 clicks)' },
+            { tool: 'text' as const, icon: Type, label: 'Text (click to place)' },
           ]
         ).map(({ tool, icon: Icon, label }) => (
           <button
@@ -3233,6 +3355,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }}
         onPatchDrawing={patchDrawing}
         onDeleteDrawing={deleteDrawing}
+        onEditText={(d) => {
+          const tm = textMeta(d.meta)
+          setTextEdit({ text: tm.text, fontSize: tm.fontSize, color: d.color, target: { id: d.id, symbol } })
+        }}
         onPatchAlert={patchAlert}
         onDeleteAlert={deleteAlert}
         onPatchExit={(info, kind, price) => void patchExitPrice(info, kind, price)}
@@ -3275,6 +3401,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         />
       )}
 
+      {/* text annotation editor (create / edit) */}
+      {textEdit && (
+        <TextEditPopover
+          initial={{ text: textEdit.text, fontSize: textEdit.fontSize, color: textEdit.color }}
+          onCancel={() => setTextEdit(null)}
+          onSave={({ text, fontSize, color }) => {
+            const te = textEdit
+            setTextEdit(null)
+            if (!te) return
+            if (te.create) {
+              void createDrawing('text', [{ time: te.create.time, price: te.create.price, pane: te.create.pane }], { meta: { text, fontSize }, color })
+            } else if (te.target) {
+              void patchDrawing(te.target.id, { meta: { text, fontSize }, color })
+            }
+          }}
+        />
+      )}
+
       {/* trade ticket (paper / live via Alpaca Trading API) */}
       {tradeOpen && (
         <TradeTicket
@@ -3300,7 +3444,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 function ContextMenu({
   menu, onClose, container, symbol, posData, indicators, timeframe,
   onAddAlert, onAddIndicatorAlarm, onAddHline, onTrade, onOpenTicket,
-  onEditValue, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
+  onEditValue, onEditText, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
   onPatchExit, onAddExit, onCancelExit, onCancelPending, onClosePosition,
 }: {
   menu: MenuState
@@ -3316,6 +3460,7 @@ function ContextMenu({
   onTrade: (side: 'buy' | 'sell', price?: number) => void
   onOpenTicket: () => void
   onEditValue: (hit: SceneHit) => void
+  onEditText: (d: Drawing) => void
   onPatchDrawing: (id: string, patch: { color?: string }) => Promise<void>
   onDeleteDrawing: (id: string) => Promise<void>
   onPatchAlert: (id: string, patch: Record<string, unknown>) => Promise<void>
@@ -3404,7 +3549,7 @@ function ContextMenu({
           {KIND_LABEL[d.kind]}
           {d.kind === 'hline' && alertPane !== 'price' ? ` · ${alertPane.toUpperCase()} ${fmtPaneValue(alertPane, alertValue)}` : ''}
         </div>
-        {d.kind !== 'vline' && alertPane !== 'vol' && (
+        {d.kind !== 'vline' && d.kind !== 'text' && alertPane !== 'vol' && (
           <MenuItem
             label={
               <span className="flex items-center gap-1.5">
@@ -3424,6 +3569,9 @@ function ContextMenu({
         )}
         {d.kind === 'hline' && (
           <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(drawingHit); onClose() }} />
+        )}
+        {d.kind === 'text' && (
+          <MenuItem label="✏️ Edit text…" onClick={() => { onEditText(d); onClose() }} />
         )}
         <ColorRow
           active={d.color}
@@ -3778,6 +3926,86 @@ function EditValuePopover({ value, onSave, onCancel, label }: { value: number; o
         <div className="mt-3 flex justify-end gap-2">
           <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={onCancel}>Cancel</Button>
           <Button size="sm" className="h-7 bg-emerald-500 text-xs text-zinc-950 hover:bg-emerald-400" onClick={() => onSave(parseFloat(v))}>
+            Apply
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Text annotation editor (Task 51): type the content, pick a font size and
+ *  color, live preview, Enter/Apply commits. Empty text = cancel. */
+function TextEditPopover({
+  initial, onSave, onCancel,
+}: {
+  initial: { text: string; fontSize: number; color: string }
+  onSave: (v: { text: string; fontSize: number; color: string }) => void
+  onCancel: () => void
+}) {
+  const [text, setText] = useState(initial.text)
+  const [fontSize, setFontSize] = useState(initial.fontSize)
+  const [color, setColor] = useState(initial.color)
+  const commit = () => {
+    const t = text.trim()
+    if (!t) return
+    onSave({ text: t, fontSize, color })
+  }
+  return (
+    <div className="absolute inset-0 z-50 flex items-center justify-center">
+      <button className="absolute inset-0 bg-black/40" onClick={onCancel} aria-label="Cancel" />
+      <div className="relative w-72 rounded-lg border border-zinc-700 bg-zinc-900 p-4 shadow-xl">
+        <p className="mb-2 text-xs font-medium text-zinc-300">{initial.text ? 'Edit text' : 'Add text'}</p>
+        <Input
+          autoFocus
+          value={text}
+          maxLength={120}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              commit()
+            }
+            if (e.key === 'Escape') onCancel()
+          }}
+          placeholder="Type the annotation…"
+          aria-label="Text content"
+          className="border-zinc-700 bg-zinc-950 text-sm"
+        />
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="text-[10px] uppercase tracking-wider text-zinc-500">Size</span>
+          <select
+            value={fontSize}
+            onChange={(e) => setFontSize(Number(e.target.value))}
+            aria-label="Font size"
+            className="h-7 rounded-md border border-zinc-700 bg-zinc-950 px-1.5 text-xs text-zinc-200"
+          >
+            {TEXT_SIZES.map((s) => (
+              <option key={s} value={s}>{s}px</option>
+            ))}
+          </select>
+          <span className="ml-1 text-[10px] uppercase tracking-wider text-zinc-500">Color</span>
+          <div className="flex items-center gap-1">
+            {DRAW_COLORS.map((c) => (
+              <button
+                key={c}
+                aria-label={`Text color ${c}`}
+                className={cn('h-4 w-4 rounded-full', color === c && 'ring-2 ring-white/70')}
+                style={{ backgroundColor: c }}
+                onClick={() => setColor(c)}
+              />
+            ))}
+          </div>
+        </div>
+        {/* live preview — same font stack/weight the canvas renderer uses */}
+        <div className="mt-3 rounded border border-zinc-800 bg-zinc-950 px-2 py-1.5">
+          <span className="block truncate font-semibold" style={{ fontSize, color }}>
+            {text || 'Preview'}
+          </span>
+        </div>
+        <div className="mt-3 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={onCancel}>Cancel</Button>
+          <Button size="sm" className="h-7 bg-emerald-500 text-xs text-zinc-950 hover:bg-emerald-400" disabled={!text.trim()} onClick={commit}>
             Apply
           </Button>
         </div>

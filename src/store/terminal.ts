@@ -85,7 +85,9 @@ export interface DrawingPoint {
   pane?: DrawingPane
 }
 
-export type DrawingKind = 'hline' | 'vline' | 'trend' | 'fib'
+/** rect = two-corner rectangle · text = text annotation (content + fontSize
+ *  live in meta: { text, fontSize }, color is the drawing color) */
+export type DrawingKind = 'hline' | 'vline' | 'trend' | 'fib' | 'rect' | 'text'
 
 export interface Drawing {
   id: string
@@ -226,6 +228,12 @@ interface TerminalState {
   updateWatchlist: (id: string, patch: { name?: string; color?: string; sortOrder?: number }) => Promise<void>
   moveWatchlist: (id: string, dir: -1 | 1) => Promise<void>
   addSymbolToWatchlist: (watchlistId: string, symbol: string) => Promise<AddSymbolResult>
+  // group separators: an item starting with '#' ("#Tech") is a section header,
+  // not a symbol — the items array order IS the grouping, so separators ride
+  // the same PATCH endpoint / export format as plain symbols
+  addGroupToWatchlist: (watchlistId: string, name: string) => Promise<{ ok: boolean; reason?: 'invalid' | 'duplicate' | 'error' }>
+  renameWatchlistGroup: (watchlistId: string, oldName: string, newName: string) => Promise<{ ok: boolean; reason?: 'invalid' | 'duplicate' | 'error' }>
+  deleteWatchlistGroup: (watchlistId: string, name: string) => Promise<void>
   removeSymbolFromWatchlist: (watchlistId: string, symbol: string) => Promise<void>
   /** drag & drop reorder: move items[from] to index to (clamped), persisted */
   reorderWatchlistSymbol: (watchlistId: string, from: number, to: number) => Promise<void>
@@ -669,16 +677,31 @@ export const useTerminal = create<TerminalState>((set, get) => ({
 
   // drag & drop reorder — the items ARRAY order IS the persisted sort (the
   // PATCH endpoint stores it verbatim; export/import carries the same array)
+  // `from`/`to` are ORIGINAL-space indices; `to` is an insertion boundary
+  // (drop on a row's top half → its index, bottom half → index+1)
   reorderWatchlistSymbol: async (watchlistId, from, to) => {
     const list = get().watchlists.find((l) => l.id === watchlistId)
     if (!list) return
     if (from < 0 || from >= list.items.length) return
     const to2 = Math.max(0, Math.min(list.items.length, to))
     if (to2 === from || to2 === from + 1) return // same place — no-op
+    const isSep = (s: string) => s.startsWith('#')
     const items = [...list.items]
-    const [sym] = items.splice(from, 1)
-    // moving DOWN: removing the item first shifts the target left by one
-    items.splice(from < to2 ? to2 - 1 : to2, 0, sym)
+    if (isSep(items[from])) {
+      // dragging a SEPARATOR moves the whole group block (marker + its symbols)
+      let end = from + 1
+      while (end < items.length && !isSep(items[end])) end++
+      const block = items.splice(from, end - from)
+      // map the boundary into the array AFTER the block was extracted, then
+      // apply the same moving-down offset as single-row moves
+      const b = to2 > from ? Math.max(from, to2 - block.length) : to2
+      const ins = Math.max(0, Math.min(items.length, from < to2 ? b - 1 : b))
+      items.splice(ins, 0, ...block)
+    } else {
+      const [sym] = items.splice(from, 1)
+      // moving DOWN: removing the item first shifts the target left by one
+      items.splice(from < to2 ? to2 - 1 : to2, 0, sym)
+    }
     set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
     try {
       const res = await fetch(`/api/watchlists/${watchlistId}`, {
@@ -689,6 +712,82 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       if (!res.ok) await get().loadWatchlists() // resync to source of truth
     } catch {
       /* offline — optimistic order stays; next action resyncs */
+    }
+  },
+
+  // ---- group separators ("#Tech", "#Health") ----
+  addGroupToWatchlist: async (watchlistId, name) => {
+    const list = get().watchlists.find((l) => l.id === watchlistId)
+    if (!list) return { ok: false, reason: 'error' }
+    const n = name.trim().replace(/^#+/, '').trim()
+    if (!n || n.length > 24) return { ok: false, reason: 'invalid' }
+    const sep = `#${n}`
+    // a group name must not duplicate another group or collide with a symbol
+    const clash = list.items.some((i) => i.toLowerCase() === sep.toLowerCase() || i.toUpperCase() === n.toUpperCase())
+    if (clash) return { ok: false, reason: 'duplicate' }
+    const items = [...list.items, sep].slice(0, 50)
+    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+    try {
+      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      if (!res.ok) {
+        await get().loadWatchlists()
+        return { ok: false, reason: 'error' }
+      }
+      return { ok: true }
+    } catch {
+      return { ok: false, reason: 'error' }
+    }
+  },
+
+  renameWatchlistGroup: async (watchlistId, oldName, newName) => {
+    const list = get().watchlists.find((l) => l.id === watchlistId)
+    if (!list) return { ok: false, reason: 'error' }
+    const n = newName.trim().replace(/^#+/, '').trim()
+    if (!n || n.length > 24) return { ok: false, reason: 'invalid' }
+    const sep = `#${n}`
+    const oldSep = `#${oldName}`
+    if (n.toLowerCase() !== oldName.toLowerCase()) {
+      const clash = list.items.some((i) => i !== oldSep && (i.toLowerCase() === sep.toLowerCase() || i.toUpperCase() === n.toUpperCase()))
+      if (clash) return { ok: false, reason: 'duplicate' }
+    }
+    const items = list.items.map((i) => (i.toLowerCase() === oldSep.toLowerCase() ? sep : i))
+    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+    try {
+      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      if (!res.ok) {
+        await get().loadWatchlists()
+        return { ok: false, reason: 'error' }
+      }
+      return { ok: true }
+    } catch {
+      return { ok: false, reason: 'error' }
+    }
+  },
+
+  // deleting a group keeps its symbols — they become ungrouped (only the
+  // marker row is removed)
+  deleteWatchlistGroup: async (watchlistId, name) => {
+    const list = get().watchlists.find((l) => l.id === watchlistId)
+    if (!list) return
+    const sep = `#${name}`
+    const items = list.items.filter((i) => i.toLowerCase() !== sep.toLowerCase())
+    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+    try {
+      await fetch(`/api/watchlists/${watchlistId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+    } catch {
+      /* offline — optimistic removal stays */
     }
   },
 

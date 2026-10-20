@@ -23,7 +23,20 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (typeof body.color === 'string') data.color = body.color
     if (typeof body.sortOrder === 'number') data.sortOrder = body.sortOrder
     if (Array.isArray(body.items)) {
-      const items = [...new Set(body.items.map((s) => String(s).trim().toUpperCase()).filter(Boolean))].slice(0, 50)
+      // entries starting with '#' are GROUP SEPARATORS, not symbols — keep
+      // their case so group names render as the user typed them (real symbols
+      // are uppercased)
+      const items = [
+        ...new Set(
+          body.items
+            .map((s) => {
+              const t = String(s).trim()
+              if (!t) return ''
+              return t.startsWith('#') ? `#${t.slice(1).trim().slice(0, 30)}` : t.toUpperCase()
+            })
+            .filter(Boolean),
+        ),
+      ].slice(0, 50)
       data.items = items
     }
     const updated = await db.watchlist.update({ where: { id }, data })

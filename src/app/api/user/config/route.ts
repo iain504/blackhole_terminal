@@ -210,7 +210,7 @@ function sanitizeDrawing(raw: unknown): SanitizedDrawing | null {
   if (!r) return null
   const symbol = str(r.symbol).toUpperCase()
   if (!symbol || symbol.length > 24) return null
-  const kind = ['hline', 'vline', 'trend', 'fib'].includes(str(r.kind)) ? str(r.kind) : null
+  const kind = ['hline', 'vline', 'trend', 'fib', 'rect', 'text'].includes(str(r.kind)) ? str(r.kind) : null
   if (!kind || !Array.isArray(r.points) || r.points.length === 0) return null
   const width = clampInt(r.width, 1, 6, 2)
   return {
@@ -261,7 +261,13 @@ export async function POST(req: Request) {
           if (!name) return null
           const items = (Array.isArray(r.items) ? r.items : [])
             .filter((i): i is string => typeof i === 'string')
-            .map((i) => i.trim().toUpperCase().slice(0, 24))
+            .map((i) => {
+              const t = i.trim()
+              // "#Tech" entries are GROUP SEPARATORS — keep their case (real
+              // symbols are uppercased)
+              if (!t) return ''
+              return t.startsWith('#') ? `#${t.slice(1).trim().slice(0, 30)}` : t.toUpperCase().slice(0, 24)
+            })
             .filter(Boolean)
             .slice(0, 500)
           return {

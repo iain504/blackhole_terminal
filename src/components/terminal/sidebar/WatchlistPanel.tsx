@@ -4,6 +4,9 @@
 // symbol, price, daily change, daily % (Task 13 #2/#4, Task 16 #2).
 // Symbol input has live prediction (symbols starting with the typed query,
 // backed by the Alpaca asset universe) and rejects unknown symbols.
+// Group separators (Task 51): an items entry starting with '#' ("#Tech")
+// renders a user-defined section header — symbols can be dragged into/out of
+// groups and the separator itself drags its whole block (order persists).
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, Watchlist } from '@/store/terminal'
 import { fmtPrice } from '@/lib/market-types'
@@ -19,9 +22,19 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil, GripVertical } from 'lucide-react'
+import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil, GripVertical, FolderPlus } from 'lucide-react'
 
 const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
+
+/** group separator marker: an items entry starting with '#' is a section
+ *  header, not a symbol (symbol format /^[A-Z0-9./:-]+$/ can never clash) */
+const isSep = (s: string) => s.startsWith('#')
+/** number of real symbols between a separator (at idx) and the next one */
+const groupSize = (items: string[], idx: number) => {
+  let n = 0
+  for (let j = idx + 1; j < items.length && !isSep(items[j]); j++) n++
+  return n
+}
 
 interface QuoteRow {
   symbol: string
@@ -49,6 +62,9 @@ export function WatchlistPanel() {
   const updateWatchlist = useTerminal((s) => s.updateWatchlist)
   const moveWatchlist = useTerminal((s) => s.moveWatchlist)
   const reorderWatchlistSymbol = useTerminal((s) => s.reorderWatchlistSymbol)
+  const addGroupToWatchlist = useTerminal((s) => s.addGroupToWatchlist)
+  const renameWatchlistGroup = useTerminal((s) => s.renameWatchlistGroup)
+  const deleteWatchlistGroup = useTerminal((s) => s.deleteWatchlistGroup)
 
   const [quotes, setQuotes] = useState<Record<string, QuoteRow>>({})
   const [newSymbol, setNewSymbol] = useState('')
@@ -69,9 +85,16 @@ export function WatchlistPanel() {
   const { toast } = useToast()
 
   // drag & drop reordering (HTML5): index of the row being dragged and the
-  // index it currently hovers over (drives the drop indicator line)
+  // insertion boundary it currently hovers over (drives the drop indicator line)
   const [dragFrom, setDragFrom] = useState<number | null>(null)
   const [dragOver, setDragOver] = useState<number | null>(null)
+
+  // group create / rename dialogs
+  const [groupOpen, setGroupOpen] = useState(false)
+  const [groupName, setGroupName] = useState('')
+  const [groupRenameOpen, setGroupRenameOpen] = useState(false)
+  const [groupRenameName, setGroupRenameName] = useState('')
+  const [groupRenameTarget, setGroupRenameTarget] = useState('')
 
   const list: Watchlist | undefined = lists.find((l) => l.id === activeId) || lists[0]
 
@@ -83,7 +106,7 @@ export function WatchlistPanel() {
   // without a live upstream keep the full 10s poll (no simulated ticks exist
   // anymore). Skips entirely while the page is hidden; a hidden→visible
   // switch refreshes immediately.
-  const itemsKey = list?.items.join(',') ?? ''
+  const itemsKey = (list?.items ?? []).filter((i) => !isSep(i)).join(',')
   const tickAtRef = useRef<Map<string, number>>(new Map())
   useEffect(() => {
     if (!itemsKey) return
@@ -249,6 +272,52 @@ export function WatchlistPanel() {
     setCreateOpen(false)
   }
 
+  const createGroup = async () => {
+    if (!list) return
+    const name = groupName.trim()
+    if (!name) return
+    const res = await addGroupToWatchlist(list.id, name)
+    if (res.ok) {
+      setGroupName('')
+      setGroupOpen(false)
+    } else {
+      toast({
+        title: 'Cannot create group',
+        description:
+          res.reason === 'duplicate'
+            ? `A group or symbol named “${name}” already exists in “${list.name}”.`
+            : res.reason === 'invalid'
+              ? 'Group name must be 1-24 characters.'
+              : 'Could not save — please try again.',
+        variant: 'destructive',
+      })
+    }
+  }
+
+  const submitGroupRename = async () => {
+    if (!list || !groupRenameTarget) return
+    const name = groupRenameName.trim()
+    if (!name || name === groupRenameTarget) {
+      setGroupRenameOpen(false)
+      return
+    }
+    const res = await renameWatchlistGroup(list.id, groupRenameTarget, name)
+    if (res.ok) {
+      setGroupRenameOpen(false)
+    } else {
+      toast({
+        title: 'Cannot rename group',
+        description:
+          res.reason === 'duplicate'
+            ? `A group or symbol named “${name}” already exists in “${list.name}”.`
+            : res.reason === 'invalid'
+              ? 'Group name must be 1-24 characters.'
+              : 'Could not save — please try again.',
+        variant: 'destructive',
+      })
+    }
+  }
+
   const openRename = (l: Watchlist) => {
     setRenameTargetId(l.id)
     setRenameName(l.name)
@@ -289,6 +358,51 @@ export function WatchlistPanel() {
     setDragOver(null)
   }
 
+  // separator rows: a dragged SYMBOL always drops BELOW the marker (first row
+  // of that group); a dragged SEPARATOR keeps the regular half-row boundaries
+  // and moves its whole block (store handles the block extraction)
+  const onSepDragOver = (e: React.DragEvent<HTMLDivElement>, idx: number) => {
+    if (dragFrom == null || !list) return
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    if (isSep(list.items[dragFrom])) {
+      const r = e.currentTarget.getBoundingClientRect()
+      const after = e.clientY > r.top + r.height / 2
+      const target = after ? idx + 1 : idx
+      setDragOver(target === dragFrom || target === dragFrom + 1 ? null : target)
+    } else {
+      setDragOver(idx + 1)
+    }
+  }
+
+  const onSepDrop = (e: React.DragEvent<HTMLDivElement>, idx: number) => {
+    e.preventDefault()
+    if (dragFrom == null || !list) {
+      setDragFrom(null)
+      setDragOver(null)
+      return
+    }
+    if (isSep(list.items[dragFrom])) {
+      const r = e.currentTarget.getBoundingClientRect()
+      const after = e.clientY > r.top + r.height / 2
+      const toIdx = after ? idx + 1 : idx
+      if (toIdx !== dragFrom && toIdx !== dragFrom + 1) {
+        void reorderWatchlistSymbol(list.id, dragFrom, toIdx)
+      }
+    } else {
+      // land as the FIRST row of the group: insertion boundary below the
+      // marker; when moving down the store's offset eats one — compensate so
+      // the symbol ends up after the marker in both directions
+      const toIdx = idx + 1
+      const to = dragFrom < toIdx ? toIdx + 1 : toIdx
+      if (to !== dragFrom && to !== dragFrom + 1) {
+        void reorderWatchlistSymbol(list.id, dragFrom, to)
+      }
+    }
+    setDragFrom(null)
+    setDragOver(null)
+  }
+
   return (
     <div className="flex h-full flex-col text-xs" ref={listRef}>
       {/* list switcher */}
@@ -306,12 +420,24 @@ export function WatchlistPanel() {
           >
             <span className="h-2 w-2 rounded-full" style={{ backgroundColor: l.color }} />
             {l.name}
-            <span className="text-zinc-600">{l.items.length}</span>
+            <span className="text-zinc-600">{l.items.filter((i) => !isSep(i)).length}</span>
           </button>
         ))}
         <Button variant="ghost" size="icon" className="h-5 w-5 text-zinc-500 hover:text-zinc-200" onClick={() => setCreateOpen(true)} aria-label="New watchlist">
           <Plus className="h-3.5 w-3.5" />
         </Button>
+        {list && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-5 w-5 text-zinc-500 hover:text-zinc-200"
+            onClick={() => { setGroupName(''); setGroupOpen(true) }}
+            aria-label="New group separator"
+            title="New group separator (e.g. Tech, Health)"
+          >
+            <FolderPlus className="h-3.5 w-3.5" />
+          </Button>
+        )}
       </div>
 
       {list && (
@@ -428,7 +554,70 @@ export function WatchlistPanel() {
             {list.items.length === 0 && (
               <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Empty — add symbols above</p>
             )}
-            {list.items.map((sym, idx) => {
+            {list.items.map((entry, idx) => {
+              if (isSep(entry)) {
+                // ---- group separator (user-defined section header) ----
+                const name = entry.slice(1)
+                const draggingSep = dragFrom != null && isSep(list.items[dragFrom])
+                const isDragged = dragFrom === idx
+                const dropAbove = draggingSep && dragOver === idx
+                const dropBelow = dragFrom != null && dragOver === idx + 1
+                return (
+                  <div
+                    key={`${entry}-${idx}`}
+                    className={cn(
+                      'group flex cursor-pointer items-center gap-1 border-l-2 px-2 py-1',
+                      isDragged && 'opacity-40',
+                      dropAbove && 'border-t-2 border-t-emerald-500',
+                      dropBelow && 'border-b-2 border-b-emerald-500',
+                    )}
+                    style={{ borderLeftColor: list.color }}
+                    draggable
+                    onDragStart={(e) => {
+                      setDragFrom(idx)
+                      e.dataTransfer.effectAllowed = 'move'
+                      e.dataTransfer.setData('text/plain', entry) // required by Firefox
+                    }}
+                    onDragOver={(e) => onSepDragOver(e, idx)}
+                    onDrop={(e) => onSepDrop(e, idx)}
+                    onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
+                  >
+                    <GripVertical
+                      className="h-3 w-3 shrink-0 cursor-grab text-zinc-600 opacity-0 transition-opacity group-hover:opacity-100"
+                      aria-hidden
+                    />
+                    <span className="min-w-0 flex-1 truncate text-[10px] font-bold uppercase tracking-widest text-zinc-300">
+                      {name}
+                    </span>
+                    <span className="text-[10px] tabular-nums text-zinc-600">{groupSize(list.items, idx)}</span>
+                    <button
+                      className="h-4 w-4 shrink-0 rounded text-zinc-600 opacity-0 hover:text-zinc-200 group-hover:opacity-100"
+                      aria-label={`Rename group ${name}`}
+                      title="Rename group"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setGroupRenameTarget(name)
+                        setGroupRenameName(name)
+                        setGroupRenameOpen(true)
+                      }}
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      className="-mr-1 h-4 w-4 shrink-0 rounded text-zinc-600 opacity-0 hover:text-rose-400 group-hover:opacity-100"
+                      aria-label={`Delete group ${name} (symbols are kept)`}
+                      title="Delete group (symbols are kept)"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void deleteWatchlistGroup(list.id, name)
+                      }}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                )
+              }
+              const sym = entry
               const q = quotes[sym]
               const up = (q?.changePct ?? 0) >= 0
               const isActive = activeTab?.type === 'chart' && activeTab.symbol === sym
@@ -569,6 +758,54 @@ export function WatchlistPanel() {
               </span>
             </Button>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* new group separator dialog */}
+      <Dialog open={groupOpen} onOpenChange={setGroupOpen}>
+        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+          <DialogHeader>
+            <DialogTitle className="text-sm text-zinc-100">New group separator</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={groupName}
+            maxLength={24}
+            onChange={(e) => setGroupName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void createGroup()}
+            placeholder="Group name (Tech, Health…)"
+            aria-label="Group name"
+            className="border-zinc-800 bg-zinc-950 text-sm"
+          />
+          <p className="text-[10px] leading-4 text-zinc-600">
+            Drag symbols onto the separator to group them; drag the separator to move the whole group.
+          </p>
+          <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" disabled={!groupName.trim()} onClick={() => void createGroup()}>
+            Create group
+          </Button>
+        </DialogContent>
+      </Dialog>
+
+      {/* rename group dialog */}
+      <Dialog open={groupRenameOpen} onOpenChange={setGroupRenameOpen}>
+        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+          <DialogHeader>
+            <DialogTitle className="text-sm text-zinc-100">Rename group</DialogTitle>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={groupRenameName}
+            maxLength={24}
+            onChange={(e) => setGroupRenameName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void submitGroupRename()}
+            onFocus={(e) => e.target.select()}
+            placeholder="Group name"
+            aria-label="New group name"
+            className="border-zinc-800 bg-zinc-950 text-sm"
+          />
+          <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" disabled={!groupRenameName.trim()} onClick={() => void submitGroupRename()}>
+            Save name
+          </Button>
         </DialogContent>
       </Dialog>
     </div>
