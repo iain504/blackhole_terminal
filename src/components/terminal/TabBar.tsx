@@ -7,7 +7,7 @@ import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
-  PanelsTopLeft, Crosshair, Check, Layers, Bot,
+  PanelsTopLeft, Crosshair, Check, Layers, Bot, ChartColumnBig,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -26,6 +26,7 @@ const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart 
   heatmap: { label: 'Heat Map', icon: Flame },
   positions: { label: 'Positions', icon: Layers },
   strategy: { label: 'Strategy Orders', icon: Bot },
+  report: { label: 'Report', icon: ChartColumnBig },
 }
 
 export function TabBar({
@@ -198,6 +199,9 @@ export function TabBar({
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => addTab('strategy')} className="gap-2 text-xs">
               <Bot className="h-3.5 w-3.5" /> Strategy Orders
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTab('report')} className="gap-2 text-xs">
+              <ChartColumnBig className="h-3.5 w-3.5" /> Performance Report
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

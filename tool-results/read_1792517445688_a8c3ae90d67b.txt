@@ -1,0 +1,737 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→// Terminal root: auth gate, tab bar, 5s layout autosave, alert engine polling.
+     4→     4→import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+     5→     5→import { useTerminal, SessionUser, Alert } from '@/store/terminal'
+     6→     6→import AuthForms from '@/components/auth/AuthForms'
+     7→     7→import SettingsDialog from '@/components/settings/SettingsDialog'
+     8→     8→import { TabBar } from './TabBar'
+     9→     9→import { ChartWorkspace } from './ChartWorkspace'
+    10→    10→import CalendarTab from './tabs/CalendarTab'
+    11→    11→import HeatmapTab from './tabs/HeatmapTab'
+    12→    12→import PositionsTab from './tabs/PositionsTab'
+    13→    13→import StrategyTab from './tabs/StrategyTab'
+    14→    14→import { StrategyDrawer } from './StrategyDrawer'
+    15→    15→import { useToast } from '@/hooks/use-toast'
+    16→    16→import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
+    17→    17→import { Button } from '@/components/ui/button'
+    18→    18→import { Badge } from '@/components/ui/badge'
+    19→    19→import { Input } from '@/components/ui/input'
+    20→    20→import { fmtPrice } from '@/lib/market-types'
+    21→    21→import { ttLog } from '@/lib/console-log'
+    22→    22→import { cn } from '@/lib/utils'
+    23→    23→import { ConsoleDrawer } from './ConsoleDrawer'
+    24→    24→
+    25→    25→export function TerminalRoot({ onExit }: { onExit?: () => void }) {
+    26→    26→  const user = useTerminal((s) => s.user)
+    27→    27→  const hydrated = useTerminal((s) => s.hydrated)
+    28→    28→  const setUser = useTerminal((s) => s.setUser)
+    29→    29→  const setHydrated = useTerminal((s) => s.setHydrated)
+    30→    30→  const { toast } = useToast()
+    31→    31→  const [settingsOpen, setSettingsOpen] = useState(false)
+    32→    32→  const [alertsOpen, setAlertsOpen] = useState(false)
+    33→    33→  const [strategiesOpen, setStrategiesOpen] = useState(false)
+    34→    34→  const meFetched = useRef(false)
+    35→    35→
+    36→    36→  const loadUserData = useCallback(async (u: SessionUser) => {
+    37→    37→    const store = useTerminal.getState()
+    38→    38→    try {
+    39→    39→      const res = await fetch('/api/layout')
+    40→    40→      if (res.ok) {
+    41→    41→        const json = await res.json()
+    42→    42→        if (json.data) store.hydrateFromServer(json.data)
+    43→    43→      }
+    44→    44→    } catch { /* offline */ }
+    45→    45→    if (!useTerminal.getState().activeTabId) {
+    46→    46→      useTerminal.setState({ activeTabId: useTerminal.getState().tabs[0].id })
+    47→    47→    }
+    48→    48→    await Promise.all([store.loadWatchlists(), store.loadAlerts(), store.loadStrategies()])
+    49→    49→  }, [])
+    50→    50→
+    51→    51→  // Session check on mount
+    52→    52→  useEffect(() => {
+    53→    53→    if (meFetched.current) return
+    54→    54→    meFetched.current = true
+    55→    55→    ;(async () => {
+    56→    56→      try {
+    57→    57→        const res = await fetch('/api/auth/me')
+    58→    58→        const json = await res.json()
+    59→    59→        if (json.user) {
+    60→    60→          setUser(json.user)
+    61→    61→          await loadUserData(json.user)
+    62→    62→        }
+    63→    63→      } catch { /* offline */ }
+    64→    64→      setHydrated(true)
+    65→    65→    })()
+    66→    66→  }, [setUser, setHydrated, loadUserData])
+    67→    67→
+    68→    68→  // Autosave layout every 5s when dirty (Task 16 #3)
+    69→    69→  useEffect(() => {
+    70→    70→    if (!user) return
+    71→    71→    const timer = setInterval(() => {
+    72→    72→      const store = useTerminal.getState()
+    73→    73→      if (!store.layoutDirty) return
+    74→    74→      const data = store.layoutSnapshot()
+    75→    75→      fetch('/api/layout', {
+    76→    76→        method: 'PUT',
+    77→    77→        headers: { 'content-type': 'application/json' },
+    78→    78→        body: JSON.stringify({ data }),
+    79→    79→      })
+    80→    80→        .then((r) => {
+    81→    81→          if (r.ok) store.markLayoutClean()
+    82→    82→          else ttLog('layout', `Autosave failed (HTTP ${r.status}) — will retry`, 'warn')
+    83→    83→        })
+    84→    84→        .catch(() => ttLog('layout', 'Autosave failed (network) — will retry', 'warn'))
+    85→    85→    }, 5000)
+    86→    86→    return () => clearInterval(timer)
+    87→    87→  }, [user])
+    88→    88→
+    89→    89→  // Flush unsaved layout on tab close
+    90→    90→  useEffect(() => {
+    91→    91→    if (!user) return
+    92→    92→    const handler = () => {
+    93→    93→      const store = useTerminal.getState()
+    94→    94→      if (!store.layoutDirty) return
+    95→    95→      const data = JSON.stringify({ data: store.layoutSnapshot() })
+    96→    96→      navigator.sendBeacon?.('/api/layout', new Blob([data], { type: 'application/json' }))
+    97→    97→    }
+    98→    98→    window.addEventListener('beforeunload', handler)
+    99→    99→    return () => window.removeEventListener('beforeunload', handler)
+   100→   100→  }, [user])
+   101→   101→
+   102→   102→  // Alert engine polling (Task 14 #2 / 16 #6) — every 30s
+   103→   103→  useEffect(() => {
+   104→   104→    if (!user) return
+   105→   105→    let stopped = false
+   106→   106→    const check = async () => {
+   107→   107→      try {
+   108→   108→        const res = await fetch('/api/alerts/check', { method: 'POST' })
+   109→   109→        if (!res.ok) return
+   110→   110→        const json = await res.json()
+   111→   111→        if (!json.triggered?.length) {
+   112→   112→          // still refresh list so server-side changes (e.g. multi-tab) appear
+   113→   113→          if (!stopped) useTerminal.getState().loadAlerts()
+   114→   114→          return
+   115→   115→        }
+   116→   116→        for (const t of json.triggered) {
+   117→   117→          toast({
+   118→   118→            title: `🔔 Alert: ${t.symbol}`,
+   119→   119→            description: t.message || `Price is ${t.direction === 'above' ? 'above' : 'below'} ${t.target} — now ${t.price}`,
+   120→   120→          })
+   121→   121→          ttLog('alerts', `🔔 ${t.symbol} ${t.message || `${t.direction} ${t.target} — now ${t.price}`}`, 'warn')
+   122→   122→        }
+   123→   123→        if (!stopped) useTerminal.getState().loadAlerts()
+   124→   124→      } catch { /* offline */ }
+   125→   125→    }
+   126→   126→    check()
+   127→   127→    const timer = setInterval(check, 30000)
+   128→   128→    return () => {
+   129→   129→      stopped = true
+   130→   130→      clearInterval(timer)
+   131→   131→    }
+   132→   132→  }, [user, toast])
+   133→   133→
+   134→   134→  // Strategy-bot polling (Task 44) — every 20s; server also self-evaluates
+   135→   135→  useEffect(() => {
+   136→   136→    if (!user) return
+   137→   137→    // the Strategy Orders tab (and empty state) can request the drawer
+   138→   138→    const open = () => setStrategiesOpen(true)
+   139→   139→    window.addEventListener('tt:open-strategies', open)
+   140→   140→    return () => window.removeEventListener('tt:open-strategies', open)
+   141→   141→  }, [user])
+   142→   142→
+   143→   143→  useEffect(() => {
+   144→   144→    if (!user) return
+   145→   145→    let stopped = false
+   146→   146→    const check = async () => {
+   147→   147→      try {
+   148→   148→        const res = await fetch('/api/strategies/check', { method: 'POST' })
+   149→   149→        if (!res.ok) return
+   150→   150→        const json = await res.json()
+   151→   151→        const fired = (json.fired || []) as { id: string; symbol: string; action: string; ok: boolean; message: string }[]
+   152→   152→        if (fired.length > 0 && !stopped) {
+   153→   153→          for (const f of fired) {
+   154→   154→            toast({
+   155→   155→              title: f.ok ? `🤖 Strategy fired: ${f.symbol}` : `🤖 Strategy FAILED: ${f.symbol}`,
+   156→   156→              description: f.message,
+   157→   157→              variant: f.ok ? undefined : 'destructive',
+   158→   158→            })
+   159→   159→            ttLog('strategy', `🤖 ${f.symbol} ${f.message}`, f.ok ? 'ok' : 'warn')
+   160→   160→          }
+   161→   161→          window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+   162→   162→        }
+   163→   163→        // always refresh — rules also change server-side (failures, supervisor fires)
+   164→   164→        if (!stopped) useTerminal.getState().loadStrategies()
+   165→   165→      } catch { /* offline */ }
+   166→   166→    }
+   167→   167→    check()
+   168→   168→    const timer = setInterval(check, 20000)
+   169→   169→    return () => {
+   170→   170→      stopped = true
+   171→   171→      clearInterval(timer)
+   172→   172→    }
+   173→   173→  }, [user, toast])
+   174→   174→
+   175→   175→  // Order-fill reaction: poll recent fills, fire toast + sound (trade feature)
+   176→   176→  useEffect(() => {
+   177→   177→    if (!user) return
+   178→   178→    let stopped = false
+   179→   179→    const KEY = 'tt:lastFillAt'
+   180→   180→    if (!localStorage.getItem(KEY)) localStorage.setItem(KEY, new Date().toISOString())
+   181→   181→    const beep = () => {
+   182→   182→      try {
+   183→   183→        const Ctor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+   184→   184→        const ctx = new Ctor()
+   185→   185→        const notes = [880, 1174.7, 1568]
+   186→   186→        notes.forEach((f, i) => {
+   187→   187→          const o = ctx.createOscillator()
+   188→   188→          const g = ctx.createGain()
+   189→   189→          o.type = 'sine'
+   190→   190→          o.frequency.value = f
+   191→   191→          const t0 = ctx.currentTime + i * 0.13
+   192→   192→          g.gain.setValueAtTime(0.0001, t0)
+   193→   193→          g.gain.exponentialRampToValueAtTime(0.14, t0 + 0.02)
+   194→   194→          g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.24)
+   195→   195→          o.connect(g)
+   196→   196→          g.connect(ctx.destination)
+   197→   197→          o.start(t0)
+   198→   198→          o.stop(t0 + 0.26)
+   199→   199→        })
+   200→   200→        setTimeout(() => void ctx.close().catch(() => {}), 1200)
+   201→   201→      } catch { /* audio unavailable */ }
+   202→   202→    }
+   203→   203→    const tick = async () => {
+   204→   204→      const since = localStorage.getItem(KEY) || new Date().toISOString()
+   205→   205→      try {
+   206→   206→        const res = await fetch(`/api/trading/fills?since=${encodeURIComponent(since)}`)
+   207→   207→        if (!res.ok) return
+   208→   208→        const json = await res.json()
+   209→   209→        // advance the marker even when nothing new (or trading not configured)
+   210→   210→        localStorage.setItem(KEY, new Date().toISOString())
+   211→   211→        if (json.configured === false) return
+   212→   212→        const fills = (json.fills || []) as { id: string; symbol: string; side: string; qty: number; price: number | null; type: string }[]
+   213→   213→        if (fills.length > 0 && !stopped) {
+   214→   214→          for (const f of fills) {
+   215→   215→            toast({
+   216→   216→              title: `💼 ${f.side === 'buy' ? 'Bought' : 'Sold'} ${f.qty} ${f.symbol}`,
+   217→   217→              description: f.price ? `Filled @ ${f.price} · ${f.type}` : `Filled · ${f.type}`,
+   218→   218→            })
+   219→   219→            ttLog('trading', `💼 ${f.side === 'buy' ? 'Bought' : 'Sold'} ${f.qty} ${f.symbol}${f.price ? ` @ ${f.price}` : ''} · ${f.type}`, 'ok')
+   220→   220→          }
+   221→   221→          beep()
+   222→   222→          window.dispatchEvent(new CustomEvent('tt:positions-changed'))
+   223→   223→        }
+   224→   224→      } catch { /* offline */ }
+   225→   225→    }
+   226→   226→    const timer = setInterval(tick, 12000)
+   227→   227→    const t0 = setTimeout(tick, 2500)
+   228→   228→    return () => {
+   229→   229→      stopped = true
+   230→   230→      clearInterval(timer)
+   231→   231→      clearTimeout(t0)
+   232→   232→    }
+   233→   233→  }, [user, toast])
+   234→   234→
+   235→   235→  if (!hydrated) {
+   236→   236→    return (
+   237→   237→      <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-zinc-400">
+   238→   238→        <div className="flex items-center gap-3 text-sm">
+   239→   239→          <Loader2 className="h-5 w-5 animate-spin" />
+   240→   240→          Loading TradeTerminal…
+   241→   241→        </div>
+   242→   242→      </div>
+   243→   243→    )
+   244→   244→  }
+   245→   245→
+   246→   246→  if (!user) {
+   247→   247→    return (
+   248→   248→      <div className="min-h-screen bg-zinc-950">
+   249→   249→        <AuthForms
+   250→   250→          onAuthed={(u) => {
+   251→   251→            setUser(u)
+   252→   252→            loadUserData(u)
+   253→   253→          }}
+   254→   254→        />
+   255→   255→      </div>
+   256→   256→    )
+   257→   257→  }
+   258→   258→
+   259→   259→  return (
+   260→   260→    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-200">
+   261→   261→      <TabBar
+   262→   262→        onOpenSettings={() => setSettingsOpen(true)}
+   263→   263→        alertsOpen={alertsOpen}
+   264→   264→        setAlertsOpen={setAlertsOpen}
+   265→   265→        strategiesOpen={strategiesOpen}
+   266→   266→        setStrategiesOpen={setStrategiesOpen}
+   267→   267→      />
+   268→   268→      <main className="flex min-h-0 flex-1 flex-col">
+   269→   269→        <ActiveTabContent />
+   270→   270→      </main>
+   271→   271→      <ConsoleDrawer />
+   272→   272→      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+   273→   273→      {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
+   274→   274→      {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
+   275→   275→      {/* footer stays glued to bottom on short viewports */}
+   276→   276→      <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
+   277→   277→        <span className="flex min-w-0 items-center">
+   278→   278→          {onExit && (
+   279→   279→            <button
+   280→   280→              onClick={onExit}
+   281→   281→              title="Back to landing page"
+   282→   282→              aria-label="Back to landing page"
+   283→   283→              className="mr-2 flex h-6 w-6 shrink-0 items-center justify-center rounded text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+   284→   284→            >
+   285→   285→              <Home className="h-3.5 w-3.5" />
+   286→   286→            </button>
+   287→   287→          )}
+   288→   288→          <span className="truncate">
+   289→   289→            TradeTerminal · data: <span className="text-zinc-400">Alpaca</span>
+   290→   290→            {useTerminal.getState().tabs.length > 0 && <BadgeDemoInline />}
+   291→   291→          </span>
+   292→   292→        </span>
+   293→   293→        <span className="flex items-center gap-3">
+   294→   294→          <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
+   295→   295→          <LiveClock />
+   296→   296→        </span>
+   297→   297→      </footer>
+   298→   298→    </div>
+   299→   299→  )
+   300→   300→}
+   301→   301→
+   302→   302→// Ticking local clock for the footer (updates every second).
+   303→   303→// Renders a placeholder until mounted so SSR/CSR markup always matches.
+   304→   304→function LiveClock() {
+   305→   305→  const [now, setNow] = useState<Date | null>(null)
+   306→   306→  useEffect(() => {
+   307→   307→    setNow(new Date())
+   308→   308→    const timer = setInterval(() => setNow(new Date()), 1000)
+   309→   309→    return () => clearInterval(timer)
+   310→   310→  }, [])
+   311→   311→  const tz = useMemo(() => {
+   312→   312→    try {
+   313→   313→      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local'
+   314→   314→    } catch {
+   315→   315→      return 'Local'
+   316→   316→    }
+   317→   317→  }, [])
+   318→   318→  const city = tz.includes('/') ? tz.split('/').pop()!.replace(/_/g, ' ') : tz
+   319→   319→  const time = now
+   320→   320→    ? now.toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+   321→   321→    : '--:--:--'
+   322→   322→  return (
+   323→   323→    <span
+   324→   324→      className="flex items-center gap-1.5 tabular-nums text-zinc-300"
+   325→   325→      title={now ? `${now.toLocaleDateString('en-GB', { weekday: 'short', day: '2-digit', month: 'short' })} ${time} · ${tz}` : tz}
+   326→   326→    >
+   327→   327→      <Clock className="h-3 w-3 text-emerald-500" aria-hidden="true" />
+   328→   328→      <span>{time}</span>
+   329→   329→      <span className="hidden text-[9px] uppercase tracking-wider text-zinc-600 sm:inline">{city}</span>
+   330→   330→    </span>
+   331→   331→  )
+   332→   332→}
+   333→   333→
+   334→   334→function BadgeDemoInline() {
+   335→   335→  const { demo, reason } = useDemoMeta()
+   336→   336→  if (!demo) return null
+   337→   337→  const rejected = reason === 'alpaca-http-401' || reason === 'alpaca-http-403'
+   338→   338→  return (
+   339→   339→    <Badge
+   340→   340→      variant="outline"
+   341→   341→      title={
+   342→   342→        rejected
+   343→   343→          ? 'Alpaca rejected the saved keys — open Settings and re-check them'
+   344→   344→          : 'Demo data — add your Alpaca API keys in Settings'
+   345→   345→      }
+   346→   346→      className={
+   347→   347→        rejected
+   348→   348→          ? 'ml-2 border-rose-500/40 text-[10px] text-rose-400'
+   349→   349→          : 'ml-2 border-amber-500/40 text-[10px] text-amber-400'
+   350→   350→      }
+   351→   351→    >
+   352→   352→      {rejected ? 'keys rejected — check Settings' : 'demo data — add Alpaca keys in Settings'}
+   353→   353→    </Badge>
+   354→   354→  )
+   355→   355→}
+   356→   356→
+   357→   357→function useDemoMeta(): { demo: boolean; reason?: string } {
+   358→   358→  const [meta, setMeta] = useState<{ demo: boolean; reason?: string }>({ demo: false })
+   359→   359→  useEffect(() => {
+   360→   360→    let alive = true
+   361→   361→    const check = async () => {
+   362→   362→      try {
+   363→   363→        const res = await fetch('/api/market/quote', {
+   364→   364→          method: 'POST',
+   365→   365→          headers: { 'content-type': 'application/json' },
+   366→   366→          body: JSON.stringify({ symbols: ['AAPL'] }),
+   367→   367→        })
+   368→   368→        if (!res.ok || !alive) return
+   369→   369→        const json = await res.json()
+   370→   370→        if (alive) setMeta({ demo: Boolean(json.meta?.demo), reason: json.meta?.reason })
+   371→   371→      } catch { /* offline */ }
+   372→   372→    }
+   373→   373→    check()
+   374→   374→    // Re-check right after keys are saved/changed and periodically, so the
+   375→   375→    // badge never lies after Settings are updated without a page reload.
+   376→   376→    window.addEventListener('tt:settings-changed', check)
+   377→   377→    const timer = setInterval(check, 60000)
+   378→   378→    return () => {
+   379→   379→      alive = false
+   380→   380→      window.removeEventListener('tt:settings-changed', check)
+   381→   381→      clearInterval(timer)
+   382→   382→    }
+   383→   383→  }, [])
+   384→   384→  return meta
+   385→   385→}
+   386→   386→
+   387→   387→function ActiveTabContent() {
+   388→   388→  const tabs = useTerminal((s) => s.tabs)
+   389→   389→  const activeTabId = useTerminal((s) => s.activeTabId)
+   390→   390→  const active = tabs.find((t) => t.id === activeTabId) || tabs[0]
+   391→   391→  if (!active) return null
+   392→   392→  if (active.type === 'calendar') return <CalendarTab />
+   393→   393→  if (active.type === 'heatmap') return <HeatmapTab />
+   394→   394→  if (active.type === 'positions') return <PositionsTab />
+   395→   395→  if (active.type === 'strategy') return <StrategyTab />
+   396→   396→  return <ChartWorkspace key={active.id} tab={active} />
+   397→   397→}
+   398→   398→
+   399→   399→const ALERT_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M'] as const
+   400→   400→const TF_LABEL: Record<string, string> = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1D': '1D', '1W': '1W', '1M': '1M' }
+   401→   401→
+   402→   402→/** One-line human summary of an alarm (any kind) for the list. */
+   403→   403→function alertSummary(a: Alert): string {
+   404→   404→  if (a.kind === 'rsi') {
+   405→   405→    return `RSI(${a.params?.period ?? 14}) crosses ${a.direction === 'above' ? 'above' : 'below'} ${a.price} · ${TF_LABEL[a.timeframe] ?? a.timeframe}`
+   406→   406→  }
+   407→   407→  if (a.kind === 'macd') {
+   408→   408→    const p = a.params ?? {}
+   409→   409→    const base = `MACD(${p.fast ?? 12},${p.slow ?? 26},${p.signal ?? 9})`
+   410→   410→    const cond =
+   411→   411→      a.condition === 'bull_cross' ? 'bullish crossover'
+   412→   412→      : a.condition === 'bear_cross' ? 'bearish crossover'
+   413→   413→      : a.condition === 'cross_above' ? `crosses above ${a.price}`
+   414→   414→      : a.condition === 'cross_below' ? `crosses below ${a.price}`
+   415→   415→      : 'crossover'
+   416→   416→    return `${base} ${cond} · ${TF_LABEL[a.timeframe] ?? a.timeframe}`
+   417→   417→  }
+   418→   418→  if (a.kind === 'trend') {
+   419→   419→    // the level MOVES with the bound trend line — show the crossing direction
+   420→   420→    // plus the level the line had when the alarm was created
+   421→   421→    return `Trend line · crosses ${a.direction === 'above' ? 'up' : 'down'} · level was ${fmtPrice(a.price)}`
+   422→   422→  }
+   423→   423→  return `${a.direction === 'above' ? '≥' : '≤'} ${fmtPrice(a.price)}`
+   424→   424→}
+   425→   425→
+   426→   426→function AlertsDrawer({ onClose }: { onClose: () => void }) {
+   427→   427→  const alerts = useTerminal((s) => s.alerts)
+   428→   428→  const addAlertLocal = useTerminal((s) => s.addAlertLocal)
+   429→   429→  const patchAlertLocal = useTerminal((s) => s.patchAlertLocal)
+   430→   430→  const removeAlertLocal = useTerminal((s) => s.removeAlertLocal)
+   431→   431→  const activeTab = useTerminal((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0])
+   432→   432→
+   433→   433→  // ---- creation form state ----
+   434→   434→  const [kind, setKind] = useState<'price' | 'rsi' | 'macd'>('rsi')
+   435→   435→  const [symbol, setSymbol] = useState('')
+   436→   436→  const [tf, setTf] = useState('1D')
+   437→   437→  // price alarm fields
+   438→   438→  const [price, setPrice] = useState('')
+   439→   439→  const [dir, setDir] = useState<'above' | 'below'>('above')
+   440→   440→  // rsi fields
+   441→   441→  const [rsiPeriod, setRsiPeriod] = useState('14')
+   442→   442→  const [rsiLevel, setRsiLevel] = useState('70')
+   443→   443→  // macd fields
+   444→   444→  const [fast, setFast] = useState('12')
+   445→   445→  const [slow, setSlow] = useState('26')
+   446→   446→  const [signal, setSignal] = useState('9')
+   447→   447→  const [cond, setCond] = useState<'bull_cross' | 'bear_cross' | 'cross_above' | 'cross_below'>('bull_cross')
+   448→   448→  const [macdLevel, setMacdLevel] = useState('0')
+   449→   449→  const [creating, setCreating] = useState(false)
+   450→   450→  const symTouched = useRef(false)
+   451→   451→
+   452→   452→  // prefill symbol/timeframe from the active chart tab (once)
+   453→   453→  useEffect(() => {
+   454→   454→    if (symTouched.current) return
+   455→   455→    if (activeTab?.symbol) {
+   456→   456→      setSymbol(activeTab.symbol)
+   457→   457→      if (activeTab.timeframe) setTf(activeTab.timeframe)
+   458→   458→    }
+   459→   459→  }, [activeTab?.symbol, activeTab?.timeframe])
+   460→   460→
+   461→   461→  // RSI level default flips with the direction (70 overbought / 30 oversold)
+   462→   462→  const flipRsiLevel = (d: 'above' | 'below') => {
+   463→   463→    setDir(d)
+   464→   464→    if (!symTouched.current || rsiLevel === '70' || rsiLevel === '30') setRsiLevel(d === 'above' ? '70' : '30')
+   465→   465→  }
+   466→   466→
+   467→   467→  const create = async () => {
+   468→   468→    const sym = symbol.trim().toUpperCase()
+   469→   469→    if (!sym) return
+   470→   470→    setCreating(true)
+   471→   471→    try {
+   472→   472→      const body: Record<string, unknown> =
+   473→   473→        kind === 'price'
+   474→   474→          ? {
+   475→   475→              symbol: sym, kind, price: parseFloat(price),
+   476→   476→              direction: dir, color: '#f59e0b',
+   477→   477→            }
+   478→   478→          : kind === 'rsi'
+   479→   479→            ? {
+   480→   480→                symbol: sym, kind, price: parseFloat(rsiLevel),
+   481→   481→                direction: dir, timeframe: tf,
+   482→   482→                params: { period: parseInt(rsiPeriod, 10) }, color: '#f472b6',
+   483→   483→              }
+   484→   484→            : {
+   485→   485→                symbol: sym, kind, condition: cond, timeframe: tf,
+   486→   486→                price: parseFloat(macdLevel) || 0,
+   487→   487→                params: { fast: parseInt(fast, 10), slow: parseInt(slow, 10), signal: parseInt(signal, 10) },
+   488→   488→                color: '#f59e0b',
+   489→   489→              }
+   490→   490→      const res = await fetch('/api/alerts', {
+   491→   491→        method: 'POST',
+   492→   492→        headers: { 'content-type': 'application/json' },
+   493→   493→        body: JSON.stringify(body),
+   494→   494→      })
+   495→   495→      const json = await res.json().catch(() => null)
+   496→   496→      if (res.ok && json?.alert) {
+   497→   497→        addAlertLocal(json.alert as Alert)
+   498→   498→      } else {
+   499→   499→        ttLog('alerts', `Create alarm failed: ${json?.error || res.status}`, 'warn')
+   500→   500→      }
+   501→   501→    } catch { /* offline */ } finally {
+   502→   502→      setCreating(false)
+   503→   503→    }
+   504→   504→  }
+   505→   505→
+   506→   506→  const toggle = async (id: string, status: string) => {
+   507→   507→    const next = status === 'paused' ? 'active' : 'paused'
+   508→   508→    patchAlertLocal(id, { status: next })
+   509→   509→    await fetch(`/api/alerts/${id}`, {
+   510→   510→      method: 'PATCH',
+   511→   511→      headers: { 'content-type': 'application/json' },
+   512→   512→      body: JSON.stringify({ status: next }),
+   513→   513→    })
+   514→   514→  }
+   515→   515→  const remove = async (id: string) => {
+   516→   516→    removeAlertLocal(id)
+   517→   517→    await fetch(`/api/alerts/${id}`, { method: 'DELETE' })
+   518→   518→  }
+   519→   519→
+   520→   520→  const formValid =
+   521→   521→    kind === 'price'
+   522→   522→      ? Number.isFinite(parseFloat(price)) && parseFloat(price) > 0 && symbol.trim().length > 0
+   523→   523→      : kind === 'rsi'
+   524→   524→        ? Number.isFinite(parseFloat(rsiLevel)) && parseFloat(rsiLevel) > 0 && symbol.trim().length > 0
+   525→   525→        : cond === 'cross_above' || cond === 'cross_below'
+   526→   526→          ? Number.isFinite(parseFloat(macdLevel)) && symbol.trim().length > 0
+   527→   527→          : symbol.trim().length > 0
+   528→   528→
+   529→   529→  return (
+   530→   530→    <div className="fixed inset-0 z-50" role="dialog" aria-label="Alerts">
+   531→   531→      <button className="absolute inset-0 bg-black/50" onClick={onClose} aria-label="Close alerts" />
+   532→   532→      <div className="absolute right-3 top-12 w-[340px] max-w-[calc(100vw-24px)] rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl">
+   533→   533→        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 text-sm font-medium">
+   534→   534→          <span className="flex items-center gap-2">
+   535→   535→            <BellRing className="h-4 w-4 text-amber-400" /> Alerts
+   536→   536→          </span>
+   537→   537→          <Button variant="ghost" size="sm" onClick={onClose} className="h-7 px-2 text-xs">
+   538→   538→            Close
+   539→   539→          </Button>
+   540→   540→        </div>
+   541→   541→
+   542→   542→        {/* ---- new alarm form ---- */}
+   543→   543→        <div className="border-b border-zinc-800 p-2.5">
+   544→   544→          <div className="mb-2 flex items-center gap-1.5">
+   545→   545→            {(['price', 'rsi', 'macd'] as const).map((k) => (
+   546→   546→              <button
+   547→   547→                key={k}
+   548→   548→                onClick={() => setKind(k)}
+   549→   549→                aria-pressed={kind === k}
+   550→   550→                className={cn(
+   551→   551→                  'rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-wide transition-colors',
+   552→   552→                  kind === k
+   553→   553→                    ? k === 'rsi'
+   554→   554→                      ? 'bg-pink-500/15 text-pink-300'
+   555→   555→                      : k === 'macd'
+   556→   556→                        ? 'bg-amber-500/15 text-amber-300'
+   557→   557→                        : 'bg-emerald-500/15 text-emerald-300'
+   558→   558→                    : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300',
+   559→   559→                )}
+   560→   560→              >
+   561→   561→                {k}
+   562→   562→              </button>
+   563→   563→            ))}
+   564→   564→            <Input
+   565→   565→              value={symbol}
+   566→   566→              onChange={(e) => { symTouched.current = true; setSymbol(e.target.value.toUpperCase()) }}
+   567→   567→              placeholder="SYMBOL"
+   568→   568→              aria-label="Alarm symbol"
+   569→   569→              className="ml-auto h-7 w-[110px] border-zinc-700 bg-zinc-950 text-xs uppercase"
+   570→   570→            />
+   571→   571→          </div>
+   572→   572→
+   573→   573→          {kind === 'price' && (
+   574→   574→            <div className="flex items-center gap-1.5">
+   575→   575→              <select
+   576→   576→                value={dir}
+   577→   577→                onChange={(e) => setDir(e.target.value as 'above' | 'below')}
+   578→   578→                aria-label="Trigger direction"
+   579→   579→                className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+   580→   580→              >
+   581→   581→                <option value="above">crosses above</option>
+   582→   582→                <option value="below">falls below</option>
+   583→   583→              </select>
+   584→   584→              <Input
+   585→   585→                type="number" step="any" value={price}
+   586→   586→                onChange={(e) => setPrice(e.target.value)}
+   587→   587→                onKeyDown={(e) => e.key === 'Enter' && formValid && void create()}
+   588→   588→                placeholder="Price" aria-label="Alert price"
+   589→   589→                className="h-7 flex-1 border-zinc-700 bg-zinc-950 text-xs"
+   590→   590→              />
+   591→   591→            </div>
+   592→   592→          )}
+   593→   593→
+   594→   594→          {kind === 'rsi' && (
+   595→   595→            <div className="space-y-1.5">
+   596→   596→              <div className="flex items-center gap-1.5">
+   597→   597→                <label className="text-[10px] uppercase tracking-wider text-zinc-500">Len</label>
+   598→   598→                <Input
+   599→   599→                  type="number" value={rsiPeriod} min={2} max={200}
+   600→   600→                  onChange={(e) => setRsiPeriod(e.target.value)}
+   601→   601→                  aria-label="RSI period"
+   602→   602→                  className="h-7 w-14 border-zinc-700 bg-zinc-950 text-xs"
+   603→   603→                />
+   604→   604→                <select
+   605→   605→                  value={dir}
+   606→   606→                  onChange={(e) => flipRsiLevel(e.target.value as 'above' | 'below')}
+   607→   607→                  aria-label="RSI trigger direction"
+   608→   608→                  className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+   609→   609→                >
+   610→   610→                  <option value="above">crosses above</option>
+   611→   611→                  <option value="below">crosses below</option>
+   612→   612→                </select>
+   613→   613→                <Input
+   614→   614→                  type="number" step="any" value={rsiLevel} min={1} max={99}
+   615→   615→                  onChange={(e) => setRsiLevel(e.target.value)}
+   616→   616→                  onKeyDown={(e) => e.key === 'Enter' && formValid && void create()}
+   617→   617→                  aria-label="RSI level"
+   618→   618→                  className="h-7 w-16 border-zinc-700 bg-zinc-950 text-xs"
+   619→   619→                />
+   620→   620→              </div>
+   621→   621→              <TfRow tf={tf} setTf={setTf} />
+   622→   622→            </div>
+   623→   623→          )}
+   624→   624→
+   625→   625→          {kind === 'macd' && (
+   626→   626→            <div className="space-y-1.5">
+   627→   627→              <div className="flex items-center gap-1.5">
+   628→   628→                <span className="text-[10px] uppercase tracking-wider text-zinc-500">F/S/G</span>
+   629→   629→                <Input type="number" value={fast} min={1} onChange={(e) => setFast(e.target.value)} aria-label="MACD fast" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+   630→   630→                <Input type="number" value={slow} min={2} onChange={(e) => setSlow(e.target.value)} aria-label="MACD slow" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+   631→   631→                <Input type="number" value={signal} min={1} onChange={(e) => setSignal(e.target.value)} aria-label="MACD signal" className="h-7 w-12 border-zinc-700 bg-zinc-950 text-xs" />
+   632→   632→                <select
+   633→   633→                  value={cond}
+   634→   634→                  onChange={(e) => setCond(e.target.value as typeof cond)}
+   635→   635→                  aria-label="MACD condition"
+   636→   636→                  className="h-7 min-w-0 flex-1 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+   637→   637→                >
+   638→   638→                  <option value="bull_cross">bull crossover</option>
+   639→   639→                  <option value="bear_cross">bear crossover</option>
+   640→   640→                  <option value="cross_above">crosses above</option>
+   641→   641→                  <option value="cross_below">crosses below</option>
+   642→   642→                </select>
+   643→   643→              </div>
+   644→   644→              <div className="flex items-center gap-1.5">
+   645→   645→                {(cond === 'cross_above' || cond === 'cross_below') && (
+   646→   646→                  <Input
+   647→   647→                    type="number" step="any" value={macdLevel}
+   648→   648→                    onChange={(e) => setMacdLevel(e.target.value)}
+   649→   649→                    aria-label="MACD level"
+   650→   650→                    className="h-7 w-20 border-zinc-700 bg-zinc-950 text-xs"
+   651→   651→                  />
+   652→   652→                )}
+   653→   653→                <TfRow tf={tf} setTf={setTf} right />
+   654→   654→              </div>
+   655→   655→            </div>
+   656→   656→          )}
+   657→   657→
+   658→   658→          <Button
+   659→   659→            size="sm" disabled={!formValid || creating} onClick={() => void create()}
+   660→   660→            className="mt-2 h-7 w-full bg-amber-500 text-xs text-zinc-950 hover:bg-amber-400"
+   661→   661→          >
+   662→   662→            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : '🔔 Create alarm'}
+   663→   663→          </Button>
+   664→   664→        </div>
+   665→   665→
+   666→   666→        {/* ---- alarm list ---- */}
+   667→   667→        <div className="max-h-[45vh] overflow-y-auto p-2">
+   668→   668→          {alerts.length === 0 && (
+   669→   669→            <p className="px-2 py-6 text-center text-xs text-zinc-500">
+   670→   670→              No alarms yet — create one above or right-click the chart.
+   671→   671→            </p>
+   672→   672→          )}
+   673→   673→          {alerts.map((a) => (
+   674→   674→            <div key={a.id} className="flex items-center justify-between rounded-md px-2 py-1.5 text-xs hover:bg-zinc-800/60">
+   675→   675→              <div className="flex min-w-0 items-center gap-2">
+   676→   676→                <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: a.color }} />
+   677→   677→                <span className="font-medium text-zinc-200">{a.symbol}</span>
+   678→   678→                <span className="truncate text-zinc-400">{alertSummary(a)}</span>
+   679→   679→                <Badge
+   680→   680→                  variant="outline"
+   681→   681→                  className={
+   682→   682→                    a.status === 'triggered'
+   683→   683→                      ? 'border-emerald-500/40 text-[10px] text-emerald-400'
+   684→   684→                      : a.status === 'paused'
+   685→   685→                        ? 'border-zinc-600 text-[10px] text-zinc-400'
+   686→   686→                        : 'border-amber-500/40 text-[10px] text-amber-400'
+   687→   687→                  }
+   688→   688→                >
+   689→   689→                  {a.status}
+   690→   690→                </Badge>
+   691→   691→              </div>
+   692→   692→              <div className="flex shrink-0 items-center gap-1">
+   693→   693→                <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => toggle(a.id, a.status)}>
+   694→   694→                  {a.status === 'paused' ? 'Resume' : 'Pause'}
+   695→   695→                </Button>
+   696→   696→                <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-rose-400 hover:text-rose-300" onClick={() => remove(a.id)}>
+   697→   697→                  ✕
+   698→   698→                </Button>
+   699→   699→              </div>
+   700→   700→            </div>
+   701→   701→          ))}
+   702→   702→        </div>
+   703→   703→        <div className="border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
+   704→   704→          Checked every 30s · indicator alarms fire on a real crossing of the chosen timeframe · Telegram via Settings
+   705→   705→          <span className="ml-1 inline-flex items-center align-middle">
+   706→   706→            <Settings2 className="h-3 w-3" />
+   707→   707→          </span>
+   708→   708→        </div>
+   709→   709→      </div>
+   710→   710→    </div>
+   711→   711→  )
+   712→   712→}
+   713→   713→
+   714→   714→/** Timeframe selector row for indicator alarms. */
+   715→   715→function TfRow({ tf, setTf, right }: { tf: string; setTf: (v: string) => void; right?: boolean }) {
+   716→   716→  return (
+   717→   717→    <div className={cn('flex items-center gap-1', right && 'ml-auto')}>
+   718→   718→      <label className="text-[10px] uppercase tracking-wider text-zinc-500">TF</label>
+   719→   719→      <div className="flex overflow-hidden rounded border border-zinc-700" role="radiogroup" aria-label="Timeframe">
+   720→   720→        {ALERT_TFS.map((t) => (
+   721→   721→          <button
+   722→   722→            key={t}
+   723→   723→            onClick={() => setTf(t)}
+   724→   724→            aria-pressed={tf === t}
+   725→   725→            className={cn(
+   726→   726→              'px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+   727→   727→              tf === t ? 'bg-zinc-700 text-zinc-100' : 'bg-zinc-950 text-zinc-500 hover:text-zinc-300',
+   728→   728→            )}
+   729→   729→          >
+   730→   730→            {TF_LABEL[t]}
+   731→   731→          </button>
+   732→   732→        ))}
+   733→   733→      </div>
+   734→   734→    </div>
+   735→   735→  )
+   736→   736→}
+   737→   737→

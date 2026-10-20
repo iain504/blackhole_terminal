@@ -11,6 +11,7 @@ import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
 import StrategyTab from './tabs/StrategyTab'
+import ReportTab from './tabs/ReportTab'
 import { StrategyDrawer } from './StrategyDrawer'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
@@ -393,6 +394,7 @@ function ActiveTabContent() {
   if (active.type === 'heatmap') return <HeatmapTab />
   if (active.type === 'positions') return <PositionsTab />
   if (active.type === 'strategy') return <StrategyTab />
+  if (active.type === 'report') return <ReportTab />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 
