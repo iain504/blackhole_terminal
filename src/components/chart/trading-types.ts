@@ -1,4 +1,6 @@
 // Client-side types for the trading feature (mirrors /api/trading/*).
+import type { ClosedTrade } from '@/lib/market-types'
+
 export interface ExitInfo {
   orderId: string
   kind: 'sl' | 'tp'
@@ -53,4 +55,54 @@ export function normSym(s: string): string {
 
 export function isCryptoTradeSymbol(symbol: string): boolean {
   return symbol.includes('/')
+}
+
+// ---------- Strategy Orders tab (mirrors /api/strategies/history) ----------
+
+/** One recorded strategy fire (success or failure). */
+export interface StrategyFireRow {
+  id: string
+  ok: boolean
+  message: string
+  /** entry order id of the placed order — attributes the round-trip trades */
+  orderId: string | null
+  createdAt: string
+}
+
+/** A strategy rule enriched with fire history + realized P&L aggregates. */
+export interface StrategyRuleDetail {
+  id: string
+  symbol: string
+  kind: string // 'rsi' | 'macd'
+  condition: string
+  level: number
+  timeframe: string
+  params: { period?: number; fast?: number; slow?: number; signal?: number } | null
+  action: string // 'buy' | 'sell'
+  qty: number
+  tpMode: string // 'none' | 'price' | 'pct'
+  tpValue: number | null
+  slMode: string
+  slValue: number | null
+  repeat: boolean
+  status: string
+  lastSide: string | null
+  triggeredAt: string | null
+  orderId: string | null
+  fireNote: string | null
+  createdAt: string
+  fires: StrategyFireRow[]
+  /** realized round-trip trades attributed to this rule's fires (newest first) */
+  trades: ClosedTrade[]
+  realizedPnl: number
+  tradeCount: number
+  lastFireAt: string | null
+  /** fires whose entry order is outside the recent closed-orders window */
+  unresolvedFires: number
+}
+
+export interface StrategiesHistoryData {
+  mode: string
+  configured: boolean
+  rules: StrategyRuleDetail[]
 }

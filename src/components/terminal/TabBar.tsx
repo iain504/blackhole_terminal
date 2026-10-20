@@ -25,6 +25,7 @@ const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart 
   calendar: { label: 'Economic Calendar', icon: CalendarDays },
   heatmap: { label: 'Heat Map', icon: Flame },
   positions: { label: 'Positions', icon: Layers },
+  strategy: { label: 'Strategy Orders', icon: Bot },
 }
 
 export function TabBar({
@@ -194,6 +195,9 @@ export function TabBar({
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => addTab('positions')} className="gap-2 text-xs">
               <Layers className="h-3.5 w-3.5" /> Positions
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTab('strategy')} className="gap-2 text-xs">
+              <Bot className="h-3.5 w-3.5" /> Strategy Orders
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

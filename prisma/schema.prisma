@@ -126,6 +126,30 @@ model StrategyRule {
   @@index([userId, status])
 }
 
+// Append-only log of every strategy evaluation that FIRED (success or
+// failure). Powers the Strategy Orders tab: per-rule fire history, the
+// historical trades each fire produced (via its entry orderId) and the
+// realized P&L attribution. Survives rule deletion (ruleId is a plain
+// string, no relation) so history is never lost.
+model StrategyFireLog {
+  id        String   @id @default(cuid())
+  userId    String
+  ruleId    String
+  symbol    String
+  action    String // 'buy' | 'sell'
+  qty       Float
+  ok        Boolean
+  message   String
+  // entry order id of the placed order (success only) — the key used to
+  // attribute the resulting round-trip trade(s) from the broker's closed
+  // orders (FIFO matching)
+  orderId   String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, ruleId])
+  @@index([userId, createdAt])
+}
+
 // Economic-calendar event alarms. Events have no stable id upstream, so the
 // key is "<ISO time>|<currency>|<title>" (same derivation on the client).
 model CalendarAlarm {

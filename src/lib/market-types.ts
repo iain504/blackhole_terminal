@@ -167,3 +167,45 @@ export function fmtPrice(p: number): string {
   if (p >= 1) return p.toFixed(2)
   return p.toFixed(4)
 }
+
+// ---------- Closed (round-trip) trades ----------
+
+/** One realized round-trip: a FIFO-matched entry fill + exit fill(s). */
+export interface ClosedTrade {
+  /** deterministic id: `entry:exit:n` (partial fills can split pairs) */
+  id: string
+  /** chart-style symbol (BTC/USD for crypto) */
+  symbol: string
+  /** direction of the ENTRY leg */
+  side: 'long' | 'short'
+  qty: number
+  entryPrice: number
+  /** qty-weighted average of the matched exit fills */
+  exitPrice: number
+  entryAt: string
+  exitAt: string
+  /** realized P&L of the matched quantity (long: exit−entry · short: entry−exit) */
+  pnl: number
+  /** pnl / (entryPrice·qty) · 100 */
+  pnlPct: number
+  durationMs: number
+  entryOrderId: string
+  exitOrderIds: string[]
+  /** every broker order id involved (entry + exits) — used to attribute trades to strategy fires */
+  orderIds: string[]
+  /** bracket/OCO family ids involved, when known */
+  groupIds: string[]
+}
+
+/** "2d 4h" / "3h 12m" / "5m 20s" — compact held-duration label. */
+export function fmtHeldDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${s % 60}s`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h}h ${m % 60}m`
+  const d = Math.floor(h / 24)
+  return `${d}d ${h % 24}h`
+}

@@ -10,6 +10,7 @@ import { ChartWorkspace } from './ChartWorkspace'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
+import StrategyTab from './tabs/StrategyTab'
 import { StrategyDrawer } from './StrategyDrawer'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
@@ -131,6 +132,14 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   }, [user, toast])
 
   // Strategy-bot polling (Task 44) — every 20s; server also self-evaluates
+  useEffect(() => {
+    if (!user) return
+    // the Strategy Orders tab (and empty state) can request the drawer
+    const open = () => setStrategiesOpen(true)
+    window.addEventListener('tt:open-strategies', open)
+    return () => window.removeEventListener('tt:open-strategies', open)
+  }, [user])
+
   useEffect(() => {
     if (!user) return
     let stopped = false
@@ -383,6 +392,7 @@ function ActiveTabContent() {
   if (active.type === 'calendar') return <CalendarTab />
   if (active.type === 'heatmap') return <HeatmapTab />
   if (active.type === 'positions') return <PositionsTab />
+  if (active.type === 'strategy') return <StrategyTab />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 

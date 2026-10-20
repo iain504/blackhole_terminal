@@ -104,6 +104,30 @@ function exitText(
   return ''
 }
 
+/** Append one fire to the history log (Strategy Orders tab: rules, P&L, trades). */
+async function logFire(
+  userId: string,
+  r: StrategyRow,
+  data: { ok: boolean; message: string; orderId?: string },
+): Promise<void> {
+  try {
+    await db.strategyFireLog.create({
+      data: {
+        userId,
+        ruleId: r.id,
+        symbol: r.symbol,
+        action: r.action === 'sell' ? 'sell' : 'buy',
+        qty: r.qty,
+        ok: data.ok,
+        message: data.message,
+        orderId: data.orderId ?? null,
+      },
+    })
+  } catch (e) {
+    console.warn('[strategy] fire log write failed:', e instanceof Error ? e.message : e)
+  }
+}
+
 async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyFire[]> {
   // 0) sweep stale claims (engine died between claim and order result)
   const staleCut = new Date(Date.now() - CLAIM_STALE_MS)
@@ -242,6 +266,7 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
             data: { status: 'failed', fireNote: failNote },
           })
           fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${ev.message} → order FAILED: ${failNote}` })
+          await logFire(userId, r, { ok: false, message: `${ev.message} → order FAILED: ${failNote}` })
           await notify(
             `🤖 <b>Strategy FAILED</b>\n<b>${symbol}</b>\n${ev.message}\nAction: ${action.toUpperCase()} ${qty} @ market\nError: ${failNote}\nTime: ${new Date().toUTCString()}`,
           )
@@ -253,6 +278,7 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
               : { status: 'triggered', lastSide: ev.side, orderId, fireNote: message, triggeredAt: new Date() },
           })
           fires.push({ id: r.id, symbol, action, qty, ok: true, message, orderId })
+          await logFire(userId, r, { ok: true, message, orderId })
           await notify(
             `🤖 <b>Strategy Fired</b>\n<b>${symbol}</b>\n${message}\nTime: ${new Date().toUTCString()}`,
           )
@@ -265,6 +291,7 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
           data: { status: 'failed', fireNote: msg },
         }).catch(() => {})
         fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${ev.message} → order FAILED: ${msg}` })
+        await logFire(userId, r, { ok: false, message: `${ev.message} → order FAILED: ${msg}` })
       }
     }
   }

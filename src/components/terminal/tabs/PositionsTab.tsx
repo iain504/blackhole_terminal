@@ -10,12 +10,12 @@
 // button that attaches the exit to the position (drag-to-price also exists
 // on the chart).
 import { useCallback, useEffect, useState } from 'react'
-import { Loader2, RefreshCw, X } from 'lucide-react'
+import { History, Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
-import { fmtPrice } from '@/lib/market-types'
+import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import AccountOverview from './AccountOverview'
 import { cn } from '@/lib/utils'
@@ -29,6 +29,13 @@ interface ModeData {
   pending: PendingOrderInfo[]
   error?: string
   loaded: boolean
+}
+
+interface HistoryData {
+  trades: ClosedTrade[]
+  configured: boolean
+  loaded: boolean
+  error?: string
 }
 
 interface PosConsoleRow {
@@ -45,6 +52,10 @@ export default function PositionsTab() {
   const [data, setData] = useState<Record<Mode, ModeData>>({
     paper: { mode: 'paper', positions: [], exits: {}, pending: [], loaded: false },
     live: { mode: 'live', positions: [], exits: {}, pending: [], loaded: false },
+  })
+  const [history, setHistory] = useState<Record<Mode, HistoryData>>({
+    paper: { trades: [], configured: true, loaded: false },
+    live: { trades: [], configured: true, loaded: false },
   })
   const [refreshing, setRefreshing] = useState(false)
   const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
@@ -72,8 +83,20 @@ export default function PositionsTab() {
         return { mode, positions: [], exits: {}, pending: [], error: 'network error', loaded: true }
       }
     }
+    const hist = async (mode: Mode): Promise<HistoryData> => {
+      try {
+        const res = await fetch(`/api/trading/history?mode=${mode}&limit=150`)
+        if (!res.ok) return { trades: [], configured: true, loaded: true, error: `HTTP ${res.status}` }
+        const json = await res.json()
+        return { trades: (json.trades || []) as ClosedTrade[], configured: json.configured !== false, loaded: true }
+      } catch {
+        return { trades: [], configured: true, loaded: true, error: 'network error' }
+      }
+    }
     const [paper, live] = await Promise.all(MODES.map(one))
+    const [hPaper, hLive] = await Promise.all(MODES.map(hist))
     setData({ paper, live })
+    setHistory({ paper: hPaper, live: hLive })
     setRefreshing(false)
   }, [])
 
@@ -99,6 +122,11 @@ export default function PositionsTab() {
     })),
   )
   const pendingRows = MODES.flatMap((m) => (data[m].pending || []).map((p) => ({ mode: m as Mode, p })))
+  // realized round-trips across both modes (newest first from the API)
+  const historyRows = MODES.flatMap((m) =>
+    (history[m].trades || []).map((t) => ({ mode: m as Mode, t })),
+  ).sort((a, b) => new Date(b.t.exitAt).getTime() - new Date(a.t.exitAt).getTime())
+  const historyPnl = historyRows.reduce((acc, r) => acc + r.t.pnl, 0)
   const noKeys = (m: Mode) => data[m].loaded && data[m].error === 'no-keys'
 
   const closePosition = async (row: PosConsoleRow) => {
@@ -162,6 +190,22 @@ export default function PositionsTab() {
         <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-400">
           {pendingRows.length} pending
         </Badge>
+        <Badge
+          variant="outline"
+          className="border-zinc-700 text-[10px] text-zinc-400"
+          title="Realized round-trip trades in the history group below"
+        >
+          <History className="mr-1 inline h-3 w-3" aria-hidden />
+          {historyRows.length} closed
+        </Badge>
+        {historyRows.length > 0 && (
+          <span
+            className={cn('text-sm font-semibold tabular-nums', historyPnl >= 0 ? 'text-emerald-400' : 'text-rose-400')}
+            title="Realized P&L of the trades in the history group below"
+          >
+            {historyPnl >= 0 ? '+' : '−'}${Math.abs(historyPnl).toFixed(2)} realized
+          </span>
+        )}
         <span className={cn('text-sm font-semibold tabular-nums', totals.upl >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
           {totals.upl >= 0 ? '+' : '−'}${Math.abs(totals.upl).toFixed(2)} unrealized
         </span>
@@ -188,8 +232,11 @@ export default function PositionsTab() {
         </div>
       </div>
 
-      {/* positions table */}
-      <div className="max-h-72 shrink-0 overflow-auto rounded-md border border-zinc-800/80 bg-zinc-900/70 terminal-scroll">
+      {/* positions table — grows/shrinks with the available screen height
+          so taller screens reveal more rows (min keeps it usable on small
+          viewports, where the root scrolls instead) */}
+      <div className="flex min-h-[150px] flex-[5_1_auto] flex-col overflow-hidden rounded-md border border-zinc-800/80 bg-zinc-900/70">
+        <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
         <table className="w-full min-w-[900px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
             <tr className="border-b border-zinc-800">
@@ -287,10 +334,11 @@ export default function PositionsTab() {
             })}
           </tbody>
         </table>
+        </div>
       </div>
 
-      {/* pending (unfilled) entry orders */}
-      <div className="flex h-44 shrink-0 flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
+      {/* pending (unfilled) entry orders — height follows the screen too */}
+      <div className="flex min-h-[130px] flex-[3_1_auto] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
         <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Pending orders</span>
           <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{pendingRows.length}</Badge>
@@ -373,9 +421,98 @@ export default function PositionsTab() {
         </div>
       </div>
 
+      {/* trade history — realized round-trips (FIFO-matched closed orders),
+          sharing the remaining screen height with the tables above */}
+      <div className="flex min-h-[130px] flex-[3_1_auto] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
+        <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
+          <History className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Trade history</span>
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{historyRows.length}</Badge>
+          {historyRows.length > 0 && (
+            <span
+              className={cn(
+                'text-[11px] font-semibold tabular-nums',
+                historyPnl >= 0 ? 'text-emerald-400' : 'text-rose-400',
+              )}
+              title="Sum of realized P&L across the listed trades (paper + live)"
+            >
+              {historyPnl >= 0 ? '+' : '−'}${Math.abs(historyPnl).toFixed(2)}
+            </span>
+          )}
+          <span className="ml-auto text-[10px] text-zinc-600">realized round-trips · paper + live · FIFO-matched fills</span>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
+          <table className="w-full min-w-[860px] border-collapse text-xs">
+            <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+              <tr className="border-b border-zinc-800">
+                <th className="px-3 py-1.5 text-left font-semibold">Closed</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Symbol</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Market</th>
+                <th className="px-3 py-1.5 text-left font-semibold">Side</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Qty</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Entry</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Exit</th>
+                <th className="px-3 py-1.5 text-right font-semibold">Held</th>
+                <th className="px-3 py-1.5 text-right font-semibold">P&amp;L</th>
+                <th className="px-3 py-1.5 text-right font-semibold">%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {historyRows.length === 0 && (
+                <tr>
+                  <td colSpan={10} className="px-3 py-6 text-center text-zinc-600">
+                    {!history.paper.loaded && !history.live.loaded ? (
+                      <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading trade history…</span>
+                    ) : history.paper.configured === false && history.live.configured === false ? (
+                      'No Alpaca keys configured — trade history unavailable.'
+                    ) : (
+                      'No closed trades yet — completed round-trips (entry + exit filled) appear here with their realized P&L.'
+                    )}
+                  </td>
+                </tr>
+              )}
+              {historyRows.map(({ mode, t }) => {
+                const up = t.pnl >= 0
+                return (
+                  <tr key={`${mode}:${t.id}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+                    <td className="whitespace-nowrap px-3 py-1.5 text-zinc-400">
+                      {new Date(t.exitAt).toLocaleString('en-GB', {
+                        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+                      })}
+                    </td>
+                    <td className="px-3 py-1.5 font-semibold text-zinc-100">{t.symbol}</td>
+                    <td className="px-3 py-1.5">
+                      <Badge
+                        variant="outline"
+                        className={cn('text-[10px]', mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400')}
+                      >
+                        {mode}
+                      </Badge>
+                    </td>
+                    <td className={cn('px-3 py-1.5 font-medium', t.side === 'long' ? 'text-emerald-400' : 'text-rose-400')}>
+                      {t.side === 'long' ? 'LONG' : 'SHORT'}
+                    </td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{t.qty}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{fmtPrice(t.entryPrice)}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{fmtPrice(t.exitPrice)}</td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{fmtHeldDuration(t.durationMs)}</td>
+                    <td className={cn('px-3 py-1.5 text-right font-semibold tabular-nums', up ? 'text-emerald-400' : 'text-rose-400')}>
+                      {up ? '+' : '−'}${Math.abs(t.pnl).toFixed(2)}
+                    </td>
+                    <td className={cn('px-3 py-1.5 text-right tabular-nums', up ? 'text-emerald-400/80' : 'text-rose-400/80')}>
+                      {up ? '+' : '−'}{Math.abs(t.pnlPct).toFixed(2)}%
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <p className="flex shrink-0 items-center gap-1.5 px-1 text-[11px] text-zinc-600">
         <X className="h-3 w-3" aria-hidden />
-        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders · [+TP]/[+SL] attaches a new exit to the position.
+        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L.
       </p>
     </div>
   )

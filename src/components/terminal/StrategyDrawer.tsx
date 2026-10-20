@@ -16,7 +16,7 @@ const TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M'] as const
 const TF_LABEL: Record<string, string> = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1D': '1D', '1W': '1W', '1M': '1M' }
 
 /** One-line human summary of a rule's condition half. */
-function condSummary(r: Strategy): string {
+export function condSummary(r: Strategy): string {
   const tf = TF_LABEL[r.timeframe] ?? r.timeframe
   if (r.kind === 'rsi') {
     return `RSI(${r.params?.period ?? 14}) crosses ${r.condition === 'cross_below' ? 'below' : 'above'} ${r.level} · ${tf}`
@@ -38,7 +38,7 @@ function exitChip(mode: string, value: number | null): string | null {
   return null
 }
 
-function statusBadgeCls(status: string): string {
+export function statusBadgeCls(status: string): string {
   if (status === 'triggered') return 'border-emerald-500/40 text-emerald-400'
   if (status === 'failed') return 'border-rose-500/40 text-rose-400'
   if (status === 'placing') return 'border-sky-500/40 text-sky-400'
