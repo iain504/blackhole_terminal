@@ -159,6 +159,10 @@ export interface ChartPanelProps {
   timeframe: Timeframe
   onSymbolChange: (s: string) => void
   onTimeframeChange: (tf: Timeframe) => void
+  /** persisted per-pane chart style (candles default); undefined = candles */
+  chartType?: 'candles' | 'line'
+  /** persist a chart-style change into the pane (layout autosave) */
+  onChartTypeChange?: (t: 'candles' | 'line') => void
   /** grid mode: click to focus this pane (drives Quote/News sidebar) */
   onFocus?: () => void
   /** grid mode: visual focus ring */
@@ -171,7 +175,7 @@ export interface ChartPanelProps {
   compact?: boolean
 }
 
-export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeChange, onFocus, focused, syncKey, syncGroup, compact }: ChartPanelProps) {
+export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeChange, chartType: chartTypeProp, onChartTypeChange, onFocus, focused, syncKey, syncGroup, compact }: ChartPanelProps) {
   // store
   const drawingTool = useTerminal((s) => s.drawingTool)
   const setDrawingTool = useTerminal((s) => s.setDrawingTool)
@@ -219,7 +223,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [ind, setIndState] = useState<IndicatorSettings>(() => loadIndicators())
   const [indDataVer, setIndDataVer] = useState(0) // bumped whenever bars change
   const [indOpen, setIndOpen] = useState(false)
-  const [chartType, setChartType] = useState<'candles' | 'line'>('candles')
+  // chart style — seeded from the persisted pane setting, changes are pushed
+  // up through onChartTypeChange so the layout autosave carries them
+  const [chartType, setChartType] = useState<'candles' | 'line'>(chartTypeProp ?? 'candles')
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number; prevClose?: number } | null>(null)
   // streaming ticks (stream-service socket.io): badge + pending-tick bookkeeping
   const liveAtRef = useRef(0)
@@ -293,11 +299,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
   // ---------- indicators: shared helpers ----------
   // Merge + clamp + persist an indicator-settings change (identity swap drives
-  // the series lifecycle / data effects).
+  // the series lifecycle / data effects). Also marks the layout dirty so the
+  // 5s autosave / unload beacon carries the new settings server-side.
   const setInd = useCallback((fn: (prev: IndicatorSettings) => IndicatorSettings) => {
     setIndState((prev) => {
       const next = normalizeIndicators(fn(prev))
       saveIndicators(next)
+      useTerminal.getState().markLayoutDirty()
       return next
     })
   }, [])
@@ -2908,14 +2916,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         <div className="pointer-events-auto flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
           <button
             className={cn('rounded px-1.5 py-1', chartType === 'candles' ? 'bg-zinc-800 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300')}
-            onClick={() => setChartType('candles')}
+            onClick={() => { setChartType('candles'); onChartTypeChange?.('candles') }}
             aria-label="Candlesticks"
           >
             <CandleIcon className="h-3.5 w-3.5" />
           </button>
           <button
             className={cn('rounded px-1.5 py-1', chartType === 'line' ? 'bg-zinc-800 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300')}
-            onClick={() => setChartType('line')}
+            onClick={() => { setChartType('line'); onChartTypeChange?.('line') }}
             aria-label="Line"
           >
             <LineIcon className="h-3.5 w-3.5" />

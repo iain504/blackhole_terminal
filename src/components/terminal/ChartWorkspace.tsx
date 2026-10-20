@@ -5,7 +5,7 @@
 // Grid layouts per chart tab: 1 / 2 side-by-side / 2 stacked / 3 / 4 (Task 19).
 import { useCallback } from 'react'
 import { ResizablePanelGroup as PanelGroup, ResizablePanel as Panel, ResizableHandle as PanelResizeHandle } from '@/components/ui/resizable'
-import { useTerminal, PanelId, Tab, tabPanes, tabLayout, GridLayoutId } from '@/store/terminal'
+import { useTerminal, PanelId, Tab, tabPanes, tabLayout, GridLayoutId, GridSizes } from '@/store/terminal'
 import { useIsMobile } from '@/hooks/use-mobile'
 import { WatchlistPanel } from './sidebar/WatchlistPanel'
 import { QuotePanel } from './sidebar/QuotePanel'
@@ -147,6 +147,7 @@ function focusedPaneSymbol(tab: Tab): string {
 function ChartPane({ tab, paneIdx }: { tab: Tab; paneIdx: number }) {
   const setPaneSymbol = useTerminal((s) => s.setPaneSymbol)
   const setPaneTimeframe = useTerminal((s) => s.setPaneTimeframe)
+  const setPaneChartType = useTerminal((s) => s.setPaneChartType)
   const setFocusedPane = useTerminal((s) => s.setFocusedPane)
   const panes = tabPanes(tab)
   const pane = panes[Math.min(paneIdx, panes.length - 1)]
@@ -156,8 +157,10 @@ function ChartPane({ tab, paneIdx }: { tab: Tab; paneIdx: number }) {
     <ChartPanel
       symbol={pane.symbol}
       timeframe={pane.timeframe}
+      chartType={pane.chartType}
       onSymbolChange={(s) => setPaneSymbol(tab.id, paneIdx, s)}
       onTimeframeChange={(tf) => setPaneTimeframe(tab.id, paneIdx, tf)}
+      onChartTypeChange={(t) => setPaneChartType(tab.id, paneIdx, t)}
       onFocus={multi ? () => setFocusedPane(tab.id, paneIdx) : undefined}
       focused={multi ? paneIdx === focusedIdx : undefined}
       syncKey={`${tab.id}:${paneIdx}`}
@@ -167,10 +170,39 @@ function ChartPane({ tab, paneIdx }: { tab: Tab; paneIdx: number }) {
   )
 }
 
-/** Multi-chart grid: renders the tab's layout (1 / 2h / 2v / 3s / 4). */
+/** Hook up per-group pane-proportion persistence: defaultSize seeds from the
+ *  tab's stored grid.sizes (hydrate restores them), onLayout writes drags back
+ *  so the 5s autosave carries them. Tabs remount on switch (keyed upstream),
+ *  so the stored proportions re-apply on every mount. */
+function useGridSizes(tab: Tab): {
+  sizeOf: (key: string, idx: number, dflt: number) => number
+  onLayout: (key: string) => (sizes: number[]) => void
+} {
+  const setGridSizes = useTerminal((s) => s.setGridSizes)
+  const sizes: GridSizes | undefined = tab.grid?.sizes
+  const sizeOf = useCallback(
+    (key: string, idx: number, dflt: number) => {
+      const arr = sizes?.[key]
+      const v = arr?.[idx]
+      return typeof v === 'number' && Number.isFinite(v) ? v : dflt
+    },
+    [sizes],
+  )
+  const onLayout = useCallback(
+    (key: string) => (groupSizes: number[]) => {
+      if (groupSizes.length >= 2) setGridSizes(tab.id, key, groupSizes)
+    },
+    [setGridSizes, tab.id],
+  )
+  return { sizeOf, onLayout }
+}
+
+/** Multi-chart grid: renders the tab's layout (1/2h/2v/3s/4/6/8) with the
+ *  tab's persisted pane proportions (dragged splitters survive reload/import). */
 function ChartGrid({ tab }: { tab: Tab }) {
   const layout: GridLayoutId = tabLayout(tab)
   const panes = tabPanes(tab)
+  const { sizeOf, onLayout } = useGridSizes(tab)
   const pane = (i: number) => <ChartPane tab={tab} paneIdx={i} />
   const handle = (dir: 'horizontal' | 'vertical') => (
     <PanelResizeHandle
@@ -181,102 +213,102 @@ function ChartGrid({ tab }: { tab: Tab }) {
   switch (layout) {
     case '2h':
       return (
-        <PanelGroup direction="horizontal" className="h-full">
-          <Panel defaultSize={50} minSize={20}>{pane(0)}</Panel>
+        <PanelGroup direction="horizontal" onLayout={onLayout('g')} className="h-full">
+          <Panel defaultSize={sizeOf('g', 0, 50)} minSize={20}>{pane(0)}</Panel>
           {handle('horizontal')}
-          <Panel defaultSize={50} minSize={20}>{pane(1)}</Panel>
+          <Panel defaultSize={sizeOf('g', 1, 50)} minSize={20}>{pane(1)}</Panel>
         </PanelGroup>
       )
     case '2v':
       return (
-        <PanelGroup direction="vertical" className="h-full">
-          <Panel defaultSize={50} minSize={20}>{pane(0)}</Panel>
+        <PanelGroup direction="vertical" onLayout={onLayout('g')} className="h-full">
+          <Panel defaultSize={sizeOf('g', 0, 50)} minSize={20}>{pane(0)}</Panel>
           {handle('vertical')}
-          <Panel defaultSize={50} minSize={20}>{pane(1)}</Panel>
+          <Panel defaultSize={sizeOf('g', 1, 50)} minSize={20}>{pane(1)}</Panel>
         </PanelGroup>
       )
     case '3s':
       return (
-        <PanelGroup direction="vertical" className="h-full">
-          <Panel defaultSize={58} minSize={25}>{pane(0)}</Panel>
+        <PanelGroup direction="vertical" onLayout={onLayout('v')} className="h-full">
+          <Panel defaultSize={sizeOf('v', 0, 58)} minSize={25}>{pane(0)}</Panel>
           {handle('vertical')}
-          <Panel defaultSize={42} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={50} minSize={20}>{pane(1)}</Panel>
+          <Panel defaultSize={sizeOf('v', 1, 42)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('h')} className="h-full">
+              <Panel defaultSize={sizeOf('h', 0, 50)} minSize={20}>{pane(1)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={50} minSize={20}>{pane(2)}</Panel>
+              <Panel defaultSize={sizeOf('h', 1, 50)} minSize={20}>{pane(2)}</Panel>
             </PanelGroup>
           </Panel>
         </PanelGroup>
       )
     case '4':
       return (
-        <PanelGroup direction="vertical" className="h-full">
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={50} minSize={20}>{pane(0)}</Panel>
+        <PanelGroup direction="vertical" onLayout={onLayout('v')} className="h-full">
+          <Panel defaultSize={sizeOf('v', 0, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('ht')} className="h-full">
+              <Panel defaultSize={sizeOf('ht', 0, 50)} minSize={20}>{pane(0)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={50} minSize={20}>{pane(1)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 1, 50)} minSize={20}>{pane(1)}</Panel>
             </PanelGroup>
           </Panel>
           {handle('vertical')}
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={50} minSize={20}>{pane(2)}</Panel>
+          <Panel defaultSize={sizeOf('v', 1, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('hb')} className="h-full">
+              <Panel defaultSize={sizeOf('hb', 0, 50)} minSize={20}>{pane(2)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={50} minSize={20}>{pane(3)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 1, 50)} minSize={20}>{pane(3)}</Panel>
             </PanelGroup>
           </Panel>
         </PanelGroup>
       )
     case '6':
       return (
-        <PanelGroup direction="vertical" className="h-full">
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={33.4} minSize={15}>{pane(0)}</Panel>
+        <PanelGroup direction="vertical" onLayout={onLayout('v')} className="h-full">
+          <Panel defaultSize={sizeOf('v', 0, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('ht')} className="h-full">
+              <Panel defaultSize={sizeOf('ht', 0, 33.4)} minSize={15}>{pane(0)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={33.3} minSize={15}>{pane(1)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 1, 33.3)} minSize={15}>{pane(1)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={33.3} minSize={15}>{pane(2)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 2, 33.3)} minSize={15}>{pane(2)}</Panel>
             </PanelGroup>
           </Panel>
           {handle('vertical')}
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={33.4} minSize={15}>{pane(3)}</Panel>
+          <Panel defaultSize={sizeOf('v', 1, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('hb')} className="h-full">
+              <Panel defaultSize={sizeOf('hb', 0, 33.4)} minSize={15}>{pane(3)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={33.3} minSize={15}>{pane(4)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 1, 33.3)} minSize={15}>{pane(4)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={33.3} minSize={15}>{pane(5)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 2, 33.3)} minSize={15}>{pane(5)}</Panel>
             </PanelGroup>
           </Panel>
         </PanelGroup>
       )
     case '8':
       return (
-        <PanelGroup direction="vertical" className="h-full">
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={25} minSize={12}>{pane(0)}</Panel>
+        <PanelGroup direction="vertical" onLayout={onLayout('v')} className="h-full">
+          <Panel defaultSize={sizeOf('v', 0, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('ht')} className="h-full">
+              <Panel defaultSize={sizeOf('ht', 0, 25)} minSize={12}>{pane(0)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(1)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 1, 25)} minSize={12}>{pane(1)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(2)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 2, 25)} minSize={12}>{pane(2)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(3)}</Panel>
+              <Panel defaultSize={sizeOf('ht', 3, 25)} minSize={12}>{pane(3)}</Panel>
             </PanelGroup>
           </Panel>
           {handle('vertical')}
-          <Panel defaultSize={50} minSize={20}>
-            <PanelGroup direction="horizontal" className="h-full">
-              <Panel defaultSize={25} minSize={12}>{pane(4)}</Panel>
+          <Panel defaultSize={sizeOf('v', 1, 50)} minSize={20}>
+            <PanelGroup direction="horizontal" onLayout={onLayout('hb')} className="h-full">
+              <Panel defaultSize={sizeOf('hb', 0, 25)} minSize={12}>{pane(4)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(5)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 1, 25)} minSize={12}>{pane(5)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(6)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 2, 25)} minSize={12}>{pane(6)}</Panel>
               {handle('horizontal')}
-              <Panel defaultSize={25} minSize={12}>{pane(7)}</Panel>
+              <Panel defaultSize={sizeOf('hb', 3, 25)} minSize={12}>{pane(7)}</Panel>
             </PanelGroup>
           </Panel>
         </PanelGroup>

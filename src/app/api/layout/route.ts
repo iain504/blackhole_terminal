@@ -34,3 +34,11 @@ export async function PUT(req: Request) {
     return handleError(e)
   }
 }
+
+// POST /api/layout — same save, but for navigator.sendBeacon: the beforeunload
+// flush fires as a POST (sendBeacon can't send PUT), so without this handler
+// the final layout flush on tab close / reload silently 404s and the last
+// few seconds of layout changes (symbol switches, chart-type toggles) are lost.
+export async function POST(req: Request) {
+  return PUT(req)
+}

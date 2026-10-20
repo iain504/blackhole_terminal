@@ -97,7 +97,13 @@ export function TabBar({
         {tabs.map((t) => {
           const Icon = TYPE_META[t.type].icon
           const isActive = t.id === activeTabId
-          const title = t.type === 'chart' ? t.symbol : TYPE_META[t.type].label
+          // chart tabs show the FOCUSED pane's symbol so multi-chart tabs
+          // follow "the symbol selected in each chart" (legacy tabs keep
+          // tab.symbol, which mirrors pane 0)
+          const panes = t.type === 'chart' ? tabPanes(t) : null
+          const title = panes
+            ? panes[Math.min(t.focusedPane ?? 0, panes.length - 1)]?.symbol ?? t.symbol
+            : TYPE_META[t.type].label
           const edge = dropEdge?.id === t.id ? dropEdge.side : null
           const dragging = dragTabId === t.id
           return (

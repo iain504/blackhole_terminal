@@ -4,6 +4,7 @@
 // Layout auto-saves to server every 5s when dirty (Task 16 #3).
 import { create } from 'zustand'
 import { Timeframe } from '@/lib/market-types'
+import { loadIndicators, saveIndicators, normalizeIndicators, type IndicatorSettings } from '@/lib/indicators'
 
 export interface SessionUser {
   id: string
@@ -29,7 +30,15 @@ export const GRID_LAYOUTS: { id: GridLayoutId; label: string; short: string; pan
 export interface Pane {
   symbol: string
   timeframe: Timeframe
+  /** chart rendering style for THIS pane (persisted per pane) */
+  chartType?: 'candles' | 'line'
 }
+
+/** Dragged pane proportions for a grid tab, keyed by splitter group
+ *  ('g' = the single group of 2h/2v, 'v' = outer stack of 3s/4/6/8,
+ *  'h' = 3s bottom row, 'ht'/'hb' = top/bottom rows of 4/6/8).
+ *  Persisted so "chart layout" survives reload / export-import. */
+export type GridSizes = Record<string, number[]>
 
 export interface Tab {
   id: string
@@ -37,7 +46,7 @@ export interface Tab {
   symbol: string
   timeframe: Timeframe
   /** multi-chart grid config; undefined = single chart (legacy layout) */
-  grid?: { layout: GridLayoutId; panes: Pane[] }
+  grid?: { layout: GridLayoutId; panes: Pane[]; sizes?: GridSizes }
   /** which pane drives the Quote/News sidebar (grid mode) */
   focusedPane?: number
   /** sync crosshair across panes of this tab */
@@ -153,6 +162,9 @@ export interface LayoutBlob {
     panelCollapsed: Record<string, boolean>
     mainSizes: [number, number]
   }
+  /** indicator settings ride the layout blob so the 5s AUTOSAVE carries
+   *  them server-side too (export additionally merges fresh localStorage) */
+  indicators?: IndicatorSettings
 }
 
 export const DRAW_COLORS = [
@@ -182,6 +194,9 @@ interface TerminalState {
   setGridLayout: (tabId: string, layout: GridLayoutId) => void
   setPaneSymbol: (tabId: string, paneIdx: number, symbol: string) => void
   setPaneTimeframe: (tabId: string, paneIdx: number, tf: Timeframe) => void
+  setPaneChartType: (tabId: string, paneIdx: number, t: 'candles' | 'line') => void
+  /** persist dragged pane proportions of a grid splitter group */
+  setGridSizes: (tabId: string, key: string, sizes: number[]) => void
   setFocusedPane: (tabId: string, paneIdx: number) => void
   setSyncCrosshair: (tabId: string, v: boolean) => void
 
@@ -322,6 +337,8 @@ export const useTerminal = create<TerminalState>((set, get) => ({
           // single pane mirrors the legacy tab fields so other panels keep working
           return { ...t, symbol: next[0].symbol, timeframe: next[0].timeframe, grid: { layout, panes: next } }
         }
+        // new arrangement → start from the default proportions (stale size
+        // keys from the previous arrangement would fight the new groups)
         return { ...t, grid: { layout, panes: next } }
       }),
       layoutDirty: true,
@@ -352,6 +369,36 @@ export const useTerminal = create<TerminalState>((set, get) => ({
         const next = panes.map((p, j) => (j === i ? { ...p, timeframe: tf } : p))
         if (!t.grid || t.grid.layout === '1') return { ...t, timeframe: tf, grid: { layout: t.grid?.layout ?? '1', panes: next } }
         return { ...t, grid: { layout: t.grid.layout, panes: next } }
+      }),
+      layoutDirty: true,
+    })),
+
+  setPaneChartType: (tabId, paneIdx, chartType) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== tabId) return t
+        const panes = tabPanes(t)
+        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+        if (panes[i].chartType === chartType) return t
+        const next = panes.map((p, j) => (j === i ? { ...p, chartType } : p))
+        if (!t.grid || t.grid.layout === '1') return { ...t, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+      }),
+      layoutDirty: true,
+    })),
+
+  setGridSizes: (tabId, key, sizes) =>
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        if (t.id !== tabId || t.type !== 'chart') return t
+        const clean = sizes.slice(0, 8).map((n) => (Number.isFinite(n) ? Math.min(97, Math.max(3, Math.round(n * 10) / 10)) : 50))
+        if (clean.length < 2) return t
+        const prev = t.grid?.sizes?.[key]
+        if (prev && prev.length === clean.length && prev.every((v, i) => Math.abs(v - clean[i]) < 0.05)) return t
+        return {
+          ...t,
+          grid: { layout: t.grid?.layout ?? '1', panes: tabPanes(t), sizes: { ...(t.grid?.sizes ?? {}), [key]: clean } },
+        }
       }),
       layoutDirty: true,
     })),
@@ -422,6 +469,9 @@ export const useTerminal = create<TerminalState>((set, get) => ({
         panelCollapsed: s.panelCollapsed,
         mainSizes: s.mainSizes,
       },
+      // indicator settings travel WITH the layout so the autosave (and the
+      // beforeunload beacon) carry them server-side, not just the export file
+      indicators: loadIndicators(),
     }
   },
 
@@ -430,7 +480,20 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     const blob = data as Partial<LayoutBlob>
     if (!blob.tabs || !Array.isArray(blob.tabs) || blob.tabs.length === 0) return
     const VALID_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M']
-    const VALID_LAYOUTS: GridLayoutId[] = ['1', '2h', '2v', '3s', '4']
+    const VALID_LAYOUTS: GridLayoutId[] = ['1', '2h', '2v', '3s', '4', '6', '8']
+    const VALID_SIZE_KEYS = ['g', 'v', 'h', 'ht', 'hb']
+    const sizes = (raw: unknown): GridSizes | undefined => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+      const out: GridSizes = {}
+      for (const [k, arr] of Object.entries(raw as Record<string, unknown>)) {
+        if (!VALID_SIZE_KEYS.includes(k) || !Array.isArray(arr)) continue
+        const clean = arr
+          .slice(0, 8)
+          .map((n) => (typeof n === 'number' && Number.isFinite(n) ? Math.min(97, Math.max(3, n)) : NaN))
+        if (clean.length >= 2 && clean.every((n) => Number.isFinite(n))) out[k] = clean.map((n) => Math.round(n * 10) / 10)
+      }
+      return Object.keys(out).length ? out : undefined
+    }
     const tabs = blob.tabs
       .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions'].includes(t.type))
       .map((t) => {
@@ -450,20 +513,27 @@ export const useTerminal = create<TerminalState>((set, get) => ({
               .map((p) => ({
                 symbol: p.symbol.toUpperCase(),
                 timeframe: (VALID_TFS.includes(p.timeframe as string) ? p.timeframe : '1D') as Timeframe,
+                chartType: p.chartType === 'line' ? 'line' : 'candles',
               }))
           : []
         if (panes.length === 0) panes = [{ symbol: base.symbol, timeframe: base.timeframe }]
         const count = layoutPaneCount(layout)
         while (panes.length < count) panes.push({ ...panes[0] })
         panes.length = count
+        const gridSizes = sizes(t.grid?.sizes)
         return {
           ...base,
-          grid: { layout, panes },
+          grid: { layout, panes, ...(gridSizes ? { sizes: gridSizes } : {}) },
           focusedPane: Math.max(0, Math.min(typeof t.focusedPane === 'number' ? t.focusedPane : 0, count - 1)),
           syncCrosshair: Boolean(t.syncCrosshair),
         }
       })
     if (tabs.length === 0) return
+    // indicator settings persisted server-side (autosave) — apply the stored
+    // copy so they follow the user across browsers/machines like the rest
+    if (blob.indicators && typeof blob.indicators === 'object') {
+      try { saveIndicators(normalizeIndicators(blob.indicators)) } catch { /* private mode */ }
+    }
     const activeTabId = tabs.some((t) => t.id === blob.activeTabId) ? (blob.activeTabId as string) : tabs[0].id
     const sb = blob.sidebar
     const mainSizes: [number, number] =

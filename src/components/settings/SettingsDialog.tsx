@@ -127,7 +127,7 @@ export default function SettingsDialog({
       if (!data || typeof data !== 'object') throw new Error('Not a BLACKHOLE Terminal config file.');
       const parts: string[] = [];
       const count = (k: string) => (Array.isArray(data[k]) ? (data[k] as unknown[]).length : 0);
-      if (data.layout) parts.push('layout (tabs, panels)');
+      if (data.layout) parts.push('layout (tabs, chart layouts & symbols, panels)');
       if (count('watchlists')) parts.push(`${count('watchlists')} watchlist(s)`);
       if (count('alerts')) parts.push(`${count('alerts')} alert(s)`);
       if (count('strategies')) parts.push(`${count('strategies')} strategy rule(s)`);
