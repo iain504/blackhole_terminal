@@ -1490,7 +1490,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy))
   }
 
-  const hitTest = useCallback((x: number, y: number): SceneHit | null => {
+  // tolMul scales every hit tolerance: 1 = mouse precision, 2 = finger precision
+  // (touch long-press menus open with the wider tolerance so an imprecise
+  // finger still lands on the line it is holding)
+  const hitTest = useCallback((x: number, y: number, tolMul = 1): SceneHit | null => {
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
     const als = st.alerts.filter((a) => a.symbol === symbol && a.status !== 'triggered' && (a.kind ?? 'price') === 'price')
@@ -1502,18 +1505,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const pendings = (posBundle?.pending || []).filter((pp) => normSym(pp.symbol) === normSym(symbol) && pp.limitPrice != null)
     for (const p of pendings) {
       const yE = yOf(p.limitPrice!)
-      if (yE != null && Math.abs(y - yE) < 7) {
+      if (yE != null && Math.abs(y - yE) < 7 * tolMul) {
         return { type: 'pending', id: p.orderId, part: 'whole', pending: p, origPrice: p.limitPrice! }
       }
       if (p.tpPrice != null) {
         const yT = yOf(p.tpPrice)
-        if (yT != null && Math.abs(y - yT) < 7) {
+        if (yT != null && Math.abs(y - yT) < 7 * tolMul) {
           return { type: 'pending', id: p.orderId, part: 'tp', pending: p, origPrice: p.tpPrice }
         }
       }
       if (p.slPrice != null) {
         const yS = yOf(p.slPrice)
-        if (yS != null && Math.abs(y - yS) < 7) {
+        if (yS != null && Math.abs(y - yS) < 7 * tolMul) {
           return { type: 'pending', id: p.orderId, part: 'sl', pending: p, origPrice: p.slPrice }
         }
       }
@@ -1521,7 +1524,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     if (myExits?.sl && (myExits.sl.stopPrice != null || myExits.sl.limitPrice != null)) {
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
       const yl = yOf(slPrice)
-      if (yl != null && Math.abs(y - yl) < 7) {
+      if (yl != null && Math.abs(y - yl) < 7 * tolMul) {
         // trailing stops are hittable too (menu / double-click → trail %);
         // their drag is a no-op (no fixed price)
         return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
@@ -1529,20 +1532,21 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
     if (myExits?.tp && myExits.tp.limitPrice != null) {
       const yl = yOf(myExits.tp.limitPrice)
-      if (yl != null && Math.abs(y - yl) < 7) {
+      if (yl != null && Math.abs(y - yl) < 7 * tolMul) {
         return { type: 'exit', id: myExits.tp.orderId, part: 'tp', origPrice: myExits.tp.limitPrice, exit: myExits.tp }
       }
     }
     // ghost [+TP]/[+SL] chips — rect hit, tested BEFORE the position line
     // (the chips sit ON the entry line at the right edge)
+    const gPad = 2 * tolMul
     for (const r of ghostChipRectsRef.current) {
-      if (x >= r.x - 2 && x <= r.x + r.w + 2 && y >= r.y - 2 && y <= r.y + r.h + 2) {
+      if (x >= r.x - gPad && x <= r.x + r.w + gPad && y >= r.y - gPad && y <= r.y + r.h + gPad) {
         return { type: 'ghost', id: r.part, part: r.part }
       }
     }
     if (myPos && myPos.avgEntry > 0) {
       const yl = yOf(myPos.avgEntry)
-      if (yl != null && Math.abs(y - yl) < 6) {
+      if (yl != null && Math.abs(y - yl) < 6 * tolMul) {
         return { type: 'position', id: myPos.tradeSymbol, part: 'whole', origPrice: myPos.avgEntry }
       }
     }
@@ -1553,16 +1557,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (d.kind === 'hline') {
           const pane = d.points[0]?.pane ?? 'price'
           const yl = yOfPane(pane, d.points[0]?.price ?? 0)
-          if (yl != null && Math.abs(y - yl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
+          if (yl != null && Math.abs(y - yl) < 7 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
         } else if (d.kind === 'vline') {
           const xl = xOf(d.points[0]?.time ?? null)
-          if (xl != null && Math.abs(x - xl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
+          if (xl != null && Math.abs(x - xl) < 7 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
         } else if (d.kind === 'trend' || d.kind === 'fib') {
           const p1 = pixelPoint(d.points[0])
           const p2 = pixelPoint(d.points[1])
-          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
-          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
-          if (d.kind === 'trend' && p1 && p2 && distToSeg(x, y, p1, p2) < 7) {
+          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8 * tolMul) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
+          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8 * tolMul) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
+          if (d.kind === 'trend' && p1 && p2 && distToSeg(x, y, p1, p2) < 7 * tolMul) {
             return { type: 'drawing', id: d.id, part: 'whole' }
           }
           if (d.kind === 'fib' && p1 && p2) {
@@ -1573,7 +1577,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               const price2 = d.points[1].price
               for (const lv of FIB_LEVELS) {
                 const yl = yOfPane(fibPane, price2 + (price1 - price2) * lv)
-                if (yl != null && Math.abs(y - yl) < 6) return { type: 'drawing', id: d.id, part: 'whole' }
+                if (yl != null && Math.abs(y - yl) < 6 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
               }
             }
           }
@@ -1582,8 +1586,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           // swallow clicks — only its outline is draggable)
           const p1 = pixelPoint(d.points[0])
           const p2 = pixelPoint(d.points[1])
-          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
-          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
+          if (p1 && Math.hypot(x - p1.x, y - p1.y) < 8 * tolMul) return { type: 'drawing', id: d.id, part: 'point', index: 0 }
+          if (p2 && Math.hypot(x - p2.x, y - p2.y) < 8 * tolMul) return { type: 'drawing', id: d.id, part: 'point', index: 1 }
           if (p1 && p2) {
             const x1 = Math.min(p1.x, p2.x)
             const x2 = Math.max(p1.x, p2.x)
@@ -1596,13 +1600,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               [{ x: x2, y: y2 }, { x: x1, y: y2 }],
             ]
             for (const [a, b] of edges) {
-              if (distToSeg(x, y, a, b) < 6) return { type: 'drawing', id: d.id, part: 'whole' }
+              if (distToSeg(x, y, a, b) < 6 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
             }
           }
         } else if (d.kind === 'text') {
           // exact measured bounds from the last overlay pass
           const r = textHitRectsRef.current[d.id]
-          if (r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+          const tPad = 2 * tolMul
+          if (r && x >= r.x - tPad && x <= r.x + r.w + tPad && y >= r.y - tPad && y <= r.y + r.h + tPad) {
             return { type: 'drawing', id: d.id, part: 'whole' }
           }
         }
@@ -1610,7 +1615,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
     for (let i = als.length - 1; i >= 0; i--) {
       const yl = yOf(als[i].price)
-      if (yl != null && Math.abs(y - yl) < 7) return { type: 'alert', id: als[i].id, part: 'whole' }
+      if (yl != null && Math.abs(y - yl) < 7 * tolMul) return { type: 'alert', id: als[i].id, part: 'whole' }
     }
     return null
      
@@ -2065,6 +2070,55 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       return { x: e.clientX - r.left, y: e.clientY - r.top }
     }
 
+    // ---- touch long-press = right click (mobile context menu) ----
+    // Phones have no right-click: pressing and HOLDING ~550ms opens the same
+    // context menu (set alarm on a line, clone, delete, trade here…). Any real
+    // movement (pan/zoom), a second finger, or lifting early cancels it.
+    // On Android the browser ALSO fires a native contextmenu ~500ms into the
+    // hold — lastNativeCtxAt de-duplicates the two paths.
+    let lpTimer: ReturnType<typeof setTimeout> | null = null
+    let lpX = 0
+    let lpY = 0
+    let lpPointerId = -1
+    let touchDown = false
+    let lastNativeCtxAt = 0
+    const cancelLongPress = () => {
+      if (lpTimer) {
+        clearTimeout(lpTimer)
+        lpTimer = null
+      }
+    }
+    const openMenuAt = (clientX: number, clientY: number, tolMul: number) => {
+      const { x, y } = rel({ clientX, clientY })
+      const hit = hitTest(x, y, tolMul)
+      // cursor price — used by "add TP/SL here" and the trade menu actions
+      const price = priceAt(y)
+      // which strip was clicked + the value IN THAT STRIP's scale — the menu
+      // uses it for pane-aware actions (RSI/MACD alarm at the pointed value,
+      // horizontal lines that hold volume/RSI/MACD values)
+      const pane = paneAt(y)
+      const paneValue = pane === 'price' ? null : valueAtPane(pane, y)
+      if (hit) {
+        setMenu({ x, y, hit, price, pane, paneValue })
+        return
+      }
+      // empty chart: custom menu with price-aware actions (alert / trade / hline)
+      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price, pane, paneValue })
+    }
+    const fireLongPress = () => {
+      lpTimer = null
+      // native contextmenu already opened the menu — don't open it twice
+      if (Date.now() - lastNativeCtxAt < 700) return
+      // a drag may have started on this same press — abandon it, the menu takes over
+      dragRef.current = null
+      exitDragRef.current = null
+      pendingDragRef.current = null
+      el.style.cursor = ''
+      try { navigator.vibrate?.(15) } catch { /* unsupported */ }
+      // fingers are imprecise — open with the WIDER hit tolerance (tolMul 2)
+      openMenuAt(lpX, lpY, 2)
+    }
+
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return
       // a chart context menu is open — clicks INSIDE it must pass through.
@@ -2074,6 +2128,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // never receives the click. The trade ticket (incl. its drag header)
       // gets the same pass-through.
       if (e.target instanceof Element && (e.target.closest('[role="menu"]') || e.target.closest('[role="dialog"][aria-label^="Trade ticket"]'))) return
+      // arm the touch long-press timer (mobile right-click equivalent).
+      // Interactive HTML (header buttons, toolbars) is excluded — a held
+      // finger there means a slow tap, not a chart menu.
+      if (e.pointerType === 'touch' || e.pointerType === 'pen') {
+        cancelLongPress()
+        const tEl = e.target instanceof Element ? e.target : null
+        if (!tEl || !tEl.closest('button, a, input, select, textarea, label, [role="button"]')) {
+          lpX = e.clientX
+          lpY = e.clientY
+          lpPointerId = e.pointerId
+          touchDown = true
+          lpTimer = setTimeout(fireLongPress, 550)
+        }
+      }
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
 
@@ -2296,6 +2364,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
 
     const onPointerMove = (e: PointerEvent) => {
+      // finger drifted — this is a pan/zoom, not a hold: cancel the long-press
+      if (lpTimer !== null && e.pointerId === lpPointerId && Math.hypot(e.clientX - lpX, e.clientY - lpY) > 10) cancelLongPress()
       if (dragRef.current) return
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
@@ -2338,24 +2408,22 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
     }
 
+    const onPointerEnd = (e: PointerEvent) => {
+      if (e.pointerId === lpPointerId) {
+        cancelLongPress()
+        touchDown = false
+      }
+    }
+
     const onContextMenu = (e: MouseEvent) => {
-      const { x, y } = rel(e)
-      const hit = hitTest(x, y)
+      // on Android a touch long-press fires this NATIVE event ~500ms in —
+      // remember it so the synthesized timer doesn't open a second menu
+      lastNativeCtxAt = Date.now()
+      cancelLongPress()
       e.preventDefault()
       e.stopPropagation()
-      // cursor price — used by "add TP/SL here" and the trade menu actions
-      const price = priceAt(y)
-      // which strip was clicked + the value IN THAT STRIP's scale — the menu
-      // uses it for pane-aware actions (RSI/MACD alarm at the pointed value,
-      // horizontal lines that hold volume/RSI/MACD values)
-      const pane = paneAt(y)
-      const paneValue = pane === 'price' ? null : valueAtPane(pane, y)
-      if (hit) {
-        setMenu({ x, y, hit, price, pane, paneValue })
-        return
-      }
-      // empty chart: custom menu with price-aware actions (alert / trade / hline)
-      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price, pane, paneValue })
+      // touch-originated long-press uses the wider finger tolerance
+      openMenuAt(e.clientX, e.clientY, touchDown ? 2 : 1)
     }
 
     const onDoubleClick = (e: MouseEvent) => {
@@ -2413,13 +2481,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     el.addEventListener('pointerdown', onPointerDown, true)
     el.addEventListener('pointermove', onPointerMove, true)
     el.addEventListener('pointerleave', onPointerLeave)
+    el.addEventListener('pointerup', onPointerEnd, true)
+    el.addEventListener('pointercancel', onPointerEnd, true)
     el.addEventListener('contextmenu', onContextMenu, true)
     el.addEventListener('dblclick', onDoubleClick)
     window.addEventListener('keydown', onKeyDown)
     return () => {
+      cancelLongPress()
       el.removeEventListener('pointerdown', onPointerDown, true)
       el.removeEventListener('pointermove', onPointerMove, true)
       el.removeEventListener('pointerleave', onPointerLeave)
+      el.removeEventListener('pointerup', onPointerEnd, true)
+      el.removeEventListener('pointercancel', onPointerEnd, true)
       el.removeEventListener('contextmenu', onContextMenu, true)
       el.removeEventListener('dblclick', onDoubleClick)
       window.removeEventListener('keydown', onKeyDown)
@@ -3115,7 +3188,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     <div
       ref={containerRef}
       className={cn(
-        'relative h-full w-full select-none overflow-hidden',
+        'relative h-full w-full select-none overflow-hidden [-webkit-touch-callout:none]',
         focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
       )}
       style={{ background: '#09090b' }}
@@ -3622,8 +3695,8 @@ function ContextMenu({
   if (!container) return null
   const w = container.clientWidth
   const h = container.clientHeight
-  const left = Math.min(menu.x + 4, w - 230)
-  const top = Math.min(menu.y + 4, h - 320)
+  const left = Math.max(4, Math.min(menu.x + 4, w - 230))
+  const top = Math.max(4, Math.min(menu.y + 4, h - 320))
   const price = menu.price ?? null
 
   if (menu.hit.type === 'alert' && alert && alertHit) {
