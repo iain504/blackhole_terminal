@@ -33,6 +33,8 @@ interface UserSettings {
   alpacaSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
+  notifyFills?: boolean
+  notifyCloses?: boolean
   tradeMode?: string
   tpslPercent?: number
 }
@@ -73,6 +75,8 @@ export async function GET() {
     if (s.alpacaSecretEnc) settings.alpacaSecret = decrypt(s.alpacaSecretEnc) || undefined
     if (s.telegramTokenEnc) settings.telegramToken = decrypt(s.telegramTokenEnc) || undefined
     if (typeof s.telegramChatId === 'string') settings.telegramChatId = s.telegramChatId
+    settings.notifyFills = s.notifyFills !== false
+    settings.notifyCloses = s.notifyCloses !== false
 
     return NextResponse.json({
       app: 'blackhole-terminal',
@@ -361,6 +365,8 @@ export async function POST(req: Request) {
       if (str(incoming.alpacaSecret)) s.alpacaSecretEnc = encrypt(str(incoming.alpacaSecret))
       if (str(incoming.telegramToken)) s.telegramTokenEnc = encrypt(str(incoming.telegramToken))
       if (typeof incoming.telegramChatId === 'string') s.telegramChatId = incoming.telegramChatId.trim()
+      if (typeof incoming.notifyFills === 'boolean') s.notifyFills = incoming.notifyFills
+      if (typeof incoming.notifyCloses === 'boolean') s.notifyCloses = incoming.notifyCloses
       if (incoming.tradeMode === 'paper' || incoming.tradeMode === 'live') s.tradeMode = incoming.tradeMode
       const pct = num(incoming.tpslPercent)
       if (Number.isFinite(pct) && pct > 0 && pct <= 90) s.tpslPercent = Math.round(pct * 100) / 100

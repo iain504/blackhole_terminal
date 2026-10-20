@@ -186,6 +186,7 @@ export interface TradingOrder {
   trail_price: string | null
   filled_at: string | null
   created_at: string | null
+  updated_at?: string | null
   replaces: string | null
   replaced_by?: string | null
   legs: TradingOrder[] | null
@@ -451,9 +452,9 @@ async function placeCryptoExitLegs(
 
 const OCO_CYCLE_MS = 6000
 const OCO_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
-// last attach-failure signature per entry id — the supervisor retries every
-// cycle, but transient rejections (e.g. Alpaca's "potential wash trade
-// detected" while a crossing pending entry rests) must not spam the log
+// last attach-backoff state per entry id — when a failed attach is followed
+// by an UNCHANGED state (same position qty + missing-leg set) the supervisor
+// does not re-POST every cycle; any state change enables one fresh attempt
 const attachWarnSig = new Map<string, string>()
 
 /** Supervised (user,mode) pairs — survives dev hot reloads via globalThis. */
@@ -502,17 +503,29 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
     const knownCoids = new Set(orders.map((o) => o.client_order_id || ''))
     const isCrypto = (o: TradingOrder) => o.asset_class === 'crypto' || o.symbol.includes('/')
 
-    // (a) OCO cleanup: a managed exit leg dies with its position
+    // (a) OCO cleanup: a managed exit leg dies with its position. Covers BOTH
+    // leg tags: `tte-` (supervisor-placed after an entry fills) and `ttp-`
+    // (user-attached via chart drag / +TP/+SL). A leftover exit against a
+    // closed position used to survive and later fire against the NEW
+    // position's balance — one source of the crypto "insufficient balance"
+    // 403 noise.
     for (const o of orders) {
       if (!isCrypto(o) || !OCO_OPEN_STATUSES.includes(o.status)) continue
-      if (!(o.client_order_id || '').startsWith('tte-')) continue
+      const coid0 = o.client_order_id || ''
+      if (!(coid0.startsWith('tte-') || coid0.startsWith('ttp-'))) continue
       if (!posSet.has(norm(o.symbol))) {
         const r = await cancelOrder(userId, mode, o.id)
-        console.log(`[oco] canceled orphaned exit ${o.client_order_id} (${o.symbol}) -> ${r.status}`)
+        console.log(`[oco] canceled orphaned exit ${coid0} (${o.symbol}) -> ${r.status}`)
       }
     }
 
-    // (b) attach exit legs to managed entries that have FILLED
+    // (b) attach exit legs to managed entries that have FILLED. Skips when
+    // the POSITION is gone (closing via another exit used to leave the
+    // supervisor POSTing a doomed leg every cycle — the repeating
+    // "insufficient balance for BTC (available: 0)" 403 spam) and backs off
+    // when nothing relevant changed since the last failed attempt (the
+    // position qty and the missing-leg set are the signature — any change
+    // re-enables one attempt).
     for (const o of orders) {
       if (!isCrypto(o) || o.status !== 'filled') continue
       const plan = parseCryptoPlan(o.client_order_id)
@@ -520,6 +533,10 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
       const wantTp = plan.tp != null && !knownCoids.has(exitLegClientId(o.id, 'tp'))
       const wantSl = plan.sl != null && !knownCoids.has(exitLegClientId(o.id, 'sl'))
       if (!wantTp && !wantSl) continue
+      const pos = positions.find((p) => norm(p.symbol) === norm(o.symbol))
+      if (!pos || !(parseFloat(pos.qty) > 0)) continue // position closed — nothing to protect
+      const stateSig = `${parseFloat(pos.qty)}|${wantTp ? 'tp' : ''}${wantSl ? 'sl' : ''}`
+      if (attachWarnSig.get(o.id) === stateSig) continue // same state, last attempt failed — back off
       const errs = await placeCryptoExitLegs(
         userId,
         mode,
@@ -528,11 +545,8 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
         wantSl ? plan.sl! : undefined,
       )
       if (errs.length) {
-        const sig = errs.join('; ')
-        if (attachWarnSig.get(o.id) !== sig) {
-          attachWarnSig.set(o.id, sig)
-          console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, sig)
-        }
+        attachWarnSig.set(o.id, stateSig)
+        console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, errs.join('; '), '— backed off until the state changes')
       } else {
         attachWarnSig.delete(o.id)
         console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
@@ -593,6 +607,70 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
         console.warn(`[oco] leg-heal failed for ${o.symbol} (${o.id}):`, r.errors.join('; '))
       }
     }
+
+    // (d) crypto PARTIAL-EXIT heal: an exit leg that partially filled and then
+    // died (filled/canceled/expired) leaves the REMAINING position without
+    // that protection — the user had to re-drag the SL after every partial
+    // fill (the BTC/USD report). Re-place the same kind at the same price for
+    // what is left (half-position sizing, same as the attach path), once per
+    // dead leg. Bounded to RECENT deaths (30 min) so a stale price is never
+    // resurrected onto an unrelated future position. Skipped when the
+    // position is gone or the user already re-added a same-kind exit.
+    const EXIT_HEAL_WINDOW_MS = 30 * 60 * 1000
+    for (const o of orders) {
+      if (!isCrypto(o) || OCO_OPEN_STATUSES.includes(o.status)) continue
+      const coid = o.client_order_id || ''
+      if (!(coid.startsWith('ttp-') || coid.startsWith('tte-'))) continue
+      if (!(coid.endsWith('-tp') || coid.endsWith('-sl'))) continue
+      const filledQty = parseFloat(o.filled_qty) || 0
+      if (filledQty <= 0) continue // canceled without any fill — nothing happened
+      const deadAt = Date.parse(o.updated_at || o.filled_at || o.created_at || '') || 0
+      if (!deadAt || nowMs - deadAt > EXIT_HEAL_WINDOW_MS) continue // too old — leave history alone
+      const healKey = `${userId}|${mode}|${o.id}`
+      if (healedSet().has(healKey)) continue
+      healedSet().add(healKey) // one-shot per dead leg (a heal leg gets its own id)
+      const kind: 'tp' | 'sl' = coid.endsWith('-tp') ? 'tp' : 'sl'
+      const px = parseFloat((kind === 'tp' ? o.limit_price : o.stop_price) || '')
+      if (!Number.isFinite(px) || px <= 0) continue
+      const posRes = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(o.symbol)}`)
+      const pos = posRes.data
+      if (!pos || !(Math.abs(parseFloat(pos.qty) || 0) > 0)) continue // position gone
+      const exitSide = pos.side === 'short' ? 'buy' : 'sell'
+      const openRes = await getOpenOrders(userId, mode, o.symbol)
+      const rows: TradingOrder[] = Array.isArray(openRes.data) ? openRes.data : []
+      const hasSameKind = rows.some(
+        (x) =>
+          norm(x.symbol) === norm(o.symbol) &&
+          x.side === exitSide &&
+          OCO_OPEN_STATUSES.includes(x.status) &&
+          x.status !== 'held' &&
+          (kind === 'tp' ? x.type === 'limit' : x.type === 'stop' || x.type === 'stop_limit'),
+      )
+      if (hasSameKind) continue // already protected (user re-added / sibling alive)
+      const avail = Math.abs(parseFloat(pos.qty_available) || 0) || Math.abs(parseFloat(pos.qty) || 0)
+      const posQty = Math.abs(parseFloat(pos.qty) || 0)
+      const qty = String(parseFloat((Math.max(0, Math.min(avail, posQty / 2)) * 0.99).toFixed(8)))
+      if (!(parseFloat(qty) > 0)) continue
+      const healCoid = `ttp-heal-${Math.random().toString(36).slice(2, 8)}-${kind}`
+      const body =
+        kind === 'tp'
+          ? {
+              symbol: o.symbol, qty, side: exitSide, type: 'limit', time_in_force: 'gtc',
+              limit_price: fmtPx(px, true), client_order_id: healCoid,
+            }
+          : {
+              symbol: o.symbol, qty, side: exitSide, type: 'stop_limit', time_in_force: 'gtc',
+              stop_price: fmtPx(px, true),
+              limit_price: fmtPx(exitSide === 'sell' ? px * 0.999 : px * 1.001, true),
+              client_order_id: healCoid,
+            }
+      const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', { method: 'POST', body: JSON.stringify(body) })
+      if (r.data && (r.data as TradingOrder).id) {
+        console.log(`[oco] healed partial-filled ${kind.toUpperCase()} leg ${o.id} (${o.symbol}, filled ${filledQty}) — re-placed for the remaining position`)
+      } else {
+        console.warn(`[oco] partial-exit heal failed for ${o.symbol} ${kind}:`, r.error || r.status)
+      }
+    }
   } catch (e) {
     console.warn('[oco] supervisor cycle failed:', e instanceof Error ? e.message : e)
   }
@@ -618,10 +696,18 @@ export async function placeTrailingStop(
 }
 
 /** Rebuild an open exit order body from an existing order (used by the
- * cancel+re-place fallback and OCO-sibling regeneration). */
+ * cancel+re-place fallback and OCO-sibling regeneration).
+ *
+ * `availQty` (optional) clamps the re-placed qty to what the account can
+ * actually deliver RIGHT NOW: partial fills of the exit itself shrink the
+ * position, and re-placing the full ORIGINAL qty after a partial close is a
+ * guaranteed 403 ("insufficient balance for BTC"). The clamp uses the
+ * order's own unfilled remainder AND the caller-supplied side-aware
+ * position capacity (whichever is smaller). */
 function exitBodyFrom(
   orig: TradingOrder,
   patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
+  availQty?: number,
 ): Record<string, unknown> | null {
   const isCrypto = orig.asset_class === 'crypto' || orig.symbol.includes('/')
   const num = (v: string | null | undefined): number | null => {
@@ -632,9 +718,18 @@ function exitBodyFrom(
   const newStop = patch.stop_price ?? num(orig.stop_price)
   const newLimit = patch.limit_price ?? num(orig.limit_price)
   const newTrail = patch.trail_percent ?? num(orig.trail_percent)
+  // qty: the order's own remaining (original minus what it already filled);
+  // an exit that partially filled must not re-place its FULL original size
+  const origQty = parseFloat(orig.qty) || 0
+  const filledQty = parseFloat(orig.filled_qty) || 0
+  let qty = filledQty > 0 ? Math.max(0, origQty - filledQty) : origQty
+  if (typeof availQty === 'number' && Number.isFinite(availQty) && availQty >= 0) {
+    qty = Math.min(qty, availQty)
+  }
+  if (!(qty > 0)) return null
   const body: Record<string, unknown> = {
     symbol: orig.symbol,
-    qty: orig.qty,
+    qty: String(parseFloat(qty.toFixed(8))),
     side: orig.side,
     type: orig.type,
     time_in_force: orig.time_in_force || 'gtc',
@@ -778,6 +873,43 @@ export async function replaceExitOrderSmart(
     }
   }
   if (!OPEN_STATUSES.includes(String(orig.status))) {
+    // The exit PARTIALLY filled and then died (filled/canceled/expired): the
+    // remaining position is naked, and re-dragging the line should place a
+    // NEW exit at the dragged price for what is LEFT — not dead-end with a
+    // 409. (The BTC/USD report: after a partial SL fill the position had no
+    // SL, and every re-drag was refused.)
+    const filledQty = parseFloat(orig.filled_qty) || 0
+    if (filledQty > 0 && patch.trail_percent == null) {
+      const isTpIntent = patch.limit_price != null && orig.type === 'limit'
+      const isSlIntent = patch.stop_price != null && (orig.type === 'stop' || orig.type === 'stop_limit')
+      const px = isTpIntent
+        ? (patch.limit_price as number)
+        : isSlIntent
+          ? (patch.stop_price as number)
+          : null
+      if (px != null && px > 0) {
+        const pos = await tradeFetch<TradingPosition>(userId, errHost, `/v2/positions/${encodeURIComponent(orig.symbol)}`)
+        if (pos.data && Math.abs(parseFloat(pos.data.qty) || 0) > 0) {
+          const r = await attachExitsToPosition(userId, errHost, orig.symbol, isTpIntent ? { tp: px } : { sl: px })
+          if (r.results.length > 0) {
+            return {
+              data: r.results[0],
+              status: 200,
+              mode: errHost,
+              method: 'cancel-replace',
+              note: `Previous exit had partially filled (${filledQty}) — a new one was attached for the remaining position`,
+            }
+          }
+          return {
+            data: null,
+            status: 502,
+            error: friendlyExitQtyError(`Could not re-attach after the partial fill: ${r.errors.join('; ')}`),
+            mode: errHost,
+            method: 'cancel-replace',
+          }
+        }
+      }
+    }
     return {
       data: null,
       status: 409,
@@ -804,10 +936,38 @@ export async function replaceExitOrderSmart(
   if (cancelRes.status !== 204 && cancelRes.status !== 200 && cancelRes.status !== 404) {
     return { data: null, status: cancelRes.status || 502, error: cancelRes.error || 'Cancel failed', mode: errHost, method: 'cancel-replace' }
   }
+  // Wait for the cancel to SETTLE before re-placing: Alpaca releases the
+  // order's qty reservation asynchronously — an immediate re-place used to
+  // 403 with "insufficient balance" while the old order still held the qty.
+  await waitUntilCanceled(userId, errHost, targetId)
 
-  const newBody = exitBodyFrom(orig, patch)
+  // Side-aware capacity of the position AFTER the cancel (partial fills of
+  // this exit may have shrunk the position; the freed reservation changes
+  // qty_available). The re-place qty is clamped to it — re-placing the full
+  // original size after a partial close was a guaranteed 403.
+  let availQty: number | undefined
+  const posAfter = await tradeFetch<TradingPosition>(userId, errHost, `/v2/positions/${encodeURIComponent(orig.symbol)}`)
+  if (posAfter.data) {
+    const p = posAfter.data
+    const qa = parseFloat(p.qty_available)
+    const pq = Math.abs(parseFloat(p.qty) || 0)
+    availQty = p.side === 'short' ? pq : Number.isFinite(qa) ? qa : pq
+    if (!(availQty > 0)) availQty = 0
+  } else {
+    availQty = 0 // position closed while we were replacing — nothing to protect
+  }
+
+  const newBody = exitBodyFrom(orig, patch, availQty)
   if (!newBody) {
-    return { data: null, status: 400, error: `Unsupported exit type ${orig.type} for re-place`, mode: errHost, method: 'cancel-replace' }
+    return {
+      data: null,
+      status: 409,
+      error: availQty === 0
+        ? 'Nothing left to protect — the position is closed or fully reserved'
+        : `Unsupported exit type ${orig.type} for re-place`,
+      mode: errHost,
+      method: 'cancel-replace',
+    }
   }
   // re-place on the host the order actually lives on (`mode` can differ when
   // the PATCH self-healed across paper/live)
@@ -816,16 +976,28 @@ export async function replaceExitOrderSmart(
     body: JSON.stringify(newBody),
   })
   if (!(r2.data && (r2.data as TradingOrder).id)) {
-    return { data: null, status: r2.status || 502, error: `Re-place failed after cancel: ${r2.error || 'unknown'}`, mode: errHost, method: 'cancel-replace' }
+    return { data: null, status: r2.status || 502, error: friendlyExitQtyError(`Re-place failed after cancel: ${r2.error || 'unknown'}`), mode: errHost, method: 'cancel-replace' }
   }
 
-  // heal the sibling if the cancel cascaded (OCO group cancellation)
+  // heal the sibling if the cancel cascaded (OCO group cancellation) — its
+  // qty is clamped the same way (recompute the capacity AFTER the main
+  // re-place consumed its reservation)
   let note: string | undefined
   if (sibling) {
     const stillOpen = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${sibling.id}`)
     const gone = !stillOpen.data || ['canceled', 'cancelled', 'expired', 'rejected'].includes(String(stillOpen.data.status))
     if (gone) {
-      const sibBody = exitBodyFrom(sibling, {})
+      let sibAvail: number | undefined
+      const posSib = await tradeFetch<TradingPosition>(userId, errHost, `/v2/positions/${encodeURIComponent(orig.symbol)}`)
+      if (posSib.data) {
+        const p = posSib.data
+        const qa = parseFloat(p.qty_available)
+        const pq = Math.abs(parseFloat(p.qty) || 0)
+        sibAvail = p.side === 'short' ? pq : Number.isFinite(qa) ? qa : pq
+      } else {
+        sibAvail = 0
+      }
+      const sibBody = exitBodyFrom(sibling, {}, sibAvail)
       if (sibBody) {
         const rs = await tradeFetch<TradingOrder>(userId, errHost, '/v2/orders', {
           method: 'POST',
@@ -869,11 +1041,22 @@ async function waitUntilCanceled(userId: string, host: TradeMode, orderId: strin
 
 /** Alpaca error text for "the position qty is already reserved by open exits". */
 export function friendlyExitQtyError(msg: string): string {
-  if (!/insufficient qty available for order/i.test(msg)) return msg
-  return (
-    msg +
-    ' — your open TP/SL exit orders reserve the position quantity. Cancel the existing exit first, or use the position row\u2019s [+TP]/[+SL] buttons (they rebuild both exits as one OCO).'
-  )
+  if (/insufficient qty available for order/i.test(msg)) {
+    return (
+      msg +
+      ' — your open TP/SL exit orders reserve the position quantity. Cancel the existing exit first, or use the position row\u2019s [+TP]/[+SL] buttons (they rebuild both exits as one OCO).'
+    )
+  }
+  // crypto exits (SELL legs) reject with "insufficient balance for <ASSET>"
+  // when the position shrank below the requested size — nearly always the
+  // residue of PARTIAL fills (the SL filled part of the position already)
+  if (/insufficient balance for /i.test(msg)) {
+    return (
+      msg +
+      ' — the remaining position is smaller than the exit size (partial fills reduced it). The qty is recalculated from the live position — try again.'
+    )
+  }
+  return msg
 }
 
 /**
@@ -1301,7 +1484,8 @@ export interface AttachExitsResult {
  *   "Position has no available qty" (the user's drag/+SL bug).
  * Crypto: ALL advanced order classes are rejected — place split exit legs
  * (50/50 qty, 0.99 fee factor) directly against the position, tagged with a
- * `ttp-` client_order_id (ignored by the OCO supervisor's `tte-` cleanup).
+ * `ttp-` client_order_id (cleaned up + partial-fill-healed by the supervisor
+ * together with the `tte-` legs).
  */
 export async function attachExitsToPosition(
   userId: string,

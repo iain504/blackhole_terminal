@@ -1,0 +1,762 @@
+     1→// Alpaca Trading API client (server-side only): paper + live order routing,
+     2→// positions, bracket/OCO exits, order replacement for SL/TP drag updates.
+     3→//
+     4→// Verified against the paper API (2026-10):
+     5→// - Stocks support order_class=bracket (entry + take_profit/stop_loss legs).
+     6→// - Crypto rejects ALL advanced order classes (order_class=oco -> 40010001
+     7→//   "invalid order type for crypto order"; bracket -> 42210000) AND plain
+     8→//   `stop` type. Sell exits also CANNOT be reserved against a PENDING buy
+     9→//   (40310000 "insufficient balance" — only settled position qty counts),
+    10→//   so crypto complex orders are EMULATED: the entry carries its intended
+    11→//   TP/SL in the client_order_id (`ttb-…`) and the OCO supervisor below
+    12→//   attaches the exit legs (`tte-…`) the moment the entry FILLS, canceling
+    13→//   any surviving leg once the position is gone.
+    14→// - PATCH /v2/orders/{id} creates a REPLACEMENT order with a NEW id.
+    15→// - Position symbols drop the crypto slash (BTC/USD -> BTCUSD); ORDER
+    16→//   symbols keep it (BTC/USD).
+    17→import { db } from './db'
+    18→import { getAlpacaKeys } from './alpaca'
+    19→
+    20→export type TradeMode = 'paper' | 'live'
+    21→
+    22→const TRADE_BASE: Record<TradeMode, string> = {
+    23→  paper: 'https://paper-api.alpaca.markets',
+    24→  live: 'https://api.alpaca.markets',
+    25→}
+    26→
+    27→interface UserSettings {
+    28→  alpacaKeyIdEnc?: string
+    29→  alpacaSecretEnc?: string
+    30→  telegramTokenEnc?: string
+    31→  telegramChatId?: string
+    32→  tradeMode?: TradeMode
+    33→}
+    34→
+    35→export function isTradeMode(v: unknown): v is TradeMode {
+    36→  return v === 'paper' || v === 'live'
+    37→}
+    38→
+    39→/** Requested mode wins; else the user's stored preference; else paper. */
+    40→export async function resolveTradeMode(userId: string | undefined, requested?: unknown): Promise<TradeMode> {
+    41→  if (isTradeMode(requested)) return requested
+    42→  if (userId) {
+    43→    const user = await db.user.findUnique({ where: { id: userId } })
+    44→    const s = (user?.settings as UserSettings | null) || null
+    45→    if (isTradeMode(s?.tradeMode)) return s.tradeMode
+    46→  }
+    47→  return 'paper'
+    48→}
+    49→
+    50→/** Normalize symbols for the trading API: BTC/USD -> BTCUSD. */
+    51→export function tradeSymbol(symbol: string): string {
+    52→  return symbol.replace('/', '')
+    53→}
+    54→
+    55→interface TradeFetchResult<T> {
+    56→  data: T | null
+    57→  status: number
+    58→  error?: string
+    59→}
+    60→
+    61→async function tradeFetch<T>(
+    62→  userId: string,
+    63→  mode: TradeMode,
+    64→  path: string,
+    65→  init: RequestInit = {},
+    66→): Promise<TradeFetchResult<T>> {
+    67→  const keys = await getAlpacaKeys(userId)
+    68→  if (!keys) return { data: null, status: 0, error: 'no-keys' }
+    69→  const controller = new AbortController()
+    70→  const timer = setTimeout(() => controller.abort(), 9000)
+    71→  try {
+    72→    const res = await fetch(`${TRADE_BASE[mode]}${path}`, {
+    73→      ...init,
+    74→      headers: {
+    75→        'APCA-API-KEY-ID': keys.keyId,
+    76→        'APCA-API-SECRET-KEY': keys.secret,
+    77→        accept: 'application/json',
+    78→        ...(init.body ? { 'content-type': 'application/json' } : {}),
+    79→        ...(init.headers || {}),
+    80→      },
+    81→      signal: controller.signal,
+    82→      cache: 'no-store',
+    83→    })
+    84→    const text = await res.text()
+    85→    let parsed: unknown = null
+    86→    try {
+    87→      parsed = text ? JSON.parse(text) : null
+    88→    } catch {
+    89→      parsed = null
+    90→    }
+    91→    if (!res.ok) {
+    92→      const msg =
+    93→        (parsed as { message?: string } | null)?.message ||
+    94→        `Trading API HTTP ${res.status}`
+    95→      console.error(`Trading ${mode} ${path} -> ${res.status}: ${msg}`)
+    96→      return { data: parsed as T, status: res.status, error: msg }
+    97→    }
+    98→    return { data: parsed as T, status: res.status }
+    99→  } catch (e) {
+   100→    console.error(`Trading ${mode} ${path} failed:`, e instanceof Error ? e.message : e)
+   101→    return { data: null, status: 0, error: e instanceof Error ? e.message : 'network error' }
+   102→  } finally {
+   103→    clearTimeout(timer)
+   104→  }
+   105→}
+   106→
+   107→// ---------- shapes ----------
+   108→
+   109→/**
+   110→ * Alpaca rejects prices with more than 9 decimal places ("limit price exceeds
+   111→ * maximum precision of 9 decimal places") on CRYPTO, and sub-penny increments
+   112→ * on STOCKS ("sub-penny increment does not fulfill minimum pricing criteria").
+   113→ * Chart drag prices are raw JS floats (65800.22400000001) that blow past both —
+   114→ * first the direct PATCH fails, then the cancel+re-place fallback fails too,
+   115→ * LEAVING THE EXIT ORDER CANCELED AND LOST. Round every outgoing price string:
+   116→ * crypto 6dp (>=1) / 8dp (<1), stocks penny 2dp (>=1) / 4dp (<1).
+   117→ */
+   118→export function fmtPx(v: number, crypto = false): string {
+   119→  if (!Number.isFinite(v) || v <= 0) return String(v)
+   120→  const dp = crypto ? (v >= 1 ? 6 : 8) : v >= 1 ? 2 : 4
+   121→  return String(parseFloat(v.toFixed(dp)))
+   122→}
+   123→
+   124→export interface TradingAccount {
+   125→  status: string
+   126→  equity: string
+   127→  cash: string
+   128→  buying_power: string
+   129→  currency: string
+   130→  // extended fields (present on current Alpaca accounts) — the Positions-tab
+   131→  // account panel / details dialog read these
+   132→  account_number?: string
+   133→  portfolio_value?: string
+   134→  last_equity?: string
+   135→  regt_buying_power?: string
+   136→  daytrading_buying_power?: string
+   137→  non_marginable_buying_power?: string
+   138→  daytrade_count?: number
+   139→  initial_margin?: string
+   140→  maintenance_margin?: string
+   141→  multiplier?: string
+   142→  shorting_enabled?: boolean
+   143→  trading_blocked?: boolean
+   144→  transfers_blocked?: boolean
+   145→  account_blocked?: boolean
+   146→  pattern_day_trader?: boolean
+   147→  sma?: string
+   148→  created_at?: string
+   149→}
+   150→
+   151→/** Raw GET /v2/account/portfolio/history response (nulls mark empty slots). */
+   152→export interface PortfolioHistoryRaw {
+   153→  timestamp: number[] // unix seconds
+   154→  equity: (number | null)[]
+   155→  profit_loss: (number | null)[]
+   156→  profit_loss_pct: (number | null)[]
+   157→  base_value: number | null
+   158→  timeframe: string
+   159→}
+   160→
+   161→export interface TradingPosition {
+   162→  symbol: string // trading symbol (BTCUSD for crypto)
+   163→  qty: string
+   164→  qty_available: string
+   165→  side: string
+   166→  avg_entry_price: string
+   167→  current_price: string
+   168→  unrealized_pl: string
+   169→  unrealized_plpc: string
+   170→  asset_class: string
+   171→}
+   172→
+   173→export interface TradingOrder {
+   174→  id: string
+   175→  symbol: string
+   176→  qty: string
+   177→  filled_qty: string
+   178→  filled_avg_price: string | null
+   179→  side: string
+   180→  type: string
+   181→  status: string
+   182→  time_in_force?: string
+   183→  stop_price: string | null
+   184→  limit_price: string | null
+   185→  trail_percent: string | null
+   186→  trail_price: string | null
+   187→  filled_at: string | null
+   188→  created_at: string | null
+   189→  replaces: string | null
+   190→  replaced_by?: string | null
+   191→  legs: TradingOrder[] | null
+   192→  client_order_id?: string
+   193→  asset_class?: string
+   194→  /** 'simple' | 'bracket' | 'oco' | 'oto' (Alpaca v2 order class) */
+   195→  order_class?: string
+   196→  /** bracket/OCO family id — legs of one family share it with the parent */
+   197→  group_id?: string | null
+   198→  /** 'entry' | 'take_profit' | 'stop_loss' (role inside the family) */
+   199→  group_role?: string | null
+   200→}
+   201→
+   202→// ---------- API wrappers ----------
+   203→
+   204→export async function getAccount(userId: string, mode: TradeMode) {
+   205→  return tradeFetch<TradingAccount>(userId, mode, '/v2/account')
+   206→}
+   207→
+   208→/** Equity curve for the Positions tab (Hour/Day/Week/Month/Year ranges). */
+   209→export async function getPortfolioHistory(userId: string, mode: TradeMode, period: string, timeframe: string) {
+   210→  return tradeFetch<PortfolioHistoryRaw>(
+   211→    userId,
+   212→    mode,
+   213→    `/v2/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}&extended_hours=true`,
+   214→  )
+   215→}
+   216→
+   217→export async function getPositions(userId: string, mode: TradeMode) {
+   218→  return tradeFetch<TradingPosition[]>(userId, mode, '/v2/positions')
+   219→}
+   220→
+   221→export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: string) {
+   222→  const q = symbol ? `&symbols=${encodeURIComponent(symbol)}` : ''
+   223→  // Alpaca hides bracket legs from the DEFAULT (nested=false) list: an open
+   224→  // bracket parent comes back with legs=null, so pending-entry TP/SL (and any
+   225→  // exit mapped from legs) is invisible to callers. The nested=true variant
+   226→  // nests the legs under the parent — but a FILLED parent's ACTIVE legs only
+   227→  // show in the flat list. Fetch BOTH and merge by id (nested wins when it
+   228→  // carries legs) so both shapes are always covered.
+   229→  const [flat, nested] = await Promise.all([
+   230→    tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100${q}`),
+   231→    tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100&nested=true${q}`),
+   232→  ])
+   233→  const flatRows: TradingOrder[] = Array.isArray(flat.data) ? flat.data : []
+   234→  const nestedRows: TradingOrder[] = Array.isArray(nested.data) ? nested.data : []
+   235→  if (nestedRows.length === 0) return flat
+   236→  const byId = new Map<string, TradingOrder>()
+   237→  for (const o of flatRows) byId.set(o.id, o)
+   238→  for (const o of nestedRows) {
+   239→    const prev = byId.get(o.id)
+   240→    byId.set(o.id, !prev || (o.legs?.length ?? 0) > 0 ? o : prev)
+   241→  }
+   242→  return { ...flat, data: [...byId.values()] }
+   243→}
+   244→
+   245→export async function getClosedOrders(userId: string, mode: TradeMode, limit = 30) {
+   246→  return tradeFetch<TradingOrder[]>(
+   247→    userId,
+   248→    mode,
+   249→    `/v2/orders?status=closed&limit=${limit}&direction=desc`,
+   250→  )
+   251→}
+   252→
+   253→export interface PlaceOrderBody {
+   254→  symbol: string
+   255→  side: 'buy' | 'sell'
+   256→  qty: number
+   257→  type?: 'market' | 'limit'
+   258→  limit_price?: number
+   259→  time_in_force?: 'gtc' | 'day' | 'ioc'
+   260→  take_profit?: number
+   261→  stop_loss?: number
+   262→  trail_percent?: number
+   263→  client_order_id?: string
+   264→}
+   265→
+   266→/**
+   267→ * Place an entry order with optional exits.
+   268→ * Stocks: single bracket request when TP/SL present (Alpaca attaches legs).
+   269→ * Crypto: advanced classes are rejected — the entry is placed ALONE carrying
+   270→ * the intended TP/SL in its client_order_id (`ttb-…`); the OCO supervisor
+   271→ * (ensureCryptoOcoSupervisor) attaches the exit legs when the entry fills.
+   272→ */
+   273→export async function placeOrderWithExits(
+   274→  userId: string,
+   275→  mode: TradeMode,
+   276→  body: PlaceOrderBody,
+   277→): Promise<{ results: TradingOrder[]; errors: string[]; splitNote?: string }> {
+   278→  const isCrypto = body.symbol.includes('/')
+   279→  const type = body.type || 'market'
+   280→  const tif = body.time_in_force || (isCrypto ? 'gtc' : type === 'market' ? 'day' : 'gtc')
+   281→  const entry: Record<string, unknown> = {
+   282→    symbol: tradeSymbol(body.symbol),
+   283→    qty: String(body.qty),
+   284→    side: body.side,
+   285→    type,
+   286→    time_in_force: tif,
+   287→  }
+   288→  if (type === 'limit') {
+   289→    if (!body.limit_price) return { results: [], errors: ['Limit price required for limit orders'] }
+   290→    entry.limit_price = String(body.limit_price)
+   291→  }
+   292→  if (body.client_order_id) entry.client_order_id = body.client_order_id
+   293→
+   294→  const errors: string[] = []
+   295→  const results: TradingOrder[] = []
+   296→
+   297→  if (!isCrypto) {
+   298→    // Stocks: bracket handles entry + legs atomically.
+   299→    const hasTp = typeof body.take_profit === 'number' && body.take_profit > 0
+   300→    const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
+   301→    if (hasTp || hasSl) {
+   302→      entry.order_class = 'bracket'
+   303→      if (hasTp) entry.take_profit = { limit_price: body.take_profit!.toFixed(2) }
+   304→      if (hasSl) entry.stop_loss = { stop_price: body.stop_loss!.toFixed(2) }
+   305→      // encode the plan for the chart's pending display: Alpaca materializes
+   306→      // bracket LEGS only when the entry activates, so a queued (weekend /
+   307→      // pre-market) bracket would otherwise render without its TP/SL lines
+   308→      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
+   309→    }
+   310→    const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+   311→      method: 'POST',
+   312→      body: JSON.stringify(entry),
+   313→    })
+   314→    if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+   315→    else errors.push(r.error || 'Entry order failed')
+   316→    return { results, errors }
+   317→  }
+   318→
+   319→  // ---- Crypto: complex orders are EMULATED (no native bracket/OCO) ----
+   320→  const hasTp = typeof body.take_profit === 'number' && body.take_profit > 0
+   321→  const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
+   322→  if (hasTp || hasSl) {
+   323→    // encode the planned exits so the chart can render them while the entry
+   324→    // is pending AND the supervisor can attach the legs without extra state
+   325→    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
+   326→  }
+   327→  const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+   328→    method: 'POST',
+   329→    body: JSON.stringify(entry),
+   330→  })
+   331→  if (r.data && (r.data as TradingOrder).id) results.push(r.data)
+   332→  else {
+   333→    errors.push(r.error || 'Entry order failed')
+   334→    return { results, errors }
+   335→  }
+   336→  if (!hasTp && !hasSl) return { results, errors }
+   337→
+   338→  // Fast path: a MARKET entry usually fills instantly — poll briefly and
+   339→  // attach the exits in-line so protection starts immediately. Limit entries
+   340→  // return right away (the supervisor attaches on fill within ~6s).
+   341→  if (type === 'market') {
+   342→    let cur: TradingOrder | null = r.data
+   343→    for (let i = 0; i < 4 && cur && cur.status !== 'filled'; i++) {
+   344→      await new Promise((res) => setTimeout(res, 600))
+   345→      const s = await tradeFetch<TradingOrder>(userId, mode, `/v2/orders/${(r.data as TradingOrder).id}`)
+   346→      cur = s.data ?? cur
+   347→      if (cur && ['canceled', 'cancelled', 'rejected', 'expired'].includes(cur.status)) break
+   348→    }
+   349→    if (cur?.status === 'filled') {
+   350→      const legErrs = await placeCryptoExitLegs(
+   351→        userId,
+   352→        mode,
+   353→        cur,
+   354→        hasTp ? body.take_profit : undefined,
+   355→        hasSl ? body.stop_loss : undefined,
+   356→      )
+   357→      errors.push(...legErrs)
+   358→      return { results, errors }
+   359→    }
+   360→  }
+   361→  return {
+   362→    results,
+   363→    errors,
+   364→    splitNote: 'TP/SL attach automatically when the entry fills (OCO-managed)',
+   365→  }
+   366→}
+   367→
+   368→// ---------- crypto complex-order emulation (OCO supervisor) ----------
+   369→
+   370→/** Price -> client_order_id-safe digits (6dp fixed point). */
+   371→function encP(v: number): string {
+   372→  return String(Math.round(v * 1e6))
+   373→}
+   374→
+   375→/** client_order_id prefix identifying a MANAGED crypto exit leg. */
+   376→function exitLegClientId(entryOrderId: string, kind: 'tp' | 'sl'): string {
+   377→  return `tte-${entryOrderId}-${kind}`
+   378→}
+   379→
+   380→/** Encode the OCO/bracket plan (mode + TP/SL prices) into the entry's client_order_id. */
+   381→function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null): string {
+   382→  const rand = Math.random().toString(36).slice(2, 8)
+   383→  return `ttb-${mode[0]}-tp${tp != null && tp > 0 ? encP(tp) : '0'}-sl${sl != null && sl > 0 ? encP(sl) : '0'}-${rand}`
+   384→}
+   385→
+   386→/** Decode the plan from a `ttb-…` client_order_id. Returns null when not ours. */
+   387→function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null } | null {
+   388→  const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(clientOrderId || '')
+   389→  if (!m) return null
+   390→  const dec = (s: string | undefined) => (s ? parseInt(s, 10) / 1e6 : 0)
+   391→  const tp = dec(m[1])
+   392→  const sl = dec(m[2])
+   393→  return { tp: tp > 0 ? tp : null, sl: sl > 0 ? sl : null }
+   394→}
+   395→
+   396→/**
+   397→ * Place the exit legs for a FILLED crypto entry (50/50 qty split when both
+   398→ * legs are requested — Alpaca reserves balance per open sell order). Leg ids
+   399→ * are deterministic (`tte-<entryId>-tp|-sl`) so the supervisor is idempotent.
+   400→ * Crypto buys receive qty minus a trading fee, so legs apply a 0.99 safety
+   401→ * factor to avoid 403 "insufficient balance".
+   402→ */
+   403→async function placeCryptoExitLegs(
+   404→  userId: string,
+   405→  mode: TradeMode,
+   406→  entry: TradingOrder,
+   407→  tp?: number,
+   408→  sl?: number,
+   409→): Promise<string[]> {
+   410→  const errors: string[] = []
+   411→  const filledQty = parseFloat(entry.filled_qty) || parseFloat(entry.qty) || 0
+   412→  if (!(filledQty > 0)) return ['entry has no filled qty']
+   413→  const exitSide = entry.side === 'buy' ? 'sell' : 'buy'
+   414→  const both = tp != null && sl != null
+   415→  const legQty = ((both ? filledQty / 2 : filledQty) * 0.99).toFixed(8).replace(/0+$/, '').replace(/\.$/, '')
+   416→  if (tp != null) {
+   417→    const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+   418→      method: 'POST',
+   419→      body: JSON.stringify({
+   420→        symbol: entry.symbol,
+   421→        qty: legQty,
+   422→        side: exitSide,
+   423→        type: 'limit',
+   424→        time_in_force: 'gtc',
+   425→        limit_price: tp.toFixed(tp < 1 ? 6 : 2),
+   426→        client_order_id: exitLegClientId(entry.id, 'tp'),
+   427→      }),
+   428→    })
+   429→    if (!(r.data && (r.data as TradingOrder).id)) errors.push(`TP: ${r.error || 'failed'}`)
+   430→  }
+   431→  if (sl != null) {
+   432→    // stop-limit sell: limit slightly below the stop so it clears the book
+   433→    const limP = exitSide === 'sell' ? sl * 0.999 : sl * 1.001
+   434→    const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+   435→      method: 'POST',
+   436→      body: JSON.stringify({
+   437→        symbol: entry.symbol,
+   438→        qty: legQty,
+   439→        side: exitSide,
+   440→        type: 'stop_limit',
+   441→        time_in_force: 'gtc',
+   442→        stop_price: sl.toFixed(sl < 1 ? 6 : 2),
+   443→        limit_price: limP.toFixed(limP < 1 ? 6 : 2),
+   444→        client_order_id: exitLegClientId(entry.id, 'sl'),
+   445→      }),
+   446→    })
+   447→    if (!(r.data && (r.data as TradingOrder).id)) errors.push(`SL: ${r.error || 'failed'}`)
+   448→  }
+   449→  return errors
+   450→}
+   451→
+   452→const OCO_CYCLE_MS = 6000
+   453→const OCO_OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+   454→// last attach-failure signature per entry id — the supervisor retries every
+   455→// cycle, but transient rejections (e.g. Alpaca's "potential wash trade
+   456→// detected" while a crossing pending entry rests) must not spam the log
+   457→const attachWarnSig = new Map<string, string>()
+   458→
+   459→/** Supervised (user,mode) pairs — survives dev hot reloads via globalThis. */
+   460→function supervisedSet(): Set<string> {
+   461→  const g = globalThis as { __ttOcoSupervised?: Set<string> }
+   462→  if (!g.__ttOcoSupervised) g.__ttOcoSupervised = new Set<string>()
+   463→  return g.__ttOcoSupervised
+   464→}
+   465→
+   466→/** Stock bracket parents already leg-healed (one-shot) — survives hot reloads. */
+   467→function healedSet(): Set<string> {
+   468→  const g = globalThis as { __ttOcoHealed?: Set<string> }
+   469→  if (!g.__ttOcoHealed) g.__ttOcoHealed = new Set<string>()
+   470→  return g.__ttOcoHealed
+   471→}
+   472→
+   473→/**
+   474→ * Start the OCO supervisor for a (user, mode) pair (idempotent). One cycle
+   475→ * every 6s: (a) cancel managed exit legs whose position is gone (OCO
+   476→ * semantics — when the position closes, the surviving leg dies),
+   477→ * (b) attach exit legs to managed entries that have FILLED.
+   478→ */
+   479→export function ensureCryptoOcoSupervisor(userId: string, mode: TradeMode): void {
+   480→  const key = `${userId}|${mode}`
+   481→  if (supervisedSet().has(key)) return
+   482→  supervisedSet().add(key)
+   483→  const timer = setInterval(() => {
+   484→    void runOcoCycle(userId, mode)
+   485→  }, OCO_CYCLE_MS)
+   486→  // never keep the process alive just for the supervisor
+   487→  if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+   488→    ;(timer as { unref: () => void }).unref()
+   489→  }
+   490→}
+   491→
+   492→async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
+   493→  try {
+   494→    const [ordRes, posRes] = await Promise.all([
+   495→      tradeFetch<TradingOrder[]>(userId, mode, '/v2/orders?status=all&limit=500&direction=desc'),
+   496→      tradeFetch<TradingPosition[]>(userId, mode, '/v2/positions'),
+   497→    ])
+   498→    const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
+   499→    const positions: TradingPosition[] = Array.isArray(posRes.data) ? posRes.data : []
+   500→    const norm = (s: string) => s.replace('/', '').toUpperCase()
+   501→    const posSet = new Set(positions.map((p) => norm(p.symbol)))
+   502→    const knownCoids = new Set(orders.map((o) => o.client_order_id || ''))
+   503→    const isCrypto = (o: TradingOrder) => o.asset_class === 'crypto' || o.symbol.includes('/')
+   504→
+   505→    // (a) OCO cleanup: a managed exit leg dies with its position
+   506→    for (const o of orders) {
+   507→      if (!isCrypto(o) || !OCO_OPEN_STATUSES.includes(o.status)) continue
+   508→      if (!(o.client_order_id || '').startsWith('tte-')) continue
+   509→      if (!posSet.has(norm(o.symbol))) {
+   510→        const r = await cancelOrder(userId, mode, o.id)
+   511→        console.log(`[oco] canceled orphaned exit ${o.client_order_id} (${o.symbol}) -> ${r.status}`)
+   512→      }
+   513→    }
+   514→
+   515→    // (b) attach exit legs to managed entries that have FILLED
+   516→    for (const o of orders) {
+   517→      if (!isCrypto(o) || o.status !== 'filled') continue
+   518→      const plan = parseCryptoPlan(o.client_order_id)
+   519→      if (!plan || (plan.tp == null && plan.sl == null)) continue
+   520→      const wantTp = plan.tp != null && !knownCoids.has(exitLegClientId(o.id, 'tp'))
+   521→      const wantSl = plan.sl != null && !knownCoids.has(exitLegClientId(o.id, 'sl'))
+   522→      if (!wantTp && !wantSl) continue
+   523→      const errs = await placeCryptoExitLegs(
+   524→        userId,
+   525→        mode,
+   526→        o,
+   527→        wantTp ? plan.tp! : undefined,
+   528→        wantSl ? plan.sl! : undefined,
+   529→      )
+   530→      if (errs.length) {
+   531→        const sig = errs.join('; ')
+   532→        if (attachWarnSig.get(o.id) !== sig) {
+   533→          attachWarnSig.set(o.id, sig)
+   534→          console.warn(`[oco] exit attach failed for ${o.id} (${o.symbol}):`, sig)
+   535→        }
+   536→      } else {
+   537→        attachWarnSig.delete(o.id)
+   538→        console.log(`[oco] attached exits to filled entry ${o.id} (${o.symbol}) tp=${plan.tp} sl=${plan.sl}`)
+   539→      }
+   540→    }
+   541→
+   542→    // (c) STOCK bracket leg-heal: a filled bracket parent whose exit legs are
+   543→    // ALL canceled leaves a NAKED position. Verified live 2026-10 (ECHO): a
+   544→    // PATCH-replace of a partially filled parent races its own cancel — the
+   545→    // original fills after being superseded, Alpaca cancels the legs instead
+   546→    // of activating them, and the replacement can fail + reverse. Re-attach
+   547→    // the planned exits once, within a short window after the fill so
+   548→    // deliberate later cancels are respected; never fight exits that already
+   549→    // exist (the user may have re-added them manually).
+   550→    const HEAL_WINDOW_MS = 15 * 60 * 1000
+   551→    const nowMs = Date.now()
+   552→    for (const o of orders) {
+   553→      if (isCrypto(o) || o.status !== 'filled') continue
+   554→      if (String(o.order_class || '') !== 'bracket' && o.group_role !== 'entry') continue
+   555→      const filledAt = o.filled_at ? Date.parse(o.filled_at) : NaN
+   556→      if (!Number.isFinite(filledAt) || nowMs - filledAt > HEAL_WINDOW_MS) continue
+   557→      const family = orders.filter((x) => x.group_id && x.group_id === o.group_id && x.id !== o.id)
+   558→      if (family.length === 0) continue
+   559→      if (family.some((l) => OCO_OPEN_STATUSES.includes(l.status))) continue // legs alive
+   560→      const tpLeg = family.find((l) => l.group_role === 'take_profit')
+   561→      const slLeg = family.find((l) => l.group_role === 'stop_loss')
+   562→      const tp = tpLeg ? parseFloat(tpLeg.limit_price || '') : NaN
+   563→      const sl = slLeg ? parseFloat(slLeg.stop_price || '') : NaN
+   564→      if (!Number.isFinite(tp) && !Number.isFinite(sl)) continue
+   565→      const healKey = `${userId}|${mode}|${o.id}`
+   566→      if (healedSet().has(healKey)) continue
+   567→      if (!posSet.has(norm(o.symbol))) {
+   568→        healedSet().add(healKey) // position gone — nothing to protect
+   569→        continue
+   570→      }
+   571→      const openNow = await getOpenOrders(userId, mode, o.symbol)
+   572→      const rows: TradingOrder[] = Array.isArray(openNow.data) ? openNow.data : []
+   573→      const exitSide = o.side === 'buy' ? 'sell' : 'buy'
+   574→      const hasExit = rows.some(
+   575→        (x) =>
+   576→          norm(x.symbol) === norm(o.symbol) &&
+   577→          x.side === exitSide &&
+   578→          OCO_OPEN_STATUSES.includes(x.status) &&
+   579→          x.status !== 'held',
+   580→      )
+   581→      if (hasExit) {
+   582→        healedSet().add(healKey) // already protected manually — respect it
+   583→        continue
+   584→      }
+   585→      const r = await attachExitsToPosition(userId, mode, o.symbol, {
+   586→        tp: Number.isFinite(tp) ? tp : undefined,
+   587→        sl: Number.isFinite(sl) ? sl : undefined,
+   588→      })
+   589→      healedSet().add(healKey)
+   590→      if (r.results.length > 0) {
+   591→        console.log(`[oco] healed naked position ${o.symbol} from filled bracket ${o.id} (tp=${tp} sl=${sl})`)
+   592→      } else {
+   593→        console.warn(`[oco] leg-heal failed for ${o.symbol} (${o.id}):`, r.errors.join('; '))
+   594→      }
+   595→    }
+   596→  } catch (e) {
+   597→    console.warn('[oco] supervisor cycle failed:', e instanceof Error ? e.message : e)
+   598→  }
+   599→}
+   600→
+   601→/** Trailing-stop entry/exit (stocks only; crypto rejects trailing_stop). */
+   602→export async function placeTrailingStop(
+   603→  userId: string,
+   604→  mode: TradeMode,
+   605→  body: { symbol: string; side: 'buy' | 'sell'; qty: number; trail_percent: number },
+   606→) {
+   607→  return tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+   608→    method: 'POST',
+   609→    body: JSON.stringify({
+   610→      symbol: tradeSymbol(body.symbol),
+   611→      qty: String(body.qty),
+   612→      side: body.side,
+   613→      type: 'trailing_stop',
+   614→      time_in_force: 'gtc',
+   615→      trail_percent: body.trail_percent.toFixed(2),
+   616→    }),
+   617→  })
+   618→}
+   619→
+   620→/** Rebuild an open exit order body from an existing order (used by the
+   621→ * cancel+re-place fallback and OCO-sibling regeneration). */
+   622→function exitBodyFrom(
+   623→  orig: TradingOrder,
+   624→  patch: { stop_price?: number; limit_price?: number; trail_percent?: number },
+   625→): Record<string, unknown> | null {
+   626→  const isCrypto = orig.asset_class === 'crypto' || orig.symbol.includes('/')
+   627→  const num = (v: string | null | undefined): number | null => {
+   628→    if (v == null) return null
+   629→    const n = parseFloat(v)
+   630→    return Number.isFinite(n) && n > 0 ? n : null
+   631→  }
+   632→  const newStop = patch.stop_price ?? num(orig.stop_price)
+   633→  const newLimit = patch.limit_price ?? num(orig.limit_price)
+   634→  const newTrail = patch.trail_percent ?? num(orig.trail_percent)
+   635→  const body: Record<string, unknown> = {
+   636→    symbol: orig.symbol,
+   637→    qty: orig.qty,
+   638→    side: orig.side,
+   639→    type: orig.type,
+   640→    time_in_force: orig.time_in_force || 'gtc',
+   641→  }
+   642→  if (orig.type === 'stop') {
+   643→    if (newStop == null) return null
+   644→    body.stop_price = fmtPx(newStop, isCrypto)
+   645→  } else if (orig.type === 'stop_limit') {
+   646→    if (newStop == null) return null
+   647→    body.stop_price = fmtPx(newStop, isCrypto)
+   648→    if (newLimit != null) {
+   649→      body.limit_price = fmtPx(newLimit, isCrypto)
+   650→    } else {
+   651→      // preserve the original stop→limit offset when only the stop moves
+   652→      const os = num(orig.stop_price)
+   653→      const ol = num(orig.limit_price)
+   654→      const ratio = os && ol ? ol / os : orig.side === 'sell' ? 0.999 : 1.001
+   655→      body.limit_price = fmtPx(newStop * ratio, isCrypto)
+   656→    }
+   657→  } else if (orig.type === 'limit') {
+   658→    if (newLimit == null) return null
+   659→    body.limit_price = fmtPx(newLimit, isCrypto)
+   660→  } else if (orig.type === 'trailing_stop') {
+   661→    if (newTrail == null) return null
+   662→    body.trail_percent = String(newTrail)
+   663→  } else {
+   664→    return null // market / unknown — never re-placed blindly
+   665→  }
+   666→  return body
+   667→}
+   668→
+   669→export interface ReplaceExitResult {
+   670→  data: TradingOrder | null
+   671→  status: number
+   672→  error?: string
+   673→  mode?: TradeMode
+   674→  method?: 'replace' | 'cancel-replace'
+   675→  note?: string
+   676→}
+   677→
+   678→/**
+   679→ * Replace SL/TP prices on an open exit order — the chart line-drag path.
+   680→ *
+   681→ * Verified against the paper API (2026-10):
+   682→ * - A PATCH on a STANDALONE exit (crypto split exits) replaces cleanly:
+   683→ *   type/time_in_force/sibling prices are preserved and a NEW order id is
+   684→ *   returned.
+   685→ * - The chart drag used to 404 when the order lived on the OTHER host: the
+   686→ *   client did not send `mode`, so the PATCH went to the stored trade-mode
+   687→ *   preference — paper order ids do not exist on live and vice versa, the
+   688→ *   update silently never landed on Alpaca.
+   689→ * - Bracket OCO legs may refuse direct replacement; cancel+re-place is the
+   690→ *   universal fallback (canceling one OCO leg can cascade-cancel the sibling,
+   691→ *   which we detect and regenerate).
+   692→ */
+   693→export async function replaceExitOrderSmart(
+   694→  userId: string,
+   695→  mode: TradeMode,
+   696→  orderId: string,
+   697→  patch: { stop_price?: number; limit_price?: number; trail_percent?: number; crypto?: boolean },
+   698→): Promise<ReplaceExitResult> {
+   699→  const patchBody: Record<string, unknown> = {}
+   700→  if (patch.stop_price != null) patchBody.stop_price = fmtPx(patch.stop_price, patch.crypto)
+   701→  if (patch.limit_price != null) patchBody.limit_price = fmtPx(patch.limit_price, patch.crypto)
+   702→  if (patch.trail_percent != null) patchBody.trail_percent = String(parseFloat(patch.trail_percent.toFixed(4)))
+   703→
+   704→  // 1) PATCH on the requested host; 2) retry the other host on 404 —
+   705→  // both hosts share the same key pair, so a wrong-host id self-heals here.
+   706→  const order: TradeMode[] = mode === 'paper' ? ['paper', 'live'] : ['live', 'paper']
+   707→  let last: TradeFetchResult<TradingOrder> | null = null
+   708→  let errHost: TradeMode = mode
+   709→  for (const m of order) {
+   710→    const r = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`, {
+   711→      method: 'PATCH',
+   712→      body: JSON.stringify(patchBody),
+   713→    })
+   714→    if (r.data && (r.data as TradingOrder).id) {
+   715→      return { data: r.data, status: r.status, mode: m, method: 'replace' }
+   716→    }
+   717→    last = r
+   718→    // 422 "order parameters are not changed" — the order ALREADY carries the
+   719→    // requested value (e.g. a second drag to the same level). That IS the
+   720→    // desired end state: return the current order instead of churning a
+   721→    // cancel+re-place cycle.
+   722→    if (r.status === 422 && String(r.error || '').includes('not changed')) {
+   723→      const cur = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`)
+   724→      if (cur.data) {
+   725→        return { data: cur.data, status: 200, mode: m, method: 'replace', note: 'Order already at this value' }
+   726→      }
+   727→    }
+   728→    if (r.status !== 404) {
+   729→      // real rejection — the order lives on THIS host; run the fallback there
+   730→      errHost = m
+   731→      break
+   732→    }
+   733→  }
+   734→
+   735→  // 3) The id may have JUST been replaced (fast double-drag: Alpaca's
+   736→  // cancel/replace is async and 404s for a beat) — follow the replaced_by
+   737→  // chain and retry the direct PATCH on the live successor first.
+   738→  const OPEN_STATUSES = ['new', 'open', 'accepted', 'pending_new', 'held', 'partially_filled']
+   739→  let orig: TradingOrder | null = null
+   740→  let targetId = orderId
+   741→  for (let hop = 0; hop < 4; hop++) {
+   742→    const o = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${targetId}`)
+   743→    if (!o.data) break
+   744→    const od = o.data
+   745→    if (OPEN_STATUSES.includes(String(od.status))) {
+   746→      orig = od
+   747→      if (targetId !== orderId) {
+   748→        // the open successor exists — retry the direct PATCH on it
+   749→        const retry = await tradeFetch<TradingOrder>(userId, errHost, `/v2/orders/${targetId}`, {
+   750→          method: 'PATCH',
+   751→          body: JSON.stringify(patchBody),
+   752→        })
+   753→        if (retry.data && (retry.data as TradingOrder).id) {
+   754→          return { data: retry.data, status: 200, mode: errHost, method: 'replace', note: 'Applied to the replacement order' }
+   755→        }
+   756→        if (retry.status === 422 && String(retry.error || '').includes('not changed')) {
+   757→          return { data: od, status: 200, mode: errHost, method: 'replace', note: 'Order already at this value' }
+   758→        }
+   759→        last = retry
+   760→      }
+
+[showing lines 1-760 of 1506; use offset=761 with limit to continue reading]

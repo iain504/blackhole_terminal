@@ -25,7 +25,7 @@ type AlpacaValidation = { valid: boolean; status: number; message: string };
 
 type SettingsState = {
   alpaca: { keyIdMasked: string; secretSet: boolean; serverKeysPresent: boolean };
-  telegram: { tokenSet: boolean; chatId: string };
+  telegram: { tokenSet: boolean; chatId: string; notifyFills?: boolean; notifyCloses?: boolean };
   tradeMode?: string;
   tpslPercent?: number;
 };
@@ -47,6 +47,8 @@ export default function SettingsDialog({
   const [secret, setSecret] = useState('');
   const [token, setToken] = useState('');
   const [chatId, setChatId] = useState('');
+  const [notifyFills, setNotifyFills] = useState(true);
+  const [notifyCloses, setNotifyCloses] = useState(true);
   const [tpslPct, setTpslPct] = useState('5');
   const [tpslPctLoaded, setTpslPctLoaded] = useState(false);
 
@@ -173,7 +175,7 @@ export default function SettingsDialog({
   }
 
   // Any typed-but-unsaved credential — closing the dialog would lose it.
-  const dirty = Boolean(keyId.trim() || secret.trim() || token.trim());
+  const dirty = Boolean(keyId.trim() || secret.trim() || token.trim() || chatId.trim() !== (state?.telegram?.chatId ?? ''));
 
   const confirmDiscard = useCallback(
     (nextOpen: boolean) => {
@@ -196,6 +198,8 @@ export default function SettingsDialog({
       const data: SettingsState = await res.json();
       setState(data);
       setChatId(data?.telegram?.chatId ?? '');
+      setNotifyFills(data?.telegram?.notifyFills !== false);
+      setNotifyCloses(data?.telegram?.notifyCloses !== false);
       if (!tpslPctLoaded) {
         setTpslPct(String(data?.tpslPercent ?? 5));
         setTpslPctLoaded(true);
@@ -216,11 +220,14 @@ export default function SettingsDialog({
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     // Only send fields the user actually changed (non-empty = "send me").
-    const payload: Record<string, string | number> = {};
+    const payload: Record<string, string | number | boolean> = {};
     if (keyId.trim()) payload.alpacaKeyId = keyId.trim();
     if (secret.trim()) payload.alpacaSecret = secret.trim();
     if (token.trim()) payload.telegramToken = token.trim();
     if (chatId.trim()) payload.telegramChatId = chatId.trim();
+    // toggles always ride along (booleans can't be "empty")
+    payload.notifyFills = notifyFills;
+    payload.notifyCloses = notifyCloses;
     const pct = parseFloat(tpslPct);
     if (tpslPctLoaded && isFinite(pct) && pct > 0) payload.tpslPercent = pct;
     if (Object.keys(payload).length === 0) {
@@ -564,6 +571,38 @@ export default function SettingsDialog({
               Create a bot with @BotFather, then message your bot and find your
               chat id via @userinfobot.
             </p>
+
+            {/* notification toggles */}
+            <div className="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-2.5">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                Notify me on Telegram when…
+              </span>
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={notifyFills}
+                  onChange={(e) => setNotifyFills(e.target.checked)}
+                  disabled={loading || saving}
+                  className="h-3.5 w-3.5 accent-emerald-500"
+                  aria-label="Notify when an order fills"
+                />
+                ✅ An order fills (entry, take-profit, stop-loss)
+              </label>
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={notifyCloses}
+                  onChange={(e) => setNotifyCloses(e.target.checked)}
+                  disabled={loading || saving}
+                  className="h-3.5 w-3.5 accent-emerald-500"
+                  aria-label="Notify when a position closes"
+                />
+                🔒 A position closes (with estimated realized P&amp;L)
+              </label>
+              <p className="text-[10px] leading-snug text-zinc-600">
+                Sent through the bot above while the terminal is open. Both default ON.
+              </p>
+            </div>
           </section>
 
           <div className="h-px bg-zinc-800" />

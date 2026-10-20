@@ -4,6 +4,7 @@ import {
   getPositions, getOpenOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
   TradingOrder, TradingPosition,
 } from '@/lib/trading'
+import { ensureFillNotifier } from '@/lib/fill-notifier'
 import { handleError } from '@/lib/api-helpers'
 
 /** Chart symbol (AAPL, BTC/USD) -> trading symbol (AAPL, BTCUSD). */
@@ -83,6 +84,8 @@ export async function GET(req: Request) {
     const symbolParam = (searchParams.get('symbol') || '').trim()
     // keep the crypto complex-order emulation running (OCO attach + cleanup)
     ensureCryptoOcoSupervisor(user.id, mode)
+    // keep the Telegram fill/position-close watcher's cursor advancing
+    ensureFillNotifier(user.id, mode)
 
     const [posRes, ordRes] = await Promise.all([
       getPositions(user.id, mode),

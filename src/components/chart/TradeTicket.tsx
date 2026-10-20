@@ -53,6 +53,8 @@ export function TradeTicket({
   const [slTouched, setSlTouched] = useState(false)
   const [tpTouched, setTpTouched] = useState(false)
   const [account, setAccount] = useState<{ buyingPower: string; equity: string; currency: string } | null>(null)
+  // open position size for THIS symbol — the SELL-side % buttons size from it
+  const [positionQty, setPositionQty] = useState<number | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
   const isCrypto = isCryptoTradeSymbol(symbol)
@@ -85,11 +87,22 @@ export function TradeTicket({
           }
         }
       } catch { /* ignore */ }
+      try {
+        const pres = await fetch(`/api/trading/positions?mode=${mode}`)
+        if (pres.ok) {
+          const pjson = await pres.json()
+          if (alive) {
+            const list = (pjson.positions || []) as { tradeSymbol?: string; symbol?: string; qty: number }[]
+            const mine = list.find((x) => x.tradeSymbol === symbol || x.symbol === symbol)
+            setPositionQty(mine && Math.abs(mine.qty) > 0 ? Math.abs(mine.qty) : 0)
+          }
+        }
+      } catch { /* ignore */ }
     })()
     return () => {
       alive = false
     }
-  }, [mode, slTouched, tpTouched])
+  }, [mode, symbol, slTouched, tpTouched])
 
   const changeMode = (m: Mode) => {
     setMode(m)
@@ -191,6 +204,52 @@ export function TradeTicket({
   }, [qty, mode, symbol, side, orderType, limitPrice, slPrice, tpPrice, trailPct, trailActive, isCrypto, toast, onPlaced])
 
   const est = refPrice * (parseFloat(qty) || 0)
+
+  // ---- Task 52.5: size the quantity from remaining buying power (BUY) or
+  // the open position (SELL) via the 5/10/25/50/100% buttons ----
+  const floorTo = (n: number, dp: number) => Math.floor(n * 10 ** dp) / 10 ** dp
+  const pctQty = (p: number): number | null => {
+    if (side === 'buy') {
+      const bp = account ? parseFloat(account.buyingPower) : NaN
+      if (!Number.isFinite(bp) || bp <= 0) return null
+      if (refPrice <= 0) return null
+      return Math.max(0, floorTo((bp * p) / 100 / refPrice, isCrypto ? 6 : 4))
+    }
+    if (!positionQty) return null
+    return Math.max(0, floorTo((positionQty * p) / 100, isCrypto ? 6 : 4))
+  }
+  const pctTitle = (p: number): string => {
+    if (side === 'buy') {
+      const bp = account ? parseFloat(account.buyingPower) : NaN
+      if (!Number.isFinite(bp)) return `${p}% of buying power — account not loaded yet`
+      if (refPrice <= 0) return `${p}% of buying power — no live price yet`
+      const q = pctQty(p)
+      return `${p}% of buying power ($${bp.toFixed(2)}) ÷ ${refPrice} ≈ ${q != null ? q : '—'} ${symbol}`
+    }
+    if (!positionQty) return `${p}% of the open position — no open ${symbol} position`
+    return `${p}% of the open position (${positionQty} ${symbol}) ≈ ${pctQty(p) ?? '—'} ${symbol}`
+  }
+  const applyPct = (p: number) => {
+    const q = pctQty(p)
+    if (q == null) {
+      toast({
+        title: 'Cannot size from percentage',
+        description:
+          side === 'buy'
+            ? refPrice <= 0
+              ? 'No live price yet — try again in a moment.'
+              : 'Buying power not loaded yet.'
+            : `No open ${symbol} position to size from.`,
+        variant: 'destructive',
+      })
+      return
+    }
+    if (q <= 0) {
+      toast({ title: 'Size rounds to zero', description: 'The percentage of the basis is below the minimum tradable quantity.', variant: 'destructive' })
+      return
+    }
+    setQty(String(q))
+  }
 
   // ---- auto TP/SL: pre-fill ± configured % from the entry basis ----
   // basis = limit price for limit orders (right-click price included), else
@@ -300,6 +359,34 @@ export function TradeTicket({
             <option value="market">Market</option>
             <option value="limit">Limit</option>
           </select>
+        </div>
+        {/* size from remaining buying power (BUY) / open position (SELL) */}
+        <div className="col-span-2 flex items-center gap-1">
+          <span className="w-8 shrink-0 text-[9px] uppercase tracking-wider text-zinc-600">
+            {side === 'buy' ? 'BP %' : 'Pos %'}
+          </span>
+          {[5, 10, 25, 50, 100].map((p) => {
+            const unusable = side === 'buy' ? !account || refPrice <= 0 : !positionQty
+            return (
+              <button
+                key={p}
+                type="button"
+                onClick={() => applyPct(p)}
+                disabled={unusable}
+                title={pctTitle(p)}
+                aria-label={`Set quantity to ${p}% of ${side === 'buy' ? 'remaining buying power' : 'the open position'}`}
+                className={cn(
+                  'flex-1 rounded border px-1 py-0.5 text-[10px] font-semibold tabular-nums transition-colors',
+                  side === 'buy'
+                    ? 'border-zinc-800 text-zinc-400 hover:border-emerald-500/50 hover:text-emerald-400'
+                    : 'border-zinc-800 text-zinc-400 hover:border-rose-500/50 hover:text-rose-400',
+                  'disabled:pointer-events-none disabled:opacity-40',
+                )}
+              >
+                {p}%
+              </button>
+            )
+          })}
         </div>
         {orderType === 'limit' && (
           <div className="col-span-2">
@@ -433,6 +520,7 @@ export function TradeTicket({
 
       <div className="mt-2 flex items-center justify-between text-[10px] text-zinc-500">
         <span>Est. {est ? `≈ $${est.toFixed(2)}` : '—'}</span>
+        {account && <span title="Remaining buying power">BP ${parseFloat(account.buyingPower).toFixed(0)}</span>}
         {account && <span>Equity ${parseFloat(account.equity).toFixed(0)}</span>}
       </div>
 

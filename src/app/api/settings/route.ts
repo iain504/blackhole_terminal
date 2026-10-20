@@ -11,6 +11,9 @@ interface UserSettings {
   alpacaSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
+  // telegram notification toggles (default true when absent)
+  notifyFills?: boolean
+  notifyCloses?: boolean
   tradeMode?: string
   tpslPercent?: number
 }
@@ -33,6 +36,8 @@ export async function GET() {
       telegram: {
         tokenSet: Boolean(s?.telegramTokenEnc),
         chatId: s?.telegramChatId || '',
+        notifyFills: s?.notifyFills !== false,
+        notifyCloses: s?.notifyCloses !== false,
       },
       tradeMode: s?.tradeMode === 'live' ? 'live' : 'paper',
       tpslPercent:
@@ -50,6 +55,8 @@ interface PutBody {
   alpacaSecret?: string
   telegramToken?: string
   telegramChatId?: string
+  notifyFills?: boolean
+  notifyCloses?: boolean
   tradeMode?: string
   tpslPercent?: number
 }
@@ -72,6 +79,12 @@ export async function PUT(req: Request) {
     }
     if (typeof body.telegramChatId === 'string') {
       s.telegramChatId = body.telegramChatId.trim()
+    }
+    if (typeof body.notifyFills === 'boolean') {
+      s.notifyFills = body.notifyFills
+    }
+    if (typeof body.notifyCloses === 'boolean') {
+      s.notifyCloses = body.notifyCloses
     }
     if (body.tradeMode === 'paper' || body.tradeMode === 'live') {
       s.tradeMode = body.tradeMode

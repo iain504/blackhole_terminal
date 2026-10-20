@@ -161,3 +161,18 @@ model CalendarAlarm {
   @@unique([userId, eventKey])
   @@index([userId])
 }
+
+// Telegram order-fill / position-close notification watcher — one cursor per
+// (user, mode). positions: snapshot of the open positions at the last cycle
+// ({symbol: {side, qty, avgEntry}}) used to detect closures; seen: recently
+// notified order ids (ring buffer, pruned after 24h) so restarts and overlaps
+// never double-notify.
+model NotifyState {
+  userId    String
+  mode      String
+  lastRunAt DateTime @default(now())
+  positions Json?
+  seen      Json?
+
+  @@id([userId, mode])
+}

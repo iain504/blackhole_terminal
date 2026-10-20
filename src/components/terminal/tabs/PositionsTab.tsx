@@ -9,14 +9,20 @@
 // use) — and a cancel action. Missing TP/SL cells offer a [+ TP]/[+ SL]
 // button that attaches the exit to the position (drag-to-price also exists
 // on the chart).
-import { useCallback, useEffect, useState } from 'react'
-import { History, Loader2, RefreshCw, X } from 'lucide-react'
+// Task 52.2: the three panels (Positions / Pending orders / Trade history)
+// are separated by DRAGGABLE splitters — the flex weights persist in the
+// layout blob (autosave + config export/import). Task 52.3: every table's
+// columns sort asc/desc by clicking the header (click again cycles desc →
+// back to the default order).
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
+import { useTerminal } from '@/store/terminal'
 import AccountOverview from './AccountOverview'
 import { cn } from '@/lib/utils'
 
@@ -47,8 +53,37 @@ interface PosConsoleRow {
 
 const MODES: Mode[] = ['paper', 'live']
 
+// panel minimum heights (px) — keep all three tables usable on short screens
+const PANEL_MIN_PX = [150, 130, 130] as const
+
+type SortState = { key: string; dir: 1 | -1 } | null
+
+/** Cycle a column's sort state: asc → desc → default (null). */
+const nextSort = (cur: SortState, key: string): SortState =>
+  cur?.key === key ? (cur.dir === 1 ? { key, dir: -1 } : null) : { key, dir: 1 }
+
+/** Generic stable sort by a derived value; nulls always sink to the bottom. */
+function sortRows<T>(arr: T[], sort: SortState, val: (r: T) => string | number | null): T[] {
+  if (!sort) return arr
+  const mul = sort.dir
+  return [...arr].sort((x, y) => {
+    const a = val(x)
+    const b = val(y)
+    if (a == null && b == null) return 0
+    if (a == null) return 1
+    if (b == null) return -1
+    if (typeof a === 'number' && typeof b === 'number') return (a - b) * mul
+    return String(a).localeCompare(String(b)) * mul
+  })
+}
+
+const numOr = (v: string | number | null | undefined): number =>
+  typeof v === 'number' ? v : parseFloat(String(v ?? '')) || 0
+
 export default function PositionsTab() {
   const { toast } = useToast()
+  const panelSizes = useTerminal((s) => s.positionsPanelSizes)
+  const commitPanelSizes = useTerminal((s) => s.setPositionsPanelSizes)
   const [data, setData] = useState<Record<Mode, ModeData>>({
     paper: { mode: 'paper', positions: [], exits: {}, pending: [], loaded: false },
     live: { mode: 'live', positions: [], exits: {}, pending: [], loaded: false },
@@ -60,6 +95,84 @@ export default function PositionsTab() {
   const [refreshing, setRefreshing] = useState(false)
   const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
   const [canceling, setCanceling] = useState<string | null>(null)
+
+  // ---- Task 52.2: draggable panel splitters ----
+  // Local (live) weights during a drag; the store copy is committed on release.
+  const [dragSizes, setDragSizes] = useState<[number, number, number] | null>(null)
+  const sizes = dragSizes ?? panelSizes
+  const panelRefs = [useRef<HTMLDivElement | null>(null), useRef<HTMLDivElement | null>(null), useRef<HTMLDivElement | null>(null)]
+  const dragRef = useRef<{
+    splitter: 0 | 1
+    startY: number
+    h: [number, number, number]
+    pxPerW: number
+  } | null>(null)
+
+  const beginDrag = (splitter: 0 | 1) => (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    const h = panelRefs.map((r) => r.current?.offsetHeight ?? 0) as [number, number, number]
+    const total = h[0] + h[1] + h[2]
+    if (!(total > 0)) return
+    const totalW = sizes[0] + sizes[1] + sizes[2]
+    dragRef.current = { splitter, startY: e.clientY, h, pxPerW: total / totalW }
+    e.currentTarget.setPointerCapture(e.pointerId)
+    e.preventDefault()
+  }
+
+  const moveDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current
+    if (!d) return
+    const dy = e.clientY - d.startY
+    const min0 = PANEL_MIN_PX[0] / d.pxPerW
+    const min1 = PANEL_MIN_PX[1] / d.pxPerW
+    const min2 = PANEL_MIN_PX[2] / d.pxPerW
+    const round = (n: number) => Math.round(n * 100) / 100
+    if (d.splitter === 0) {
+      const h01 = d.h[0] + d.h[1]
+      const w0 = Math.min(Math.max((d.h[0] + dy) / d.pxPerW, min0), (h01 / d.pxPerW) - min1)
+      const w1 = h01 / d.pxPerW - w0
+      setDragSizes([round(w0), round(w1), sizes[2]])
+    } else {
+      const h12 = d.h[1] + d.h[2]
+      const w1 = Math.min(Math.max((d.h[1] + dy) / d.pxPerW, min1), (h12 / d.pxPerW) - min2)
+      const w2 = h12 / d.pxPerW - w1
+      setDragSizes([sizes[0], round(w1), round(w2)])
+    }
+  }
+
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return
+    dragRef.current = null
+    // release is automatic on real pointerup; guard anyway (synthetic events
+    // can throw NotFoundError and must NOT skip the commit below)
+    try {
+      e.currentTarget.releasePointerCapture?.(e.pointerId)
+    } catch { /* not captured */ }
+    if (dragSizes) commitPanelSizes(dragSizes)
+    setDragSizes(null)
+  }
+
+  // keyboard support for the splitters (accessibility): ±0.5 weight swapped
+  // with the neighbouring panel, clamped so nothing collapses below minimums
+  const nudge = (splitter: 0 | 1, dir: 1 | -1) => {
+    const step = 0.5 * dir
+    if (splitter === 0) {
+      const w0 = Math.max(0.5, sizes[0] + step)
+      const w1 = Math.max(0.5, sizes[1] - step)
+      if (w0 === sizes[0] || w1 === sizes[1]) return
+      commitPanelSizes([w0, w1, sizes[2]])
+    } else {
+      const w1 = Math.max(0.5, sizes[1] + step)
+      const w2 = Math.max(0.5, sizes[2] - step)
+      if (w1 === sizes[1] || w2 === sizes[2]) return
+      commitPanelSizes([sizes[0], w1, w2])
+    }
+  }
+
+  // ---- Task 52.3: per-table sort states ----
+  const [posSort, setPosSort] = useState<SortState>(null)
+  const [pendSort, setPendSort] = useState<SortState>(null)
+  const [histSort, setHistSort] = useState<SortState>(null)
 
   const refresh = useCallback(async () => {
     setRefreshing(true)
@@ -126,6 +239,52 @@ export default function PositionsTab() {
   const historyRows = MODES.flatMap((m) =>
     (history[m].trades || []).map((t) => ({ mode: m as Mode, t })),
   ).sort((a, b) => new Date(b.t.exitAt).getTime() - new Date(a.t.exitAt).getTime())
+  // applied sorts (52.3)
+  const sortedRows = sortRows(rows, posSort, (r) => {
+    switch (posSort?.key) {
+      case 'symbol': return r.pos.symbol
+      case 'market': return r.mode
+      case 'side': return r.pos.side
+      case 'qty': return Math.abs(numOr(r.pos.qty))
+      case 'entry': return r.pos.avgEntry
+      case 'last': return r.pos.current
+      case 'tp': return r.tp?.limitPrice ?? null
+      case 'sl': return r.sl?.stopPrice ?? r.sl?.limitPrice ?? null
+      case 'trailing': return r.sl?.trailPercent ?? null
+      case 'pnl': return r.pos.upl
+      default: return null
+    }
+  })
+  const sortedPending = sortRows(pendingRows, pendSort, ({ mode, p }) => {
+    switch (pendSort?.key) {
+      case 'symbol': return p.symbol
+      case 'market': return mode
+      case 'side': return p.side
+      case 'type': return p.type
+      case 'qty': return numOr(p.qty)
+      case 'filled': return numOr(p.filledQty)
+      case 'limit': return p.limitPrice ?? null
+      case 'tp': return p.tpPrice ?? null
+      case 'sl': return p.slPrice ?? null
+      case 'status': return p.status
+      default: return null
+    }
+  })
+  const sortedHistory = sortRows(historyRows, histSort, ({ mode, t }) => {
+    switch (histSort?.key) {
+      case 'closed': return new Date(t.exitAt).getTime()
+      case 'symbol': return t.symbol
+      case 'market': return mode
+      case 'side': return t.side
+      case 'qty': return numOr(t.qty)
+      case 'entry': return t.entryPrice
+      case 'exit': return t.exitPrice
+      case 'held': return t.durationMs
+      case 'pnl': return t.pnl
+      case 'pct': return t.pnlPct
+      default: return null
+    }
+  })
   const historyPnl = historyRows.reduce((acc, r) => acc + r.t.pnl, 0)
   const noKeys = (m: Mode) => data[m].loaded && data[m].error === 'no-keys'
 
@@ -232,29 +391,32 @@ export default function PositionsTab() {
         </div>
       </div>
 
-      {/* positions table — grows/shrinks with the available screen height
-          so taller screens reveal more rows (min keeps it usable on small
-          viewports, where the root scrolls instead) */}
-      <div className="flex min-h-[150px] flex-[5_1_auto] flex-col overflow-hidden rounded-md border border-zinc-800/80 bg-zinc-900/70">
+      {/* positions table — height follows the draggable splitter weights
+          (persisted in the layout blob: autosave + export/import) */}
+      <div
+        ref={panelRefs[0]}
+        style={{ flex: `${sizes[0]} 1 0%` }}
+        className="flex min-h-[150px] flex-col overflow-hidden rounded-md border border-zinc-800/80 bg-zinc-900/70"
+      >
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
         <table className="w-full min-w-[900px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
             <tr className="border-b border-zinc-800">
-              <th className="px-3 py-2 text-left font-semibold">Symbol</th>
-              <th className="px-3 py-2 text-left font-semibold">Market</th>
-              <th className="px-3 py-2 text-left font-semibold">Side</th>
-              <th className="px-3 py-2 text-right font-semibold">Qty</th>
-              <th className="px-3 py-2 text-right font-semibold">Entry price</th>
-              <th className="px-3 py-2 text-right font-semibold">Last</th>
-              <th className="px-3 py-2 text-right font-semibold">TP</th>
-              <th className="px-3 py-2 text-right font-semibold">SL</th>
-              <th className="px-3 py-2 text-right font-semibold">Trailing</th>
-              <th className="px-3 py-2 text-right font-semibold">P&amp;L</th>
+              <SortTh label="Symbol" k="symbol" sort={posSort} onSort={setPosSort} />
+              <SortTh label="Market" k="market" sort={posSort} onSort={setPosSort} />
+              <SortTh label="Side" k="side" sort={posSort} onSort={setPosSort} />
+              <SortTh label="Qty" k="qty" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="Entry price" k="entry" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="Last" k="last" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="TP" k="tp" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="SL" k="sl" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="Trailing" k="trailing" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="P&L" k="pnl" sort={posSort} onSort={setPosSort} align="right" />
               <th className="px-3 py-2 text-right font-semibold">Action</th>
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
+            {sortedRows.length === 0 && (
               <tr>
                 <td colSpan={11} className="px-3 py-10 text-center text-zinc-500">
                   {data.paper.loaded && data.live.loaded ? (
@@ -270,7 +432,7 @@ export default function PositionsTab() {
                 </td>
               </tr>
             )}
-            {rows.map((r) => {
+            {sortedRows.map((r) => {
               const key = `${r.mode}:${r.pos.tradeSymbol}`
               const long = r.pos.side === 'long'
               const up = r.pos.upl >= 0
@@ -337,8 +499,21 @@ export default function PositionsTab() {
         </div>
       </div>
 
-      {/* pending (unfilled) entry orders — height follows the screen too */}
-      <div className="flex min-h-[130px] flex-[3_1_auto] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
+      {/* draggable splitter between Positions and Pending orders */}
+      <PanelSplitter
+        label="Resize Positions and Pending orders panels"
+        onPointerDown={beginDrag(0)}
+        onPointerMove={moveDrag}
+        onPointerUp={endDrag}
+        onKeyDown={(dir) => nudge(0, dir)}
+      />
+
+      {/* pending (unfilled) entry orders */}
+      <div
+        ref={panelRefs[1]}
+        style={{ flex: `${sizes[1]} 1 0%` }}
+        className="flex min-h-[130px] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70"
+      >
         <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Pending orders</span>
           <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{pendingRows.length}</Badge>
@@ -348,28 +523,28 @@ export default function PositionsTab() {
           <table className="w-full min-w-[820px] border-collapse text-xs">
             <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
               <tr className="border-b border-zinc-800">
-                <th className="px-3 py-1.5 text-left font-semibold">Symbol</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Market</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Side</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Type</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Qty</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Filled</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Limit</th>
-                <th className="px-3 py-1.5 text-right font-semibold">TP</th>
-                <th className="px-3 py-1.5 text-right font-semibold">SL</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Status</th>
+                <SortTh label="Symbol" k="symbol" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Market" k="market" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Side" k="side" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Type" k="type" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Qty" k="qty" sort={pendSort} onSort={setPendSort} align="right" />
+                <SortTh label="Filled" k="filled" sort={pendSort} onSort={setPendSort} align="right" />
+                <SortTh label="Limit" k="limit" sort={pendSort} onSort={setPendSort} align="right" />
+                <SortTh label="TP" k="tp" sort={pendSort} onSort={setPendSort} align="right" />
+                <SortTh label="SL" k="sl" sort={pendSort} onSort={setPendSort} align="right" />
+                <SortTh label="Status" k="status" sort={pendSort} onSort={setPendSort} />
                 <th className="px-3 py-1.5 text-right font-semibold">Action</th>
               </tr>
             </thead>
             <tbody>
-              {pendingRows.length === 0 && (
+              {sortedPending.length === 0 && (
                 <tr>
                   <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
                     No pending orders.
                   </td>
                 </tr>
               )}
-              {pendingRows.map(({ mode, p }) => (
+              {sortedPending.map(({ mode, p }) => (
                 <tr key={`${mode}:${p.orderId}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
                   <td className="px-3 py-1.5 font-semibold text-zinc-100">{p.symbol}</td>
                   <td className="px-3 py-1.5">
@@ -421,9 +596,21 @@ export default function PositionsTab() {
         </div>
       </div>
 
-      {/* trade history — realized round-trips (FIFO-matched closed orders),
-          sharing the remaining screen height with the tables above */}
-      <div className="flex min-h-[130px] flex-[3_1_auto] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
+      {/* draggable splitter between Pending orders and Trade history */}
+      <PanelSplitter
+        label="Resize Pending orders and Trade history panels"
+        onPointerDown={beginDrag(1)}
+        onPointerMove={moveDrag}
+        onPointerUp={endDrag}
+        onKeyDown={(dir) => nudge(1, dir)}
+      />
+
+      {/* trade history — realized round-trips (FIFO-matched closed orders) */}
+      <div
+        ref={panelRefs[2]}
+        style={{ flex: `${sizes[2]} 1 0%` }}
+        className="flex min-h-[130px] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70"
+      >
         <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <History className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Trade history</span>
@@ -445,20 +632,20 @@ export default function PositionsTab() {
           <table className="w-full min-w-[860px] border-collapse text-xs">
             <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
               <tr className="border-b border-zinc-800">
-                <th className="px-3 py-1.5 text-left font-semibold">Closed</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Symbol</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Market</th>
-                <th className="px-3 py-1.5 text-left font-semibold">Side</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Qty</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Entry</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Exit</th>
-                <th className="px-3 py-1.5 text-right font-semibold">Held</th>
-                <th className="px-3 py-1.5 text-right font-semibold">P&amp;L</th>
-                <th className="px-3 py-1.5 text-right font-semibold">%</th>
+                <SortTh label="Closed" k="closed" sort={histSort} onSort={setHistSort} />
+                <SortTh label="Symbol" k="symbol" sort={histSort} onSort={setHistSort} />
+                <SortTh label="Market" k="market" sort={histSort} onSort={setHistSort} />
+                <SortTh label="Side" k="side" sort={histSort} onSort={setHistSort} />
+                <SortTh label="Qty" k="qty" sort={histSort} onSort={setHistSort} align="right" />
+                <SortTh label="Entry" k="entry" sort={histSort} onSort={setHistSort} align="right" />
+                <SortTh label="Exit" k="exit" sort={histSort} onSort={setHistSort} align="right" />
+                <SortTh label="Held" k="held" sort={histSort} onSort={setHistSort} align="right" />
+                <SortTh label="P&L" k="pnl" sort={histSort} onSort={setHistSort} align="right" />
+                <SortTh label="%" k="pct" sort={histSort} onSort={setHistSort} align="right" />
               </tr>
             </thead>
             <tbody>
-              {historyRows.length === 0 && (
+              {sortedHistory.length === 0 && (
                 <tr>
                   <td colSpan={10} className="px-3 py-6 text-center text-zinc-600">
                     {!history.paper.loaded && !history.live.loaded ? (
@@ -471,7 +658,7 @@ export default function PositionsTab() {
                   </td>
                 </tr>
               )}
-              {historyRows.map(({ mode, t }) => {
+              {sortedHistory.map(({ mode, t }) => {
                 const up = t.pnl >= 0
                 return (
                   <tr key={`${mode}:${t.id}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
@@ -512,9 +699,77 @@ export default function PositionsTab() {
 
       <p className="flex shrink-0 items-center gap-1.5 px-1 text-[11px] text-zinc-600">
         <X className="h-3 w-3" aria-hidden />
-        Close submits a market order for the full position · refreshes every 10s · TP/SL edits on the chart (drag lines) apply to these orders · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L.
+        Drag the ── handles to resize the panels (saved with your layout) · click a column header to sort asc/desc · Close submits a market order for the full position · refreshes every 10s · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L.
       </p>
     </div>
+  )
+}
+
+/** Thin draggable divider between two panels (Task 52.2). Pointer-drag
+ * adjusts the flex weights; ↑/↓ arrows nudge for keyboard users. */
+function PanelSplitter({ label, onPointerDown, onPointerMove, onPointerUp, onKeyDown }: {
+  label: string
+  onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => void
+  onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => void
+  onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => void
+  onKeyDown: (dir: 1 | -1) => void
+}) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={label}
+      tabIndex={0}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onKeyDown={(e) => {
+        if (e.key === 'ArrowUp') {
+          e.preventDefault()
+          onKeyDown(-1)
+        } else if (e.key === 'ArrowDown') {
+          e.preventDefault()
+          onKeyDown(1)
+        }
+      }}
+      className="group flex h-3 shrink-0 cursor-row-resize items-center justify-center rounded outline-none focus-visible:ring-1 focus-visible:ring-emerald-500/60"
+    >
+      <div className="h-1 w-12 rounded-full bg-zinc-800 transition-colors group-hover:bg-emerald-500/50 group-focus-visible:bg-emerald-500/60" />
+    </div>
+  )
+}
+
+/** Sortable table header cell (Task 52.3): click cycles asc → desc → off. */
+function SortTh({ label, k, sort, onSort, align = 'left' }: {
+  label: string
+  k: string
+  sort: SortState
+  onSort: (s: SortState) => void
+  align?: 'left' | 'right'
+}) {
+  const active = sort?.key === k
+  return (
+    <th
+      className={cn('px-3 py-1.5 font-semibold', align === 'right' ? 'text-right' : 'text-left')}
+      aria-sort={active ? (sort?.dir === 1 ? 'ascending' : 'descending') : undefined}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(nextSort(sort, k))}
+        aria-label={`Sort by ${label}${active ? (sort?.dir === 1 ? ' (ascending — click for descending)' : ' (descending — click to reset)') : ''}`}
+        className={cn(
+          'inline-flex items-center gap-1 uppercase tracking-wider text-[10px] transition-colors hover:text-zinc-200',
+          active ? 'text-emerald-400' : 'text-zinc-500',
+        )}
+      >
+        {label}
+        {active ? (
+          sort?.dir === 1 ? <ArrowUp className="h-3 w-3" aria-hidden /> : <ArrowDown className="h-3 w-3" aria-hidden />
+        ) : (
+          <ArrowUpDown className="h-3 w-3 opacity-40" aria-hidden />
+        )}
+      </button>
+    </th>
   )
 }
 

@@ -167,6 +167,11 @@ export interface LayoutBlob {
   /** indicator settings ride the layout blob so the 5s AUTOSAVE carries
    *  them server-side too (export additionally merges fresh localStorage) */
   indicators?: IndicatorSettings
+  /** chart toolbar: drawings visibility eye toggle (Task 52.1) */
+  showDrawings?: boolean
+  /** Positions tab: flex weights of the Positions / Pending / History panels
+   *  (user-draggable splitters, Task 52.2) — rides export/import */
+  positionsPanelSizes?: [number, number, number]
 }
 
 export const DRAW_COLORS = [
@@ -216,6 +221,12 @@ interface TerminalState {
   markLayoutClean: () => void
   layoutSnapshot: () => LayoutBlob
   hydrateFromServer: (data: unknown) => void
+
+  // chart toolbar / positions-tab layout prefs (ride the autosave + export)
+  showDrawings: boolean
+  setShowDrawings: (v: boolean) => void
+  positionsPanelSizes: [number, number, number]
+  setPositionsPanelSizes: (sizes: [number, number, number]) => void
 
   // watchlists
   watchlists: Watchlist[]
@@ -277,6 +288,8 @@ const DEFAULT_LAYOUT: LayoutBlob = {
   tabs: [],
   activeTabId: null,
   sidebar: { panelOrder: ['watchlist', 'quote', 'news'], panelCollapsed: {}, mainSizes: [72, 28] },
+  showDrawings: true,
+  positionsPanelSizes: [5, 3, 3],
 }
 
 export const useTerminal = create<TerminalState>((set, get) => ({
@@ -466,6 +479,17 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   markLayoutDirty: () => set({ layoutDirty: true }),
   markLayoutClean: () => set({ layoutDirty: false }),
 
+  showDrawings: true,
+  setShowDrawings: (v) =>
+    set((s) => (s.showDrawings === v ? {} : { showDrawings: v, layoutDirty: true })),
+
+  positionsPanelSizes: [5, 3, 3],
+  setPositionsPanelSizes: (sizes) => {
+    const prev = get().positionsPanelSizes
+    if (sizes.every((w, i) => Math.abs(w - prev[i]) < 0.05)) return
+    set({ positionsPanelSizes: sizes, layoutDirty: true })
+  },
+
   layoutSnapshot: () => {
     const s = get()
     return {
@@ -480,6 +504,8 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       // indicator settings travel WITH the layout so the autosave (and the
       // beforeunload beacon) carry them server-side, not just the export file
       indicators: loadIndicators(),
+      showDrawings: s.showDrawings,
+      positionsPanelSizes: s.positionsPanelSizes,
     }
   },
 
@@ -546,12 +572,20 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     const sb = blob.sidebar
     const mainSizes: [number, number] =
       Array.isArray(sb?.mainSizes) && sb.mainSizes.length === 2 ? [sb.mainSizes[0], 100 - sb.mainSizes[0]] : [72, 28]
+    // positions-panel flex weights: three finite weights 0.5..12 (Task 52.2)
+    const rawSizes = blob.positionsPanelSizes
+    const panelSizes: [number, number, number] =
+      Array.isArray(rawSizes) && rawSizes.length === 3 && rawSizes.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0.5 && n <= 12)
+        ? [rawSizes[0], rawSizes[1], rawSizes[2]]
+        : [5, 3, 3]
     set({
       tabs,
       activeTabId,
       panelOrder: sb?.panelOrder?.length === 3 ? sb.panelOrder : DEFAULT_LAYOUT.sidebar.panelOrder,
       panelCollapsed: sb?.panelCollapsed || {},
       mainSizes,
+      showDrawings: blob.showDrawings !== false,
+      positionsPanelSizes: panelSizes,
       layoutDirty: false,
     })
   },

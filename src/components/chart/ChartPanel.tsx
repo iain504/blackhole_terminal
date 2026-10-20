@@ -245,7 +245,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const liveAtRef = useRef(0)
   const [liveBadge, setLiveBadge] = useState<'live' | null>(null)
   const pendingTickRef = useRef<StreamTick | null>(null)
-  const [showDrawings, setShowDrawings] = useState(true)
+  // drawings visibility eye toggle — persisted in the layout blob so the
+  // choice survives reloads and travels with export/import (Task 52.1)
+  const showDrawings = useTerminal((s) => s.showDrawings)
+  const setShowDrawingsStore = useTerminal((s) => s.setShowDrawings)
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const activeColorRef = useRef(activeColor)
   activeColorRef.current = activeColor
@@ -3269,7 +3272,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         <button
           title={showDrawings ? 'Hide drawings' : 'Show drawings'}
           aria-label={showDrawings ? 'Hide drawings' : 'Show drawings'}
-          onClick={() => setShowDrawings((v) => !v)}
+          onClick={() => setShowDrawingsStore(!showDrawings)}
           className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
         >
           {showDrawings ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
