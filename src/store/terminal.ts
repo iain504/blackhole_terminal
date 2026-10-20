@@ -62,9 +62,18 @@ export function layoutPaneCount(id: GridLayoutId): number {
 
 export type PanelId = 'watchlist' | 'quote' | 'news'
 
+/** Which y-scale a drawing point lives in: the main price scale or one of
+ *  the indicator strips (volume / RSI / MACD). 'price' = main scale.
+ *  A point drawn inside the VOL strip stores a VOLUME value, inside RSI an
+ *  RSI level (0-100), inside MACD a MACD-line value — so lines stay glued to
+ *  the pane they were drawn on (TradingView-style per-pane coordinates). */
+export type DrawingPane = 'price' | 'vol' | 'rsi' | 'macd'
+
 export interface DrawingPoint {
   time: number | null
   price: number
+  /** scale the value belongs to (default 'price') — pointsJson in db */
+  pane?: DrawingPane
 }
 
 export type DrawingKind = 'hline' | 'vline' | 'trend' | 'fib'
@@ -203,6 +212,8 @@ interface TerminalState {
   moveWatchlist: (id: string, dir: -1 | 1) => Promise<void>
   addSymbolToWatchlist: (watchlistId: string, symbol: string) => Promise<AddSymbolResult>
   removeSymbolFromWatchlist: (watchlistId: string, symbol: string) => Promise<void>
+  /** drag & drop reorder: move items[from] to index to (clamped), persisted */
+  reorderWatchlistSymbol: (watchlistId: string, from: number, to: number) => Promise<void>
 
   // drawings
   drawingsBySymbol: Record<string, Drawing[]>
@@ -584,6 +595,31 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ items }),
     })
+  },
+
+  // drag & drop reorder — the items ARRAY order IS the persisted sort (the
+  // PATCH endpoint stores it verbatim; export/import carries the same array)
+  reorderWatchlistSymbol: async (watchlistId, from, to) => {
+    const list = get().watchlists.find((l) => l.id === watchlistId)
+    if (!list) return
+    if (from < 0 || from >= list.items.length) return
+    const to2 = Math.max(0, Math.min(list.items.length, to))
+    if (to2 === from || to2 === from + 1) return // same place — no-op
+    const items = [...list.items]
+    const [sym] = items.splice(from, 1)
+    // moving DOWN: removing the item first shifts the target left by one
+    items.splice(from < to2 ? to2 - 1 : to2, 0, sym)
+    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+    try {
+      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      if (!res.ok) await get().loadWatchlists() // resync to source of truth
+    } catch {
+      /* offline — optimistic order stays; next action resyncs */
+    }
   },
 
   drawingsBySymbol: {},

@@ -10,7 +10,7 @@ import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
-import { useTerminal, Drawing, DrawingKind, DrawingPoint, DRAW_COLORS } from '@/store/terminal'
+import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS } from '@/store/terminal'
 import { useShallow } from 'zustand/react/shallow'
 import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
 import {
@@ -61,13 +61,17 @@ interface MenuState {
   y: number
   hit: Hit
   price?: number | null
+  /** strip under the cursor when the menu was opened ('price' = main pane) */
+  pane?: DrawingPane
+  /** value in THAT pane's scale at the cursor (RSI level / volume / macd) */
+  paneValue?: number | null
 }
 
 interface DragState {
   hit: SceneHit
   x0: number
   y0: number
-  orig: { time: number | null; price: number }[]
+  orig: DrawingPoint[]
   origPixels: ({ x: number; y: number } | null)[]
   moved: boolean
 }
@@ -94,6 +98,13 @@ const fmtVolCompact = (v: number) =>
 
 /** Sign-prefixed value for MACD axis chips / strip titles. */
 const fmtSigned = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+
+/** Value label per pane: volume compact / RSI 2dp / MACD signed / price. */
+const fmtPaneValue = (pane: DrawingPane | undefined, v: number) =>
+  pane === 'vol' ? fmtVolCompact(v)
+  : pane === 'rsi' ? v.toFixed(2)
+  : pane === 'macd' ? fmtSigned(v)
+  : fmtPrice(v)
 
 /** lightweight-charts series for every ENABLED indicator (slots optional). */
 interface IndSeriesBundle {
@@ -218,7 +229,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [editValue, setEditValue] = useState<{
-    type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; pctMode?: boolean; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
+    type: 'drawing' | 'alert' | 'exit' | 'ghost' | 'pending'; id?: string; part?: 'sl' | 'tp' | 'entry'; price: number; pctMode?: boolean; pane?: DrawingPane; exit?: { info: ExitInfo; kind: 'sl' | 'tp' }; pending?: PendingOrderInfo
   } | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
@@ -434,6 +445,50 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     if (!seriesRef.current) return null
     const p = seriesRef.current.coordinateToPrice(y)
     return p == null ? null : Number(p)
+  }, [])
+
+  // ---------- pane-aware coordinates (drawings inside VOL/RSI/MACD strips) ----------
+  // lightweight-charts v4 squeezes the volume/RSI/MACD strips into the SAME
+  // pane on hidden price scales of their own, so a y pixel maps to a DIFFERENT
+  // value depending on which strip it is in. Drawings remember the pane they
+  // were drawn on (DrawingPoint.pane) and convert value↔pixel through THAT
+  // pane's series — a line drawn at RSI 70 stays glued to RSI 70 (not to the
+  // nonsense price the main scale extrapolates at that pixel).
+  const paneSeries = useCallback((pane: DrawingPane): ISeriesApi<'Line'> | ISeriesApi<'Histogram'> | ISeriesApi<'Candlestick'> | null => {
+    if (pane === 'vol') return volSeriesRef.current
+    if (pane === 'rsi') return indSeriesRef.current?.rsi ?? null
+    if (pane === 'macd') return indSeriesRef.current?.macdLine ?? null
+    return seriesRef.current
+  }, [])
+
+  /** value → y inside a SPECIFIC pane's scale. */
+  const yOfPane = useCallback((pane: DrawingPane, v: number): number | null => {
+    const s = paneSeries(pane)
+    if (!s) return null
+    try { const y = s.priceToCoordinate(v); return y == null ? null : Number(y) } catch { return null }
+  }, [paneSeries])
+
+  /** y → value inside a SPECIFIC pane's scale (volume / RSI level / macd). */
+  const valueAtPane = useCallback((pane: DrawingPane, y: number): number | null => {
+    const s = paneSeries(pane)
+    if (!s) return null
+    try { const v = s.coordinateToPrice(y); return v == null ? null : Number(v) } catch { return null }
+  }, [paneSeries])
+
+  /** which pane (price / vol / rsi / macd strip) a container-y coordinate is in. */
+  const paneAt = useCallback((y: number): DrawingPane => {
+    const strips = indStripsRef.current
+    const chart = chartRef.current
+    if (!strips || !chart) return 'price'
+    let paneH = 0
+    try { paneH = chart.paneSize().height } catch { return 'price' }
+    if (!(paneH > 0)) return 'price'
+    const rsiTop = strips.rsi ? strips.rsi.top * paneH : Infinity
+    const macdTop = strips.macd ? strips.macd.top * paneH : Infinity
+    if (y >= macdTop) return 'macd'
+    if (y >= rsiTop) return 'rsi'
+    if (y >= strips.vol.top * paneH) return 'vol'
+    return 'price'
   }, [])
 
   // Time under the cursor, CONTINUOUS (no snapping). lightweight-charts'
@@ -1023,20 +1078,51 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       if (hoverIdx >= 0 && hoverIdx < axisIconsRef.current.length) {
         const hit = axisIconsRef.current[hoverIdx]
         ctx.save()
-        ctx.font = '10px ui-sans-serif, system-ui'
-        const maxW = 240
+        const maxW = 260
+        // wrap the tip to the bubble width — the FIRST line renders bold, so it
+        // must also be MEASURED bold (regular-font measurement left it a few px
+        // wider than the bubble → clipped text)
+        const measure = (s: string, bold: boolean) => {
+          ctx.font = `${bold ? '600 ' : ''}10px ui-sans-serif, system-ui`
+          return ctx.measureText(s).width
+        }
         const words = hit.tip.split(' ')
         const lines: string[] = []
+        const MAX_LINES = 8
         let line = ''
-        for (const wd of words) {
+        let truncated = false
+        for (let wi = 0; wi < words.length; wi++) {
+          let wd = words[wi]
+          // a single word wider than the bubble (URL/ticker) hard-breaks
+          while (measure(wd, lines.length === 0 && !line) > maxW && wd.length > 1) {
+            let cut = wd.length
+            while (cut > 1 && measure(wd.slice(0, cut), lines.length === 0 && !line) > maxW) cut--
+            if (line) { lines.push(line); line = '' }
+            lines.push(wd.slice(0, cut))
+            wd = wd.slice(cut)
+            if (lines.length >= MAX_LINES) break
+          }
+          if (lines.length >= MAX_LINES) { truncated = true; break }
+          const bold = lines.length === 0 && !line
           const cand = line ? `${line} ${wd}` : wd
-          if (ctx.measureText(cand).width > maxW && line) {
+          if (measure(cand, bold) > maxW && line) {
             lines.push(line)
+            if (lines.length >= MAX_LINES) { truncated = true; line = ''; break }
             line = wd
           } else line = cand
         }
-        if (line) lines.push(line)
-        const tw = Math.min(maxW, ...lines.map((l) => ctx.measureText(l).width)) + 14
+        if (line) {
+          if (lines.length >= MAX_LINES) truncated = true
+          else lines.push(line)
+        }
+        if (truncated) {
+          // replace the tail of the last line with an ellipsis
+          let last = lines[lines.length - 1] ?? ''
+          while (last.length > 1 && measure(`${last}…`, lines.length === 1) > maxW) last = last.slice(0, -1)
+          lines[lines.length - 1] = `${last}…`
+        }
+        // bubble must cover the WIDEST line (measured in its own weight)
+        const tw = Math.max(...lines.map((l, i) => measure(l, i === 0))) + 14
         const th = lines.length * 14 + 9
         const tx = Math.min(Math.max(hit.x + hit.w / 2 - tw / 2, 6), w - psW - tw - 6)
         const ty = Math.max(6, hit.y - th - 6)
@@ -1081,7 +1167,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
   function pixelPoint(pt: DrawingPoint): { x: number; y: number } | null {
     const x = pt.time == null ? null : xOf(pt.time)
-    const y = yOf(pt.price)
+    // pane-aware: a point drawn in the RSI strip maps through the RSI scale
+    const y = yOfPane(pt.pane ?? 'price', pt.price)
     if (x == null || y == null) return null
     return { x, y }
   }
@@ -1121,10 +1208,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.globalAlpha = 1
 
     if (d.kind === 'hline') {
-      const y = yOf(d.points[0]?.price ?? 0)
+      const pane = d.points[0]?.pane ?? 'price'
+      const y = yOfPane(pane, d.points[0]?.price ?? 0)
       if (y != null) {
         hlinePath(ctx, y, w)
-        drawChip(ctx, w - 74, y, fmtPrice(d.points[0].price), d.color, highlighted)
+        drawChip(ctx, w - 74, y, fmtPaneValue(pane, d.points[0].price), d.color, highlighted)
         // move grip dots at center
         dot(ctx, w / 2, y, d.color, highlighted)
       }
@@ -1141,14 +1229,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (d.kind === 'trend') {
           segPath(ctx, p1, p2, w, false)
         } else {
-          // fib: levels between p1..p2 extended to right edge
+          // fib: levels between p1..p2 extended to right edge (levels live in
+          // the SAME pane the fib was drawn on — RSI fib levels are RSI units)
           const xLeft = Math.min(p1.x, p2.x)
+          const fibPane = d.points[0]?.pane ?? 'price'
           const price1 = d.points[0].price
           const price2 = d.points[1].price
           ctx.font = '10px ui-monospace, monospace'
           for (const lv of FIB_LEVELS) {
             const priceLv = price2 + (price1 - price2) * lv
-            const y = yOf(priceLv)
+            const y = yOfPane(fibPane, priceLv)
             if (y == null) continue
             ctx.globalAlpha = lv === 0 || lv === 1 ? 0.9 : 0.6
             ctx.setLineDash(lv === 0.5 ? [6, 3] : [])
@@ -1158,7 +1248,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             ctx.stroke()
             ctx.globalAlpha = 0.95
             ctx.fillStyle = d.color
-            const label = `${lv.toFixed(3)}  ${fmtPrice(priceLv)}`
+            const label = `${lv.toFixed(3)}  ${fmtPaneValue(fibPane, priceLv)}`
             ctx.fillText(label, xLeft + 4, y - 3)
           }
         }
@@ -1364,7 +1454,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       for (let i = ds.length - 1; i >= 0; i--) {
         const d = ds[i]
         if (d.kind === 'hline') {
-          const yl = yOf(d.points[0]?.price ?? 0)
+          const pane = d.points[0]?.pane ?? 'price'
+          const yl = yOfPane(pane, d.points[0]?.price ?? 0)
           if (yl != null && Math.abs(y - yl) < 7) return { type: 'drawing', id: d.id, part: 'whole' }
         } else if (d.kind === 'vline') {
           const xl = xOf(d.points[0]?.time ?? null)
@@ -1380,10 +1471,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           if (d.kind === 'fib' && p1 && p2) {
             const xLeft = Math.min(p1.x, p2.x)
             if (x >= xLeft - 4) {
+              const fibPane = d.points[0]?.pane ?? 'price'
               const price1 = d.points[0].price
               const price2 = d.points[1].price
               for (const lv of FIB_LEVELS) {
-                const yl = yOf(price2 + (price1 - price2) * lv)
+                const yl = yOfPane(fibPane, price2 + (price1 - price2) * lv)
                 if (yl != null && Math.abs(y - yl) < 6) return { type: 'drawing', id: d.id, part: 'whole' }
               }
             }
@@ -1397,7 +1489,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
     return null
      
-  }, [symbol, showDrawings, xOf, yOf])
+  }, [symbol, showDrawings, xOf, yOf, yOfPane])
 
   // ---------- drawing persistence ----------
   const createDrawing = useCallback(async (kind: DrawingKind, points: DrawingPoint[]) => {
@@ -1453,26 +1545,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     await fetch(`/api/alerts/${id}`, { method: 'DELETE' }).catch(() => { /* offline */ })
   }, [removeAlertLocal])
 
-  const addAlertAtPrice = useCallback(async (price: number) => {
-    const cur = quote?.price ?? price
-    // 'above' fires when price rises into the level (current price below it);
-    // 'below' fires when price falls into it (current price above it).
-    const direction = cur > price ? 'below' : 'above'
-    try {
-      const res = await fetch('/api/alerts', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ symbol, price, direction, color: DRAW_COLORS[2] }),
-      })
-      if (res.ok) {
-        const json = await res.json()
-        addAlertLocal(json.alert)
-      }
-    } catch { /* offline */ }
-  }, [symbol, quote, addAlertLocal])
-
   // one-click indicator alarm from the chart's right-click menu — carries the
   // indicator config CURRENTLY shown on this chart and its timeframe
+  // (declared BEFORE addAlertAtPrice, which delegates strip alarms to it)
   const addIndicatorAlarm = useCallback(async (req: {
     kind: 'rsi' | 'macd'
     label: string
@@ -1498,6 +1573,57 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       toast({ title: 'Alarm failed', description: 'Network error', variant: 'destructive' })
     }
   }, [symbol, tf, addAlertLocal, toast])
+
+  // price alarm at a level — or, when the level lives in an indicator strip
+  // (drawing line / right-click inside RSI/MACD), the matching INDICATOR alarm
+  // using this chart's indicator settings + timeframe
+  const addAlertAtPrice = useCallback(async (price: number, pane?: DrawingPane) => {
+    const ib = indSeriesRef.current
+    if (pane === 'rsi' || pane === 'macd') {
+      const period = ib?.settings.rsi.period ?? 14
+      if (pane === 'rsi') {
+        const level = Math.min(99, Math.max(1, Math.round(price * 100) / 100))
+        const last = ib?.lastPts.rsi
+        const direction: 'above' | 'below' = Number.isFinite(last!) ? ((last as number) > level ? 'below' : 'above') : 'above'
+        await addIndicatorAlarm({
+          kind: 'rsi',
+          label: `RSI(${period}) crosses ${direction} ${level.toFixed(2)}`,
+          params: { period },
+          direction,
+          price: level,
+        })
+        return
+      }
+      // macd line crossing the drawn level
+      const m = ib?.settings.macd
+      const lastMacd = ib?.lastPts.macd
+      const level = Math.round(price * 10000) / 10000
+      const condition: 'cross_above' | 'cross_below' = Number.isFinite(lastMacd!) ? ((lastMacd as number) > level ? 'cross_below' : 'cross_above') : 'cross_above'
+      await addIndicatorAlarm({
+        kind: 'macd',
+        label: `MACD(${m?.fast ?? 12},${m?.slow ?? 26},${m?.signal ?? 9}) crosses ${condition === 'cross_above' ? 'above' : 'below'} ${fmtSigned(level)}`,
+        params: { fast: m?.fast ?? 12, slow: m?.slow ?? 26, signal: m?.signal ?? 9 },
+        condition,
+        price: level,
+      })
+      return
+    }
+    const cur = quote?.price ?? price
+    // 'above' fires when price rises into the level (current price below it);
+    // 'below' fires when price falls into it (current price above it).
+    const direction = cur > price ? 'below' : 'above'
+    try {
+      const res = await fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ symbol, price, direction, color: DRAW_COLORS[2] }),
+      })
+      if (res.ok) {
+        const json = await res.json()
+        addAlertLocal(json.alert)
+      }
+    } catch { /* offline */ }
+  }, [symbol, quote, addAlertLocal, addIndicatorAlarm])
 
   // ---------- trade assistance actions ----------
   const patchExitPrice = useCallback(async (
@@ -1750,9 +1876,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         e.stopPropagation()
         e.preventDefault()
         const t = timeAt(x)
-        const p = priceAt(y)
+        // the point lives in WHATEVER pane was clicked — a line started in the
+        // RSI strip stores an RSI level, in the VOL strip a volume value
+        const pane = paneAt(y)
+        const p = valueAtPane(pane, y)
         if (p == null) return
-        const pt: DrawingPoint = { time: t, price: p }
+        const pt: DrawingPoint = { time: t, price: p, pane }
         if (tool === 'hline' || tool === 'vline') {
           void createDrawing(tool, [pt])
           setDrawingTool('cursor')
@@ -1774,7 +1903,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         e.preventDefault()
         setMenu(null)
         const st = useTerminal.getState()
-        let orig: { time: number | null; price: number }[] = []
+        let orig: DrawingPoint[] = []
         let origPixels: ({ x: number; y: number } | null)[] = []
         if (hit.type === 'drawing') {
           const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
@@ -1783,9 +1912,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           // hlines created from the RIGHT-CLICK menu carry time:null and
           // pixelPoint() returns null for them (x == null) — a null origPixel
           // made the drag a no-op ("right-click horizontal line cannot move").
-          // hline dragging only needs the Y pixel, so fall back to it.
+          // hline dragging only needs the Y pixel, so fall back to it (via the
+          // line's OWN pane — a strip hline maps through its strip's scale).
           origPixels = orig.map((p) =>
-            pixelPoint(p) ?? (d.kind === 'hline' ? { x: 0, y: yOf(p.price) ?? y } : null),
+            pixelPoint(p) ?? (d.kind === 'hline' ? { x: 0, y: yOfPane(p.pane ?? 'price', p.price) ?? y } : null),
           )
         } else if (hit.type === 'alert') {
           const a = st.alerts.find((aa) => aa.id === hit.id)
@@ -1876,6 +2006,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const oo = drag.orig[i]
             let time = oo.time
             let price = oo.price
+            const pane = oo.pane // each point converts within its OWN pane
             if (d.kind !== 'hline') {
               // time needs the original x pixel (hlines never move in time and
               // may carry time:null — no origPixel — which is fine for them)
@@ -1885,13 +2016,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               }
             }
             if (d.kind !== 'vline') {
-              const oy = yOf(oo.price)
+              const oy = yOfPane(pane ?? 'price', oo.price)
               if (oy != null) {
-                const np = priceAt(oy + dy)
+                const np = valueAtPane(pane ?? 'price', oy + dy)
                 if (np != null) price = np
               }
             }
-            return { time, price }
+            return { time, price, pane }
           })
           store.patchDrawingLocal(drag.hit.id, symbol, { points })
         }
@@ -1958,12 +2089,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       if (dragRef.current) return
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
-      if (tool !== 'cursor') {
+      if (tool !== 'cursor' || draftRef.current) {
         el.style.cursor = 'crosshair'
         const t = timeAt(x)
-        const p = priceAt(y)
+        // draft preview converts in the DRAFT'S OWN pane (p1's pane): a trend
+        // started in the RSI strip previews RSI values while the cursor stays
+        // in the strip; each committed point keeps its own independent pane
+        const draftPane = draftRef.current?.p1.pane ?? paneAt(y)
+        const p = valueAtPane(draftPane, y)
         if (draftRef.current && p != null) {
-          draftRef.current.p2 = { time: t, price: p }
+          draftRef.current.p2 = { time: t, price: p, pane: draftPane }
           scheduleRedraw()
         }
         return
@@ -2000,12 +2135,17 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       e.stopPropagation()
       // cursor price — used by "add TP/SL here" and the trade menu actions
       const price = priceAt(y)
+      // which strip was clicked + the value IN THAT STRIP's scale — the menu
+      // uses it for pane-aware actions (RSI/MACD alarm at the pointed value,
+      // horizontal lines that hold volume/RSI/MACD values)
+      const pane = paneAt(y)
+      const paneValue = pane === 'price' ? null : valueAtPane(pane, y)
       if (hit) {
-        setMenu({ x, y, hit, price })
+        setMenu({ x, y, hit, price, pane, paneValue })
         return
       }
       // empty chart: custom menu with price-aware actions (alert / trade / hline)
-      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price })
+      setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price, pane, paneValue })
     }
 
     const onDoubleClick = (e: MouseEvent) => {
@@ -2041,7 +2181,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         })
       } else if (hit.type === 'drawing') {
         const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
-        if (d && d.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
+        if (d && d.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price, pane: d.points[0]?.pane ?? 'price' })
       }
     }
 
@@ -2070,7 +2210,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       el.removeEventListener('dblclick', onDoubleClick)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, scheduleRedraw, setDrawingTool])
+  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, yOfPane, valueAtPane, paneAt, scheduleRedraw, setDrawingTool])
 
   // ---------- chart lifecycle ----------
   useEffect(() => {
@@ -3035,10 +3175,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         posData={posData.data}
         indicators={ind}
         timeframe={tf}
-        onAddAlert={(price) => void addAlertAtPrice(price)}
+        onAddAlert={(price, pane) => void addAlertAtPrice(price, pane)}
         onAddIndicatorAlarm={(req) => void addIndicatorAlarm(req)}
-        onAddHline={(price) => {
-          void createDrawing('hline', [{ time: null, price }])
+        onAddHline={(pane, value) => {
+          void createDrawing('hline', [{ time: null, price: value, pane }])
         }}
         onTrade={(side, price) => {
           // right-click price => limit order AT that price
@@ -3080,7 +3220,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             })
           } else if (hit.type === 'drawing') {
             const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
-            if (d?.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price })
+            if (d?.kind === 'hline') setEditValue({ type: 'drawing', id: d.id, price: d.points[0].price, pane: d.points[0]?.pane ?? 'price' })
           }
         }}
         onPatchDrawing={patchDrawing}
@@ -3098,7 +3238,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       {editValue && (
         <EditValuePopover
           value={editValue.price}
-          label={editValue.pctMode ? 'Set trail % (stop distance from price)' : undefined}
+          label={
+            editValue.pctMode ? 'Set trail % (stop distance from price)'
+            : editValue.type === 'drawing' && editValue.pane === 'rsi' ? 'Set RSI level (0-100)'
+            : editValue.type === 'drawing' && editValue.pane === 'vol' ? 'Set volume level'
+            : editValue.type === 'drawing' && editValue.pane === 'macd' ? 'Set MACD level'
+            : undefined
+          }
           onCancel={() => setEditValue(null)}
           onSave={(price) => {
             if (editValue.type === 'alert') void patchAlert(editValue.id!, { price })
@@ -3110,8 +3256,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             } else if (editValue.type === 'ghost' && (editValue.part === 'tp' || editValue.part === 'sl')) {
               void addExitToPosition(editValue.part, price)
             } else {
+              // strip drawings: RSI levels clamp to 0-100 so an edited line
+              // stays inside the oscillator's range
+              const v = editValue.pane === 'rsi' ? Math.min(100, Math.max(0, price)) : price
               const d = (useTerminal.getState().drawingsBySymbol[symbol] || []).find((dd) => dd.id === editValue.id)
-              if (d) void patchDrawing(d.id, { points: d.points.map((p, i) => (i === 0 ? { ...p, price } : p)) })
+              if (d) void patchDrawing(d.id, { points: d.points.map((p, i) => (i === 0 ? { ...p, price: v } : p)) })
             }
             setEditValue(null)
           }}
@@ -3153,9 +3302,9 @@ function ContextMenu({
   posData: { positions: { symbol: string; tradeSymbol: string; qty: number; side: string; avgEntry: number }[]; exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> } | null
   indicators: IndicatorSettings
   timeframe: Timeframe
-  onAddAlert: (price: number) => void
+  onAddAlert: (price: number, pane?: DrawingPane) => void
   onAddIndicatorAlarm: (req: { kind: 'rsi' | 'macd'; label: string; params: Record<string, number>; direction?: 'above' | 'below'; price?: number; condition?: string }) => void
-  onAddHline: (price: number) => void
+  onAddHline: (pane: DrawingPane, value: number) => void
   onTrade: (side: 'buy' | 'sell', price?: number) => void
   onOpenTicket: () => void
   onEditValue: (hit: SceneHit) => void
@@ -3230,6 +3379,12 @@ function ContextMenu({
   if (menu.hit.type === 'drawing' && symDrawing && symDrawingData) {
     const d = symDrawingData
     const drawingHit = symDrawing
+    // a drawing line lives in the pane its point was placed in — "Add alert"
+    // offers the matching alarm kind (RSI level / MACD level / price); volume
+    // has no alarm kind so the item is hidden there
+    const alertPoint = d.kind === 'hline' ? d.points[0] : d.points[d.points.length - 1]
+    const alertPane = alertPoint?.pane ?? 'price'
+    const alertValue = alertPoint?.price ?? 0
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -3239,12 +3394,22 @@ function ContextMenu({
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           {KIND_LABEL[d.kind]}
+          {d.kind === 'hline' && alertPane !== 'price' ? ` · ${alertPane.toUpperCase()} ${fmtPaneValue(alertPane, alertValue)}` : ''}
         </div>
-        {d.kind !== 'vline' && (
+        {d.kind !== 'vline' && alertPane !== 'vol' && (
           <MenuItem
-            label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add alert at {fmtPrice(d.kind === 'hline' ? d.points[0].price : d.points[d.points.length - 1].price)}</span>}
+            label={
+              <span className="flex items-center gap-1.5">
+                <BellPlus className="h-3.5 w-3.5 text-amber-400" />
+                {alertPane === 'rsi'
+                  ? `Add RSI alarm at ${fmtPaneValue(alertPane, alertValue)}`
+                  : alertPane === 'macd'
+                    ? `Add MACD alarm at ${fmtPaneValue(alertPane, alertValue)}`
+                    : `Add alert at ${fmtPrice(alertValue)}`}
+              </span>
+            }
             onClick={() => {
-              onAddAlert(d.kind === 'hline' ? d.points[0].price : d.points[d.points.length - 1].price)
+              onAddAlert(alertValue, alertPane)
               onClose()
             }}
           />
@@ -3410,6 +3575,14 @@ function ContextMenu({
   }
 
   if (menu.hit.type === 'chart') {
+    // pane-aware menu: inside a strip the pointed value is an RSI level /
+    // volume / MACD value — alarms and hlines use THAT value, not the price
+    // the main scale extrapolates at the same pixel
+    const pane = menu.pane ?? 'price'
+    const pv = menu.paneValue ?? null
+    const rsiLvl = pane === 'rsi' && pv != null ? Math.min(99, Math.max(1, Math.round(pv * 100) / 100)) : null
+    const macdLvl = pane === 'macd' && pv != null ? Math.round(pv * 10000) / 10000 : null
+    const hlineValue = pane === 'price' ? price : pv
     return (
       <div
         className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -3418,9 +3591,12 @@ function ContextMenu({
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-          {symbol}{price != null ? ` · ${fmtPrice(price)}` : ''}
+          {symbol}
+          {pane === 'price'
+            ? price != null ? ` · ${fmtPrice(price)}` : ''
+            : pv != null ? ` · ${pane === 'rsi' ? 'RSI ' : pane === 'vol' ? 'VOL ' : 'MACD '}${fmtPaneValue(pane, pv)}` : ''}
         </div>
-        {price != null && (
+        {pane === 'price' && price != null && (
           <MenuItem
             label={<span className="flex items-center gap-1.5"><BellPlus className="h-3.5 w-3.5 text-amber-400" /> Add price alert at {fmtPrice(price)}</span>}
             onClick={() => { onAddAlert(price); onClose() }}
@@ -3430,57 +3606,104 @@ function ContextMenu({
           <>
             <div className="my-1 h-px bg-zinc-800" />
             {indicators.rsi.enabled && (
-              <>
-                <MenuItem
-                  label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses above 70</span>}
-                  onClick={() => {
-                    onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses above 70`, params: { period: indicators.rsi.period }, direction: 'above', price: 70 })
-                    onClose()
-                  }}
-                />
-                <MenuItem
-                  label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses below 30</span>}
-                  onClick={() => {
-                    onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses below 30`, params: { period: indicators.rsi.period }, direction: 'below', price: 30 })
-                    onClose()
-                  }}
-                />
-              </>
+              rsiLvl != null ? (
+                // right-click INSIDE the RSI strip: the alarm level follows the
+                // RSI value the cursor points at (not the fixed 70/30)
+                <>
+                  <MenuItem
+                    label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses above {rsiLvl.toFixed(2)}</span>}
+                    onClick={() => {
+                      onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses above ${rsiLvl.toFixed(2)}`, params: { period: indicators.rsi.period }, direction: 'above', price: rsiLvl })
+                      onClose()
+                    }}
+                  />
+                  <MenuItem
+                    label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses below {rsiLvl.toFixed(2)}</span>}
+                    onClick={() => {
+                      onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses below ${rsiLvl.toFixed(2)}`, params: { period: indicators.rsi.period }, direction: 'below', price: rsiLvl })
+                      onClose()
+                    }}
+                  />
+                </>
+              ) : (
+                <>
+                  <MenuItem
+                    label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses above 70</span>}
+                    onClick={() => {
+                      onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses above 70`, params: { period: indicators.rsi.period }, direction: 'above', price: 70 })
+                      onClose()
+                    }}
+                  />
+                  <MenuItem
+                    label={<span className="text-pink-300">🔔 RSI({indicators.rsi.period}) crosses below 30</span>}
+                    onClick={() => {
+                      onAddIndicatorAlarm({ kind: 'rsi', label: `RSI(${indicators.rsi.period}) crosses below 30`, params: { period: indicators.rsi.period }, direction: 'below', price: 30 })
+                      onClose()
+                    }}
+                  />
+                </>
+              )
             )}
             {indicators.macd.enabled && (
-              <>
-                <MenuItem
-                  label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bull crossover</span>}
-                  onClick={() => {
-                    const m = indicators.macd
-                    onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bull crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bull_cross' })
-                    onClose()
-                  }}
-                />
-                <MenuItem
-                  label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bear crossover</span>}
-                  onClick={() => {
-                    const m = indicators.macd
-                    onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bear crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bear_cross' })
-                    onClose()
-                  }}
-                />
-              </>
+              macdLvl != null ? (
+                // right-click INSIDE the MACD strip: level alarms at the
+                // pointed MACD value
+                <>
+                  <MenuItem
+                    label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) crosses above {fmtSigned(macdLvl)}</span>}
+                    onClick={() => {
+                      const m = indicators.macd
+                      onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) crosses above ${fmtSigned(macdLvl)}`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'cross_above', price: macdLvl })
+                      onClose()
+                    }}
+                  />
+                  <MenuItem
+                    label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) crosses below {fmtSigned(macdLvl)}</span>}
+                    onClick={() => {
+                      const m = indicators.macd
+                      onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) crosses below ${fmtSigned(macdLvl)}`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'cross_below', price: macdLvl })
+                      onClose()
+                    }}
+                  />
+                </>
+              ) : (
+                <>
+                  <MenuItem
+                    label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bull crossover</span>}
+                    onClick={() => {
+                      const m = indicators.macd
+                      onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bull crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bull_cross' })
+                      onClose()
+                    }}
+                  />
+                  <MenuItem
+                    label={<span className="text-amber-300">🔔 MACD({indicators.macd.fast},{indicators.macd.slow},{indicators.macd.signal}) bear crossover</span>}
+                    onClick={() => {
+                      const m = indicators.macd
+                      onAddIndicatorAlarm({ kind: 'macd', label: `MACD(${m.fast},${m.slow},${m.signal}) bear crossover`, params: { fast: m.fast, slow: m.slow, signal: m.signal }, condition: 'bear_cross' })
+                      onClose()
+                    }}
+                  />
+                </>
+              )
             )}
             <div className="px-3 pb-1 text-[10px] text-zinc-600">alarms use this chart's timeframe ({TIMEFRAMES[timeframe]?.label ?? timeframe}) and indicator settings</div>
           </>
         )}
-        {price != null && (
-          <MenuItem label="─ Horizontal line here" onClick={() => { onAddHline(price); onClose() }} />
+        {hlineValue != null && (
+          <MenuItem
+            label={pane === 'price' ? '─ Horizontal line here' : `─ Horizontal line at ${fmtPaneValue(pane, hlineValue)}`}
+            onClick={() => { onAddHline(pane, hlineValue); onClose() }}
+          />
         )}
         <div className="my-1 h-px bg-zinc-800" />
-        {price != null && (
+        {pane === 'price' && price != null && (
           <MenuItem
             label={<span className="text-emerald-400">🟢 Buy limit @ {fmtPrice(price)}</span>}
             onClick={() => { onTrade('buy', price); onClose() }}
           />
         )}
-        {price != null && (
+        {pane === 'price' && price != null && (
           <MenuItem
             label={<span className="text-rose-400">🔴 Sell limit @ {fmtPrice(price)}</span>}
             onClick={() => { onTrade('sell', price); onClose() }}

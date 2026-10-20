@@ -5,7 +5,7 @@ import { getQuotes } from '@/lib/alpaca'
 import { sendTelegram, handleError } from '@/lib/api-helpers'
 import { Bar, Timeframe, TIMEFRAMES } from '@/lib/market-types'
 import { barsFor } from '@/lib/bars-cache'
-import { evalIndicatorSignal, isCross, IndicatorParams } from '@/lib/indicator-eval'
+import { evalIndicatorSignal, isCross, IndicatorParams, IndEval } from '@/lib/indicator-eval'
 
 interface UserSettings {
   telegramTokenEnc?: string

@@ -287,7 +287,13 @@ export async function POST(req: Request) {
       await db.$transaction(async (tx) => {
         await tx.alert.deleteMany({ where: { userId: user.id } })
         if (alerts.length) {
-          await tx.alert.createMany({ data: alerts.map((a) => ({ userId: user.id, ...a })) })
+          await tx.alert.createMany({
+            data: alerts.map((a) => ({
+              userId: user.id, ...a,
+              // explicit JsonNull for absent params (Prisma's null-input union)
+              params: (a.params ?? Prisma.JsonNull) as Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput,
+            })),
+          })
         }
       })
       summary.alerts = alerts.length
@@ -311,7 +317,12 @@ export async function POST(req: Request) {
       await db.$transaction(async (tx) => {
         await tx.drawing.deleteMany({ where: { userId: user.id } })
         if (drawings.length) {
-          await tx.drawing.createMany({ data: drawings.map((d) => ({ userId: user.id, ...d })) })
+          await tx.drawing.createMany({
+            data: drawings.map((d) => ({
+              userId: user.id, ...d,
+              meta: (d.meta ?? Prisma.JsonNull) as Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput,
+            })),
+          })
         }
       })
       summary.drawings = drawings.length

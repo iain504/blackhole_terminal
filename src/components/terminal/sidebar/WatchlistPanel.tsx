@@ -19,7 +19,7 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil } from 'lucide-react'
+import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil, GripVertical } from 'lucide-react'
 
 const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
 
@@ -48,6 +48,7 @@ export function WatchlistPanel() {
   const deleteWatchlist = useTerminal((s) => s.deleteWatchlist)
   const updateWatchlist = useTerminal((s) => s.updateWatchlist)
   const moveWatchlist = useTerminal((s) => s.moveWatchlist)
+  const reorderWatchlistSymbol = useTerminal((s) => s.reorderWatchlistSymbol)
 
   const [quotes, setQuotes] = useState<Record<string, QuoteRow>>({})
   const [newSymbol, setNewSymbol] = useState('')
@@ -66,6 +67,11 @@ export function WatchlistPanel() {
   const suggDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
   const inputBoxRef = useRef<HTMLDivElement>(null)
   const { toast } = useToast()
+
+  // drag & drop reordering (HTML5): index of the row being dragged and the
+  // index it currently hovers over (drives the drop indicator line)
+  const [dragFrom, setDragFrom] = useState<number | null>(null)
+  const [dragOver, setDragOver] = useState<number | null>(null)
 
   const list: Watchlist | undefined = lists.find((l) => l.id === activeId) || lists[0]
 
@@ -272,6 +278,17 @@ export function WatchlistPanel() {
 
   const sorted = useMemo(() => [...lists].sort((a, b) => a.sortOrder - b.sortOrder), [lists])
 
+  // drop: move the dragged symbol to the hovered insertion index (top half of
+  // a row → its index, bottom half → after it). No-op drops (on itself / right
+  // below itself) are skipped.
+  const onRowDrop = (toIdx: number) => {
+    if (dragFrom != null && list && toIdx !== dragFrom && toIdx !== dragFrom + 1) {
+      void reorderWatchlistSymbol(list.id, dragFrom, toIdx)
+    }
+    setDragFrom(null)
+    setDragOver(null)
+  }
+
   return (
     <div className="flex h-full flex-col text-xs" ref={listRef}>
       {/* list switcher */}
@@ -411,23 +428,58 @@ export function WatchlistPanel() {
             {list.items.length === 0 && (
               <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Empty — add symbols above</p>
             )}
-            {list.items.map((sym) => {
+            {list.items.map((sym, idx) => {
               const q = quotes[sym]
               const up = (q?.changePct ?? 0) >= 0
               const isActive = activeTab?.type === 'chart' && activeTab.symbol === sym
+              const isDragged = dragFrom === idx
+              // insertion line: dragOver holds the TARGET index (0..items.length)
+              // — above this row when it equals idx, below when it equals idx+1
+              const dropAbove = dragFrom != null && dragOver === idx
+              const dropBelow = dragFrom != null && dragOver === idx + 1
               return (
                 <div
                   key={sym}
                   className={cn(
                     'group grid cursor-pointer grid-cols-[1fr_72px_64px_56px] items-center gap-1 px-2 py-1.5 hover:bg-zinc-800/60',
                     isActive && 'bg-emerald-500/5',
+                    isDragged && 'opacity-40',
+                    dropAbove && 'border-t-2 border-t-emerald-500',
+                    dropBelow && 'border-b-2 border-b-emerald-500',
                   )}
                   onClick={() => selectSymbol(sym)}
                   role="button"
                   tabIndex={0}
                   onKeyDown={(e) => e.key === 'Enter' && selectSymbol(sym)}
+                  draggable
+                  onDragStart={(e) => {
+                    setDragFrom(idx)
+                    e.dataTransfer.effectAllowed = 'move'
+                    e.dataTransfer.setData('text/plain', sym) // required by Firefox
+                  }}
+                  onDragOver={(e) => {
+                    if (dragFrom == null) return
+                    e.preventDefault()
+                    e.dataTransfer.dropEffect = 'move'
+                    const r = e.currentTarget.getBoundingClientRect()
+                    const after = e.clientY > r.top + r.height / 2
+                    const target = after ? idx + 1 : idx
+                    setDragOver(target === dragFrom || target === dragFrom + 1 ? null : target)
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault()
+                    // dropping in the bottom half of the LAST row → after it
+                    const r = e.currentTarget.getBoundingClientRect()
+                    const after = e.clientY > r.top + r.height / 2
+                    onRowDrop(after ? idx + 1 : idx)
+                  }}
+                  onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
                 >
                   <span className="flex min-w-0 items-center gap-1.5 font-medium text-zinc-200">
+                    <GripVertical
+                      className="h-3 w-3 shrink-0 cursor-grab text-zinc-600 opacity-0 transition-opacity group-hover:opacity-100"
+                      aria-hidden
+                    />
                     <span className="truncate">{sym}</span>
                     {sym.includes('/') && <Badge variant="outline" className="border-amber-500/40 px-1 py-0 text-[8px] text-amber-400">7×24</Badge>}
                   </span>
