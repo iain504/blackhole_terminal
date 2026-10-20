@@ -443,6 +443,12 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     })),
 
   selectSymbol: (symbol) => {
+    // Task 56: let the mobile shell know a symbol was picked from a full-screen
+    // tool (heat-map tile, calendar row, …) so it can switch to the chart view.
+    // Desktop has no listener — harmless CustomEvent.
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('tt:symbol-picked', { detail: symbol }))
+    }
     const { activeTabId, tabs } = get()
     const active = tabs.find((t) => t.id === activeTabId)
     if (active && active.type === 'chart') {

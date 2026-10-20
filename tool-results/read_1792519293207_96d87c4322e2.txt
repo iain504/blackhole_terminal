@@ -1,0 +1,814 @@
+     1→'use client'
+     2→
+     3→// Watchlist panel: multiple personal lists with tag colors; rows show
+     4→// symbol, price, daily change, daily % (Task 13 #2/#4, Task 16 #2).
+     5→// Symbol input has live prediction (symbols starting with the typed query,
+     6→// backed by the Alpaca asset universe) and rejects unknown symbols.
+     7→// Group separators (Task 51): an items entry starting with '#' ("#Tech")
+     8→// renders a user-defined section header — symbols can be dragged into/out of
+     9→// groups and the separator itself drags its whole block (order persists).
+    10→import { useEffect, useMemo, useRef, useState } from 'react'
+    11→import { useTerminal, Watchlist } from '@/store/terminal'
+    12→import { fmtPrice } from '@/lib/market-types'
+    13→import { subscribeStream } from '@/lib/stream-client'
+    14→import { cn } from '@/lib/utils'
+    15→import { Button } from '@/components/ui/button'
+    16→import { Input } from '@/components/ui/input'
+    17→import { Badge } from '@/components/ui/badge'
+    18→import { useToast } from '@/hooks/use-toast'
+    19→import {
+    20→  Dialog, DialogContent, DialogHeader, DialogTitle,
+    21→} from '@/components/ui/dialog'
+    22→import {
+    23→  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
+    24→} from '@/components/ui/dropdown-menu'
+    25→import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil, GripVertical, FolderPlus } from 'lucide-react'
+    26→
+    27→const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
+    28→
+    29→/** group separator marker: an items entry starting with '#' is a section
+    30→ *  header, not a symbol (symbol format /^[A-Z0-9./:-]+$/ can never clash) */
+    31→const isSep = (s: string) => s.startsWith('#')
+    32→/** number of real symbols between a separator (at idx) and the next one */
+    33→const groupSize = (items: string[], idx: number) => {
+    34→  let n = 0
+    35→  for (let j = idx + 1; j < items.length && !isSep(items[j]); j++) n++
+    36→  return n
+    37→}
+    38→
+    39→interface QuoteRow {
+    40→  symbol: string
+    41→  price: number
+    42→  change: number
+    43→  changePct: number
+    44→}
+    45→
+    46→interface SuggRow {
+    47→  symbol: string
+    48→  name: string
+    49→  crypto: boolean
+    50→}
+    51→
+    52→export function WatchlistPanel() {
+    53→  const lists = useTerminal((s) => s.watchlists)
+    54→  const activeId = useTerminal((s) => s.activeWatchlistId)
+    55→  const setActiveWatchlist = useTerminal((s) => s.setActiveWatchlist)
+    56→  const selectSymbol = useTerminal((s) => s.selectSymbol)
+    57→  const activeTab = useTerminal((s) => s.tabs.find((t) => t.id === s.activeTabId) || s.tabs[0])
+    58→  const addSymbolToWatchlist = useTerminal((s) => s.addSymbolToWatchlist)
+    59→  const removeSymbolFromWatchlist = useTerminal((s) => s.removeSymbolFromWatchlist)
+    60→  const createWatchlist = useTerminal((s) => s.createWatchlist)
+    61→  const deleteWatchlist = useTerminal((s) => s.deleteWatchlist)
+    62→  const updateWatchlist = useTerminal((s) => s.updateWatchlist)
+    63→  const moveWatchlist = useTerminal((s) => s.moveWatchlist)
+    64→  const reorderWatchlistSymbol = useTerminal((s) => s.reorderWatchlistSymbol)
+    65→  const addGroupToWatchlist = useTerminal((s) => s.addGroupToWatchlist)
+    66→  const renameWatchlistGroup = useTerminal((s) => s.renameWatchlistGroup)
+    67→  const deleteWatchlistGroup = useTerminal((s) => s.deleteWatchlistGroup)
+    68→
+    69→  const [quotes, setQuotes] = useState<Record<string, QuoteRow>>({})
+    70→  const [newSymbol, setNewSymbol] = useState('')
+    71→  const [createOpen, setCreateOpen] = useState(false)
+    72→  const [newName, setNewName] = useState('')
+    73→  const [newColor, setNewColor] = useState(LIST_COLORS[0])
+    74→  const [sugg, setSugg] = useState<SuggRow[]>([])
+    75→  const [suggOpen, setSuggOpen] = useState(false)
+    76→  const [suggIdx, setSuggIdx] = useState(-1)
+    77→  const [suggLoading, setSuggLoading] = useState(false)
+    78→  const [renameOpen, setRenameOpen] = useState(false)
+    79→  const [renameTargetId, setRenameTargetId] = useState<string | null>(null)
+    80→  const [renameName, setRenameName] = useState('')
+    81→  const [renaming, setRenaming] = useState(false)
+    82→  const listRef = useRef<HTMLDivElement>(null)
+    83→  const suggDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+    84→  const inputBoxRef = useRef<HTMLDivElement>(null)
+    85→  const { toast } = useToast()
+    86→
+    87→  // drag & drop reordering (HTML5): index of the row being dragged and the
+    88→  // insertion boundary it currently hovers over (drives the drop indicator line)
+    89→  const [dragFrom, setDragFrom] = useState<number | null>(null)
+    90→  const [dragOver, setDragOver] = useState<number | null>(null)
+    91→
+    92→  // group create / rename dialogs
+    93→  const [groupOpen, setGroupOpen] = useState(false)
+    94→  const [groupName, setGroupName] = useState('')
+    95→  const [groupRenameOpen, setGroupRenameOpen] = useState(false)
+    96→  const [groupRenameName, setGroupRenameName] = useState('')
+    97→  const [groupRenameTarget, setGroupRenameTarget] = useState('')
+    98→
+    99→  const list: Watchlist | undefined = lists.find((l) => l.id === activeId) || lists[0]
+   100→
+   101→  // REST quotes are the reconciliation BACKSTOP for the live stream. The whole
+   102→  // list costs ONE batched request (server-side Alpaca snapshots endpoint;
+   103→  // 200 req/min plan limit → 6 req/min here, far under it). The cadence is
+   104→  // TICK-AWARE, not socket-aware: only when EVERY symbol actually received a
+   105→  // fresh stream tick (≤8s ago) do we drop to a ~30s reconcile; symbols
+   106→  // without a live upstream keep the full 10s poll (no simulated ticks exist
+   107→  // anymore). Skips entirely while the page is hidden; a hidden→visible
+   108→  // switch refreshes immediately.
+   109→  const itemsKey = (list?.items ?? []).filter((i) => !isSep(i)).join(',')
+   110→  const tickAtRef = useRef<Map<string, number>>(new Map())
+   111→  useEffect(() => {
+   112→    if (!itemsKey) return
+   113→    let alive = true
+   114→    let n = 0
+   115→    const syms = itemsKey.split(',')
+   116→    tickAtRef.current.clear() // symbol set changed — freshness starts over
+   117→    const streamFresh = (s: string, now: number) => {
+   118→      const at = tickAtRef.current.get(s)
+   119→      return at != null && now - at < 8000
+   120→    }
+   121→    const fetchQ = async () => {
+   122→      if (document.hidden) return // background tab — save the API budget
+   123→      const now = Date.now()
+   124→      if (syms.every((s) => streamFresh(s, now)) && ++n % 3 !== 1) return // whole list streaming → reconcile every 30s
+   125→      try {
+   126→        const res = await fetch('/api/market/quote', {
+   127→          method: 'POST',
+   128→          headers: { 'content-type': 'application/json' },
+   129→          body: JSON.stringify({ symbols: syms }),
+   130→        })
+   131→        if (!res.ok || !alive) return
+   132→        const json = await res.json()
+   133→        if (!alive) return
+   134→        const at = Date.now()
+   135→        const next: Record<string, QuoteRow> = {}
+   136→        for (const q of json.quotes || []) {
+   137→          if (streamFresh(q.symbol, at)) continue // a cached REST snapshot must not yank a live tick backwards
+   138→          next[q.symbol] = { symbol: q.symbol, price: q.price, change: q.change, changePct: q.changePct }
+   139→        }
+   140→        setQuotes((prev) => {
+   141→          const merged: Record<string, QuoteRow> = { ...next }
+   142→          for (const s of syms) {
+   143→            // rows with a fresh live tick keep their streamed value
+   144→            if (!merged[s] && prev[s] && streamFresh(s, at)) merged[s] = prev[s]
+   145→          }
+   146→          return merged
+   147→        })
+   148→      } catch { /* offline */ }
+   149→    }
+   150→    fetchQ()
+   151→    const timer = setInterval(fetchQ, 10000)
+   152→    const onVis = () => {
+   153→      if (!document.hidden) void fetchQ()
+   154→    }
+   155→    document.addEventListener('visibilitychange', onVis)
+   156→    return () => {
+   157→      alive = false
+   158→      clearInterval(timer)
+   159→      document.removeEventListener('visibilitychange', onVis)
+   160→    }
+   161→  }, [itemsKey])
+   162→
+   163→  // stream ticks: the PRIMARY price source between REST reconciliations
+   164→  // (crypto streams from Binance; stocks from the one shared Alpaca websocket
+   165→  // when the keys pass its data-stream auth — simulated ticks are PERMANENTLY
+   166→  // disabled: symbols without a live upstream fall back to the 10s REST poll)
+   167→  useEffect(() => {
+   168→    if (!itemsKey) return
+   169→    return subscribeStream(itemsKey.split(','), (t) => {
+   170→      tickAtRef.current.set(t.s, Date.now())
+   171→      setQuotes((prev) => {
+   172→        const row = prev[t.s]
+   173→        if (!row) return prev
+   174→        const prevClose = row.price - row.change // implied by the last REST row
+   175→        const change = t.p - prevClose
+   176→        return {
+   177→          ...prev,
+   178→          [t.s]: {
+   179→            ...row,
+   180→            price: t.p,
+   181→            change,
+   182→            changePct: prevClose ? (change / prevClose) * 100 : row.changePct,
+   183→          },
+   184→        }
+   185→      })
+   186→    })
+   187→  }, [itemsKey])
+   188→
+   189→  // live symbol prediction: query the Alpaca-backed universe as the user types
+   190→  const fetchSuggestions = async (q: string) => {
+   191→    try {
+   192→      setSuggLoading(true)
+   193→      const res = await fetch(`/api/market/symbols?q=${encodeURIComponent(q)}`)
+   194→      if (!res.ok) return
+   195→      const json = (await res.json()) as { symbols?: SuggRow[] }
+   196→      const rows = (json.symbols || []).slice(0, 12)
+   197→      setSugg(rows)
+   198→      setSuggOpen(rows.length > 0)
+   199→      setSuggIdx(-1)
+   200→    } catch {
+   201→      /* offline — dropdown just stays closed */
+   202→    } finally {
+   203→      setSuggLoading(false)
+   204→    }
+   205→  }
+   206→
+   207→  const onInputChange = (v: string) => {
+   208→    setNewSymbol(v)
+   209→    if (suggDebounce.current) clearTimeout(suggDebounce.current)
+   210→    const q = v.trim().toUpperCase()
+   211→    if (!q || /[^A-Z0-9./:\-]/.test(q) || q.length > 15) {
+   212→      setSugg([])
+   213→      setSuggOpen(false)
+   214→      return
+   215→    }
+   216→    suggDebounce.current = setTimeout(() => void fetchSuggestions(q), 160)
+   217→  }
+   218→
+   219→  const closeSuggestions = () => {
+   220→    setSuggOpen(false)
+   221→    setSuggIdx(-1)
+   222→  }
+   223→
+   224→  const addSymbol = async (raw?: string) => {
+   225→    const sym = (raw ?? newSymbol).trim().toUpperCase()
+   226→    if (!sym || !list) return
+   227→    const res = await addSymbolToWatchlist(list.id, sym)
+   228→    if (res.ok) {
+   229→      setNewSymbol('')
+   230→      closeSuggestions()
+   231→    } else {
+   232→      const desc =
+   233→        res.reason === 'duplicate'
+   234→          ? `${sym} is already in “${list.name}”.`
+   235→          : res.reason === 'invalid'
+   236→            ? `“${sym}” is not a valid symbol format (letters/digits, . - / only).`
+   237→            : res.reason === 'unknown'
+   238→              ? `“${sym}” was not found in the Alpaca asset universe. Pick a suggestion or check the spelling.`
+   239→              : 'Could not save — please try again.'
+   240→      toast({ title: 'Cannot add symbol', description: desc, variant: 'destructive' })
+   241→      if (res.reason === 'duplicate') {
+   242→        setNewSymbol('')
+   243→        closeSuggestions()
+   244→      }
+   245→    }
+   246→  }
+   247→
+   248→  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+   249→    if (e.key === 'ArrowDown' && suggOpen && sugg.length > 0) {
+   250→      e.preventDefault()
+   251→      setSuggIdx((i) => Math.min(i + 1, sugg.length - 1))
+   252→    } else if (e.key === 'ArrowUp' && suggOpen && sugg.length > 0) {
+   253→      e.preventDefault()
+   254→      setSuggIdx((i) => Math.max(i - 1, -1))
+   255→    } else if (e.key === 'Escape') {
+   256→      closeSuggestions()
+   257→    } else if (e.key === 'Enter') {
+   258→      e.preventDefault()
+   259→      // highlighted suggestion wins; otherwise validate the exact typed symbol
+   260→      // (unknown symbols are rejected with a clear error)
+   261→      const picked = suggOpen && suggIdx >= 0 && sugg[suggIdx] ? sugg[suggIdx].symbol : undefined
+   262→      void addSymbol(picked)
+   263→    }
+   264→  }
+   265→
+   266→  const create = async () => {
+   267→    const name = newName.trim()
+   268→    if (!name) return
+   269→    await createWatchlist(name, newColor)
+   270→    setNewName('')
+   271→    setNewColor(LIST_COLORS[0])
+   272→    setCreateOpen(false)
+   273→  }
+   274→
+   275→  const createGroup = async () => {
+   276→    if (!list) return
+   277→    const name = groupName.trim()
+   278→    if (!name) return
+   279→    const res = await addGroupToWatchlist(list.id, name)
+   280→    if (res.ok) {
+   281→      setGroupName('')
+   282→      setGroupOpen(false)
+   283→    } else {
+   284→      toast({
+   285→        title: 'Cannot create group',
+   286→        description:
+   287→          res.reason === 'duplicate'
+   288→            ? `A group or symbol named “${name}” already exists in “${list.name}”.`
+   289→            : res.reason === 'invalid'
+   290→              ? 'Group name must be 1-24 characters.'
+   291→              : 'Could not save — please try again.',
+   292→        variant: 'destructive',
+   293→      })
+   294→    }
+   295→  }
+   296→
+   297→  const submitGroupRename = async () => {
+   298→    if (!list || !groupRenameTarget) return
+   299→    const name = groupRenameName.trim()
+   300→    if (!name || name === groupRenameTarget) {
+   301→      setGroupRenameOpen(false)
+   302→      return
+   303→    }
+   304→    const res = await renameWatchlistGroup(list.id, groupRenameTarget, name)
+   305→    if (res.ok) {
+   306→      setGroupRenameOpen(false)
+   307→    } else {
+   308→      toast({
+   309→        title: 'Cannot rename group',
+   310→        description:
+   311→          res.reason === 'duplicate'
+   312→            ? `A group or symbol named “${name}” already exists in “${list.name}”.`
+   313→            : res.reason === 'invalid'
+   314→              ? 'Group name must be 1-24 characters.'
+   315→              : 'Could not save — please try again.',
+   316→        variant: 'destructive',
+   317→      })
+   318→    }
+   319→  }
+   320→
+   321→  const openRename = (l: Watchlist) => {
+   322→    setRenameTargetId(l.id)
+   323→    setRenameName(l.name)
+   324→    setRenameOpen(true)
+   325→  }
+   326→
+   327→  const submitRename = async () => {
+   328→    if (!renameTargetId) return
+   329→    const name = renameName.trim()
+   330→    if (!name) return
+   331→    const original = lists.find((l) => l.id === renameTargetId)
+   332→    if (original && name === original.name) {
+   333→      setRenameOpen(false)
+   334→      return
+   335→    }
+   336→    try {
+   337→      setRenaming(true)
+   338→      await updateWatchlist(renameTargetId, { name })
+   339→      toast({ title: 'Watchlist renamed', description: `Now “${name}”.` })
+   340→      setRenameOpen(false)
+   341→    } catch {
+   342→      toast({ title: 'Rename failed', description: 'Could not save the new name — please try again.', variant: 'destructive' })
+   343→    } finally {
+   344→      setRenaming(false)
+   345→    }
+   346→  }
+   347→
+   348→  const sorted = useMemo(() => [...lists].sort((a, b) => a.sortOrder - b.sortOrder), [lists])
+   349→
+   350→  // drop: move the dragged symbol to the hovered insertion index (top half of
+   351→  // a row → its index, bottom half → after it). No-op drops (on itself / right
+   352→  // below itself) are skipped.
+   353→  const onRowDrop = (toIdx: number) => {
+   354→    if (dragFrom != null && list && toIdx !== dragFrom && toIdx !== dragFrom + 1) {
+   355→      void reorderWatchlistSymbol(list.id, dragFrom, toIdx)
+   356→    }
+   357→    setDragFrom(null)
+   358→    setDragOver(null)
+   359→  }
+   360→
+   361→  // separator rows: a dragged SYMBOL always drops BELOW the marker (first row
+   362→  // of that group); a dragged SEPARATOR keeps the regular half-row boundaries
+   363→  // and moves its whole block (store handles the block extraction)
+   364→  const onSepDragOver = (e: React.DragEvent<HTMLDivElement>, idx: number) => {
+   365→    if (dragFrom == null || !list) return
+   366→    e.preventDefault()
+   367→    e.dataTransfer.dropEffect = 'move'
+   368→    if (isSep(list.items[dragFrom])) {
+   369→      const r = e.currentTarget.getBoundingClientRect()
+   370→      const after = e.clientY > r.top + r.height / 2
+   371→      const target = after ? idx + 1 : idx
+   372→      setDragOver(target === dragFrom || target === dragFrom + 1 ? null : target)
+   373→    } else {
+   374→      setDragOver(idx + 1)
+   375→    }
+   376→  }
+   377→
+   378→  const onSepDrop = (e: React.DragEvent<HTMLDivElement>, idx: number) => {
+   379→    e.preventDefault()
+   380→    if (dragFrom == null || !list) {
+   381→      setDragFrom(null)
+   382→      setDragOver(null)
+   383→      return
+   384→    }
+   385→    if (isSep(list.items[dragFrom])) {
+   386→      const r = e.currentTarget.getBoundingClientRect()
+   387→      const after = e.clientY > r.top + r.height / 2
+   388→      const toIdx = after ? idx + 1 : idx
+   389→      if (toIdx !== dragFrom && toIdx !== dragFrom + 1) {
+   390→        void reorderWatchlistSymbol(list.id, dragFrom, toIdx)
+   391→      }
+   392→    } else {
+   393→      // land as the FIRST row of the group: insertion boundary below the
+   394→      // marker; when moving down the store's offset eats one — compensate so
+   395→      // the symbol ends up after the marker in both directions
+   396→      const toIdx = idx + 1
+   397→      const to = dragFrom < toIdx ? toIdx + 1 : toIdx
+   398→      if (to !== dragFrom && to !== dragFrom + 1) {
+   399→        void reorderWatchlistSymbol(list.id, dragFrom, to)
+   400→      }
+   401→    }
+   402→    setDragFrom(null)
+   403→    setDragOver(null)
+   404→  }
+   405→
+   406→  return (
+   407→    <div className="flex h-full flex-col text-xs" ref={listRef}>
+   408→      {/* list switcher */}
+   409→      <div className="flex flex-wrap items-center gap-1 border-b border-zinc-800/60 px-2 py-1.5">
+   410→        {sorted.map((l) => (
+   411→          <button
+   412→            key={l.id}
+   413→            onClick={() => setActiveWatchlist(l.id)}
+   414→            onDoubleClick={() => openRename(l)}
+   415→            title={`${l.name} — double-click to rename`}
+   416→            className={cn(
+   417→              'flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] transition-colors',
+   418→              l.id === list?.id ? 'border-zinc-600 bg-zinc-800 text-zinc-100' : 'border-transparent text-zinc-400 hover:bg-zinc-800/60',
+   419→            )}
+   420→          >
+   421→            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: l.color }} />
+   422→            {l.name}
+   423→            <span className="text-zinc-600">{l.items.filter((i) => !isSep(i)).length}</span>
+   424→          </button>
+   425→        ))}
+   426→        <Button variant="ghost" size="icon" className="h-5 w-5 text-zinc-500 hover:text-zinc-200" onClick={() => setCreateOpen(true)} aria-label="New watchlist">
+   427→          <Plus className="h-3.5 w-3.5" />
+   428→        </Button>
+   429→        {list && (
+   430→          <Button
+   431→            variant="ghost"
+   432→            size="icon"
+   433→            className="h-5 w-5 text-zinc-500 hover:text-zinc-200"
+   434→            onClick={() => { setGroupName(''); setGroupOpen(true) }}
+   435→            aria-label="New group separator"
+   436→            title="New group separator (e.g. Tech, Health)"
+   437→          >
+   438→            <FolderPlus className="h-3.5 w-3.5" />
+   439→          </Button>
+   440→        )}
+   441→      </div>
+   442→
+   443→      {list && (
+   444→        <>
+   445→          {/* list actions */}
+   446→          <div className="flex items-center justify-between px-2 pt-1.5">
+   447→            <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-zinc-500">
+   448→              <Tag className="h-3 w-3" style={{ color: list.color }} /> {list.name}
+   449→            </span>
+   450→            <DropdownMenu>
+   451→              <DropdownMenuTrigger asChild>
+   452→                <Button variant="ghost" size="icon" className="h-5 w-5 text-zinc-500 hover:text-zinc-200" aria-label="Watchlist options">
+   453→                  <MoreVertical className="h-3.5 w-3.5" />
+   454→                </Button>
+   455→              </DropdownMenuTrigger>
+   456→              <DropdownMenuContent align="end" className="border-zinc-800 bg-zinc-900 text-xs">
+   457→                <DropdownMenuItem className="gap-2" onClick={() => openRename(list)}>
+   458→                  <Pencil className="h-3.5 w-3.5" /> Rename
+   459→                </DropdownMenuItem>
+   460→                <DropdownMenuItem className="gap-2" onClick={() => void moveWatchlist(list.id, -1)}>
+   461→                  <ChevronUp className="h-3.5 w-3.5" /> Move up
+   462→                </DropdownMenuItem>
+   463→                <DropdownMenuItem className="gap-2" onClick={() => void moveWatchlist(list.id, 1)}>
+   464→                  <ChevronDown className="h-3.5 w-3.5" /> Move down
+   465→                </DropdownMenuItem>
+   466→                <DropdownMenuSeparator className="bg-zinc-800" />
+   467→                <div className="flex items-center gap-1.5 px-2 py-1.5">
+   468→                  <Palette className="h-3.5 w-3.5 text-zinc-500" />
+   469→                  {LIST_COLORS.map((c) => (
+   470→                    <button
+   471→                      key={c}
+   472→                      aria-label={`Set color ${c}`}
+   473→                      className={cn('h-3.5 w-3.5 rounded-full', list.color === c && 'ring-2 ring-white/70')}
+   474→                      style={{ backgroundColor: c }}
+   475→                      onClick={() => void updateWatchlist(list.id, { color: c })}
+   476→                    />
+   477→                  ))}
+   478→                </div>
+   479→                <DropdownMenuSeparator className="bg-zinc-800" />
+   480→                <DropdownMenuItem className="gap-2 text-rose-400" onClick={() => void deleteWatchlist(list.id)}>
+   481→                  <Trash2 className="h-3.5 w-3.5" /> Delete list
+   482→                </DropdownMenuItem>
+   483→              </DropdownMenuContent>
+   484→            </DropdownMenu>
+   485→          </div>
+   486→
+   487→          {/* add symbol + prediction dropdown */}
+   488→          <div className="relative flex items-center gap-1 px-2 py-1.5" ref={inputBoxRef}>
+   489→            <div className="relative flex-1">
+   490→              <Input
+   491→                value={newSymbol}
+   492→                onChange={(e) => onInputChange(e.target.value)}
+   493→                onKeyDown={onInputKeyDown}
+   494→                onBlur={(e) => {
+   495→                  if (!inputBoxRef.current?.contains(e.relatedTarget as Node)) closeSuggestions()
+   496→                }}
+   497→                placeholder="Add symbol (AAPL, BTC/USD)"
+   498→                autoComplete="off"
+   499→                spellCheck={false}
+   500→                className="h-6 border-zinc-800 bg-zinc-950 pr-6 text-[11px]"
+   501→              />
+   502→              {suggLoading && (
+   503→                <Loader2 className="absolute right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 animate-spin text-zinc-600" />
+   504→              )}
+   505→              {suggOpen && sugg.length > 0 && (
+   506→                <div
+   507→                  className="absolute inset-x-0 top-full z-50 mt-1 max-h-56 overflow-y-auto terminal-scroll rounded-md border border-zinc-700/80 bg-zinc-900 py-1 shadow-xl"
+   508→                  role="listbox"
+   509→                  aria-label="Symbol suggestions"
+   510→                >
+   511→                  {sugg.map((r, i) => (
+   512→                    <button
+   513→                      key={r.symbol}
+   514→                      type="button"
+   515→                      role="option"
+   516→                      aria-selected={i === suggIdx}
+   517→                      className={cn(
+   518→                        'flex w-full items-center gap-2 px-2 py-1 text-left text-[11px]',
+   519→                        i === suggIdx ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-300 hover:bg-zinc-800/70',
+   520→                      )}
+   521→                      onMouseDown={(e) => {
+   522→                        e.preventDefault() // keep input focus
+   523→                        void addSymbol(r.symbol)
+   524→                      }}
+   525→                      onMouseEnter={() => setSuggIdx(i)}
+   526→                    >
+   527→                      <span className="w-16 shrink-0 font-semibold">{r.symbol}</span>
+   528→                      <span className="min-w-0 flex-1 truncate text-zinc-500">{r.name || (r.crypto ? 'Crypto pair' : '')}</span>
+   529→                      {r.crypto ? (
+   530→                        <Badge variant="outline" className="shrink-0 border-amber-500/40 px-1 py-0 text-[8px] text-amber-400">7×24</Badge>
+   531→                      ) : (
+   532→                        <span className="shrink-0 text-[8px] uppercase tracking-wide text-zinc-600">US</span>
+   533→                      )}
+   534→                    </button>
+   535→                  ))}
+   536→                </div>
+   537→              )}
+   538→            </div>
+   539→            <Button size="sm" variant="secondary" className="h-6 shrink-0 px-2 text-[11px]" onClick={() => void addSymbol()}>
+   540→              Add
+   541→            </Button>
+   542→          </div>
+   543→
+   544→          {/* header */}
+   545→          <div className="grid grid-cols-[1fr_72px_64px_56px] items-center gap-1 border-b border-zinc-800/60 px-2 pb-1 text-[10px] uppercase tracking-wide text-zinc-500">
+   546→            <span>Symbol</span>
+   547→            <span className="text-right">Price</span>
+   548→            <span className="text-right">Chg</span>
+   549→            <span className="text-right">Chg%</span>
+   550→          </div>
+   551→
+   552→          {/* rows */}
+   553→          <div className="min-h-0 flex-1 overflow-y-auto terminal-scroll">
+   554→            {list.items.length === 0 && (
+   555→              <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Empty — add symbols above</p>
+   556→            )}
+   557→            {list.items.map((entry, idx) => {
+   558→              if (isSep(entry)) {
+   559→                // ---- group separator (user-defined section header) ----
+   560→                const name = entry.slice(1)
+   561→                const draggingSep = dragFrom != null && isSep(list.items[dragFrom])
+   562→                const isDragged = dragFrom === idx
+   563→                const dropAbove = draggingSep && dragOver === idx
+   564→                const dropBelow = dragFrom != null && dragOver === idx + 1
+   565→                return (
+   566→                  <div
+   567→                    key={`${entry}-${idx}`}
+   568→                    className={cn(
+   569→                      'group flex cursor-pointer items-center gap-1 border-l-2 px-2 py-1',
+   570→                      isDragged && 'opacity-40',
+   571→                      dropAbove && 'border-t-2 border-t-emerald-500',
+   572→                      dropBelow && 'border-b-2 border-b-emerald-500',
+   573→                    )}
+   574→                    style={{ borderLeftColor: list.color }}
+   575→                    draggable
+   576→                    onDragStart={(e) => {
+   577→                      setDragFrom(idx)
+   578→                      e.dataTransfer.effectAllowed = 'move'
+   579→                      e.dataTransfer.setData('text/plain', entry) // required by Firefox
+   580→                    }}
+   581→                    onDragOver={(e) => onSepDragOver(e, idx)}
+   582→                    onDrop={(e) => onSepDrop(e, idx)}
+   583→                    onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
+   584→                  >
+   585→                    <GripVertical
+   586→                      className="h-3 w-3 shrink-0 cursor-grab text-zinc-600 opacity-0 transition-opacity group-hover:opacity-100"
+   587→                      aria-hidden
+   588→                    />
+   589→                    <span className="min-w-0 flex-1 truncate text-[10px] font-bold uppercase tracking-widest text-zinc-300">
+   590→                      {name}
+   591→                    </span>
+   592→                    <span className="text-[10px] tabular-nums text-zinc-600">{groupSize(list.items, idx)}</span>
+   593→                    <button
+   594→                      className="h-4 w-4 shrink-0 rounded text-zinc-600 opacity-0 hover:text-zinc-200 group-hover:opacity-100"
+   595→                      aria-label={`Rename group ${name}`}
+   596→                      title="Rename group"
+   597→                      onClick={(e) => {
+   598→                        e.stopPropagation()
+   599→                        setGroupRenameTarget(name)
+   600→                        setGroupRenameName(name)
+   601→                        setGroupRenameOpen(true)
+   602→                      }}
+   603→                    >
+   604→                      <Pencil className="h-3 w-3" />
+   605→                    </button>
+   606→                    <button
+   607→                      className="-mr-1 h-4 w-4 shrink-0 rounded text-zinc-600 opacity-0 hover:text-rose-400 group-hover:opacity-100"
+   608→                      aria-label={`Delete group ${name} (symbols are kept)`}
+   609→                      title="Delete group (symbols are kept)"
+   610→                      onClick={(e) => {
+   611→                        e.stopPropagation()
+   612→                        void deleteWatchlistGroup(list.id, name)
+   613→                      }}
+   614→                    >
+   615→                      <X className="h-3 w-3" />
+   616→                    </button>
+   617→                  </div>
+   618→                )
+   619→              }
+   620→              const sym = entry
+   621→              const q = quotes[sym]
+   622→              const up = (q?.changePct ?? 0) >= 0
+   623→              const isActive = activeTab?.type === 'chart' && activeTab.symbol === sym
+   624→              const isDragged = dragFrom === idx
+   625→              // insertion line: dragOver holds the TARGET index (0..items.length)
+   626→              // — above this row when it equals idx, below when it equals idx+1
+   627→              const dropAbove = dragFrom != null && dragOver === idx
+   628→              const dropBelow = dragFrom != null && dragOver === idx + 1
+   629→              return (
+   630→                <div
+   631→                  key={sym}
+   632→                  className={cn(
+   633→                    'group grid cursor-pointer grid-cols-[1fr_72px_64px_56px] items-center gap-1 px-2 py-1.5 hover:bg-zinc-800/60',
+   634→                    isActive && 'bg-emerald-500/5',
+   635→                    isDragged && 'opacity-40',
+   636→                    dropAbove && 'border-t-2 border-t-emerald-500',
+   637→                    dropBelow && 'border-b-2 border-b-emerald-500',
+   638→                  )}
+   639→                  onClick={() => selectSymbol(sym)}
+   640→                  role="button"
+   641→                  tabIndex={0}
+   642→                  onKeyDown={(e) => e.key === 'Enter' && selectSymbol(sym)}
+   643→                  draggable
+   644→                  onDragStart={(e) => {
+   645→                    setDragFrom(idx)
+   646→                    e.dataTransfer.effectAllowed = 'move'
+   647→                    e.dataTransfer.setData('text/plain', sym) // required by Firefox
+   648→                  }}
+   649→                  onDragOver={(e) => {
+   650→                    if (dragFrom == null) return
+   651→                    e.preventDefault()
+   652→                    e.dataTransfer.dropEffect = 'move'
+   653→                    const r = e.currentTarget.getBoundingClientRect()
+   654→                    const after = e.clientY > r.top + r.height / 2
+   655→                    const target = after ? idx + 1 : idx
+   656→                    setDragOver(target === dragFrom || target === dragFrom + 1 ? null : target)
+   657→                  }}
+   658→                  onDrop={(e) => {
+   659→                    e.preventDefault()
+   660→                    // dropping in the bottom half of the LAST row → after it
+   661→                    const r = e.currentTarget.getBoundingClientRect()
+   662→                    const after = e.clientY > r.top + r.height / 2
+   663→                    onRowDrop(after ? idx + 1 : idx)
+   664→                  }}
+   665→                  onDragEnd={() => { setDragFrom(null); setDragOver(null) }}
+   666→                >
+   667→                  <span className="flex min-w-0 items-center gap-1.5 font-medium text-zinc-200">
+   668→                    <GripVertical
+   669→                      className="h-3 w-3 shrink-0 cursor-grab text-zinc-600 opacity-0 transition-opacity group-hover:opacity-100"
+   670→                      aria-hidden
+   671→                    />
+   672→                    <span className="truncate">{sym}</span>
+   673→                    {sym.includes('/') && <Badge variant="outline" className="border-amber-500/40 px-1 py-0 text-[8px] text-amber-400">7×24</Badge>}
+   674→                  </span>
+   675→                  <span className="text-right tabular-nums text-zinc-300">{q ? fmtPrice(q.price) : '—'}</span>
+   676→                  <span className={cn('text-right tabular-nums', q ? (up ? 'text-emerald-400' : 'text-rose-400') : 'text-zinc-500')}>
+   677→                    {q ? `${up ? '+' : ''}${fmtPrice(q.change)}` : '—'}
+   678→                  </span>
+   679→                  <span className={cn('text-right tabular-nums', q ? (up ? 'text-emerald-400' : 'text-rose-400') : 'text-zinc-500')}>
+   680→                    {q ? `${up ? '+' : ''}${q.changePct.toFixed(2)}%` : '—'}
+   681→                  </span>
+   682→                  <button
+   683→                    className="col-start-5 row-start-1 -mr-1 h-4 w-4 place-self-end rounded text-zinc-600 opacity-0 hover:text-rose-400 group-hover:opacity-100"
+   684→                    aria-label={`Remove ${sym}`}
+   685→                    onClick={(e) => {
+   686→                      e.stopPropagation()
+   687→                      void removeSymbolFromWatchlist(list.id, sym)
+   688→                    }}
+   689→                  >
+   690→                    <X className="h-3 w-3" />
+   691→                  </button>
+   692→                </div>
+   693→              )
+   694→            })}
+   695→          </div>
+   696→        </>
+   697→      )}
+   698→
+   699→      {/* create dialog */}
+   700→      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+   701→        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+   702→          <DialogHeader>
+   703→            <DialogTitle className="text-sm text-zinc-100">New watchlist</DialogTitle>
+   704→          </DialogHeader>
+   705→          <Input
+   706→            autoFocus
+   707→            value={newName}
+   708→            onChange={(e) => setNewName(e.target.value)}
+   709→            onKeyDown={(e) => e.key === 'Enter' && void create()}
+   710→            placeholder="List name"
+   711→            className="border-zinc-800 bg-zinc-950 text-sm"
+   712→          />
+   713→          <div className="flex items-center gap-2">
+   714→            <span className="text-xs text-zinc-500">Tag color</span>
+   715→            {LIST_COLORS.map((c) => (
+   716→              <button
+   717→                key={c}
+   718→                aria-label={`color ${c}`}
+   719→                className={cn('h-4 w-4 rounded-full', newColor === c && 'ring-2 ring-white/70')}
+   720→                style={{ backgroundColor: c }}
+   721→                onClick={() => setNewColor(c)}
+   722→              />
+   723→            ))}
+   724→          </div>
+   725→          <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" onClick={() => void create()}>
+   726→            Create list
+   727→          </Button>
+   728→        </DialogContent>
+   729→      </Dialog>
+   730→
+   731→      {/* rename dialog */}
+   732→      <Dialog open={renameOpen} onOpenChange={(o) => { if (!renaming) setRenameOpen(o) }}>
+   733→        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+   734→          <DialogHeader>
+   735→            <DialogTitle className="text-sm text-zinc-100">Rename watchlist</DialogTitle>
+   736→          </DialogHeader>
+   737→          <Input
+   738→            autoFocus
+   739→            value={renameName}
+   740→            maxLength={40}
+   741→            onChange={(e) => setRenameName(e.target.value)}
+   742→            onKeyDown={(e) => { if (e.key === 'Enter' && renameName.trim()) void submitRename() }}
+   743→            onFocus={(e) => e.target.select()}
+   744→            placeholder="List name"
+   745→            aria-label="New watchlist name"
+   746→            className="border-zinc-800 bg-zinc-950 text-sm"
+   747→          />
+   748→          <div className="flex items-center justify-between gap-2">
+   749→            <span className="text-[10px] text-zinc-600">{renameName.trim().length}/40</span>
+   750→            <Button
+   751→              className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400"
+   752→              disabled={!renameName.trim() || renaming}
+   753→              onClick={() => void submitRename()}
+   754→            >
+   755→              <span className="flex items-center gap-1.5">
+   756→                {renaming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+   757→                Save name
+   758→              </span>
+   759→            </Button>
+   760→          </div>
+   761→        </DialogContent>
+   762→      </Dialog>
+   763→
+   764→      {/* new group separator dialog */}
+   765→      <Dialog open={groupOpen} onOpenChange={setGroupOpen}>
+   766→        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+   767→          <DialogHeader>
+   768→            <DialogTitle className="text-sm text-zinc-100">New group separator</DialogTitle>
+   769→          </DialogHeader>
+   770→          <Input
+   771→            autoFocus
+   772→            value={groupName}
+   773→            maxLength={24}
+   774→            onChange={(e) => setGroupName(e.target.value)}
+   775→            onKeyDown={(e) => e.key === 'Enter' && void createGroup()}
+   776→            placeholder="Group name (Tech, Health…)"
+   777→            aria-label="Group name"
+   778→            className="border-zinc-800 bg-zinc-950 text-sm"
+   779→          />
+   780→          <p className="text-[10px] leading-4 text-zinc-600">
+   781→            Drag symbols onto the separator to group them; drag the separator to move the whole group.
+   782→          </p>
+   783→          <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" disabled={!groupName.trim()} onClick={() => void createGroup()}>
+   784→            Create group
+   785→          </Button>
+   786→        </DialogContent>
+   787→      </Dialog>
+   788→
+   789→      {/* rename group dialog */}
+   790→      <Dialog open={groupRenameOpen} onOpenChange={setGroupRenameOpen}>
+   791→        <DialogContent className="max-w-xs border-zinc-800 bg-zinc-900">
+   792→          <DialogHeader>
+   793→            <DialogTitle className="text-sm text-zinc-100">Rename group</DialogTitle>
+   794→          </DialogHeader>
+   795→          <Input
+   796→            autoFocus
+   797→            value={groupRenameName}
+   798→            maxLength={24}
+   799→            onChange={(e) => setGroupRenameName(e.target.value)}
+   800→            onKeyDown={(e) => e.key === 'Enter' && void submitGroupRename()}
+   801→            onFocus={(e) => e.target.select()}
+   802→            placeholder="Group name"
+   803→            aria-label="New group name"
+   804→            className="border-zinc-800 bg-zinc-950 text-sm"
+   805→          />
+   806→          <Button className="bg-emerald-500 text-zinc-950 hover:bg-emerald-400" disabled={!groupRenameName.trim()} onClick={() => void submitGroupRename()}>
+   807→            Save name
+   808→          </Button>
+   809→        </DialogContent>
+   810→      </Dialog>
+   811→    </div>
+   812→  )
+   813→}
+   814→

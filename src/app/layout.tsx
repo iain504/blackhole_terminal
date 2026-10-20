@@ -27,6 +27,9 @@ export const viewport: Viewport = {
   themeColor: "#09090b",
   width: "device-width",
   initialScale: 1,
+  // viewport-fit=cover lets the mobile shell pad for the iOS home indicator
+  // via env(safe-area-inset-bottom) (Task 56 mobile interface).
+  viewportFit: "cover",
 };
 
 export default function RootLayout({

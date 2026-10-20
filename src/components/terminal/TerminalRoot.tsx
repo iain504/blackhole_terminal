@@ -7,6 +7,8 @@ import AuthForms from '@/components/auth/AuthForms'
 import SettingsDialog from '@/components/settings/SettingsDialog'
 import { TabBar } from './TabBar'
 import { ChartWorkspace } from './ChartWorkspace'
+import { MobileShell } from './mobile/MobileShell'
+import { useIsMobile } from '@/hooks/use-mobile'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
@@ -28,6 +30,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const hydrated = useTerminal((s) => s.hydrated)
   const setUser = useTerminal((s) => s.setUser)
   const setHydrated = useTerminal((s) => s.setHydrated)
+  const isMobile = useIsMobile()
   const { toast } = useToast()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [alertsOpen, setAlertsOpen] = useState(false)
@@ -254,6 +257,26 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
           }}
         />
       </div>
+    )
+  }
+
+  // MOBILE (Task 56): below 768px the terminal renders the TradingView-app-
+  // style shell — full-screen views (watchlist / chart / trades / report /
+  // menu) driven by a fixed bottom tab bar. Same store, same autosave; the
+  // dialogs stay mounted here so menu rows can open them.
+  if (isMobile) {
+    return (
+      <>
+        <MobileShell
+          onExit={onExit}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenAlerts={() => setAlertsOpen((v) => !v)}
+          onOpenStrategies={() => setStrategiesOpen((v) => !v)}
+        />
+        <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+        {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
+        {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
+      </>
     )
   }
 

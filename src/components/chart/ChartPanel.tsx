@@ -3014,6 +3014,45 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     })
   }, [symbol])
 
+  // Remote control for the MOBILE shell (Task 56): the floating bottom toolbar
+  // opens this panel's INTERNAL states — symbol search, indicators popover,
+  // trade ticket — and sets the drawing color / chart type (tool + timeframe
+  // live in the shared store, the rest is local). Desktop never dispatches
+  // these events.
+  const onChartTypeChangeRef = useRef(onChartTypeChange)
+  onChartTypeChangeRef.current = onChartTypeChange
+  useEffect(() => {
+    const onSearch = () => setSearchOpen(true)
+    const onIndicators = () => setIndOpen((v) => !v)
+    const onTicket = () => {
+      setTicketPrefill(null)
+      setTradeOpen(true)
+    }
+    const onColor = (e: Event) => {
+      const c = (e as CustomEvent).detail
+      if (typeof c === 'string' && (DRAW_COLORS as readonly string[]).includes(c)) setActiveColor(c)
+    }
+    const onChartType = (e: Event) => {
+      const t = (e as CustomEvent).detail
+      if (t === 'candles' || t === 'line') {
+        setChartType(t) // the internal state drives the series re-creation
+        onChartTypeChangeRef.current?.(t)
+      }
+    }
+    window.addEventListener('tt:open-symbol-search', onSearch)
+    window.addEventListener('tt:toggle-indicators', onIndicators)
+    window.addEventListener('tt:open-ticket', onTicket)
+    window.addEventListener('tt:set-color', onColor)
+    window.addEventListener('tt:set-chart-type', onChartType)
+    return () => {
+      window.removeEventListener('tt:open-symbol-search', onSearch)
+      window.removeEventListener('tt:toggle-indicators', onIndicators)
+      window.removeEventListener('tt:open-ticket', onTicket)
+      window.removeEventListener('tt:set-color', onColor)
+      window.removeEventListener('tt:set-chart-type', onChartType)
+    }
+  }, [])
+
   // quote polling (10s) — REST fallback that keeps prevClose/OHLC fresh while
   // the websocket stream provides the fast price path (skipped while ticks
   // are flowing so a cached REST snapshot never yanks the streamed price back)
@@ -3104,7 +3143,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>
         </div>
-        <div className="pointer-events-auto flex items-center gap-0.5 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
+        <div className="pointer-events-auto flex min-w-0 max-w-[150px] items-center gap-0.5 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5 terminal-scroll sm:max-w-none">
           {(Object.keys(TIMEFRAMES) as (keyof typeof TIMEFRAMES)[]).map((k) => (
             <button
               key={k}
@@ -3119,7 +3158,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             </button>
           ))}
         </div>
-        <div className="pointer-events-auto flex items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5">
+        <div className="pointer-events-auto hidden items-center gap-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5 sm:flex">
           <button
             className={cn('rounded px-1.5 py-1', chartType === 'candles' ? 'bg-zinc-800 text-emerald-400' : 'text-zinc-500 hover:text-zinc-300')}
             onClick={() => { setChartType('candles'); onChartTypeChange?.('candles') }}
@@ -3254,7 +3293,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           {liveBadge && (
             <span
               title="Streaming live prices (websocket)"
-              className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-400"
+              className="hidden items-center gap-1 rounded-full border border-emerald-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-emerald-400 sm:inline-flex"
             >
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
               LIVE
@@ -3296,8 +3335,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         </div>
       </div>
 
-      {/* drawing toolbar — semi-transparent so values behind stay visible (Task 14 #4) */}
-      <div className="absolute left-2 top-12 z-30 flex flex-col gap-0.5 rounded-lg border border-zinc-800/80 bg-zinc-900/60 p-1 opacity-40 backdrop-blur-sm transition-opacity hover:opacity-100 focus-within:opacity-100">
+      {/* drawing toolbar — semi-transparent so values behind stay visible (Task 14 #4).
+          Hidden on mobile (Task 56): the shell's draw sheet drives the same tools
+          from the floating bottom toolbar. */}
+      <div className="absolute left-2 top-12 z-30 hidden flex-col gap-0.5 rounded-lg border border-zinc-800/80 bg-zinc-900/60 p-1 opacity-40 backdrop-blur-sm transition-opacity hover:opacity-100 focus-within:opacity-100 sm:flex">
         <button
           title="Trade ticket — buy/sell with SL/TP/trailing (paper or live)"
           aria-label="Open trade ticket"
