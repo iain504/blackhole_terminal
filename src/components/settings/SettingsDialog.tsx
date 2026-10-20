@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { KeyRound, Loader2, Percent, PlugZap, Send } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Download, FileJson, KeyRound, Loader2, Percent, PlugZap, Send, Upload } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -14,8 +14,12 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
+import { useTerminal } from '@/store/terminal';
+import { loadIndicators } from '@/lib/indicators';
 
 export const SETTINGS_CHANGED_EVENT = 'tt:settings-changed';
+
+const INDICATORS_LS_KEY = 'tt.indicators.v1';
 
 type AlpacaValidation = { valid: boolean; status: number; message: string };
 
@@ -48,6 +52,125 @@ export default function SettingsDialog({
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+
+  // ---- config backup (export / import) ----
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Export: flush unsaved layout so the file has the CURRENT state, fetch the
+  // server-side bundle, merge the client-side indicator settings (localStorage)
+  // and download as one JSON file.
+  async function handleExport() {
+    setExporting(true);
+    try {
+      // flush any pending layout changes (autosave runs every 5s)
+      const store = useTerminal.getState();
+      if (store.layoutDirty) {
+        await fetch('/api/layout', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ data: store.layoutSnapshot() }),
+        }).catch(() => undefined);
+        store.markLayoutClean();
+      }
+      const res = await fetch('/api/user/config');
+      if (!res.ok) throw new Error(`Export failed (${res.status}).`);
+      const file = await res.json();
+      // merge client-side indicator settings into the bundle
+      try {
+        file.data.indicators = loadIndicators();
+      } catch {
+        /* indicators optional */
+      }
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      const name = `blackhole-config-${file.username || 'user'}-${stamp}.json`;
+      const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast({
+        title: 'Config exported',
+        description: `${name} — includes API keys in plaintext, store it safely.`,
+      });
+    } catch (err) {
+      toast({
+        title: 'Export failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // Import: parse the picked file client-side (friendly errors), confirm the
+  // sections it will REPLACE, then POST it. Applied sections: layout,
+  // watchlists, alerts, strategies, drawings, calendar alarms, settings.
+  // Absent sections are untouched. Reload afterwards for a clean re-hydrate.
+  async function handleImportFile(file: File) {
+    setImporting(true);
+    try {
+      const text = await file.text();
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        throw new Error('Not a valid JSON file.');
+      }
+      const data = (parsed.data ?? parsed) as Record<string, unknown> | null;
+      if (!data || typeof data !== 'object') throw new Error('Not a BLACKHOLE Terminal config file.');
+      const parts: string[] = [];
+      const count = (k: string) => (Array.isArray(data[k]) ? (data[k] as unknown[]).length : 0);
+      if (data.layout) parts.push('layout (tabs, panels)');
+      if (count('watchlists')) parts.push(`${count('watchlists')} watchlist(s)`);
+      if (count('alerts')) parts.push(`${count('alerts')} alert(s)`);
+      if (count('strategies')) parts.push(`${count('strategies')} strategy rule(s)`);
+      if (count('drawings')) parts.push(`${count('drawings')} drawing(s)`);
+      if (count('calendarAlarms')) parts.push(`${count('calendarAlarms')} calendar alarm(s)`);
+      if (data.settings) parts.push('settings (API keys, Telegram, trading defaults)');
+      if (data.indicators) parts.push('indicator settings');
+      if (parts.length === 0) throw new Error('Nothing importable found in the file.');
+      const ok = window.confirm(
+        `Import config from "${file.name}"?\n\nThis will REPLACE:\n• ${parts.join('\n• ')}\n\nSections not in the file are kept. Continue?`
+      );
+      if (!ok) return;
+      const res = await fetch('/api/user/config', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(json?.error || `Import failed (${res.status}).`);
+      // write client-side indicators before the reload picks them up
+      if (data.indicators && typeof data.indicators === 'object') {
+        try {
+          window.localStorage.setItem(INDICATORS_LS_KEY, JSON.stringify(data.indicators));
+        } catch {
+          /* storage full / private mode — indicators just stay as-is */
+        }
+      }
+      // prevent the 5s autosave from overwriting the imported layout with the
+      // stale in-memory one, then hard-reload for a clean re-hydration
+      useTerminal.getState().markLayoutClean();
+      toast({ title: 'Config imported — reloading…' });
+      setTimeout(() => window.location.reload(), 600);
+    } catch (err) {
+      toast({
+        title: 'Import failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
 
   // Any typed-but-unsaved credential — closing the dialog would lose it.
   const dirty = Boolean(keyId.trim() || secret.trim() || token.trim());
@@ -440,6 +563,59 @@ export default function SettingsDialog({
             <p className="text-xs leading-relaxed text-zinc-500">
               Create a bot with @BotFather, then message your bot and find your
               chat id via @userinfobot.
+            </p>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- Config backup (export / import) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <FileJson className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">Config backup</h3>
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              Export everything to one file — layout, watchlists, alerts,
+              strategy rules, chart drawings, calendar alarms, indicator
+              settings, API keys and trading defaults — and restore it here or
+              on another install.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleExport}
+                disabled={exporting || importing}
+                className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Export config file
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={exporting || importing}
+                className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Import config file
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleImportFile(f);
+                }}
+              />
+            </div>
+            <p className="text-xs leading-relaxed text-amber-500/90">
+              The export file contains your API keys in plaintext — store it
+              safely. Import replaces the sections present in the file (alarms
+              and strategies are re-armed fresh).
             </p>
           </section>
 
