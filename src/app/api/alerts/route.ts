@@ -49,12 +49,12 @@ export async function GET() {
 
 interface CreateBody {
   symbol: string
-  kind?: string // 'price' (default) | 'rsi' | 'macd'
-  price?: number // price alerts: the level; rsi: 0-100 level; macd cross modes: macd-line level
+  kind?: string // 'price' (default) | 'rsi' | 'macd' | 'trend'
+  price?: number // price alerts: the level; rsi: 0-100 level; macd cross modes: macd-line level; trend: the line's projected level at creation (display)
   direction?: string // 'above' | 'below'
   condition?: string // macd: 'bull_cross' | 'bear_cross' | 'cross_above' | 'cross_below'
   timeframe?: string // indicator alarms: bar timeframe
-  params?: { period?: number; fast?: number; slow?: number; signal?: number }
+  params?: { period?: number; fast?: number; slow?: number; signal?: number; drawingId?: string }
   color?: string
   note?: string
 }
@@ -74,7 +74,7 @@ export async function POST(req: Request) {
     const symbol = (body.symbol || '').toUpperCase()
     if (!symbol) return NextResponse.json({ error: 'symbol required' }, { status: 400 })
 
-    const kind = body.kind === 'rsi' || body.kind === 'macd' ? body.kind : 'price'
+    const kind = body.kind === 'rsi' || body.kind === 'macd' || body.kind === 'trend' ? body.kind : 'price'
     const count = await db.alert.count({ where: { userId: user.id } })
     if (count >= 100) return NextResponse.json({ error: 'Alert limit reached (100)' }, { status: 400 })
 
@@ -123,6 +123,38 @@ export async function POST(req: Request) {
           params: { fast, slow, signal },
           color, note,
           lastSide: null,
+        },
+      })
+      return NextResponse.json({ alert: toDto(a) })
+    }
+
+    if (kind === 'trend') {
+      // TREND-LINE alarm — fires when price crosses the (extended) trend line
+      // drawing. Bound to the drawing via params.drawingId; the check engine
+      // re-projects the line through its two points at every poll, so the
+      // level MOVES with the line (editing the line moves the alert with it).
+      const drawingId = typeof body.params?.drawingId === 'string' ? body.params.drawingId : ''
+      if (!drawingId) return NextResponse.json({ error: 'drawingId required for trend alarms' }, { status: 400 })
+      const drawing = await db.drawing.findFirst({ where: { id: drawingId, userId: user.id } })
+      if (!drawing || drawing.kind !== 'trend') {
+        return NextResponse.json({ error: 'trend drawing not found' }, { status: 404 })
+      }
+      if (drawing.symbol !== symbol) {
+        return NextResponse.json({ error: 'drawing belongs to a different symbol' }, { status: 400 })
+      }
+      const level = Number(body.price)
+      if (!Number.isFinite(level) || Math.abs(level) > 1e9) {
+        return NextResponse.json({ error: 'numeric level required' }, { status: 400 })
+      }
+      const direction = body.direction === 'below' ? 'below' : 'above'
+      const a = await db.alert.create({
+        data: {
+          userId: user.id, symbol, kind, price: level, direction,
+          timeframe: validTf(body.timeframe),
+          params: { drawingId },
+          color: /^#[0-9a-fA-F]{6}$/.test(body.color || '') ? body.color! : '#f59e0b',
+          note: body.note?.slice(0, 200) || 'Trend line',
+          lastSide: null, // first check records the side without triggering
         },
       })
       return NextResponse.json({ alert: toDto(a) })

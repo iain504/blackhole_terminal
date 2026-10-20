@@ -121,8 +121,8 @@ export interface Alert {
   condition: string | null
   /** bar timeframe the indicator is computed on (rsi/macd) */
   timeframe: string
-  /** rsi {period} · macd {fast,slow,signal} */
-  params: { period?: number; fast?: number; slow?: number; signal?: number } | null
+  /** rsi {period} · macd {fast,slow,signal} · trend {drawingId} */
+  params: { period?: number; fast?: number; slow?: number; signal?: number; drawingId?: string } | null
   color: string
   status: 'active' | 'paused' | 'triggered' | string
   note: string | null
@@ -172,6 +172,9 @@ export interface LayoutBlob {
   /** Positions tab: flex weights of the Positions / Pending / History panels
    *  (user-draggable splitters, Task 52.2) — rides export/import */
   positionsPanelSizes?: [number, number, number]
+  /** Trade ticket position: absolute left/top px inside the chart container
+   *  (draggable header, Task 54.3) — null = default anchor (right-2 top-12) */
+  ticketPos?: { x: number; y: number } | null
 }
 
 export const DRAW_COLORS = [
@@ -227,6 +230,9 @@ interface TerminalState {
   setShowDrawings: (v: boolean) => void
   positionsPanelSizes: [number, number, number]
   setPositionsPanelSizes: (sizes: [number, number, number]) => void
+  /** trade ticket drag position (null = default anchor) */
+  ticketPos: { x: number; y: number } | null
+  setTicketPos: (p: { x: number; y: number } | null) => void
 
   // watchlists
   watchlists: Watchlist[]
@@ -490,6 +496,9 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     set({ positionsPanelSizes: sizes, layoutDirty: true })
   },
 
+  ticketPos: null,
+  setTicketPos: (p) => set({ ticketPos: p, layoutDirty: true }),
+
   layoutSnapshot: () => {
     const s = get()
     return {
@@ -506,6 +515,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       indicators: loadIndicators(),
       showDrawings: s.showDrawings,
       positionsPanelSizes: s.positionsPanelSizes,
+      ticketPos: s.ticketPos,
     }
   },
 
@@ -578,6 +588,12 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       Array.isArray(rawSizes) && rawSizes.length === 3 && rawSizes.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0.5 && n <= 12)
         ? [rawSizes[0], rawSizes[1], rawSizes[2]]
         : [5, 3, 3]
+    // trade ticket drag position: finite px offsets, clamped into a sane range
+    const rawTicket = blob.ticketPos
+    const ticketPos: { x: number; y: number } | null =
+      rawTicket && typeof rawTicket.x === 'number' && typeof rawTicket.y === 'number' && Number.isFinite(rawTicket.x) && Number.isFinite(rawTicket.y)
+        ? { x: Math.min(8000, Math.max(0, rawTicket.x)), y: Math.min(8000, Math.max(0, rawTicket.y)) }
+        : null
     set({
       tabs,
       activeTabId,
@@ -586,6 +602,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       mainSizes,
       showDrawings: blob.showDrawings !== false,
       positionsPanelSizes: panelSizes,
+      ticketPos,
       layoutDirty: false,
     })
   },

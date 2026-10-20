@@ -3,8 +3,8 @@
 // Compact trade ticket: paper/live order entry against the Alpaca Trading API.
 // Market/limit entries with optional SL/TP (bracket for stocks; split exits for
 // crypto) and trailing-stop exits for stocks.
-import { useCallback, useEffect, useState } from 'react'
-import { Loader2, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Loader2, X, GripVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice } from '@/lib/market-types'
 import { isCryptoTradeSymbol } from './trading-types'
+import { useTerminal } from '@/store/terminal'
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
@@ -39,6 +40,64 @@ export function TradeTicket({
   onPlaced: () => void
 }) {
   const { toast } = useToast()
+  // ---- moveable ticket (Task 54.3): drag by the header; the position is a
+  // left/top px offset inside the chart container, persisted in the layout ----
+  const ticketPos = useTerminal((s) => s.ticketPos)
+  const setTicketPos = useTerminal((s) => s.setTicketPos)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const dragState = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null)
+  const lastPos = useRef<{ x: number; y: number } | null>(null)
+  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null)
+  const pos = dragPos ?? ticketPos
+
+  const clampPos = useCallback((x: number, y: number): { x: number; y: number } => {
+    const el = rootRef.current
+    const parent = el?.parentElement
+    if (!el || !parent) return { x, y }
+    const pw = parent.clientWidth
+    const ph = parent.clientHeight
+    if (!(pw > 0) || !(ph > 0)) return { x, y }
+    const maxX = Math.max(4, pw - el.offsetWidth - 4)
+    const maxY = Math.max(4, ph - el.offsetHeight - 4)
+    return { x: Math.min(Math.max(4, x), maxX), y: Math.min(Math.max(4, y), maxY) }
+  }, [])
+
+  // a saved position may fall outside after a chart resize — clamp VISUALLY
+  // on mount (the stored value stays until the next drag commit)
+  useEffect(() => {
+    if (ticketPos) setDragPos(clampPos(ticketPos.x, ticketPos.y))
+  }, [ticketPos, clampPos])
+
+  const onHeaderPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    if ((e.target as HTMLElement).closest('[data-no-drag]')) return // close button
+    const el = rootRef.current
+    const parent = el?.parentElement
+    if (!el || !parent) return
+    const er = el.getBoundingClientRect()
+    const pr = parent.getBoundingClientRect()
+    const origX = er.left - pr.left
+    const origY = er.top - pr.top
+    dragState.current = { startX: e.clientX, startY: e.clientY, origX, origY }
+    lastPos.current = { x: origX, y: origY }
+    setDragPos({ x: origX, y: origY })
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* noop */ }
+  }
+  const onHeaderPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const st = dragState.current
+    if (!st) return
+    const next = clampPos(st.origX + (e.clientX - st.startX), st.origY + (e.clientY - st.startY))
+    lastPos.current = next
+    setDragPos(next)
+  }
+  const endHeaderDrag = () => {
+    if (!dragState.current) return
+    dragState.current = null
+    const final = lastPos.current
+    setDragPos(null)
+    if (final) setTicketPos(final)
+  }
+
   const [mode, setMode] = useState<Mode>('paper')
   const [side, setSide] = useState<'buy' | 'sell'>(prefill?.side ?? 'buy')
   const [qty, setQty] = useState('1')
@@ -280,15 +339,29 @@ export function TradeTicket({
 
   return (
     <div
-      className="terminal-scroll absolute right-2 top-12 z-40 max-h-[calc(100%-3.5rem)] w-64 overflow-y-auto rounded-lg border border-zinc-700/80 bg-zinc-900/95 p-3 text-xs shadow-2xl backdrop-blur"
+      ref={rootRef}
+      style={pos ? { left: pos.x, top: pos.y, right: 'auto' } : undefined}
+      className={cn(
+        'terminal-scroll absolute z-40 max-h-[calc(100%-3.5rem)] w-64 overflow-y-auto rounded-lg border border-zinc-700/80 bg-zinc-900/95 p-3 text-xs shadow-2xl backdrop-blur',
+        !pos && 'right-2 top-12',
+      )}
       role="dialog"
       aria-label={`Trade ticket ${symbol}`}
     >
-      <div className="mb-2 flex items-center justify-between">
+      <div
+        className="mb-2 flex cursor-move touch-none select-none items-center justify-between"
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={endHeaderDrag}
+        onPointerCancel={endHeaderDrag}
+        title="Drag to move the trade ticket"
+        aria-label="Drag to move the trade ticket"
+      >
         <span className="flex items-center gap-1.5 font-semibold text-zinc-100">
+          <GripVertical className="h-3.5 w-3.5 text-zinc-600" />
           Trade <span className="text-emerald-400">{symbol}</span>
         </span>
-        <button onClick={onClose} aria-label="Close trade ticket" className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
+        <button data-no-drag onClick={onClose} aria-label="Close trade ticket" className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
           <X className="h-3.5 w-3.5" />
         </button>
       </div>

@@ -415,6 +415,11 @@ function alertSummary(a: Alert): string {
       : 'crossover'
     return `${base} ${cond} · ${TF_LABEL[a.timeframe] ?? a.timeframe}`
   }
+  if (a.kind === 'trend') {
+    // the level MOVES with the bound trend line — show the crossing direction
+    // plus the level the line had when the alarm was created
+    return `Trend line · crosses ${a.direction === 'above' ? 'up' : 'down'} · level was ${fmtPrice(a.price)}`
+  }
   return `${a.direction === 'above' ? '≥' : '≤'} ${fmtPrice(a.price)}`
 }
 

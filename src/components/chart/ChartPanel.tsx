@@ -10,7 +10,7 @@ import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
-import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS } from '@/store/terminal'
+import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS, Alert } from '@/store/terminal'
 import { useShallow } from 'zustand/react/shallow'
 import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
 import {
@@ -779,11 +779,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     // text annotation hit rects are rebuilt every pass (drawDrawing fills them)
     textHitRectsRef.current = {}
+    // trend drawings with an ACTIVE line alert render a bell chip on the line
+    const trendAlertIds = new Set(
+      st.alerts
+        .filter((a) => a.kind === 'trend' && a.status !== 'triggered')
+        .map((a) => a.params?.drawingId)
+        .filter((x): x is string => typeof x === 'string'),
+    )
     if (st.drawingTool === 'cursor') {
-      if (showDrawings) for (const d of ds) drawDrawing(ctx, d, w, h, hoverRef.current === d.id || (dragRef.current?.hit.type === 'drawing' && dragRef.current.hit.id === d.id))
+      if (showDrawings) for (const d of ds) drawDrawing(ctx, d, w, h, hoverRef.current === d.id || (dragRef.current?.hit.type === 'drawing' && dragRef.current.hit.id === d.id), trendAlertIds.has(d.id))
       for (const a of als) drawAlert(ctx, a, w)
     } else if (showDrawings) {
-      for (const d of ds) drawDrawing(ctx, d, w, h, false)
+      for (const d of ds) drawDrawing(ctx, d, w, h, false, trendAlertIds.has(d.id))
     }
 
     // ---- trade zones + position / pending-order lines (trade assistance) ----
@@ -1250,7 +1257,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.stroke()
   }
 
-  function drawDrawing(ctx: CanvasRenderingContext2D, d: Drawing, w: number, h: number, highlighted: boolean) {
+  function drawDrawing(ctx: CanvasRenderingContext2D, d: Drawing, w: number, h: number, highlighted: boolean, alerted = false) {
     ctx.save()
     ctx.strokeStyle = d.color
     ctx.lineWidth = d.width + (highlighted ? 1 : 0)
@@ -1277,6 +1284,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       if (p1 && p2) {
         if (d.kind === 'trend') {
           segPath(ctx, p1, p2, w, false)
+          // trend-line alert chip at the line's end point (Task 54.1)
+          if (alerted) {
+            drawChip(ctx, Math.min(p2.x + 6, w - 46), Math.max(4, p2.y - 20), '🔔', d.color, highlighted)
+          }
         } else {
           // fib: levels between p1..p2 extended to right edge (levels live in
           // the SAME pane the fib was drawn on — RSI fib levels are RSI units)
@@ -1741,6 +1752,77 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     } catch { /* offline */ }
   }, [symbol, quote, addAlertLocal, addIndicatorAlarm])
 
+  // TREND-LINE alert (Task 54.1): fires when price crosses the (extended) line
+  // drawing. The server re-projects the line through its two points at every
+  // poll, so the level MOVES with the line. Direction is auto-picked as the
+  // NEXT crossing (price above the line → fires when it crosses down, and
+  // vice-versa), matching TradingView's "alert on trend line" behaviour.
+  const addTrendLineAlert = useCallback(async (d: Drawing) => {
+    const p1 = d.points[0]
+    const p2 = d.points[1]
+    if (!p1 || !p2) return
+    const bars = barsRef.current
+    const now = bars.length ? bars[bars.length - 1].time : Math.floor(Date.now() / 1000)
+    let level: number
+    if (p1.time != null && p2.time != null && p1.time !== p2.time) {
+      level = p1.price + ((p2.price - p1.price) * (now - p1.time)) / (p2.time - p1.time)
+    } else {
+      level = p2.price
+    }
+    const cur = quote?.price
+    const direction: 'above' | 'below' = cur != null && cur > level ? 'below' : 'above'
+    try {
+      const res = await fetch('/api/alerts', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          symbol, kind: 'trend', price: level, direction, timeframe: tf,
+          params: { drawingId: d.id }, color: d.color, note: 'Trend line',
+        }),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.alert) {
+        addAlertLocal(json.alert)
+        toast({
+          title: '🔔 Trend-line alert created',
+          description: `Fires when price crosses ${direction === 'above' ? 'UP' : 'DOWN'} through the line · ${symbol}`,
+        })
+      } else {
+        toast({ title: 'Alert failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Alert failed', description: 'Network error', variant: 'destructive' })
+    }
+  }, [symbol, tf, quote, addAlertLocal, toast])
+
+  // CLONE drawing (Task 54.2): duplicate with every point shifted slightly
+  // down-right (px-based through the pane scales, so the offset is visually
+  // consistent at any zoom). Text clones get a " (copy)" suffix.
+  const cloneDrawing = useCallback(async (d: Drawing) => {
+    const DX = 30
+    const DY = 26
+    const pts: DrawingPoint[] = d.points.map((p) => {
+      const pane: DrawingPane = p.pane ?? 'price'
+      const x = xOf(p.time ?? null)
+      const y = yOfPane(pane, p.price)
+      if (x == null && y == null) return { ...p, pane }
+      const nt = x != null ? timeAt(x + DX) : null
+      const nv = y != null ? valueAtPane(pane, y + DY) : null
+      return {
+        ...p,
+        pane,
+        // fall back to a 2-bar time shift when the pixel projection fails
+        time: nt ?? (p.time != null ? p.time + 2 * TIMEFRAMES[tf].seconds : p.time),
+        price: nv ?? p.price,
+      }
+    })
+    const meta = d.meta
+      ? { ...d.meta, ...(typeof d.meta.text === 'string' ? { text: `${d.meta.text} (copy)` } : {}) }
+      : null
+    await createDrawing(d.kind, pts, { color: d.color, meta })
+    toast({ title: `${KIND_LABEL[d.kind]} cloned`, description: 'Duplicated slightly below-right of the original.' })
+  }, [xOf, yOfPane, timeAt, valueAtPane, tf, createDrawing, toast])
+
   // ---------- trade assistance actions ----------
   const patchExitPrice = useCallback(async (
     info: ExitInfo, kind: 'sl' | 'tp', price: number, attempt = 0,
@@ -1989,8 +2071,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // Without this, the capture-phase hitTest below eats the pointerdown
       // whenever the menu item happens to overlap a drawing/line hit zone
       // (e.g. a color swatch sitting on a rectangle edge) and the menu button
-      // never receives the click.
-      if (e.target instanceof Element && e.target.closest('[role="menu"]')) return
+      // never receives the click. The trade ticket (incl. its drag header)
+      // gets the same pass-through.
+      if (e.target instanceof Element && (e.target.closest('[role="menu"]') || e.target.closest('[role="dialog"][aria-label^="Trade ticket"]'))) return
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
 
@@ -3308,8 +3391,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         posData={posData.data}
         indicators={ind}
         timeframe={tf}
+        alerts={symbolAlerts}
         onAddAlert={(price, pane) => void addAlertAtPrice(price, pane)}
         onAddIndicatorAlarm={(req) => void addIndicatorAlarm(req)}
+        onAddTrendAlert={(d) => void addTrendLineAlert(d)}
+        onCloneDrawing={(d) => void cloneDrawing(d)}
         onAddHline={(pane, value) => {
           void createDrawing('hline', [{ time: null, price: value, pane }])
         }}
@@ -3445,8 +3531,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
 // ---------- context menu ----------
 function ContextMenu({
-  menu, onClose, container, symbol, posData, indicators, timeframe,
-  onAddAlert, onAddIndicatorAlarm, onAddHline, onTrade, onOpenTicket,
+  menu, onClose, container, symbol, posData, indicators, timeframe, alerts,
+  onAddAlert, onAddIndicatorAlarm, onAddTrendAlert, onCloneDrawing, onAddHline, onTrade, onOpenTicket,
   onEditValue, onEditText, onPatchDrawing, onDeleteDrawing, onPatchAlert, onDeleteAlert,
   onPatchExit, onAddExit, onCancelExit, onCancelPending, onClosePosition,
 }: {
@@ -3457,8 +3543,11 @@ function ContextMenu({
   posData: { positions: { symbol: string; tradeSymbol: string; qty: number; side: string; avgEntry: number }[]; exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> } | null
   indicators: IndicatorSettings
   timeframe: Timeframe
+  alerts: Alert[]
   onAddAlert: (price: number, pane?: DrawingPane) => void
   onAddIndicatorAlarm: (req: { kind: 'rsi' | 'macd'; label: string; params: Record<string, number>; direction?: 'above' | 'below'; price?: number; condition?: string }) => void
+  onAddTrendAlert: (d: Drawing) => void
+  onCloneDrawing: (d: Drawing) => void
   onAddHline: (pane: DrawingPane, value: number) => void
   onTrade: (side: 'buy' | 'sell', price?: number) => void
   onOpenTicket: () => void
@@ -3541,6 +3630,12 @@ function ContextMenu({
     const alertPoint = d.kind === 'hline' ? d.points[0] : d.points[d.points.length - 1]
     const alertPane = alertPoint?.pane ?? 'price'
     const alertValue = alertPoint?.price ?? 0
+    // price-pane trend lines alert on the LINE itself (dynamic level that
+    // follows the drawing) instead of a static endpoint price
+    const isPriceTrend = d.kind === 'trend' && alertPane === 'price'
+    const lineAlert = isPriceTrend
+      ? alerts.find((a) => a.kind === 'trend' && a.params?.drawingId === d.id && a.status !== 'triggered')
+      : undefined
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -3552,7 +3647,7 @@ function ContextMenu({
           {KIND_LABEL[d.kind]}
           {d.kind === 'hline' && alertPane !== 'price' ? ` · ${alertPane.toUpperCase()} ${fmtPaneValue(alertPane, alertValue)}` : ''}
         </div>
-        {d.kind !== 'vline' && d.kind !== 'text' && alertPane !== 'vol' && (
+        {d.kind !== 'vline' && d.kind !== 'text' && alertPane !== 'vol' && !isPriceTrend && (
           <MenuItem
             label={
               <span className="flex items-center gap-1.5">
@@ -3570,6 +3665,29 @@ function ContextMenu({
             }}
           />
         )}
+        {isPriceTrend && (lineAlert ? (
+          <>
+            <div className="px-3 py-1 text-[10px] leading-snug text-zinc-500">
+              🔔 Line alert {lineAlert.status === 'paused' ? 'paused' : 'active'} — fires when price crosses{' '}
+              {lineAlert.direction === 'above' ? 'UP' : 'DOWN'} the line
+            </div>
+            <MenuItem label="🔔 Delete line alert" danger onClick={() => { void onDeleteAlert(lineAlert.id); onClose() }} />
+          </>
+        ) : (
+          <MenuItem
+            label={
+              <span className="flex items-center gap-1.5">
+                <BellPlus className="h-3.5 w-3.5 text-amber-400" />
+                Add alert on line
+              </span>
+            }
+            onClick={() => {
+              onAddTrendAlert(d)
+              onClose()
+            }}
+          />
+        ))}
+        <MenuItem label="⧉ Clone drawing" onClick={() => { onCloneDrawing(d); onClose() }} />
         {d.kind === 'hline' && (
           <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(drawingHit); onClose() }} />
         )}

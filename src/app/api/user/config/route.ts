@@ -25,7 +25,7 @@ const FILE_KIND = 'blackhole-terminal-config'
 const FILE_VERSION = 1
 
 const VALID_TFS = Object.keys(TIMEFRAMES) as string[]
-const ALERT_KINDS = ['price', 'rsi', 'macd']
+const ALERT_KINDS = ['price', 'rsi', 'macd', 'trend']
 const STRAT_CONDITIONS = ['cross_above', 'cross_below', 'bull_cross', 'bear_cross']
 
 interface UserSettings {
@@ -104,7 +104,9 @@ export async function GET() {
           repeat: r.repeat,
         })),
         drawings: drawings.map((d) => ({
-          symbol: d.symbol, kind: d.kind, points: d.points, color: d.color, width: d.width, meta: d.meta,
+          // id rides the export so TREND-line alarms (params.drawingId) re-bind
+          // to the same drawing after an import round-trip
+          id: d.id, symbol: d.symbol, kind: d.kind, points: d.points, color: d.color, width: d.width, meta: d.meta,
         })),
         calendarAlarms: calendarAlarms.map((c) => ({ eventKey: c.eventKey })),
         settings,
@@ -134,6 +136,7 @@ interface SanitizedStrategy {
 }
 
 interface SanitizedDrawing {
+  id?: string
   symbol: string; kind: string; points: Prisma.InputJsonValue
   color: string; width: number; meta: Prisma.InputJsonValue | null
 }
@@ -162,6 +165,12 @@ function sanitizeAlert(raw: unknown): SanitizedAlert | null {
           fast: clampInt(params.fast, 1, 200, 12),
           slow: clampInt(params.slow, 2, 400, 26),
           signal: clampInt(params.signal, 1, 200, 9),
+          // trend-line alarms carry their drawing binding (best-effort: if the
+          // drawing ids in the file match the imported drawings the alert
+          // stays live, otherwise it simply never fires)
+          ...(typeof params.drawingId === 'string' && params.drawingId.length <= 40
+            ? { drawingId: params.drawingId }
+            : {}),
         }
       : null,
     color: /^#[0-9a-fA-F]{6}$/.test(str(r.color)) ? str(r.color) : '#f59e0b',
@@ -218,6 +227,9 @@ function sanitizeDrawing(raw: unknown): SanitizedDrawing | null {
   if (!kind || !Array.isArray(r.points) || r.points.length === 0) return null
   const width = clampInt(r.width, 1, 6, 2)
   return {
+    // original id (when the file carries one) — TREND-line alarms re-bind to
+    // their drawing after an import round-trip through this id
+    ...(typeof r.id === 'string' && r.id.length > 0 && r.id.length <= 40 ? { id: r.id } : {}),
     symbol, kind,
     points: r.points.slice(0, 8) as Prisma.InputJsonValue,
     color: /^#[0-9a-fA-F]{6}$/.test(str(r.color)) ? str(r.color) : '#2962ff',
@@ -323,13 +335,23 @@ export async function POST(req: Request) {
 
     // ---- drawings ----
     if (Array.isArray(data.drawings)) {
-      const drawings = data.drawings.slice(0, 2000).map(sanitizeDrawing).filter((d): d is SanitizedDrawing => d !== null)
+      // dedupe by preserved id (a duplicate PK would fail the whole createMany)
+      const seenIds = new Set<string>()
+      const drawings = data.drawings.slice(0, 2000).map(sanitizeDrawing).filter((d): d is SanitizedDrawing => {
+        if (!d) return false
+        if (d.id) {
+          if (seenIds.has(d.id)) return false
+          seenIds.add(d.id)
+        }
+        return true
+      })
       await db.$transaction(async (tx) => {
         await tx.drawing.deleteMany({ where: { userId: user.id } })
         if (drawings.length) {
           await tx.drawing.createMany({
             data: drawings.map((d) => ({
-              userId: user.id, ...d,
+              ...(d.id ? { id: d.id } : {}),
+              userId: user.id, symbol: d.symbol, kind: d.kind, points: d.points, color: d.color, width: d.width,
               meta: (d.meta ?? Prisma.JsonNull) as Prisma.InputJsonValue | Prisma.NullableJsonNullValueInput,
             })),
           })

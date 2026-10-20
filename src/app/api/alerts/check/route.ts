@@ -73,8 +73,11 @@ export async function POST() {
       target: number; direction: string; message: string
     }[] = []
 
-    // ---- price alarms (legacy path, unchanged) ----
-    const priceAlerts = alerts.filter((a) => a.kind !== 'rsi' && a.kind !== 'macd')
+    // ---- price alarms (legacy path, unchanged) + trend-line alarms ----
+    // trend alerts are handled separately below (their level MOVES with the
+    // line drawing); everything else that is not an indicator alarm takes the
+    // static price path
+    const priceAlerts = alerts.filter((a) => a.kind !== 'rsi' && a.kind !== 'macd' && a.kind !== 'trend')
     if (priceAlerts.length > 0) {
       const symbols = [...new Set(priceAlerts.map((a) => a.symbol))]
       const { quotes } = await getQuotes(symbols, user.id)
@@ -146,6 +149,72 @@ export async function POST() {
           // record the current side (also the FIRST check after creation —
           // indicator alarms fire only on a genuine crossing afterwards)
           await db.alert.update({ where: { id: a.id }, data: { lastSide: ev.side } })
+        }
+      }
+    }
+
+    // ---- trend-line alarms: the trigger level is the (extended) trend line
+    // drawing, re-projected through its two points at EVERY poll via wall-clock
+    // time — editing/dragging the line moves the alert with it. Crossing
+    // semantics match the indicator alarms: the first check only RECORDS the
+    // side, a genuine crossing afterwards fires. ----
+    const trendAlerts = alerts.filter((a) => a.kind === 'trend')
+    if (trendAlerts.length > 0) {
+      const drawingIds = [...new Set(trendAlerts.map((a) => (a.params as { drawingId?: string } | null)?.drawingId).filter((x): x is string => typeof x === 'string' && x.length > 0))]
+      const drawings = drawingIds.length
+        ? await db.drawing.findMany({ where: { id: { in: drawingIds }, userId: user.id, kind: 'trend' } })
+        : []
+      const drawingById = new Map(drawings.map((dr) => [dr.id, dr]))
+      const quoteSyms = [...new Set(trendAlerts.map((a) => a.symbol))]
+      const { quotes: tQuotes } = await getQuotes(quoteSyms, user.id)
+      const tQuoteBy = new Map(tQuotes.map((q) => [q.symbol, q]))
+      for (const a of trendAlerts) {
+        const drawingId = (a.params as { drawingId?: string } | null)?.drawingId
+        const dr = drawingId ? drawingById.get(drawingId) : null
+        if (!dr) continue // drawing deleted — alert lies dormant (no false fires)
+        const pts = Array.isArray(dr.points) ? (dr.points as { time?: number | null; price?: number }[]) : []
+        const p1 = pts[0]
+        const p2 = pts[1]
+        const price1 = p1?.price
+        const price2 = p2?.price
+        if (!p1 || !p2 || typeof price1 !== 'number' || typeof price2 !== 'number' || !Number.isFinite(price1) || !Number.isFinite(price2)) continue
+        let level: number
+        const t1 = typeof p1.time === 'number' ? p1.time : null
+        const t2 = typeof p2.time === 'number' ? p2.time : null
+        if (t1 != null && t2 != null && t1 !== t2) {
+          // straight line through both points, evaluated at NOW (extended)
+          const now = Math.floor(Date.now() / 1000)
+          level = price1 + ((price2 - price1) * (now - t1)) / (t2 - t1)
+        } else {
+          // vertical-in-time / missing times — degrade to the end point's level
+          level = price2
+        }
+        if (!Number.isFinite(level) || Math.abs(level) > 1e12) continue
+        const q = tQuoteBy.get(a.symbol)
+        if (!q) continue
+        const side = q.price > level ? 'above' : q.price < level ? 'below' : a.lastSide
+        if (a.lastSide == null) {
+          // FIRST check: record the starting side only — the alert fires on a
+          // genuine crossing afterwards (no immediate fire at creation)
+          if (side) await db.alert.update({ where: { id: a.id }, data: { lastSide: side } })
+          continue
+        }
+        const crossed =
+          a.direction === 'above'
+            ? side === 'above' && a.lastSide !== 'above'
+            : side === 'below' && a.lastSide !== 'below'
+        if (crossed) {
+          await db.alert.update({
+            where: { id: a.id },
+            data: { status: 'triggered', triggeredAt: new Date(), lastSide: side },
+          })
+          const message = `Price crossed ${a.direction === 'above' ? 'above' : 'below'} the trend line (line level ${level.toFixed(4)}) — now ${q.price.toFixed(4)}`
+          triggered.push({ id: a.id, symbol: a.symbol, kind: 'trend', price: q.price, target: level, direction: a.direction, message })
+          await notify(
+            `🔔 <b>Trend-line Alert</b>\n<b>${a.symbol}</b> crossed ${a.direction === 'above' ? '📈 above' : '📉 below'} your trend line\n\nPrice: <b>${q.price.toFixed(4)}</b>\nLine level: ${level.toFixed(4)}\nTime: ${new Date().toUTCString()}`,
+          )
+        } else if (side !== a.lastSide && side) {
+          await db.alert.update({ where: { id: a.id }, data: { lastSide: side } })
         }
       }
     }
