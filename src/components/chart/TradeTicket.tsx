@@ -115,11 +115,19 @@ export function TradeTicket({
   }
 
   const submit = useCallback(async () => {
-    const q = parseFloat(qty)
-    if (!q || q <= 0) {
+    // Alpaca requires a whole-number quantity for non-fractional assets:
+    // stock qty is rounded DOWN to an integer (crypto keeps its fractions).
+    const raw = parseFloat(qty)
+    const q = isCrypto ? raw : Math.floor(raw)
+    if (!raw || raw <= 0) {
       toast({ title: 'Enter a quantity', variant: 'destructive' })
       return
     }
+    if (!q || q <= 0) {
+      toast({ title: 'Quantity rounds to 0', description: 'Stocks require a whole number — enter at least 1 share.', variant: 'destructive' })
+      return
+    }
+    if (!isCrypto && q !== raw) setQty(String(q))
     const body: Record<string, unknown> = {
       mode,
       symbol,
@@ -203,7 +211,7 @@ export function TradeTicket({
     }
   }, [qty, mode, symbol, side, orderType, limitPrice, slPrice, tpPrice, trailPct, trailActive, isCrypto, toast, onPlaced])
 
-  const est = refPrice * (parseFloat(qty) || 0)
+  const est = refPrice * ((isCrypto ? parseFloat(qty) : Math.floor(parseFloat(qty))) || 0)
 
   // ---- Task 52.5: size the quantity from remaining buying power (BUY) or
   // the open position (SELL) via the 5/10/25/50/100% buttons ----
@@ -213,10 +221,10 @@ export function TradeTicket({
       const bp = account ? parseFloat(account.buyingPower) : NaN
       if (!Number.isFinite(bp) || bp <= 0) return null
       if (refPrice <= 0) return null
-      return Math.max(0, floorTo((bp * p) / 100 / refPrice, isCrypto ? 6 : 4))
+      return Math.max(0, floorTo((bp * p) / 100 / refPrice, isCrypto ? 6 : 0))
     }
     if (!positionQty) return null
-    return Math.max(0, floorTo((positionQty * p) / 100, isCrypto ? 6 : 4))
+    return Math.max(0, floorTo((positionQty * p) / 100, isCrypto ? 6 : 0))
   }
   const pctTitle = (p: number): string => {
     if (side === 'buy') {
@@ -272,7 +280,7 @@ export function TradeTicket({
 
   return (
     <div
-      className="absolute right-2 top-12 z-40 w-64 rounded-lg border border-zinc-700/80 bg-zinc-900/95 p-3 text-xs shadow-2xl backdrop-blur"
+      className="terminal-scroll absolute right-2 top-12 z-40 max-h-[calc(100%-3.5rem)] w-64 overflow-y-auto rounded-lg border border-zinc-700/80 bg-zinc-900/95 p-3 text-xs shadow-2xl backdrop-blur"
       role="dialog"
       aria-label={`Trade ticket ${symbol}`}
     >
@@ -337,14 +345,22 @@ export function TradeTicket({
 
       <div className="grid grid-cols-2 gap-2">
         <div className="col-span-1">
-          <Label htmlFor="tt-qty" className="text-[10px] text-zinc-400">Quantity</Label>
+          <Label htmlFor="tt-qty" className="text-[10px] text-zinc-400">
+            Quantity{!isCrypto && <span title="Alpaca requires whole-number quantity for stocks — fractional input is rounded down" className="ml-1 cursor-help text-zinc-600">(whole)</span>}
+          </Label>
           <Input
             id="tt-qty"
             type="number"
             min="0"
-            step="any"
+            step={isCrypto ? 'any' : '1'}
             value={qty}
             onChange={(e) => setQty(e.target.value)}
+            onBlur={() => {
+              // stocks are non-fractionable — normalize to a whole number
+              if (isCrypto) return
+              const n = parseFloat(qty)
+              if (Number.isFinite(n) && n > 0 && !Number.isInteger(n)) setQty(String(Math.floor(n)))
+            }}
             className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
           />
         </div>
@@ -528,7 +544,7 @@ export function TradeTicket({
         onClick={() => void submit()}
         disabled={submitting}
         className={cn(
-          'mt-2 h-8 w-full font-semibold',
+          'mt-2 h-auto min-h-8 w-full whitespace-normal px-2 py-1 font-semibold leading-snug',
           side === 'buy' ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-600 text-white hover:bg-rose-500',
         )}
       >

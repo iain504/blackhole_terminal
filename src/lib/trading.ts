@@ -279,9 +279,15 @@ export async function placeOrderWithExits(
   const isCrypto = body.symbol.includes('/')
   const type = body.type || 'market'
   const tif = body.time_in_force || (isCrypto ? 'gtc' : type === 'market' ? 'day' : 'gtc')
+  // Alpaca requires a whole-number quantity for non-fractional assets: every
+  // STOCK order qty is rounded DOWN to an integer (crypto stays fractional).
+  const qty = isCrypto ? body.qty : Math.floor(body.qty)
+  if (!(qty > 0)) {
+    return { results: [], errors: ['Quantity rounds to 0 — stocks require a whole number (min 1 share)'] }
+  }
   const entry: Record<string, unknown> = {
     symbol: tradeSymbol(body.symbol),
-    qty: String(body.qty),
+    qty: String(qty),
     side: body.side,
     type,
     time_in_force: tif,
@@ -682,11 +688,16 @@ export async function placeTrailingStop(
   mode: TradeMode,
   body: { symbol: string; side: 'buy' | 'sell'; qty: number; trail_percent: number },
 ) {
+  // stocks only — whole shares required (round down, never up)
+  const qty = Math.floor(body.qty)
+  if (!(qty > 0)) {
+    return { data: null, error: 'Quantity rounds to 0 — stocks require a whole number (min 1 share)', status: 422 }
+  }
   return tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
     method: 'POST',
     body: JSON.stringify({
       symbol: tradeSymbol(body.symbol),
-      qty: String(body.qty),
+      qty: String(qty),
       side: body.side,
       type: 'trailing_stop',
       time_in_force: 'gtc',
@@ -726,6 +737,8 @@ function exitBodyFrom(
   if (typeof availQty === 'number' && Number.isFinite(availQty) && availQty >= 0) {
     qty = Math.min(qty, availQty)
   }
+  // stocks are non-fractionable — a re-placed exit is always whole shares
+  if (!isCrypto) qty = Math.floor(qty)
   if (!(qty > 0)) return null
   const body: Record<string, unknown> = {
     symbol: orig.symbol,
