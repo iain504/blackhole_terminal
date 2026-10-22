@@ -72,22 +72,22 @@ const cfgs: { name: string; series: typeof MIXED; cfg: BacktestConfig }[] = [
   {
     name: 'bb-reversion',
     series: DOWN,
-    cfg: { strategy: 'bb-reversion', params: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1 }, qty: 10, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
+    cfg: { strategy: 'bb-reversion', params: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1 }, qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
   },
   {
     name: 'rsi2-connors',
     series: MIXED,
-    cfg: { strategy: 'rsi2-connors', params: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5 }, qty: 10, tpMode: 'pct', tpValue: 1.5, slMode: 'pct', slValue: 1, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
+    cfg: { strategy: 'rsi2-connors', params: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5 }, qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false, tpMode: 'pct', tpValue: 1.5, slMode: 'pct', slValue: 1, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
   },
   {
     name: 'orb15',
     series: ORB,
-    cfg: { strategy: 'orb15', params: { orMinutes: 15, onePerSide: 0 }, qty: 10, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
+    cfg: { strategy: 'orb15', params: { orMinutes: 15, onePerSide: 0 }, qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
   },
   {
     name: 'vwap-fade',
     series: MIXED,
-    cfg: { strategy: 'vwap-fade', params: { devPct: 0.4, allowShort: 1 }, qty: 10, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
+    cfg: { strategy: 'vwap-fade', params: { devPct: 0.4, allowShort: 1 }, qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5, maxTradesDay: 50, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000 },
   },
 ]
 

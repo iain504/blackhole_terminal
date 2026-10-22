@@ -17,7 +17,7 @@ function ok(name: string, cond: boolean, extra = '') {
 const cfg: AlpoRunConfig = {
   symbol: 'TSLA', timeframe: '5m', strategy: 'orb15',
   params: { orMinutes: 15, onePerSide: 0 },
-  qty: 10, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5,
+  qty: 10, sizingMode: 'fixed' as const, riskMoney: null, tpMode: 'pct', tpValue: 1, slMode: 'pct', slValue: 0.5,
   maxTradesDay: 3, rthOnly: true, flattenEod: true,
   cooldownMin: 15, requireNewSignal: true,
 }

@@ -148,12 +148,41 @@ export function normalizeAlgoParams(strategy: AlgoStrategyId, raw: unknown): Rec
 /** Exit modes: 'none' (strategy-managed only) or 'pct' (bracket % from entry). */
 export type AlgoExitMode = 'none' | 'pct'
 
+/** Position sizing (Task 78 — "Risk Money"): 'fixed' trades `qty` units per
+ *  entry (legacy) · 'risk' treats `riskMoney` as the DOLLARS AT RISK per trade
+ *  and derives the position size at entry: qty = riskMoney / (entry × SL%).
+ *  Risk sizing requires an SL % bracket — without one every consumer (live
+ *  engine, backtest) falls back to `qty` and says so. */
+export type AlgoSizingMode = 'fixed' | 'risk'
+
+/** Risk-Money position sizing (Task 78). Returns the entry quantity whose
+ *  worst-case loss to the stop ≈ `riskMoney`, or null when sizing is
+ *  impossible (non-positive inputs, or the risk budget is too small for the
+ *  instrument's minimum increment at this stop distance).
+ *  Stocks floor to whole shares; crypto floors to 4 decimals (Alpaca qty_step). */
+export function riskSizedQty(riskMoney: number, entryPx: number, slPct: number, isCrypto: boolean): number | null {
+  if (!(riskMoney > 0) || !(entryPx > 0) || !(slPct > 0)) return null
+  const riskPerUnit = entryPx * (Math.min(100, slPct) / 100)
+  if (!(riskPerUnit > 0)) return null
+  const raw = riskMoney / riskPerUnit
+  if (!Number.isFinite(raw) || raw <= 0) return null
+  if (isCrypto) {
+    const q = Math.floor(raw * 1e4) / 1e4
+    return q >= 0.0001 ? q : null
+  }
+  const q = Math.floor(raw)
+  return q >= 1 ? q : null
+}
+
 export interface AlpoRunConfig {
   symbol: string
   timeframe: AlgoTimeframe
   strategy: AlgoStrategyId
   params: Record<string, number>
   qty: number
+  // Task 78 — Risk Money sizing ('fixed' keeps qty as the per-entry size)
+  sizingMode: AlgoSizingMode
+  riskMoney: number | null
   tpMode: AlgoExitMode
   tpValue: number | null
   slMode: AlgoExitMode
@@ -221,11 +250,16 @@ export interface AlgoRunLike {
   flattenEod: boolean
   cooldownMin?: number
   requireNewSignal?: boolean
+  // Task 78 — optional so legacy rows/DTOs (pre-Risk-Money) still satisfy it
+  sizingMode?: string
+  riskMoney?: number | null
 }
 
-/** Human label used as the default entry name ("BB + RSI Mean Reversion · TSLA 5m"). */
+/** Human label used as the default entry name ("BB + RSI Mean Reversion · TSLA 5m").
+ *  Risk-Money configs carry the sizing in the name so exports/imports stay legible. */
 export function algoConfigSummaryName(cfg: AlpoRunConfig): string {
-  return `${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe}`
+  const sizing = cfg.sizingMode === 'risk' && cfg.riskMoney != null ? ` · risk $${cfg.riskMoney}` : ''
+  return `${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe}${sizing}`
 }
 
 /** Map a persisted run (or its DTO) to a portable config. */
@@ -240,6 +274,8 @@ export function runToAlgoConfig(run: AlgoRunLike): AlpoRunConfig {
     strategy,
     params: normalizeAlgoParams(strategy, run.params),
     qty: run.qty,
+    sizingMode: run.sizingMode === 'risk' ? 'risk' : 'fixed',
+    riskMoney: run.sizingMode === 'risk' ? (run.riskMoney ?? null) : null,
     tpMode: run.tpMode === 'pct' ? 'pct' : 'none',
     tpValue: run.tpMode === 'pct' ? run.tpValue : null,
     slMode: run.slMode === 'pct' ? 'pct' : 'none',
@@ -317,12 +353,20 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
   if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) return 'qty must be a positive number'
   const tpRaw = clampPct(r.tpValue)
   const slRaw = clampPct(r.slValue)
+  // Task 78 — Risk Money: sizing is an identity field here (silently downgrading
+  // a risk-sized config to fixed qty would change what the engine trades)
+  const sizingMode: AlgoSizingMode = r.sizingMode === 'risk' ? 'risk' : 'fixed'
+  const riskRaw = Number(r.riskMoney)
+  const riskMoney = Number.isFinite(riskRaw) && riskRaw > 0 ? Math.min(10_000_000, riskRaw) : null
+  if (sizingMode === 'risk' && riskMoney == null) return 'risk sizing requires a positive riskMoney'
   return {
     symbol,
     timeframe: tf as AlgoTimeframe,
     strategy,
     params: normalizeAlgoParams(strategy, r.params),
     qty,
+    sizingMode,
+    riskMoney: sizingMode === 'risk' ? riskMoney : null,
     tpMode: r.tpMode === 'pct' && tpRaw != null ? 'pct' : 'none',
     tpValue: r.tpMode === 'pct' ? tpRaw : null,
     slMode: r.slMode === 'pct' && slRaw != null ? 'pct' : 'none',

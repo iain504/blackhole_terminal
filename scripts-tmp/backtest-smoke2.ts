@@ -26,7 +26,7 @@ const series = prepareSeries(bars)
 const cfg: BacktestConfig = {
   strategy: 'bb-reversion',
   params: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 35, rsiOverbought: 65, allowShort: 1 },
-  qty: 10, tpMode: 'pct', tpValue: 1.2, slMode: 'pct', slValue: 1.2,
+  qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false, tpMode: 'pct', tpValue: 1.2, slMode: 'pct', slValue: 1.2,
   maxTradesDay: 3, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false, capital: 10000,
 }
 const bb = runBacktest(series, cfg)

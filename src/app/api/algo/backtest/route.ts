@@ -10,6 +10,8 @@
 //   qty, tpMode, tpValue, slMode, slValue, maxTradesDay, rthOnly, flattenEod,
 //   cooldownMin?: number                    (Task 70-c) no-entry minutes after a close (0..240, default 0)
 //   requireNewSignal?: boolean              (Task 70-c) edge-triggered re-entry (default false)
+//   sizingMode?: 'fixed'|'risk'             (Task 78) 'risk' = Risk-Money sizing (default 'fixed')
+//   riskMoney?: number                      (Task 78) dollars at risk per trade (required for 'risk')
 //   capital?: number                       starting equity for % / DD metrics
 //   minTrades?: number                     (optimize) minimum trades to score
 // }
@@ -69,6 +71,8 @@ interface BacktestBody {
   flattenEod?: boolean
   cooldownMin?: number
   requireNewSignal?: boolean
+  sizingMode?: string
+  riskMoney?: number | null
   capital?: number
   minTrades?: number
 }
@@ -97,6 +101,15 @@ export async function POST(req: NextRequest) {
     }
     const capital = Math.max(100, Math.min(100_000_000, Number(body.capital) || 10000))
     const maxTradesDay = Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
+    // Task 78 — Risk Money sizing (required riskMoney > 0 when 'risk')
+    const sizingMode = body.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskMoneyRaw = Number(body.riskMoney)
+    const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
+      ? Math.min(10_000_000, riskMoneyRaw)
+      : null
+    if (sizingMode === 'risk' && riskMoney == null) {
+      return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
+    }
 
     // ---- fetch the history (same source the live engine polls; TTL-cached) ----
     const res = await getBarsCached(symbol, tf as Timeframe, user.id, days)
@@ -128,6 +141,9 @@ export async function POST(req: NextRequest) {
       strategy,
       params: normalizeAlgoParams(strategy, body.params),
       qty: symbol.includes('/') ? qty : Math.max(1, Math.floor(qty)),
+      sizingMode,
+      riskMoney: sizingMode === 'risk' ? riskMoney : null,
+      isCrypto: symbol.includes('/'),
       tpMode: body.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0 ? Number(body.tpValue) : null,
       slMode: body.slMode === 'pct' ? 'pct' : 'none',

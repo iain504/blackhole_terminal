@@ -29,10 +29,11 @@ import {
   ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES,
   normalizeAlgoParams, algoConfigSummaryName, algoExportFileBase,
   buildAlgoConfigExport, runToAlgoConfig, ruleToExportEntry,
-  type AlpoRunConfig, type AlgoStrategyId, type AlgoTimeframe,
+  type AlpoRunConfig, type AlgoStrategyId, type AlgoSizingMode, type AlgoTimeframe,
   type AlgoRuleFileEntry, type AlgoRuleLike,
 } from '@/lib/algo-strategies'
 import BacktestPanel, { type AlgoSetupCfg } from '@/components/terminal/tabs/BacktestPanel'
+import { Segmented } from '@/components/terminal/tabs/Segmented'
 import AlgoImportDialog, { downloadJsonFile } from '@/components/terminal/tabs/AlgoConfigIO'
 import AlgoRunSettingsDialog from '@/components/terminal/tabs/AlgoRunSettings'
 import type { AlgoRunDto } from '@/app/api/algo/route'
@@ -63,7 +64,12 @@ export default function AlgoTab() {
   const [strategy, setStrategy] = useState<AlgoStrategyId>('bb-reversion')
   const [symbol, setSymbol] = useState('TSLA')
   const [timeframe, setTimeframe] = useState<AlgoTimeframe>('5m')
+  // position sizing (Task 78 — Risk Money): 'fixed' trades `qty` units per
+  // entry · 'risk' risks `riskMoney` dollars per trade (size derived at entry
+  // from the SL % distance — hence risk sizing requires SL % below)
+  const [sizingMode, setSizingMode] = useState<AlgoSizingMode>('fixed')
   const [qty, setQty] = useState('10')
+  const [riskMoney, setRiskMoney] = useState('200')
   const [tpOn, setTpOn] = useState(true)
   const [tpPct, setTpPct] = useState('1.5')
   const [slOn, setSlOn] = useState(true)
@@ -127,6 +133,8 @@ export default function AlgoTab() {
           strategy,
           params,
           qty: Number(qty),
+          sizingMode,
+          riskMoney: sizingMode === 'risk' ? Number(riskMoney) : null,
           tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
           tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -176,6 +184,12 @@ export default function AlgoTab() {
   const ruleRows = data?.rules ?? []
   const running = useMemo(() => runs.filter((r) => r.status === 'running').length, [runs])
   const def = ALGO_STRATEGIES[strategy]
+  // risk sizing is only meaningful with an SL % bracket (the stop distance IS
+  // the risk unit) — Start/backtest stay disabled until the config is coherent
+  const riskOk = sizingMode === 'fixed' || (Number(riskMoney) > 0 && slOn && Number(slPct) > 0)
+  const sizingHint = sizingMode === 'risk'
+    ? `$ at risk per trade — qty = risk ÷ (entry × SL%)${slOn && Number(slPct) > 0 ? '' : ' · turn SL % ON'}`
+    : 'units traded per entry'
 
   // shared config bundle — the backtest replays EXACTLY what a run would do
   const setupCfg: AlgoSetupCfg = useMemo(() => ({
@@ -184,6 +198,8 @@ export default function AlgoTab() {
     timeframe,
     params,
     qty: Number(qty) || 0,
+    sizingMode,
+    riskMoney: sizingMode === 'risk' ? (Number(riskMoney) || 0) : null,
     tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
     tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
     slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -193,7 +209,7 @@ export default function AlgoTab() {
     flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
     requireNewSignal,
-  }), [strategy, symbol, timeframe, params, qty, tpOn, tpPct, slOn, slPct, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
+  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskMoney, tpOn, tpPct, slOn, slPct, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
 
   // ---- config import / export (Task 66) ----
   const exportSetup = () => {
@@ -235,6 +251,8 @@ export default function AlgoTab() {
     setStrategy(cfg.strategy)
     setSymbol(cfg.symbol)
     setTimeframe(cfg.timeframe)
+    setSizingMode(cfg.sizingMode === 'risk' ? 'risk' : 'fixed')
+    setRiskMoney(cfg.riskMoney != null ? String(cfg.riskMoney) : '200')
     setQty(String(cfg.qty))
     setTpOn(cfg.tpMode === 'pct')
     setTpPct(cfg.tpValue != null ? String(cfg.tpValue) : '1.5')
@@ -270,32 +288,16 @@ export default function AlgoTab() {
             {data.mode} mode
           </Badge>
         )}
-        <span className="flex shrink-0 items-center gap-0.5 rounded border border-zinc-800 bg-zinc-950 p-0.5" role="tablist" aria-label="Algo view">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'runs'}
-            onClick={() => setView('runs')}
-            className={cn(
-              'h-6 rounded px-2 text-[11px] font-medium',
-              view === 'runs' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
-            )}
-          >
-            Live runs
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'backtest'}
-            onClick={() => setView('backtest')}
-            className={cn(
-              'h-6 rounded px-2 text-[11px] font-medium',
-              view === 'backtest' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
-            )}
-          >
-            Backtest
-          </button>
-        </span>
+        <Segmented
+          ariaLabel="Algo view"
+          size="sm"
+          value={view}
+          onChange={(v) => setView(v)}
+          options={[
+            { value: 'runs', label: 'Live runs' },
+            { value: 'backtest', label: 'Backtest' },
+          ]}
+        />
         <span className="ml-auto text-[11px] text-zinc-500">strategies evaluated on closed bars · every 15s</span>
         {runs.length > 0 && (
           <Button
@@ -363,30 +365,67 @@ export default function AlgoTab() {
               </div>
               <div className="col-span-1">
                 <Label htmlFor="algo-tf" className="text-[10px] text-zinc-500">Timeframe</Label>
-                <div className="mt-1 flex gap-1">
-                  {ALGO_TIMEFRAMES.map((tf) => (
-                    <button
-                      key={tf}
-                      type="button"
-                      onClick={() => setTimeframe(tf)}
-                      className={cn(
-                        'h-8 flex-1 rounded border text-xs',
-                        tf === timeframe ? 'border-zinc-500 bg-zinc-800 text-zinc-100' : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-700',
-                      )}
-                      aria-pressed={tf === timeframe}
-                    >
-                      {tf}
-                    </button>
-                  ))}
+                <Segmented
+                  ariaLabel="Timeframe"
+                  size="md"
+                  grow
+                  className="mt-1 w-full"
+                  value={timeframe}
+                  onChange={(tf) => setTimeframe(tf as AlgoTimeframe)}
+                  options={ALGO_TIMEFRAMES.map((tf) => ({ value: tf, label: tf }))}
+                />
+              </div>
+              {/* position sizing (Task 78 — Risk Money) */}
+              <div className="col-span-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Position sizing</p>
+                  <Segmented
+                    ariaLabel="Position sizing mode"
+                    size="sm"
+                    value={sizingMode}
+                    onChange={setSizingMode}
+                    options={[
+                      { value: 'fixed', label: 'Fixed qty', title: 'Trade a fixed quantity every entry' },
+                      { value: 'risk', label: 'Risk $ / trade', title: 'Risk-Money sizing — dollars at risk per trade, size derived from the SL % distance at entry' },
+                    ]}
+                  />
+                </div>
+                <div className="mt-1.5 flex items-center justify-between gap-2">
+                  {sizingMode === 'fixed' ? (
+                    <div className="min-w-0">
+                      <Label htmlFor="algo-qty" className="text-[11px] text-zinc-300">Quantity (shares)</Label>
+                      <p className="text-[10px] leading-snug text-zinc-500">{sizingHint}</p>
+                    </div>
+                  ) : (
+                    <div className="min-w-0">
+                      <Label htmlFor="algo-risk" className="text-[11px] text-zinc-300">Risk money per trade ($)</Label>
+                      <p className={cn('text-[10px] leading-snug', slOn && Number(slPct) > 0 ? 'text-zinc-500' : 'text-amber-400')}>{sizingHint}</p>
+                    </div>
+                  )}
+                  {sizingMode === 'fixed' ? (
+                    <Input
+                      id="algo-qty"
+                      value={qty}
+                      onChange={(e) => setQty(e.target.value)}
+                      inputMode="decimal"
+                      className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
+                    />
+                  ) : (
+                    <Input
+                      id="algo-risk"
+                      value={riskMoney}
+                      onChange={(e) => setRiskMoney(e.target.value)}
+                      onBlur={() => setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0))))}
+                      inputMode="decimal"
+                      aria-label="Risk money per trade in dollars"
+                      className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
+                    />
+                  )}
                 </div>
               </div>
-              <div className="col-span-1">
-                <Label htmlFor="algo-qty" className="text-[10px] text-zinc-500">Quantity (shares)</Label>
-                <Input id="algo-qty" value={qty} onChange={(e) => setQty(e.target.value)} inputMode="decimal" className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs" />
-              </div>
-              <div className="col-span-1">
-                <Label htmlFor="algo-cap" className="text-[10px] text-zinc-500">Max trades / day</Label>
-                <Input id="algo-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs" />
+              <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+                <Label htmlFor="algo-cap" className="text-[11px] text-zinc-300">Max trades / day</Label>
+                <Input id="algo-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
               </div>
               <div className="col-span-1 flex items-center gap-2">
                 <Switch id="algo-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
@@ -489,7 +528,8 @@ export default function AlgoTab() {
 
             <Button
               className="mt-3 h-9 w-full gap-2 bg-sky-600 text-xs text-white hover:bg-sky-500"
-              disabled={starting || !symbol.trim() || !(Number(qty) > 0)}
+              disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
+              title={!riskOk ? 'Risk sizing needs a positive risk $ and an SL % bracket' : undefined}
               onClick={() => void start()}
             >
               {starting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -557,7 +597,16 @@ export default function AlgoTab() {
                   <span className="text-sm font-semibold text-zinc-100">{r.symbol}</span>
                   <span className="font-medium text-zinc-300">{sDef?.name ?? r.strategy}</span>
                   <Badge variant="outline" className="text-[10px] text-zinc-400">{r.timeframe}</Badge>
-                  <span className="text-zinc-400">qty {r.qty}</span>
+                  {r.sizingMode === 'risk' ? (
+                    <span
+                      className="text-sky-400/90"
+                      title={`Risk-Money sizing — $${r.riskMoney} at risk per trade, position size derived at entry (risk ÷ (entry × SL%)) · fallback qty ${r.qty}`}
+                    >
+                      risk ${r.riskMoney}/trade
+                    </span>
+                  ) : (
+                    <span className="text-zinc-400">qty {r.qty}</span>
+                  )}
                   {(r.tpMode === 'pct' || r.slMode === 'pct') && (
                     <span className="text-zinc-500">
                       {r.tpMode === 'pct' && <span className="text-emerald-400/80">TP {r.tpValue}%</span>}

@@ -26,8 +26,9 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
   ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES, isAlgoStrategyId,
-  normalizeAlgoParams, type AlgoStrategyId, type AlgoTimeframe,
+  normalizeAlgoParams, type AlgoSizingMode, type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
+import { Segmented } from '@/components/terminal/tabs/Segmented'
 import type { AlgoRunDto } from '@/app/api/algo/route'
 
 export default function AlgoRunSettingsDialog({
@@ -44,7 +45,10 @@ export default function AlgoRunSettingsDialog({
   const [strategy, setStrategy] = useState<AlgoStrategyId>('bb-reversion')
   const [symbol, setSymbol] = useState('')
   const [timeframe, setTimeframe] = useState<AlgoTimeframe>('5m')
+  // position sizing (Task 78 — Risk Money)
+  const [sizingMode, setSizingMode] = useState<AlgoSizingMode>('fixed')
   const [qty, setQty] = useState('10')
+  const [riskMoney, setRiskMoney] = useState('200')
   const [tpOn, setTpOn] = useState(true)
   const [tpPct, setTpPct] = useState('1.5')
   const [slOn, setSlOn] = useState(true)
@@ -68,6 +72,8 @@ export default function AlgoRunSettingsDialog({
     setSymbol(run.symbol)
     setTimeframe((ALGO_TIMEFRAMES as readonly string[]).includes(run.timeframe) ? (run.timeframe as AlgoTimeframe) : '5m')
     setQty(String(run.qty))
+    setSizingMode(run.sizingMode === 'risk' ? 'risk' : 'fixed')
+    setRiskMoney(run.riskMoney != null ? String(run.riskMoney) : '200')
     setTpOn(run.tpMode === 'pct' && run.tpValue != null)
     setTpPct(run.tpValue != null ? String(run.tpValue) : '1.5')
     setSlOn(run.slMode === 'pct' && run.slValue != null)
@@ -92,6 +98,8 @@ export default function AlgoRunSettingsDialog({
 
   const def = ALGO_STRATEGIES[strategy]
   const identityChanged = !!run && (symbol.trim().toUpperCase() !== run.symbol || timeframe !== run.timeframe || strategy !== run.strategy)
+  // risk sizing requires an SL % bracket — mirror the run setup's Start gate
+  const riskOk = sizingMode === 'fixed' || (Number(riskMoney) > 0 && slOn && Number(slPct) > 0)
 
   const save = async () => {
     if (!run) return
@@ -106,6 +114,8 @@ export default function AlgoRunSettingsDialog({
           strategy,
           params,
           qty: Number(qty),
+          sizingMode,
+          riskMoney: sizingMode === 'risk' ? Number(riskMoney) : null,
           tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
           tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -218,16 +228,53 @@ export default function AlgoRunSettingsDialog({
             </div>
           </div>
 
-          {/* size + cap */}
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <Label htmlFor="rs-qty" className="text-[10px] text-zinc-500">Quantity (shares)</Label>
-              <Input id="rs-qty" value={qty} onChange={(e) => setQty(e.target.value)} inputMode="decimal" className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs" />
+          {/* size + cap (Task 78 — Risk Money sizing modes) */}
+          <div className="rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Position sizing</p>
+              <Segmented
+                ariaLabel="Position sizing mode"
+                size="sm"
+                value={sizingMode}
+                onChange={setSizingMode}
+                options={[
+                  { value: 'fixed', label: 'Fixed qty', title: 'Trade a fixed quantity every entry' },
+                  { value: 'risk', label: 'Risk $ / trade', title: 'Risk-Money sizing — dollars at risk per trade, size derived from the SL % distance at entry' },
+                ]}
+              />
             </div>
-            <div>
-              <Label htmlFor="rs-cap" className="text-[10px] text-zinc-500">Max trades / day</Label>
-              <Input id="rs-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs" />
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              {sizingMode === 'fixed' ? (
+                <div className="min-w-0">
+                  <Label htmlFor="rs-qty" className="text-[11px] text-zinc-300">Quantity (shares)</Label>
+                  <p className="text-[10px] leading-snug text-zinc-500">units traded per entry</p>
+                </div>
+              ) : (
+                <div className="min-w-0">
+                  <Label htmlFor="rs-risk" className="text-[11px] text-zinc-300">Risk money per trade ($)</Label>
+                  <p className={cn('text-[10px] leading-snug', slOn && Number(slPct) > 0 ? 'text-zinc-500' : 'text-amber-400')}>
+                    $ at risk per trade — qty = risk ÷ (entry × SL%) · applies to new entries
+                  </p>
+                </div>
+              )}
+              {sizingMode === 'fixed' ? (
+                <Input id="rs-qty" value={qty} onChange={(e) => setQty(e.target.value)} inputMode="decimal" className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs" />
+              ) : (
+                <Input
+                  id="rs-risk"
+                  value={riskMoney}
+                  onChange={(e) => setRiskMoney(e.target.value)}
+                  onBlur={() => setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0))))}
+                  inputMode="decimal"
+                  aria-label="Risk money per trade in dollars"
+                  className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
+                />
+              )}
             </div>
+          </div>
+          <div className="flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+            <Label htmlFor="rs-cap" className="text-[11px] text-zinc-300">Max trades / day</Label>
+            <Input id="rs-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
           </div>
 
           {/* TP / SL */}
@@ -349,7 +396,8 @@ export default function AlgoRunSettingsDialog({
           <Button
             size="sm"
             className="h-8 gap-1.5 bg-sky-600 px-3 text-[11px] text-white hover:bg-sky-500"
-            disabled={saving || !symbol.trim() || !(Number(qty) > 0)}
+            disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
+            title={!riskOk ? 'Risk sizing needs a positive risk $ and an SL % bracket' : undefined}
             onClick={() => void save()}
           >
             {saving ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Settings2 className="h-3 w-3" />}

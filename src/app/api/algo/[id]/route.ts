@@ -43,6 +43,8 @@ interface AlgoPatchBody {
   strategy?: string
   params?: Record<string, number>
   qty?: number
+  sizingMode?: string
+  riskMoney?: number
   tpMode?: string
   tpValue?: number
   slMode?: string
@@ -89,12 +91,23 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       const n = Number(v)
       return Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(0.01, n)) : null
     }
+    // Task 78 — Risk Money sizing (riskMoney required > 0 when 'risk')
+    const sizingMode = body?.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskMoneyRaw = Number(body?.riskMoney)
+    const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
+      ? Math.min(10_000_000, riskMoneyRaw)
+      : null
+    if (sizingMode === 'risk' && riskMoney == null) {
+      return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
+    }
     const updated = await updateAlgoRunConfig(id, {
       symbol,
       timeframe: tf as AlgoTimeframe,
       strategy,
       params: body?.params,
       qty,
+      sizingMode,
+      riskMoney,
       tpMode: body?.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body?.tpMode === 'pct' ? clampPct(body?.tpValue) : null,
       slMode: body?.slMode === 'pct' ? 'pct' : 'none',

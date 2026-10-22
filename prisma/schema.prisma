@@ -190,6 +190,14 @@ model AlgoRun {
   strategy     String // 'bb-reversion' | 'rsi2-connors' | 'orb15' | 'vwap-fade'
   params       Json
   qty          Float
+  // Position sizing (Task 78 — "Risk Money"): 'fixed' trades `qty` units per
+  // entry (legacy behavior) · 'risk' treats `riskMoney` as the DOLLARS AT RISK
+  // per trade and derives the position size at entry time:
+  //   qty = riskMoney / (entryPrice × slValue/100)
+  // Risk sizing requires an SL % bracket — without one the engine falls back
+  // to `qty` and journals why. `riskMoney` is null in fixed mode.
+  sizingMode   String    @default("fixed")
+  riskMoney    Float?
   // exits: 'none' (strategy logic closes) | 'pct' (bracket % from entry)
   tpMode       String    @default("none")
   tpValue      Float?

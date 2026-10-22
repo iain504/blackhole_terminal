@@ -43,6 +43,7 @@ function run(label: string, over: Partial<BacktestConfig>) {
     strategy: 'orb15',
     params: { orMinutes: 15, onePerSide: 0 },
     qty: 10,
+    sizingMode: 'fixed', riskMoney: null, isCrypto: false,
     tpMode: 'pct', tpValue: 1,
     slMode: 'pct', slValue: 0.5,
     maxTradesDay: 50, rthOnly: true, flattenEod: true,

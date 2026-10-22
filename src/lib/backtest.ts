@@ -43,6 +43,12 @@ export interface BacktestConfig {
   strategy: AlgoStrategyId
   params: Record<string, number>
   qty: number
+  // Task 78 — Risk Money sizing: 'risk' derives the per-trade size from the
+  // dollars-at-risk budget and THIS bar's open/stop distance (so every trade
+  // risks ≈ riskMoney). Falls back to `qty` when the config has no SL %.
+  sizingMode: 'fixed' | 'risk'
+  riskMoney: number | null
+  isCrypto: boolean // risk sizing floors to whole shares for stocks, 4dp for crypto
   tpMode: 'none' | 'pct'
   tpValue: number | null
   slMode: 'none' | 'pct'
@@ -380,13 +386,31 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         const px = profitSide ? fill * (1 + p / 100) : fill * (1 - p / 100)
         return px > 0 ? px : null
       }
+      const slPx = cfg.slMode === 'pct' ? pctPx(cfg.slValue, false) : null
+      // Risk-Money sizing (Task 78) — size each trade so the loss to THIS
+      // trade's stop ≈ riskMoney, using the actual fill price. Risk-sized
+      // trades therefore breathe with volatility exactly like the live engine.
+      let qty = cfg.qty
+      if (cfg.sizingMode === 'risk' && slPx != null && cfg.riskMoney != null && cfg.riskMoney > 0) {
+        const riskPerUnit = Math.abs(fill - slPx)
+        if (riskPerUnit > 0) {
+          const raw = cfg.riskMoney / riskPerUnit
+          if (cfg.isCrypto) {
+            const q = Math.floor(raw * 1e4) / 1e4
+            if (q >= 0.0001) qty = q
+          } else {
+            const q = Math.floor(raw)
+            if (q >= 1) qty = q
+          }
+        }
+      }
       pos = {
         side: dir,
-        qty: cfg.qty,
+        qty,
         entryPx: fill,
         entryTime: bar.time,
         tpPx: cfg.tpMode === 'pct' ? pctPx(cfg.tpValue, true) : null,
-        slPx: cfg.slMode === 'pct' ? pctPx(cfg.slValue, false) : null,
+        slPx,
       }
       pending = null
     }

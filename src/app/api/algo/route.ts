@@ -18,6 +18,8 @@ export interface AlgoRunDto {
   strategy: string
   params: Record<string, number>
   qty: number
+  sizingMode: string
+  riskMoney: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -36,7 +38,8 @@ export interface AlgoRunDto {
 
 export function toDto(r: {
   id: string; symbol: string; timeframe: string; strategy: string; params: unknown
-  qty: number; tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
+  qty: number; sizingMode?: string; riskMoney?: number | null
+  tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
   maxTradesDay: number; rthOnly: boolean; flattenEod: boolean
   cooldownMin?: number; requireNewSignal?: boolean
   status: string
@@ -46,7 +49,10 @@ export function toDto(r: {
   return {
     id: r.id, symbol: r.symbol, timeframe: r.timeframe, strategy: r.strategy,
     params: (r.params as Record<string, number>) ?? {},
-    qty: r.qty, tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
+    qty: r.qty,
+    sizingMode: r.sizingMode === 'risk' ? 'risk' : 'fixed',
+    riskMoney: r.sizingMode === 'risk' ? (r.riskMoney ?? null) : null,
+    tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
     maxTradesDay: r.maxTradesDay, rthOnly: r.rthOnly, flattenEod: r.flattenEod,
     cooldownMin: r.cooldownMin ?? 0, requireNewSignal: r.requireNewSignal === true,
     status: r.status, tradesToday: st.tradesToday ?? 0,
@@ -104,6 +110,8 @@ interface AlgoStartBody {
   strategy?: string
   params?: Record<string, number>
   qty?: number
+  sizingMode?: string
+  riskMoney?: number
   tpMode?: string
   tpValue?: number
   slMode?: string
@@ -147,6 +155,15 @@ export async function POST(req: NextRequest) {
       const n = Number(v)
       return Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(0.01, n)) : null
     }
+    // Task 78 — Risk Money sizing (riskMoney required > 0 when 'risk')
+    const sizingMode = body?.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskMoneyRaw = Number(body?.riskMoney)
+    const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
+      ? Math.min(10_000_000, riskMoneyRaw)
+      : null
+    if (sizingMode === 'risk' && riskMoney == null) {
+      return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
+    }
     const run = await startAlgoRun({
       userId: user.id,
       symbol,
@@ -154,6 +171,8 @@ export async function POST(req: NextRequest) {
       strategy,
       params: body?.params,
       qty,
+      sizingMode,
+      riskMoney,
       tpMode: body?.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body?.tpMode === 'pct' ? clampPct(body?.tpValue) : null,
       slMode: body?.slMode === 'pct' ? 'pct' : 'none',

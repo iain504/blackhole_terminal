@@ -22,7 +22,7 @@ import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
-import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, type AlgoStrategyId } from '@/lib/algo-strategies'
+import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
 
 const CYCLE_MS = 15000
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
@@ -37,6 +37,9 @@ interface AlgoRunRow {
   strategy: string
   params: unknown
   qty: number
+  // Task 78 — Risk Money sizing ('fixed' legacy · 'risk' derives qty at entry)
+  sizingMode: string
+  riskMoney: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -439,9 +442,9 @@ async function cycle(runId: string) {
           await log(runId, run.userId, 'info', `Signal suppressed (daily cap ${run.maxTradesDay}): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
-          // resolve % legs against the live quote
+          // resolve % legs — and Risk-Money sizing — against the live quote
           let ref: number | null = null
-          if (run.tpMode === 'pct' || run.slMode === 'pct') {
+          if (run.tpMode === 'pct' || run.slMode === 'pct' || run.sizingMode === 'risk') {
             try {
               const { quotes } = await getQuotes([run.symbol], run.userId)
               ref = quotes.find((q) => q.symbol === run.symbol)?.price ?? null
@@ -457,7 +460,31 @@ async function cycle(runId: string) {
           }
           const tp = pctPx(run.tpMode, run.tpValue, 'tp')
           const sl = pctPx(run.slMode, run.slValue, 'sl')
-          const qty = run.symbol.includes('/') ? run.qty : Math.floor(run.qty)
+          // ---- position sizing (Task 78 — Risk Money) ----
+          // 'risk' derives the size from the dollars-at-risk budget and the
+          // live quote; anything that makes the derivation impossible (no SL %,
+          // no quote, budget below one increment) falls back to the fixed qty
+          // with a journal line so the sizing behavior is never silent.
+          const isCryptoSym = run.symbol.includes('/')
+          let qty = isCryptoSym ? run.qty : Math.floor(run.qty)
+          let riskSized = false
+          if (run.sizingMode === 'risk') {
+            const slPct = run.slMode === 'pct' ? run.slValue : null
+            const sized = ref != null && slPct != null && sl != null
+              ? riskSizedQty(Number(run.riskMoney), ref, slPct, isCryptoSym)
+              : null
+            if (sized != null) {
+              qty = sized
+              riskSized = true
+            } else {
+              const why = slPct == null
+                ? 'no SL % bracket — risk needs a stop distance'
+                : ref == null
+                  ? 'no live quote'
+                  : `risk $${run.riskMoney} is below one ${isCryptoSym ? '0.0001 unit' : 'share'} at SL ${slPct}%`
+              await log(runId, run.userId, 'info', `Risk sizing unavailable (${why}) — using fixed qty ${run.qty}`)
+            }
+          }
           if (qty <= 0) {
             await log(runId, run.userId, 'error', 'qty rounds to 0 — fix the run quantity')
           } else {
@@ -482,7 +509,8 @@ async function cycle(runId: string) {
                   else st.firedShort = true
                 }
                 const legs = [tp ? `TP ${fmtP(tp)}` : null, sl ? `SL ${fmtP(sl)}` : null].filter(Boolean).join(' · ')
-                await log(runId, run.userId, 'trade', `ENTRY ${res.entry.side.toUpperCase()} ${qty} ${run.symbol} @ mkt${legs ? ` · ${legs}` : ''} · #${r.results[0].id.slice(-8)} · trade ${st.tradesToday}/${run.maxTradesDay} today`)
+                const riskNote = riskSized ? ` · sized by risk $${run.riskMoney}/trade` : ''
+                await log(runId, run.userId, 'trade', `ENTRY ${res.entry.side.toUpperCase()} ${qty} ${run.symbol} @ mkt${legs ? ` · ${legs}` : ''}${riskNote} · #${r.results[0].id.slice(-8)} · trade ${st.tradesToday}/${run.maxTradesDay} today`)
                 st.freshGateSide = undefined // fired — a new episode starts after this
                 // never swallow leg problems — a crypto OCO attach failure or
                 // a split (attach-on-fill) plan used to be invisible here,
@@ -551,6 +579,8 @@ export async function startAlgoRun(cfg: {
   strategy: AlgoStrategyId
   params: unknown
   qty: number
+  sizingMode: string
+  riskMoney: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -569,6 +599,8 @@ export async function startAlgoRun(cfg: {
       strategy: cfg.strategy,
       params: normalizeAlgoParams(cfg.strategy, cfg.params) as unknown as object,
       qty: cfg.qty,
+      sizingMode: cfg.sizingMode === 'risk' ? 'risk' : 'fixed',
+      riskMoney: cfg.sizingMode === 'risk' ? cfg.riskMoney : null,
       tpMode: cfg.tpMode,
       tpValue: cfg.tpValue,
       slMode: cfg.slMode,
@@ -582,7 +614,8 @@ export async function startAlgoRun(cfg: {
       state: {} as unknown as object,
     },
   })
-  await log(run.id, cfg.userId, 'info', `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · qty ${cfg.qty}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`)
+  const sizing = cfg.sizingMode === 'risk' ? `risk $${cfg.riskMoney}/trade` : `qty ${cfg.qty}`
+  await log(run.id, cfg.userId, 'info', `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`)
   startEngine(run.id)
   return run
 }
@@ -601,6 +634,8 @@ export interface AlgoRunConfigPatch {
   strategy: AlgoStrategyId
   params: unknown
   qty: number
+  sizingMode: string
+  riskMoney: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -643,6 +678,15 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.timeframe !== patch.timeframe) diffs.push(`timeframe ${run.timeframe} → ${patch.timeframe}`)
   if (run.strategy !== patch.strategy) diffs.push(`strategy ${run.strategy} → ${patch.strategy}`)
   if (run.qty !== patch.qty) diffs.push(`qty ${run.qty} → ${patch.qty}`)
+  // Task 78 — sizing diff reads as whole-mode changes when the mode flips,
+  // and as a plain $ change when only the risk budget moves
+  const sizingLabel = (mode: string, qty: number, rm: number | null) =>
+    mode === 'risk' ? `risk $${rm ?? 0}/trade` : `fixed qty ${qty}`
+  if (run.sizingMode !== patch.sizingMode) {
+    diffs.push(`sizing ${sizingLabel(run.sizingMode, run.qty, run.riskMoney)} → ${sizingLabel(patch.sizingMode, patch.qty, patch.riskMoney)}`)
+  } else if (patch.sizingMode === 'risk' && run.riskMoney !== patch.riskMoney) {
+    diffs.push(`risk $${run.riskMoney ?? 0} → $${patch.riskMoney ?? 0}/trade`)
+  }
   if (run.tpMode !== patch.tpMode || (patch.tpMode === 'pct' && run.tpValue !== patch.tpValue)) {
     diffs.push(`TP ${run.tpMode === 'pct' ? `${run.tpValue}%` : 'off'} → ${patch.tpMode === 'pct' ? `${patch.tpValue}%` : 'off'}`)
   }
@@ -666,6 +710,8 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       strategy: patch.strategy,
       params: nextParams as unknown as object,
       qty: patch.qty,
+      sizingMode: patch.sizingMode === 'risk' ? 'risk' : 'fixed',
+      riskMoney: patch.sizingMode === 'risk' ? patch.riskMoney : null,
       tpMode: patch.tpMode,
       tpValue: patch.tpMode === 'pct' ? patch.tpValue : null,
       slMode: patch.slMode,

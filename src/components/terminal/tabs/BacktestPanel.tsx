@@ -31,6 +31,8 @@ import {
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import type { BacktestResult, OptimizeResult } from '@/lib/backtest'
+import { Segmented } from '@/components/terminal/tabs/Segmented'
+import { type AlgoSizingMode } from '@/lib/algo-strategies'
 
 export interface AlgoSetupCfg {
   strategy: AlgoStrategyId
@@ -38,6 +40,9 @@ export interface AlgoSetupCfg {
   timeframe: AlgoTimeframe
   params: Record<string, number>
   qty: number
+  // Task 78 — Risk Money sizing (mirrors the live run config)
+  sizingMode: AlgoSizingMode
+  riskMoney: number | null
   tpMode: 'none' | 'pct'
   tpValue: number | null
   slMode: 'none' | 'pct'
@@ -132,6 +137,8 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     strategy: cfg.strategy,
     params: cfg.params,
     qty: cfg.qty,
+    sizingMode: cfg.sizingMode,
+    riskMoney: cfg.sizingMode === 'risk' ? cfg.riskMoney : null,
     tpMode: cfg.tpMode,
     tpValue: cfg.tpValue,
     slMode: cfg.slMode,
@@ -215,6 +222,12 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   const m = runRes?.metrics
   const pnlColor = (v: number) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-zinc-300')
 
+  // coherent sizing gate (Task 78): risk mode needs a positive risk $ AND an
+  // SL % bracket (the stop distance is the risk unit); fixed needs qty > 0
+  const sizingOk = cfg.sizingMode === 'risk'
+    ? (cfg.riskMoney ?? 0) > 0 && cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0
+    : cfg.qty > 0
+
   // fixed win/loss buckets by EXIT time (America/New_York, Task 71-2) —
   // zero-count buckets stay visible so the shape of the day/week/year reads true
   const wlRows = useMemo(() => {
@@ -296,6 +309,12 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
               Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · no slippage/fees. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+              {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && (cfg.riskMoney ?? 0) > 0 && (
+                <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ ${cfg.riskMoney} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
+              )}
+              {cfg.sizingMode === 'risk' && !(cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0) && (
+                <> <span className="text-amber-400">Risk Money sizing needs an SL % — turn Stop loss % ON in the run setup.</span></>
+              )}
             </p>
           </div>
         </div>
@@ -303,7 +322,8 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
         <div className="mt-2 flex flex-wrap gap-2">
           <Button
             className="h-8 gap-2 bg-sky-600 px-3 text-xs text-white hover:bg-sky-500"
-            disabled={busy !== null || !cfg.symbol || !(cfg.qty > 0)}
+            disabled={busy !== null || !cfg.symbol || !sizingOk}
+            title={!sizingOk ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ and SL % ON in the run setup' : 'Set a positive quantity in the run setup') : undefined}
             onClick={() => void post('run')}
           >
             {busy === 'run' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <TrendingUp className="h-3.5 w-3.5" />}
@@ -361,7 +381,7 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
               <span className="text-[10px] text-zinc-600">{activeRanges.length === 0 ? 'tick at least one parameter' : `${activeRanges.length} parameter${activeRanges.length === 1 ? '' : 's'} selected`}</span>
               <Button
                 className="ml-auto h-8 gap-2 bg-amber-600 px-3 text-xs text-white hover:bg-amber-500"
-                disabled={busy !== null || activeRanges.length === 0 || !cfg.symbol || !(cfg.qty > 0)}
+                disabled={busy !== null || activeRanges.length === 0 || !cfg.symbol || !sizingOk}
                 onClick={() => void post('optimize')}
               >
                 {busy === 'optimize' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
@@ -431,23 +451,17 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
             <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
               <div className="flex flex-wrap items-center gap-2">
                 <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Win / Loss breakdown</p>
-                <span className="flex items-center gap-0.5 rounded border border-zinc-800 bg-zinc-950 p-0.5" role="tablist" aria-label="Win/loss bucket size">
-                  {(['hour', 'weekday', 'monthyear'] as const).map((g) => (
-                    <button
-                      key={g}
-                      type="button"
-                      role="tab"
-                      aria-selected={wlGran === g}
-                      onClick={() => setWlGran(g)}
-                      className={cn(
-                        'h-6 rounded px-2 text-[11px] font-medium',
-                        wlGran === g ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
-                      )}
-                    >
-                      {g === 'hour' ? 'Hour of day' : g === 'weekday' ? 'Day of week' : 'Month of year'}
-                    </button>
-                  ))}
-                </span>
+                <Segmented
+                  ariaLabel="Win/loss bucket size"
+                  size="sm"
+                  value={wlGran}
+                  onChange={setWlGran}
+                  options={[
+                    { value: 'hour', label: 'Hour of day' },
+                    { value: 'weekday', label: 'Day of week' },
+                    { value: 'monthyear', label: 'Month of year' },
+                  ]}
+                />
                 <span className="ml-auto flex items-center gap-3 text-[10px] text-zinc-500">
                   <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: '#10b981' }} aria-hidden />Wins</span>
                   <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: '#f43f5e' }} aria-hidden />Losses</span>

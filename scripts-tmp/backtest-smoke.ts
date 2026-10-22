@@ -37,7 +37,7 @@ const series = prepareSeries(bars)
 const baseCfg: BacktestConfig = {
   strategy: 'bb-reversion',
   params: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1 },
-  qty: 10,
+  qty: 10, sizingMode: 'fixed' as const, riskMoney: null, isCrypto: false,
   tpMode: 'pct', tpValue: 1.5,
   slMode: 'pct', slValue: 1,
   maxTradesDay: 3,
