@@ -1544,3 +1544,17 @@ Work Log:
 
 Stage Summary:
 - Risk Money accepts Percentage%: a run can now risk "0.5% of equity" instead of "$250" EVERYWHERE the risk budget lives — run setup, live engine (budget = live broker equity × % at each entry), backtest/optimizer (budget = simulated equity × % at each fill → risk compounds), run editor, run cards, journals, import/export, REST APIs. The two bases are identity fields (never silently converted), validation is mirrored across all three endpoints, and the fallback/failure journaling stays never-silent. $-mode behavior is byte-identical to Task 78 (regression probes pass).
+
+---
+Task ID: 78-push
+Agent: Z.ai Code (main)
+Task: "push to github." (push Task 78 + 78e commits)
+
+Work Log:
+- Verified local state: working tree clean; 4 commits ahead of origin/main (409b79c auto/db-churn, 66416ed Task 78 Risk Money + Segmented, 75c9cca Task 78e Percentage% risk basis, 64e2798 auto/db-churn-only).
+- Confirmed auto-commits contain only db/custom.db churn (+1 worklog line) — nothing sensitive beyond the known private-repo profile.
+- Attempted push: GH_TOKEN empty, no ~/.netrc, no ~/.git-credentials, no gh CLI, no credential helper → `git push origin main` failed: "Repository not found / Authentication failed" (both Task 77 PATs externally revoked; fine-grained PATs require Contents: Read and Write).
+- BLOCKED on user-supplied token. Push command ready: `GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/gh-askpass.sh git push origin main` with GH_TOKEN set (askpass script still in place at /tmp/gh-askpass.sh).
+
+Stage Summary:
+- 4 commits staged locally and push-verified as far as auth; awaiting a fresh fine-grained PAT (Contents: Read and Write) to complete the push. Old PAT #1/#2 are dead.
