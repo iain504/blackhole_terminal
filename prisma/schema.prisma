@@ -176,3 +176,53 @@ model NotifyState {
 
   @@id([userId, mode])
 }
+
+// Algo Trading (Task 61) — one row per strategy run. The engine loop
+// (algo-engine.ts) re-reads the row every cycle, so the DB is the single
+// source of truth: `state` carries the working memory (position tracking,
+// day counters, OR range, VWAP accumulator, last evaluated bar) and survives
+// dev-server restarts — runs with status 'running' are auto-resumed.
+model AlgoRun {
+  id           String    @id @default(cuid())
+  userId       String
+  symbol       String
+  timeframe    String    @default("5m") // '1m' | '5m' | '15m'
+  strategy     String // 'bb-reversion' | 'rsi2-connors' | 'orb15' | 'vwap-fade'
+  params       Json
+  qty          Float
+  // exits: 'none' (strategy logic closes) | 'pct' (bracket % from entry)
+  tpMode       String    @default("none")
+  tpValue      Float?
+  slMode       String    @default("none")
+  slValue      Float?
+  maxTradesDay Int       @default(3)
+  rthOnly      Boolean   @default(true)
+  flattenEod   Boolean   @default(true)
+  // re-entry control (Task 70-c): cooldownMin = no new entries for N minutes
+  // after the run's position closes (0 = off) · requireNewSignal = a signal may
+  // only fire on a false→true edge vs the previously processed closed bar
+  cooldownMin     Int     @default(0)
+  requireNewSignal Boolean @default(false)
+  // 'running' | 'stopped'
+  status       String    @default("running")
+  state        Json?
+  startedAt    DateTime  @default(now())
+  stoppedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId, status])
+}
+
+// Append-only engine journal: cycle notes, signal detection, order results,
+// errors. Powers the live log feed in the Algo tab.
+model AlgoLog {
+  id        String   @id @default(cuid())
+  runId     String
+  userId    String
+  level     String   @default("info") // info | signal | trade | error
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([runId, createdAt])
+  @@index([userId, createdAt])
+}

@@ -1,0 +1,6 @@
+const { db } = await import('../src/lib/db.ts')
+const runs = await db.algoRun.findMany({ select: { id: true, strategy: true, symbol: true, status: true, cooldownMin: true, requireNewSignal: true } })
+console.log('RUNS:', JSON.stringify(runs))
+const rules = await db.strategyRule.count()
+console.log('RULES:', rules)
+process.exit(0)

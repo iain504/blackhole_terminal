@@ -13,7 +13,7 @@
 
 import { useState } from 'react'
 import { useTerminal, tabPanes, DRAW_COLORS, DrawingKind } from '@/store/terminal'
-import { TIMEFRAMES, Timeframe } from '@/lib/market-types'
+import { TIMEFRAMES, isCryptoSymbol, Timeframe } from '@/lib/market-types'
 import { ChartPanel } from '@/components/chart/ChartPanel'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
@@ -21,6 +21,7 @@ import {
   ChevronDown, Pencil, Sigma, Briefcase, Ellipsis, X, Plus,
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Square, Type,
   CandlestickChart as CandlestickIcon, LineChart as LineChartIcon,
+  AlignHorizontalJustifyCenter, Clock,
 } from 'lucide-react'
 
 const TOOLS: { id: DrawingKind | 'cursor'; label: string; icon: typeof MousePointer2; hint?: string }[] = [
@@ -52,6 +53,10 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
   const drawingTool = useTerminal((s) => s.drawingTool)
   const setDrawingTool = useTerminal((s) => s.setDrawingTool)
   const addTab = useTerminal((s) => s.addTab)
+  // ETH toggle state lives in the shared store (Task 59) — the row only
+  // READS it for the ON/OFF badge; flipping dispatches tt:toggle-eth which
+  // the chart panel (and the Alt+Shift+E shortcut) apply globally
+  const showExtendedHours = useTerminal((s) => s.showExtendedHours)
 
   const [tfOpen, setTfOpen] = useState(false)
   const [drawOpen, setDrawOpen] = useState(false)
@@ -78,6 +83,8 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
   const paneIdx = Math.min(chartTab.focusedPane ?? 0, panes.length - 1)
   const pane = panes[paneIdx]
   const tfLabel = TIMEFRAMES[pane.timeframe]?.label ?? pane.timeframe
+  // extended hours only make sense for stocks on intraday timeframes
+  const ethApplies = !isCryptoSymbol(pane.symbol) && (TIMEFRAMES[pane.timeframe]?.seconds ?? 86400) < 86400
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col bg-zinc-950">
@@ -277,6 +284,41 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
                 </button>
               </div>
             </div>
+            <button
+              onClick={() => {
+                setMoreOpen(false)
+                window.dispatchEvent(new CustomEvent('tt:open-sr'))
+              }}
+              className="flex h-11 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-200 active:bg-zinc-800"
+            >
+              <AlignHorizontalJustifyCenter className="h-4 w-4 text-emerald-400" aria-hidden />
+              Auto S/R lines
+              <span className="ml-auto flex items-center gap-1 text-[10px] text-zinc-500">
+                <span className="h-2 w-2 rounded-full bg-[#ef4444]" aria-hidden />1D
+                <span className="h-2 w-2 rounded-full bg-[#f59e0b]" aria-hidden />4H
+                <span className="h-2 w-2 rounded-full bg-[#22c55e]" aria-hidden />1H
+              </span>
+            </button>
+            {ethApplies && (
+              <button
+                onClick={() => window.dispatchEvent(new CustomEvent('tt:toggle-eth'))}
+                aria-pressed={showExtendedHours}
+                className="flex h-11 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-200 active:bg-zinc-800"
+              >
+                <Clock className="h-4 w-4 text-emerald-400" aria-hidden />
+                Extended trading hours
+                <span
+                  className={cn(
+                    'ml-auto rounded border px-1.5 py-0.5 text-[10px] font-semibold',
+                    showExtendedHours
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-500',
+                  )}
+                >
+                  {showExtendedHours ? 'ON' : 'OFF'}
+                </span>
+              </button>
+            )}
             <button
               onClick={() => {
                 setMoreOpen(false)

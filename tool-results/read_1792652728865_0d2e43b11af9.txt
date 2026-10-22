@@ -1,0 +1,943 @@
+     1→'use client'
+     2→
+     3→// Central terminal store: session, tabs, panel layout, watchlists, drawings, alerts.
+     4→// Layout auto-saves to server every 5s when dirty (Task 16 #3).
+     5→import { create } from 'zustand'
+     6→import { Timeframe } from '@/lib/market-types'
+     7→import { loadIndicators, saveIndicators, normalizeIndicators, type IndicatorSettings } from '@/lib/indicators'
+     8→
+     9→export interface SessionUser {
+    10→  id: string
+    11→  username: string
+    12→}
+    13→
+    14→export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions' | 'strategy' | 'report'
+    15→
+    16→// Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
+    17→// '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid, '6' 3×2 grid,
+    18→// '8' 4×2 grid.
+    19→export type GridLayoutId = '1' | '2h' | '2v' | '3s' | '4' | '6' | '8'
+    20→export const GRID_LAYOUTS: { id: GridLayoutId; label: string; short: string; panes: number }[] = [
+    21→  { id: '1', label: 'Single chart', short: '1', panes: 1 },
+    22→  { id: '2h', label: '2 charts — side by side', short: '2×1', panes: 2 },
+    23→  { id: '2v', label: '2 charts — stacked', short: '1×2', panes: 2 },
+    24→  { id: '3s', label: '3 charts — one wide + two', short: '3', panes: 3 },
+    25→  { id: '4', label: '4 charts — grid', short: '2×2', panes: 4 },
+    26→  { id: '6', label: '6 charts — grid', short: '3×2', panes: 6 },
+    27→  { id: '8', label: '8 charts — grid', short: '4×2', panes: 8 },
+    28→]
+    29→
+    30→export interface Pane {
+    31→  symbol: string
+    32→  timeframe: Timeframe
+    33→  /** chart rendering style for THIS pane (persisted per pane) */
+    34→  chartType?: 'candles' | 'line'
+    35→}
+    36→
+    37→/** Dragged pane proportions for a grid tab, keyed by splitter group
+    38→ *  ('g' = the single group of 2h/2v, 'v' = outer stack of 3s/4/6/8,
+    39→ *  'h' = 3s bottom row, 'ht'/'hb' = top/bottom rows of 4/6/8).
+    40→ *  Persisted so "chart layout" survives reload / export-import. */
+    41→export type GridSizes = Record<string, number[]>
+    42→
+    43→export interface Tab {
+    44→  id: string
+    45→  type: TabType
+    46→  symbol: string
+    47→  timeframe: Timeframe
+    48→  /** multi-chart grid config; undefined = single chart (legacy layout) */
+    49→  grid?: { layout: GridLayoutId; panes: Pane[]; sizes?: GridSizes }
+    50→  /** which pane drives the Quote/News sidebar (grid mode) */
+    51→  focusedPane?: number
+    52→  /** sync crosshair across panes of this tab */
+    53→  syncCrosshair?: boolean
+    54→}
+    55→
+    56→/** Resolves the pane list for a tab (grid config or the single legacy pane). */
+    57→export function tabPanes(tab: Tab): Pane[] {
+    58→  if (tab.grid?.panes?.length) return tab.grid.panes
+    59→  return [{ symbol: tab.symbol, timeframe: tab.timeframe }]
+    60→}
+    61→
+    62→/** Resolves the active grid layout for a tab ('1' when unset). */
+    63→export function tabLayout(tab: Tab): GridLayoutId {
+    64→  return tab.grid?.layout ?? '1'
+    65→}
+    66→
+    67→/** Pane count for a layout id. */
+    68→export function layoutPaneCount(id: GridLayoutId): number {
+    69→  return GRID_LAYOUTS.find((l) => l.id === id)?.panes ?? 1
+    70→}
+    71→
+    72→export type PanelId = 'watchlist' | 'quote' | 'news'
+    73→
+    74→/** Which y-scale a drawing point lives in: the main price scale or one of
+    75→ *  the indicator strips (volume / RSI / MACD). 'price' = main scale.
+    76→ *  A point drawn inside the VOL strip stores a VOLUME value, inside RSI an
+    77→ *  RSI level (0-100), inside MACD a MACD-line value — so lines stay glued to
+    78→ *  the pane they were drawn on (TradingView-style per-pane coordinates). */
+    79→export type DrawingPane = 'price' | 'vol' | 'rsi' | 'macd'
+    80→
+    81→export interface DrawingPoint {
+    82→  time: number | null
+    83→  price: number
+    84→  /** scale the value belongs to (default 'price') — pointsJson in db */
+    85→  pane?: DrawingPane
+    86→}
+    87→
+    88→/** rect = two-corner rectangle · text = text annotation (content + fontSize
+    89→ *  live in meta: { text, fontSize }, color is the drawing color) */
+    90→export type DrawingKind = 'hline' | 'vline' | 'trend' | 'fib' | 'rect' | 'text'
+    91→
+    92→export interface Drawing {
+    93→  id: string
+    94→  symbol: string
+    95→  kind: DrawingKind
+    96→  points: DrawingPoint[]
+    97→  color: string
+    98→  width: number
+    99→  meta?: Record<string, unknown> | null
+   100→}
+   101→
+   102→export interface Watchlist {
+   103→  id: string
+   104→  name: string
+   105→  color: string
+   106→  sortOrder: number
+   107→  items: string[]
+   108→}
+   109→
+   110→/** Result of adding a symbol to a watchlist (validation-aware). */
+   111→export type AddSymbolResult = { ok: true } | { ok: false; reason: 'invalid' | 'duplicate' | 'unknown' | 'error' }
+   112→
+   113→export interface Alert {
+   114→  id: string
+   115→  symbol: string
+   116→  kind: 'price' | 'rsi' | 'macd' | string
+   117→  /** trigger level: price / RSI level / MACD cross level */
+   118→  price: number
+   119→  direction: 'above' | 'below' | string
+   120→  /** macd conditions: bull_cross | bear_cross | cross_above | cross_below */
+   121→  condition: string | null
+   122→  /** bar timeframe the indicator is computed on (rsi/macd) */
+   123→  timeframe: string
+   124→  /** rsi {period} · macd {fast,slow,signal} · trend {drawingId} */
+   125→  params: { period?: number; fast?: number; slow?: number; signal?: number; drawingId?: string } | null
+   126→  color: string
+   127→  status: 'active' | 'paused' | 'triggered' | string
+   128→  note: string | null
+   129→  triggeredAt: string | null
+   130→  createdAt: string
+   131→}
+   132→
+   133→/** Conditional ("complex") order rule — IF indicator condition THEN buy/sell + TP/SL. */
+   134→export interface Strategy {
+   135→  id: string
+   136→  symbol: string
+   137→  kind: 'rsi' | 'macd' | string
+   138→  /** rsi: cross_above | cross_below · macd: bull_cross | bear_cross | cross_above | cross_below */
+   139→  condition: string
+   140→  level: number
+   141→  timeframe: string
+   142→  params: { period?: number; fast?: number; slow?: number; signal?: number } | null
+   143→  action: 'buy' | 'sell' | string
+   144→  qty: number
+   145→  tpMode: 'none' | 'price' | 'pct' | string
+   146→  tpValue: number | null
+   147→  slMode: 'none' | 'price' | 'pct' | string
+   148→  slValue: number | null
+   149→  repeat: boolean
+   150→  status: 'armed' | 'paused' | 'placing' | 'triggered' | 'failed' | string
+   151→  lastSide: string | null
+   152→  triggeredAt: string | null
+   153→  orderId: string | null
+   154→  fireNote: string | null
+   155→  createdAt: string
+   156→}
+   157→
+   158→export interface LayoutBlob {
+   159→  v: 1
+   160→  tabs: Tab[]
+   161→  activeTabId: string | null
+   162→  sidebar: {
+   163→    panelOrder: PanelId[]
+   164→    panelCollapsed: Record<string, boolean>
+   165→    mainSizes: [number, number]
+   166→  }
+   167→  /** indicator settings ride the layout blob so the 5s AUTOSAVE carries
+   168→   *  them server-side too (export additionally merges fresh localStorage) */
+   169→  indicators?: IndicatorSettings
+   170→  /** chart toolbar: drawings visibility eye toggle (Task 52.1) */
+   171→  showDrawings?: boolean
+   172→  /** Positions tab: flex weights of the Positions / Pending / History panels
+   173→   *  (user-draggable splitters, Task 52.2) — rides export/import */
+   174→  positionsPanelSizes?: [number, number, number]
+   175→  /** Trade ticket position: absolute left/top px inside the chart container
+   176→   *  (draggable header, Task 54.3) — null = default anchor (right-2 top-12) */
+   177→  ticketPos?: { x: number; y: number } | null
+   178→}
+   179→
+   180→export const DRAW_COLORS = [
+   181→  '#22c55e', '#ef4444', '#f59e0b', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5',
+   182→]
+   183→
+   184→interface TerminalState {
+   185→  // session
+   186→  user: SessionUser | null
+   187→  hydrated: boolean
+   188→  setUser: (u: SessionUser | null) => void
+   189→  setHydrated: (v: boolean) => void
+   190→
+   191→  // tabs
+   192→  tabs: Tab[]
+   193→  activeTabId: string
+   194→  addTab: (type: TabType) => void
+   195→  closeTab: (id: string) => void
+   196→  setActiveTab: (id: string) => void
+   197→  /** drag-and-drop reorder: move a tab to a target index (clamped) */
+   198→  moveTab: (dragId: string, toIndex: number) => void
+   199→  setTabSymbol: (tabId: string, symbol: string) => void
+   200→  setTabTimeframe: (tabId: string, tf: Timeframe) => void
+   201→  selectSymbol: (symbol: string) => void
+   202→
+   203→  // multi-chart grid (per chart tab)
+   204→  setGridLayout: (tabId: string, layout: GridLayoutId) => void
+   205→  setPaneSymbol: (tabId: string, paneIdx: number, symbol: string) => void
+   206→  setPaneTimeframe: (tabId: string, paneIdx: number, tf: Timeframe) => void
+   207→  setPaneChartType: (tabId: string, paneIdx: number, t: 'candles' | 'line') => void
+   208→  /** persist dragged pane proportions of a grid splitter group */
+   209→  setGridSizes: (tabId: string, key: string, sizes: number[]) => void
+   210→  setFocusedPane: (tabId: string, paneIdx: number) => void
+   211→  setSyncCrosshair: (tabId: string, v: boolean) => void
+   212→
+   213→  // right sidebar panel layout (Task 12)
+   214→  panelOrder: PanelId[]
+   215→  panelCollapsed: Record<string, boolean>
+   216→  mainSizes: [number, number]
+   217→  setPanelOrder: (order: PanelId[]) => void
+   218→  togglePanelCollapsed: (id: PanelId) => void
+   219→  setMainSizes: (sizes: [number, number]) => void
+   220→
+   221→  // autosave
+   222→  layoutDirty: boolean
+   223→  markLayoutDirty: () => void
+   224→  markLayoutClean: () => void
+   225→  layoutSnapshot: () => LayoutBlob
+   226→  hydrateFromServer: (data: unknown) => void
+   227→
+   228→  // chart toolbar / positions-tab layout prefs (ride the autosave + export)
+   229→  showDrawings: boolean
+   230→  setShowDrawings: (v: boolean) => void
+   231→  positionsPanelSizes: [number, number, number]
+   232→  setPositionsPanelSizes: (sizes: [number, number, number]) => void
+   233→  /** trade ticket drag position (null = default anchor) */
+   234→  ticketPos: { x: number; y: number } | null
+   235→  setTicketPos: (p: { x: number; y: number } | null) => void
+   236→
+   237→  // watchlists
+   238→  watchlists: Watchlist[]
+   239→  activeWatchlistId: string | null
+   240→  watchlistsLoaded: boolean
+   241→  loadWatchlists: () => Promise<void>
+   242→  setActiveWatchlist: (id: string) => void
+   243→  createWatchlist: (name: string, color: string) => Promise<void>
+   244→  deleteWatchlist: (id: string) => Promise<void>
+   245→  updateWatchlist: (id: string, patch: { name?: string; color?: string; sortOrder?: number }) => Promise<void>
+   246→  moveWatchlist: (id: string, dir: -1 | 1) => Promise<void>
+   247→  addSymbolToWatchlist: (watchlistId: string, symbol: string) => Promise<AddSymbolResult>
+   248→  // group separators: an item starting with '#' ("#Tech") is a section header,
+   249→  // not a symbol — the items array order IS the grouping, so separators ride
+   250→  // the same PATCH endpoint / export format as plain symbols
+   251→  addGroupToWatchlist: (watchlistId: string, name: string) => Promise<{ ok: boolean; reason?: 'invalid' | 'duplicate' | 'error' }>
+   252→  renameWatchlistGroup: (watchlistId: string, oldName: string, newName: string) => Promise<{ ok: boolean; reason?: 'invalid' | 'duplicate' | 'error' }>
+   253→  deleteWatchlistGroup: (watchlistId: string, name: string) => Promise<void>
+   254→  removeSymbolFromWatchlist: (watchlistId: string, symbol: string) => Promise<void>
+   255→  /** drag & drop reorder: move items[from] to index to (clamped), persisted */
+   256→  reorderWatchlistSymbol: (watchlistId: string, from: number, to: number) => Promise<void>
+   257→
+   258→  // drawings
+   259→  drawingsBySymbol: Record<string, Drawing[]>
+   260→  drawingTool: DrawingKind | 'cursor'
+   261→  setDrawingTool: (t: DrawingKind | 'cursor') => void
+   262→  loadDrawings: (symbol: string) => Promise<void>
+   263→  addDrawingLocal: (d: Drawing) => void
+   264→  patchDrawingLocal: (id: string, symbol: string, patch: Partial<Drawing>) => void
+   265→  removeDrawingLocal: (id: string, symbol: string) => void
+   266→
+   267→  // alerts
+   268→  alerts: Alert[]
+   269→  alertsLoaded: boolean
+   270→  loadAlerts: () => Promise<void>
+   271→  addAlertLocal: (a: Alert) => void
+   272→  patchAlertLocal: (id: string, patch: Partial<Alert>) => void
+   273→  removeAlertLocal: (id: string) => void
+   274→
+   275→  // strategy bot (conditional orders)
+   276→  strategies: Strategy[]
+   277→  strategiesLoaded: boolean
+   278→  loadStrategies: () => Promise<void>
+   279→  addStrategyLocal: (s: Strategy) => void
+   280→  patchStrategyLocal: (id: string, patch: Partial<Strategy>) => void
+   281→  removeStrategyLocal: (id: string) => void
+   282→}
+   283→
+   284→const DEFAULT_TAB: Omit<Tab, 'id'> = { type: 'chart', symbol: 'AAPL', timeframe: '1D' }
+   285→
+   286→let idCounter = 0
+   287→function uid(prefix: string): string {
+   288→  idCounter += 1
+   289→  return `${prefix}-${Date.now().toString(36)}-${idCounter}`
+   290→}
+   291→
+   292→const DEFAULT_LAYOUT: LayoutBlob = {
+   293→  v: 1,
+   294→  tabs: [],
+   295→  activeTabId: null,
+   296→  sidebar: { panelOrder: ['watchlist', 'quote', 'news'], panelCollapsed: {}, mainSizes: [72, 28] },
+   297→  showDrawings: true,
+   298→  positionsPanelSizes: [5, 3, 3],
+   299→}
+   300→
+   301→export const useTerminal = create<TerminalState>((set, get) => ({
+   302→  user: null,
+   303→  hydrated: false,
+   304→  setUser: (u) => set({ user: u }),
+   305→  setHydrated: (v) => set({ hydrated: v }),
+   306→
+   307→  tabs: [{ id: uid('tab'), ...DEFAULT_TAB }],
+   308→  activeTabId: '',
+   309→
+   310→  addTab: (type) => {
+   311→    const t: Tab =
+   312→      type === 'chart'
+   313→        ? { id: uid('tab'), type, symbol: get().tabs.find((x) => x.id === get().activeTabId)?.symbol || 'AAPL', timeframe: get().tabs.find((x) => x.id === get().activeTabId)?.timeframe || '1D' }
+   314→        : { id: uid('tab'), type, symbol: 'AAPL', timeframe: '1D' }
+   315→    set((s) => ({ tabs: [...s.tabs, t], activeTabId: t.id, layoutDirty: true }))
+   316→  },
+   317→
+   318→  closeTab: (id) => {
+   319→    const { tabs, activeTabId } = get()
+   320→    if (tabs.length <= 1) return
+   321→    const idx = tabs.findIndex((t) => t.id === id)
+   322→    const remaining = tabs.filter((t) => t.id !== id)
+   323→    const nextActive = activeTabId === id ? remaining[Math.max(0, idx - 1)].id : activeTabId
+   324→    set({ tabs: remaining, activeTabId: nextActive, layoutDirty: true })
+   325→  },
+   326→
+   327→  setActiveTab: (id) => set({ activeTabId: id, layoutDirty: true }),
+   328→
+   329→  moveTab: (dragId, toIndex) =>
+   330→    set((s) => {
+   331→      const from = s.tabs.findIndex((t) => t.id === dragId)
+   332→      if (from < 0) return {}
+   333→      // remove first, then clamp the insertion point into the shortened array
+   334→      const next = s.tabs.filter((t) => t.id !== dragId)
+   335→      const idx = Math.max(0, Math.min(toIndex, next.length))
+   336→      next.splice(idx, 0, s.tabs[from])
+   337→      if (next.every((t, i) => t.id === s.tabs[i].id)) return {} // no-op order
+   338→      return { tabs: next, layoutDirty: true }
+   339→    }),
+   340→
+   341→  setTabSymbol: (tabId, symbol) =>
+   342→    set((s) => ({
+   343→      tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, symbol } : t)),
+   344→      layoutDirty: true,
+   345→    })),
+   346→
+   347→  setTabTimeframe: (tabId, tf) =>
+   348→    set((s) => ({
+   349→      tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, timeframe: tf } : t)),
+   350→      layoutDirty: true,
+   351→    })),
+   352→
+   353→  // ---------- multi-chart grid ----------
+   354→  setGridLayout: (tabId, layout) =>
+   355→    set((s) => ({
+   356→      tabs: s.tabs.map((t) => {
+   357→        if (t.id !== tabId || t.type !== 'chart') return t
+   358→        const panes = tabPanes(t)
+   359→        const count = layoutPaneCount(layout)
+   360→        const next = [...panes]
+   361→        while (next.length < count) next.push({ ...panes[0] })
+   362→        next.length = count
+   363→        if (layout === '1') {
+   364→          // single pane mirrors the legacy tab fields so other panels keep working
+   365→          return { ...t, symbol: next[0].symbol, timeframe: next[0].timeframe, grid: { layout, panes: next } }
+   366→        }
+   367→        // new arrangement → start from the default proportions (stale size
+   368→        // keys from the previous arrangement would fight the new groups)
+   369→        return { ...t, grid: { layout, panes: next } }
+   370→      }),
+   371→      layoutDirty: true,
+   372→    })),
+   373→
+   374→  setPaneSymbol: (tabId, paneIdx, symbol) =>
+   375→    set((s) => ({
+   376→      tabs: s.tabs.map((t) => {
+   377→        if (t.id !== tabId) return t
+   378→        const panes = tabPanes(t)
+   379→        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+   380→        if (panes[i].symbol === symbol) return t
+   381→        const next = panes.map((p, j) => (j === i ? { ...p, symbol } : p))
+   382→        // legacy single-chart mode keeps tab fields in sync
+   383→        if (!t.grid || t.grid.layout === '1') return { ...t, symbol, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+   384→        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+   385→      }),
+   386→      layoutDirty: true,
+   387→    })),
+   388→
+   389→  setPaneTimeframe: (tabId, paneIdx, tf) =>
+   390→    set((s) => ({
+   391→      tabs: s.tabs.map((t) => {
+   392→        if (t.id !== tabId) return t
+   393→        const panes = tabPanes(t)
+   394→        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+   395→        if (panes[i].timeframe === tf) return t
+   396→        const next = panes.map((p, j) => (j === i ? { ...p, timeframe: tf } : p))
+   397→        if (!t.grid || t.grid.layout === '1') return { ...t, timeframe: tf, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+   398→        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+   399→      }),
+   400→      layoutDirty: true,
+   401→    })),
+   402→
+   403→  setPaneChartType: (tabId, paneIdx, chartType) =>
+   404→    set((s) => ({
+   405→      tabs: s.tabs.map((t) => {
+   406→        if (t.id !== tabId) return t
+   407→        const panes = tabPanes(t)
+   408→        const i = Math.max(0, Math.min(paneIdx, panes.length - 1))
+   409→        if (panes[i].chartType === chartType) return t
+   410→        const next = panes.map((p, j) => (j === i ? { ...p, chartType } : p))
+   411→        if (!t.grid || t.grid.layout === '1') return { ...t, grid: { layout: t.grid?.layout ?? '1', panes: next } }
+   412→        return { ...t, grid: { layout: t.grid.layout, panes: next } }
+   413→      }),
+   414→      layoutDirty: true,
+   415→    })),
+   416→
+   417→  setGridSizes: (tabId, key, sizes) =>
+   418→    set((s) => ({
+   419→      tabs: s.tabs.map((t) => {
+   420→        if (t.id !== tabId || t.type !== 'chart') return t
+   421→        const clean = sizes.slice(0, 8).map((n) => (Number.isFinite(n) ? Math.min(97, Math.max(3, Math.round(n * 10) / 10)) : 50))
+   422→        if (clean.length < 2) return t
+   423→        const prev = t.grid?.sizes?.[key]
+   424→        if (prev && prev.length === clean.length && prev.every((v, i) => Math.abs(v - clean[i]) < 0.05)) return t
+   425→        return {
+   426→          ...t,
+   427→          grid: { layout: t.grid?.layout ?? '1', panes: tabPanes(t), sizes: { ...(t.grid?.sizes ?? {}), [key]: clean } },
+   428→        }
+   429→      }),
+   430→      layoutDirty: true,
+   431→    })),
+   432→
+   433→  setFocusedPane: (tabId, paneIdx) =>
+   434→    set((s) => ({
+   435→      tabs: s.tabs.map((t) => (t.id === tabId && t.focusedPane !== paneIdx ? { ...t, focusedPane: paneIdx } : t)),
+   436→      layoutDirty: true,
+   437→    })),
+   438→
+   439→  setSyncCrosshair: (tabId, v) =>
+   440→    set((s) => ({
+   441→      tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, syncCrosshair: v } : t)),
+   442→      layoutDirty: true,
+   443→    })),
+   444→
+   445→  selectSymbol: (symbol) => {
+   446→    // Task 56: let the mobile shell know a symbol was picked from a full-screen
+   447→    // tool (heat-map tile, calendar row, …) so it can switch to the chart view.
+   448→    // Desktop has no listener — harmless CustomEvent.
+   449→    if (typeof window !== 'undefined') {
+   450→      window.dispatchEvent(new CustomEvent('tt:symbol-picked', { detail: symbol }))
+   451→    }
+   452→    const { activeTabId, tabs } = get()
+   453→    const active = tabs.find((t) => t.id === activeTabId)
+   454→    if (active && active.type === 'chart') {
+   455→      // target the focused pane so multi-chart grids follow watchlist clicks
+   456→      const panes = tabPanes(active)
+   457→      const idx = Math.min(active.focusedPane ?? 0, panes.length - 1)
+   458→      get().setPaneSymbol(active.id, idx, symbol)
+   459→    } else {
+   460→      const chartTab = tabs.find((t) => t.type === 'chart')
+   461→      if (chartTab) {
+   462→        // Activate the first chart tab and route through setPaneSymbol so the
+   463→        // tab's PANES are updated too — setting only `symbol` left
+   464→        // grid.panes[0] on the old symbol (tab label said XOM, chart showed
+   465→        // AAPL after clicking a heatmap tile from the heatmap tab).
+   466→        get().setPaneSymbol(chartTab.id, chartTab.focusedPane ?? 0, symbol)
+   467→        set((s) => ({ activeTabId: chartTab.id, layoutDirty: true }))
+   468→      }
+   469→    }
+   470→  },
+   471→
+   472→  panelOrder: DEFAULT_LAYOUT.sidebar.panelOrder,
+   473→  panelCollapsed: {},
+   474→  mainSizes: DEFAULT_LAYOUT.sidebar.mainSizes,
+   475→
+   476→  setPanelOrder: (order) => set({ panelOrder: order, layoutDirty: true }),
+   477→
+   478→  togglePanelCollapsed: (id) =>
+   479→    set((s) => ({
+   480→      panelCollapsed: { ...s.panelCollapsed, [id]: !s.panelCollapsed[id] },
+   481→      layoutDirty: true,
+   482→    })),
+   483→
+   484→  setMainSizes: (sizes) => {
+   485→    const prev = get().mainSizes
+   486→    if (Math.abs(prev[0] - sizes[0]) < 0.1 && Math.abs(prev[1] - sizes[1]) < 0.1) return
+   487→    set({ mainSizes: sizes, layoutDirty: true })
+   488→  },
+   489→
+   490→  layoutDirty: false,
+   491→  markLayoutDirty: () => set({ layoutDirty: true }),
+   492→  markLayoutClean: () => set({ layoutDirty: false }),
+   493→
+   494→  showDrawings: true,
+   495→  setShowDrawings: (v) =>
+   496→    set((s) => (s.showDrawings === v ? {} : { showDrawings: v, layoutDirty: true })),
+   497→
+   498→  positionsPanelSizes: [5, 3, 3],
+   499→  setPositionsPanelSizes: (sizes) => {
+   500→    const prev = get().positionsPanelSizes
+   501→    if (sizes.every((w, i) => Math.abs(w - prev[i]) < 0.05)) return
+   502→    set({ positionsPanelSizes: sizes, layoutDirty: true })
+   503→  },
+   504→
+   505→  ticketPos: null,
+   506→  setTicketPos: (p) => set({ ticketPos: p, layoutDirty: true }),
+   507→
+   508→  layoutSnapshot: () => {
+   509→    const s = get()
+   510→    return {
+   511→      v: 1 as const,
+   512→      tabs: s.tabs,
+   513→      activeTabId: s.activeTabId,
+   514→      sidebar: {
+   515→        panelOrder: s.panelOrder,
+   516→        panelCollapsed: s.panelCollapsed,
+   517→        mainSizes: s.mainSizes,
+   518→      },
+   519→      // indicator settings travel WITH the layout so the autosave (and the
+   520→      // beforeunload beacon) carry them server-side, not just the export file
+   521→      indicators: loadIndicators(),
+   522→      showDrawings: s.showDrawings,
+   523→      positionsPanelSizes: s.positionsPanelSizes,
+   524→      ticketPos: s.ticketPos,
+   525→    }
+   526→  },
+   527→
+   528→  hydrateFromServer: (data) => {
+   529→    if (!data || typeof data !== 'object') return
+   530→    const blob = data as Partial<LayoutBlob>
+   531→    if (!blob.tabs || !Array.isArray(blob.tabs) || blob.tabs.length === 0) return
+   532→    const VALID_TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M']
+   533→    const VALID_LAYOUTS: GridLayoutId[] = ['1', '2h', '2v', '3s', '4', '6', '8']
+   534→    const VALID_SIZE_KEYS = ['g', 'v', 'h', 'ht', 'hb']
+   535→    const sizes = (raw: unknown): GridSizes | undefined => {
+   536→      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+   537→      const out: GridSizes = {}
+   538→      for (const [k, arr] of Object.entries(raw as Record<string, unknown>)) {
+   539→        if (!VALID_SIZE_KEYS.includes(k) || !Array.isArray(arr)) continue
+   540→        const clean = arr
+   541→          .slice(0, 8)
+   542→          .map((n) => (typeof n === 'number' && Number.isFinite(n) ? Math.min(97, Math.max(3, n)) : NaN))
+   543→        if (clean.length >= 2 && clean.every((n) => Number.isFinite(n))) out[k] = clean.map((n) => Math.round(n * 10) / 10)
+   544→      }
+   545→      return Object.keys(out).length ? out : undefined
+   546→    }
+   547→    const tabs = blob.tabs
+   548→      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions', 'strategy', 'report'].includes(t.type))
+   549→      .map((t) => {
+   550→        const base = {
+   551→          id: t.id,
+   552→          type: t.type as TabType,
+   553→          symbol: (t.symbol || 'AAPL').toUpperCase(),
+   554→          timeframe: (VALID_TFS.includes(t.timeframe as string) ? t.timeframe : '1D') as Timeframe,
+   555→        }
+   556→        if (t.type !== 'chart') return { ...base }
+   557→        // restore multi-chart grid (sanitized; legacy blobs get a single pane)
+   558→        const layout: GridLayoutId =
+   559→          t.grid && VALID_LAYOUTS.includes(t.grid.layout) ? t.grid.layout : '1'
+   560→        let panes: Pane[] = Array.isArray(t.grid?.panes)
+   561→          ? t.grid.panes
+   562→              .filter((p) => p && typeof p.symbol === 'string')
+   563→              .map((p) => ({
+   564→                symbol: p.symbol.toUpperCase(),
+   565→                timeframe: (VALID_TFS.includes(p.timeframe as string) ? p.timeframe : '1D') as Timeframe,
+   566→                chartType: p.chartType === 'line' ? 'line' : 'candles',
+   567→              }))
+   568→          : []
+   569→        if (panes.length === 0) panes = [{ symbol: base.symbol, timeframe: base.timeframe }]
+   570→        const count = layoutPaneCount(layout)
+   571→        while (panes.length < count) panes.push({ ...panes[0] })
+   572→        panes.length = count
+   573→        const gridSizes = sizes(t.grid?.sizes)
+   574→        return {
+   575→          ...base,
+   576→          grid: { layout, panes, ...(gridSizes ? { sizes: gridSizes } : {}) },
+   577→          focusedPane: Math.max(0, Math.min(typeof t.focusedPane === 'number' ? t.focusedPane : 0, count - 1)),
+   578→          syncCrosshair: Boolean(t.syncCrosshair),
+   579→        }
+   580→      })
+   581→    if (tabs.length === 0) return
+   582→    // indicator settings persisted server-side (autosave) — apply the stored
+   583→    // copy so they follow the user across browsers/machines like the rest
+   584→    if (blob.indicators && typeof blob.indicators === 'object') {
+   585→      try { saveIndicators(normalizeIndicators(blob.indicators)) } catch { /* private mode */ }
+   586→    }
+   587→    const activeTabId = tabs.some((t) => t.id === blob.activeTabId) ? (blob.activeTabId as string) : tabs[0].id
+   588→    const sb = blob.sidebar
+   589→    const mainSizes: [number, number] =
+   590→      Array.isArray(sb?.mainSizes) && sb.mainSizes.length === 2 ? [sb.mainSizes[0], 100 - sb.mainSizes[0]] : [72, 28]
+   591→    // positions-panel flex weights: three finite weights 0.5..12 (Task 52.2)
+   592→    const rawSizes = blob.positionsPanelSizes
+   593→    const panelSizes: [number, number, number] =
+   594→      Array.isArray(rawSizes) && rawSizes.length === 3 && rawSizes.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0.5 && n <= 12)
+   595→        ? [rawSizes[0], rawSizes[1], rawSizes[2]]
+   596→        : [5, 3, 3]
+   597→    // trade ticket drag position: finite px offsets, clamped into a sane range
+   598→    const rawTicket = blob.ticketPos
+   599→    const ticketPos: { x: number; y: number } | null =
+   600→      rawTicket && typeof rawTicket.x === 'number' && typeof rawTicket.y === 'number' && Number.isFinite(rawTicket.x) && Number.isFinite(rawTicket.y)
+   601→        ? { x: Math.min(8000, Math.max(0, rawTicket.x)), y: Math.min(8000, Math.max(0, rawTicket.y)) }
+   602→        : null
+   603→    set({
+   604→      tabs,
+   605→      activeTabId,
+   606→      panelOrder: sb?.panelOrder?.length === 3 ? sb.panelOrder : DEFAULT_LAYOUT.sidebar.panelOrder,
+   607→      panelCollapsed: sb?.panelCollapsed || {},
+   608→      mainSizes,
+   609→      showDrawings: blob.showDrawings !== false,
+   610→      positionsPanelSizes: panelSizes,
+   611→      ticketPos,
+   612→      layoutDirty: false,
+   613→    })
+   614→  },
+   615→
+   616→  watchlists: [],
+   617→  activeWatchlistId: null,
+   618→  watchlistsLoaded: false,
+   619→
+   620→  loadWatchlists: async () => {
+   621→    try {
+   622→      const res = await fetch('/api/watchlists')
+   623→      if (!res.ok) return
+   624→      const json = await res.json()
+   625→      const lists = (json.lists as Watchlist[]) || []
+   626→      const { activeWatchlistId } = get()
+   627→      set({
+   628→        watchlists: lists,
+   629→        watchlistsLoaded: true,
+   630→        activeWatchlistId: activeWatchlistId && lists.some((l) => l.id === activeWatchlistId) ? activeWatchlistId : lists[0]?.id ?? null,
+   631→      })
+   632→    } catch {
+   633→      /* offline */
+   634→    }
+   635→  },
+   636→
+   637→  setActiveWatchlist: (id) => set({ activeWatchlistId: id }),
+   638→
+   639→  createWatchlist: async (name, color) => {
+   640→    const res = await fetch('/api/watchlists', {
+   641→      method: 'POST',
+   642→      headers: { 'content-type': 'application/json' },
+   643→      body: JSON.stringify({ name, color }),
+   644→    })
+   645→    if (!res.ok) return
+   646→    const json = await res.json()
+   647→    set((s) => ({ watchlists: [...s.watchlists, json.list], activeWatchlistId: json.list.id }))
+   648→  },
+   649→
+   650→  deleteWatchlist: async (id) => {
+   651→    await fetch(`/api/watchlists/${id}`, { method: 'DELETE' })
+   652→    set((s) => {
+   653→      const lists = s.watchlists.filter((l) => l.id !== id)
+   654→      return {
+   655→        watchlists: lists,
+   656→        activeWatchlistId: s.activeWatchlistId === id ? lists[0]?.id ?? null : s.activeWatchlistId,
+   657→      }
+   658→    })
+   659→  },
+   660→
+   661→  updateWatchlist: async (id, patch) => {
+   662→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === id ? { ...l, ...patch } : l)) }))
+   663→    try {
+   664→      const res = await fetch(`/api/watchlists/${id}`, {
+   665→        method: 'PATCH',
+   666→        headers: { 'content-type': 'application/json' },
+   667→        body: JSON.stringify(patch),
+   668→      })
+   669→      if (!res.ok) {
+   670→        // server rejected the patch (e.g. empty name) — resync to source of truth
+   671→        await get().loadWatchlists()
+   672→      }
+   673→    } catch {
+   674→      /* offline — optimistic state stays; next successful action resyncs */
+   675→    }
+   676→  },
+   677→
+   678→  moveWatchlist: async (id, dir) => {
+   679→    const lists = [...get().watchlists]
+   680→    const idx = lists.findIndex((l) => l.id === id)
+   681→    const swap = idx + dir
+   682→    if (idx < 0 || swap < 0 || swap >= lists.length) return
+   683→    ;[lists[idx], lists[swap]] = [lists[swap], lists[idx]]
+   684→    const reordered = lists.map((l, i) => ({ ...l, sortOrder: i }))
+   685→    set({ watchlists: reordered })
+   686→    await Promise.all(
+   687→      reordered.map((l) =>
+   688→        fetch(`/api/watchlists/${l.id}`, {
+   689→          method: 'PATCH',
+   690→          headers: { 'content-type': 'application/json' },
+   691→          body: JSON.stringify({ sortOrder: l.sortOrder }),
+   692→        }),
+   693→      ),
+   694→    )
+   695→  },
+   696→
+   697→  addSymbolToWatchlist: async (watchlistId, symbol) => {
+   698→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   699→    if (!list) return { ok: false, reason: 'error' }
+   700→    const sym = symbol.trim().toUpperCase()
+   701→    // format guard — Alpaca symbols are letters/digits plus . - / : (BRK.B, BTC/USD)
+   702→    if (!sym || !/^[A-Z0-9./:-]{1,15}$/.test(sym)) return { ok: false, reason: 'invalid' }
+   703→    if (list.items.includes(sym)) return { ok: false, reason: 'duplicate' }
+   704→    // existence check against the Alpaca asset universe (crypto majors always allowed)
+   705→    try {
+   706→      const res = await fetch(`/api/market/symbols?q=${encodeURIComponent(sym)}&exact=1`)
+   707→      if (res.ok) {
+   708→        const json = (await res.json()) as { valid?: boolean }
+   709→        if (json.valid !== true) return { ok: false, reason: 'unknown' }
+   710→      }
+   711→      // check endpoint unreachable → allow format-valid symbols (offline tolerance)
+   712→    } catch { /* offline */ }
+   713→    const items = [...list.items, sym].slice(0, 50)
+   714→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   715→    const res = await fetch(`/api/watchlists/${watchlistId}`, {
+   716→      method: 'PATCH',
+   717→      headers: { 'content-type': 'application/json' },
+   718→      body: JSON.stringify({ items }),
+   719→    })
+   720→    return res.ok ? { ok: true } : { ok: false, reason: 'error' }
+   721→  },
+   722→
+   723→  removeSymbolFromWatchlist: async (watchlistId, symbol) => {
+   724→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   725→    if (!list) return
+   726→    const items = list.items.filter((s) => s !== symbol)
+   727→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   728→    await fetch(`/api/watchlists/${watchlistId}`, {
+   729→      method: 'PATCH',
+   730→      headers: { 'content-type': 'application/json' },
+   731→      body: JSON.stringify({ items }),
+   732→    })
+   733→  },
+   734→
+   735→  // drag & drop reorder — the items ARRAY order IS the persisted sort (the
+   736→  // PATCH endpoint stores it verbatim; export/import carries the same array)
+   737→  // `from`/`to` are ORIGINAL-space indices; `to` is an insertion boundary
+   738→  // (drop on a row's top half → its index, bottom half → index+1)
+   739→  reorderWatchlistSymbol: async (watchlistId, from, to) => {
+   740→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   741→    if (!list) return
+   742→    if (from < 0 || from >= list.items.length) return
+   743→    const to2 = Math.max(0, Math.min(list.items.length, to))
+   744→    if (to2 === from || to2 === from + 1) return // same place — no-op
+   745→    const isSep = (s: string) => s.startsWith('#')
+   746→    const items = [...list.items]
+   747→    if (isSep(items[from])) {
+   748→      // dragging a SEPARATOR moves the whole group block (marker + its symbols)
+   749→      let end = from + 1
+   750→      while (end < items.length && !isSep(items[end])) end++
+   751→      const block = items.splice(from, end - from)
+   752→      // map the boundary into the array AFTER the block was extracted, then
+   753→      // apply the same moving-down offset as single-row moves
+   754→      const b = to2 > from ? Math.max(from, to2 - block.length) : to2
+   755→      const ins = Math.max(0, Math.min(items.length, from < to2 ? b - 1 : b))
+   756→      items.splice(ins, 0, ...block)
+   757→    } else {
+   758→      const [sym] = items.splice(from, 1)
+   759→      // moving DOWN: removing the item first shifts the target left by one
+   760→      items.splice(from < to2 ? to2 - 1 : to2, 0, sym)
+   761→    }
+   762→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   763→    try {
+   764→      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+   765→        method: 'PATCH',
+   766→        headers: { 'content-type': 'application/json' },
+   767→        body: JSON.stringify({ items }),
+   768→      })
+   769→      if (!res.ok) await get().loadWatchlists() // resync to source of truth
+   770→    } catch {
+   771→      /* offline — optimistic order stays; next action resyncs */
+   772→    }
+   773→  },
+   774→
+   775→  // ---- group separators ("#Tech", "#Health") ----
+   776→  addGroupToWatchlist: async (watchlistId, name) => {
+   777→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   778→    if (!list) return { ok: false, reason: 'error' }
+   779→    const n = name.trim().replace(/^#+/, '').trim()
+   780→    if (!n || n.length > 24) return { ok: false, reason: 'invalid' }
+   781→    const sep = `#${n}`
+   782→    // a group name must not duplicate another group or collide with a symbol
+   783→    const clash = list.items.some((i) => i.toLowerCase() === sep.toLowerCase() || i.toUpperCase() === n.toUpperCase())
+   784→    if (clash) return { ok: false, reason: 'duplicate' }
+   785→    const items = [...list.items, sep].slice(0, 50)
+   786→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   787→    try {
+   788→      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+   789→        method: 'PATCH',
+   790→        headers: { 'content-type': 'application/json' },
+   791→        body: JSON.stringify({ items }),
+   792→      })
+   793→      if (!res.ok) {
+   794→        await get().loadWatchlists()
+   795→        return { ok: false, reason: 'error' }
+   796→      }
+   797→      return { ok: true }
+   798→    } catch {
+   799→      return { ok: false, reason: 'error' }
+   800→    }
+   801→  },
+   802→
+   803→  renameWatchlistGroup: async (watchlistId, oldName, newName) => {
+   804→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   805→    if (!list) return { ok: false, reason: 'error' }
+   806→    const n = newName.trim().replace(/^#+/, '').trim()
+   807→    if (!n || n.length > 24) return { ok: false, reason: 'invalid' }
+   808→    const sep = `#${n}`
+   809→    const oldSep = `#${oldName}`
+   810→    if (n.toLowerCase() !== oldName.toLowerCase()) {
+   811→      const clash = list.items.some((i) => i !== oldSep && (i.toLowerCase() === sep.toLowerCase() || i.toUpperCase() === n.toUpperCase()))
+   812→      if (clash) return { ok: false, reason: 'duplicate' }
+   813→    }
+   814→    const items = list.items.map((i) => (i.toLowerCase() === oldSep.toLowerCase() ? sep : i))
+   815→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   816→    try {
+   817→      const res = await fetch(`/api/watchlists/${watchlistId}`, {
+   818→        method: 'PATCH',
+   819→        headers: { 'content-type': 'application/json' },
+   820→        body: JSON.stringify({ items }),
+   821→      })
+   822→      if (!res.ok) {
+   823→        await get().loadWatchlists()
+   824→        return { ok: false, reason: 'error' }
+   825→      }
+   826→      return { ok: true }
+   827→    } catch {
+   828→      return { ok: false, reason: 'error' }
+   829→    }
+   830→  },
+   831→
+   832→  // deleting a group keeps its symbols — they become ungrouped (only the
+   833→  // marker row is removed)
+   834→  deleteWatchlistGroup: async (watchlistId, name) => {
+   835→    const list = get().watchlists.find((l) => l.id === watchlistId)
+   836→    if (!list) return
+   837→    const sep = `#${name}`
+   838→    const items = list.items.filter((i) => i.toLowerCase() !== sep.toLowerCase())
+   839→    set((s) => ({ watchlists: s.watchlists.map((l) => (l.id === watchlistId ? { ...l, items } : l)) }))
+   840→    try {
+   841→      await fetch(`/api/watchlists/${watchlistId}`, {
+   842→        method: 'PATCH',
+   843→        headers: { 'content-type': 'application/json' },
+   844→        body: JSON.stringify({ items }),
+   845→      })
+   846→    } catch {
+   847→      /* offline — optimistic removal stays */
+   848→    }
+   849→  },
+   850→
+   851→  drawingsBySymbol: {},
+   852→  drawingTool: 'cursor',
+   853→  setDrawingTool: (t) => set({ drawingTool: t }),
+   854→
+   855→  loadDrawings: async (symbol) => {
+   856→    try {
+   857→      const res = await fetch(`/api/drawings?symbol=${encodeURIComponent(symbol)}`)
+   858→      if (!res.ok) return
+   859→      const json = await res.json()
+   860→      set((s) => {
+   861→        const server = (json.drawings as Drawing[]) || []
+   862→        // The response was computed before the request finished, so it can be
+   863→        // stale: a drawing created WHILE the GET was in flight (optimistic
+   864→        // `tmp-` entry, or the confirmed one after the POST resolved) would be
+   865→        // silently wiped by a blind replace. Keep local-only entries — a
+   866→        // locally deleted drawing is absent from this list already, so
+   867→        // nothing deleted ever resurrects.
+   868→        const serverIds = new Set(server.map((d) => d.id))
+   869→        const localOnly = (s.drawingsBySymbol[symbol] || []).filter((d) => !serverIds.has(d.id))
+   870→        return { drawingsBySymbol: { ...s.drawingsBySymbol, [symbol]: [...server, ...localOnly] } }
+   871→      })
+   872→    } catch {
+   873→      /* offline */
+   874→    }
+   875→  },
+   876→
+   877→  addDrawingLocal: (d) =>
+   878→    set((s) => ({
+   879→      drawingsBySymbol: { ...s.drawingsBySymbol, [d.symbol]: [...(s.drawingsBySymbol[d.symbol] || []), d] },
+   880→    })),
+   881→
+   882→  patchDrawingLocal: (id, symbol, patch) =>
+   883→    set((s) => ({
+   884→      drawingsBySymbol: {
+   885→        ...s.drawingsBySymbol,
+   886→        [symbol]: (s.drawingsBySymbol[symbol] || []).map((d) => (d.id === id ? { ...d, ...patch } : d)),
+   887→      },
+   888→    })),
+   889→
+   890→  removeDrawingLocal: (id, symbol) =>
+   891→    set((s) => ({
+   892→      drawingsBySymbol: {
+   893→        ...s.drawingsBySymbol,
+   894→        [symbol]: (s.drawingsBySymbol[symbol] || []).filter((d) => d.id !== id),
+   895→      },
+   896→    })),
+   897→
+   898→  alerts: [],
+   899→  alertsLoaded: false,
+   900→
+   901→  loadAlerts: async () => {
+   902→    try {
+   903→      const res = await fetch('/api/alerts')
+   904→      if (!res.ok) return
+   905→      const json = await res.json()
+   906→      set({ alerts: (json.alerts as Alert[]) || [], alertsLoaded: true })
+   907→    } catch {
+   908→      /* offline */
+   909→    }
+   910→  },
+   911→
+   912→  addAlertLocal: (a) => set((s) => ({ alerts: [a, ...s.alerts] })),
+   913→  patchAlertLocal: (id, patch) =>
+   914→    set((s) => ({ alerts: s.alerts.map((a) => (a.id === id ? { ...a, ...patch } : a)) })),
+   915→  removeAlertLocal: (id) => set((s) => ({ alerts: s.alerts.filter((a) => a.id !== id) })),
+   916→
+   917→  // ---- strategy bot (conditional orders) ----
+   918→  strategies: [],
+   919→  strategiesLoaded: false,
+   920→
+   921→  loadStrategies: async () => {
+   922→    try {
+   923→      const res = await fetch('/api/strategies')
+   924→      if (!res.ok) return
+   925→      const json = await res.json()
+   926→      set({ strategies: (json.strategies as Strategy[]) || [], strategiesLoaded: true })
+   927→    } catch {
+   928→      /* offline */
+   929→    }
+   930→  },
+   931→
+   932→  addStrategyLocal: (r) => set((s) => ({ strategies: [r, ...s.strategies] })),
+   933→  patchStrategyLocal: (id, patch) =>
+   934→    set((s) => ({ strategies: s.strategies.map((r) => (r.id === id ? { ...r, ...patch } : r)) })),
+   935→  removeStrategyLocal: (id) => set((s) => ({ strategies: s.strategies.filter((r) => r.id !== id) })),
+   936→}))
+   937→
+   938→// helper (non-hook)
+   939→export function activeTabOf() {
+   940→  const { tabs, activeTabId } = useTerminal.getState()
+   941→  return tabs.find((t) => t.id === activeTabId) || tabs[0]
+   942→}
+   943→

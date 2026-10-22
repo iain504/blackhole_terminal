@@ -11,7 +11,7 @@ export interface SessionUser {
   username: string
 }
 
-export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions' | 'strategy' | 'report'
+export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions' | 'strategy' | 'report' | 'algo'
 
 // Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
 // '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid, '6' 3×2 grid,
@@ -169,6 +169,9 @@ export interface LayoutBlob {
   indicators?: IndicatorSettings
   /** chart toolbar: drawings visibility eye toggle (Task 52.1) */
   showDrawings?: boolean
+  /** chart toolbar: extended trading hours (pre/post market bars) toggle —
+   *  stocks on intraday timeframes only (Task 59); default true = show */
+  showExtendedHours?: boolean
   /** Positions tab: flex weights of the Positions / Pending / History panels
    *  (user-draggable splitters, Task 52.2) — rides export/import */
   positionsPanelSizes?: [number, number, number]
@@ -228,6 +231,9 @@ interface TerminalState {
   // chart toolbar / positions-tab layout prefs (ride the autosave + export)
   showDrawings: boolean
   setShowDrawings: (v: boolean) => void
+  /** extended trading hours (ETH) toggle — default ON = show pre/post bars */
+  showExtendedHours: boolean
+  setShowExtendedHours: (v: boolean) => void
   positionsPanelSizes: [number, number, number]
   setPositionsPanelSizes: (sizes: [number, number, number]) => void
   /** trade ticket drag position (null = default anchor) */
@@ -295,6 +301,7 @@ const DEFAULT_LAYOUT: LayoutBlob = {
   activeTabId: null,
   sidebar: { panelOrder: ['watchlist', 'quote', 'news'], panelCollapsed: {}, mainSizes: [72, 28] },
   showDrawings: true,
+  showExtendedHours: true,
   positionsPanelSizes: [5, 3, 3],
 }
 
@@ -495,6 +502,10 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   setShowDrawings: (v) =>
     set((s) => (s.showDrawings === v ? {} : { showDrawings: v, layoutDirty: true })),
 
+  showExtendedHours: true,
+  setShowExtendedHours: (v) =>
+    set((s) => (s.showExtendedHours === v ? {} : { showExtendedHours: v, layoutDirty: true })),
+
   positionsPanelSizes: [5, 3, 3],
   setPositionsPanelSizes: (sizes) => {
     const prev = get().positionsPanelSizes
@@ -520,6 +531,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       // beforeunload beacon) carry them server-side, not just the export file
       indicators: loadIndicators(),
       showDrawings: s.showDrawings,
+      showExtendedHours: s.showExtendedHours,
       positionsPanelSizes: s.positionsPanelSizes,
       ticketPos: s.ticketPos,
     }
@@ -545,7 +557,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       return Object.keys(out).length ? out : undefined
     }
     const tabs = blob.tabs
-      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions', 'strategy', 'report'].includes(t.type))
+      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions', 'strategy', 'report', 'algo'].includes(t.type))
       .map((t) => {
         const base = {
           id: t.id,
@@ -607,6 +619,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       panelCollapsed: sb?.panelCollapsed || {},
       mainSizes,
       showDrawings: blob.showDrawings !== false,
+      showExtendedHours: blob.showExtendedHours !== false,
       positionsPanelSizes: panelSizes,
       ticketPos,
       layoutDirty: false,

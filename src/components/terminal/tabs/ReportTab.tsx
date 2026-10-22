@@ -3,13 +3,16 @@
 // Performance Report tab (Task 55) — a performance dashboard built from the
 // FIFO-matched round-trip trades (/api/trading/history, the same matcher that
 // powers the Positions tab's "Trade history" group):
-//   1. Win / Loss bar chart bucketed per day / week / month (by exit time)
+//   1. Win / Loss bar chart bucketed per day / week / month / weekday /
+//      month-of-year (by exit time; Task 70 added the fixed ET calendar modes)
 //   2. Long vs Short donut (closed trades counted by entry direction)
 //   3. Trades per week (weekly activity bars, zero weeks included)
 //   4. Average hold time (mean + median of the round-trip durations)
 //   5. Profit factor (gross profit ÷ gross loss) — plus win rate & net P&L
-// All aggregation runs client-side in the browser's local time, so the
-// Day/Week/Month toggle is instant and the buckets are timezone-honest.
+// Day/Week/Month aggregation runs client-side in the browser's local time, so
+// the toggle is instant and the buckets are timezone-honest. The Weekday /
+// Month-of-Year modes group ALL trades by the exit's America/New_York calendar
+// day/month — the same ET day logic the rest of the terminal uses.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, XAxis, YAxis } from 'recharts'
 import {
@@ -22,7 +25,7 @@ import { ClosedTrade, fmtHeldDuration } from '@/lib/market-types'
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
-type Gran = 'day' | 'week' | 'month'
+type Gran = 'day' | 'week' | 'month' | 'weekday' | 'monthyear'
 
 interface ModeHistory {
   trades: ClosedTrade[]
@@ -39,6 +42,8 @@ const LOSS_C = '#f43f5e'
 const LONG_C = '#14b8a6'
 const SHORT_C = '#f59e0b'
 const WEEK_C = '#a1a1aa'
+const MANUAL_C = '#a1a1aa'
+const ALGO_C = '#a78bfa'
 
 const DAY = 86_400_000
 const WEEK = 7 * DAY
@@ -58,6 +63,13 @@ function weekStart(d: Date): Date {
 const fmtShort = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short' })
 const fmtMonth = new Intl.DateTimeFormat('en-GB', { month: 'short', year: 'numeric' })
 
+// Weekday / month-of-year buckets use the exit's AMERICA/NEW_YORK calendar
+// day/month (explicit timeZone → deterministic, no browser-TZ drift).
+const etWeekday = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' })
+const etMonth = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', month: 'short' })
+const WDAY_ORDER = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const
+const MOY_ORDER = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
+
 interface Bucket {
   key: string
   label: string
@@ -68,6 +80,14 @@ function bucketOf(exitAt: string, gran: Gran): Bucket | null {
   const d = new Date(exitAt)
   const t = d.getTime()
   if (!Number.isFinite(t)) return null
+  if (gran === 'weekday') {
+    const label = etWeekday.format(d) // 'Mon'..'Sun' in ET
+    return { key: label, label, sort: WDAY_ORDER.indexOf(label as (typeof WDAY_ORDER)[number]) }
+  }
+  if (gran === 'monthyear') {
+    const label = etMonth.format(d) // 'Jan'..'Dec' in ET
+    return { key: label, label, sort: MOY_ORDER.indexOf(label as (typeof MOY_ORDER)[number]) }
+  }
   if (gran === 'month') {
     return {
       key: `${d.getFullYear()}-${pad(d.getMonth() + 1)}`,
@@ -112,6 +132,15 @@ function signedMoney(v: number): string {
 
 const pnlClass = (v: number) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-zinc-100')
 
+/** Section title per bucket mode (day/week/month keep the "per X" wording). */
+const GRAN_TITLE: Record<Gran, string> = {
+  day: 'Win / Loss per day',
+  week: 'Win / Loss per week',
+  month: 'Win / Loss per month',
+  weekday: 'Win / Loss by weekday',
+  monthyear: 'Win / Loss by month of year',
+}
+
 function StatCard({
   icon: Icon, label, value, sub, valueClass,
 }: {
@@ -136,31 +165,38 @@ function StatCard({
 }
 
 function Segmented<T extends string>({
-  options, value, onChange, groupLabel,
+  options, value, onChange, groupLabel, optionMeta,
 }: {
   options: readonly T[]
   value: T
   onChange: (v: T) => void
   groupLabel: string
+  /** optional explicit label + tooltip per option (falls back to the capitalized key) */
+  optionMeta?: Partial<Record<T, { label?: string; title?: string }>>
 }) {
   return (
     <div role="group" aria-label={groupLabel} className="flex overflow-hidden rounded-md border border-zinc-700">
-      {options.map((o) => (
-        <button
-          key={o}
-          type="button"
-          aria-pressed={value === o}
-          onClick={() => onChange(o)}
-          className={cn(
-            'min-h-[26px] px-2.5 py-0.5 text-[11px] font-medium capitalize transition-colors',
-            value === o
-              ? 'bg-emerald-500/15 text-emerald-400'
-              : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200',
-          )}
-        >
-          {o}
-        </button>
-      ))}
+      {options.map((o) => {
+        const meta = optionMeta?.[o]
+        return (
+          <button
+            key={o}
+            type="button"
+            aria-pressed={value === o}
+            title={meta?.title}
+            onClick={() => onChange(o)}
+            className={cn(
+              'min-h-[26px] px-2.5 py-0.5 text-[11px] font-medium transition-colors',
+              meta?.label ? '' : 'capitalize',
+              value === o
+                ? 'bg-emerald-500/15 text-emerald-400'
+                : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200',
+            )}
+          >
+            {meta?.label ?? o}
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -178,6 +214,27 @@ const sideConfig = {
   Long: { label: 'Long' },
   Short: { label: 'Short' },
 } satisfies ChartConfig
+
+const srcConfig = {
+  profit: { label: 'Gross profit' },
+  loss: { label: 'Gross loss' },
+} satisfies ChartConfig
+
+interface SourceAcc {
+  trades: number
+  wins: number
+  losses: number
+  profit: number
+  loss: number
+  net: number
+}
+
+interface StratAcc {
+  trades: number
+  wins: number
+  losses: number
+  net: number
+}
 
 export default function ReportTab() {
   const [mode, setMode] = useState<Mode>('paper')
@@ -281,9 +338,26 @@ export default function ReportTab() {
     }
   }, [trades])
 
-  // ---------- win / loss buckets (day | week | month) ----------
+  // ---------- win / loss buckets (day | week | month | weekday | month of year) ----------
   const wlRows = useMemo<WlRow[]>(() => {
     if (agg.asc.length === 0) return []
+    // Weekday / month-of-year: FIXED calendar buckets over ALL trades —
+    // zero-count buckets stay visible so the shape of the week/year reads true.
+    if (gran === 'weekday' || gran === 'monthyear') {
+      const order: readonly string[] = gran === 'weekday' ? WDAY_ORDER : MOY_ORDER
+      const rows: WlRow[] = order.map((label, i) => ({ key: label, label, sort: i, wins: 0, losses: 0, pnl: 0 }))
+      const byKey = new Map(rows.map((r) => [r.key, r]))
+      for (const t of agg.asc) {
+        const b = bucketOf(t.exitAt, gran)
+        const row = b ? byKey.get(b.key) : undefined
+        if (!row) continue
+        const pnl = Number.isFinite(t.pnl) ? t.pnl : 0
+        row.pnl += pnl
+        if (pnl > 0) row.wins++
+        else if (pnl < 0) row.losses++
+      }
+      return rows
+    }
     const map = new Map<string, WlRow>()
     for (const t of agg.asc) {
       const b = bucketOf(t.exitAt, gran)
@@ -331,6 +405,51 @@ export default function ReportTab() {
     ],
     [agg.longs, agg.shorts],
   )
+
+  // ---------- Manual vs Algo attribution (Task 65) ----------
+  // Each closed trade carries `source` (decoded from the entry order's
+  // client_order_id: `ttr-` = algo run) and, for algo trades, the strategy name.
+  const src = useMemo(() => {
+    const acc: { manual: SourceAcc; algo: SourceAcc } = {
+      manual: { trades: 0, wins: 0, losses: 0, profit: 0, loss: 0, net: 0 },
+      algo: { trades: 0, wins: 0, losses: 0, profit: 0, loss: 0, net: 0 },
+    }
+    const strat = new Map<string, StratAcc>()
+    for (const t of agg.asc) {
+      const pnl = Number.isFinite(t.pnl) ? t.pnl : 0
+      const a = t.source === 'algo' ? acc.algo : acc.manual
+      a.trades++
+      a.net += pnl
+      if (pnl > 0) {
+        a.wins++
+        a.profit += pnl
+      } else if (pnl < 0) {
+        a.losses++
+        a.loss += -pnl
+      }
+      if (t.source === 'algo') {
+        const name = t.strategy || 'Algo'
+        const s = strat.get(name) ?? { trades: 0, wins: 0, losses: 0, net: 0 }
+        s.trades++
+        s.net += pnl
+        if (pnl > 0) s.wins++
+        else if (pnl < 0) s.losses++
+        strat.set(name, s)
+      }
+    }
+    const chart = [
+      // NOTE: no per-entry `fill` — recharts turns data-row fills into implicit
+      // Cells that override the Bar's green/rose; source identity lives on the
+      // X axis + the breakdown panel (MANUAL_C/ALGO_C dots there).
+      { name: 'Manual', profit: Math.round(acc.manual.profit * 100) / 100, loss: Math.round(acc.manual.loss * 100) / 100, net: acc.manual.net, trades: acc.manual.trades },
+      { name: 'Algo', profit: Math.round(acc.algo.profit * 100) / 100, loss: Math.round(acc.algo.loss * 100) / 100, net: acc.algo.net, trades: acc.algo.trades },
+    ]
+    return {
+      acc,
+      chart,
+      strategies: [...strat.entries()].sort((a, b) => b[1].trades - a[1].trades),
+    }
+  }, [agg.asc])
 
   // ---------- render states ----------
   if (!cur.loaded) {
@@ -450,9 +569,18 @@ export default function ReportTab() {
           >
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
-                Win / Loss per {gran}
+                {GRAN_TITLE[gran]}
               </h2>
-              <Segmented options={['day', 'week', 'month'] as const} value={gran} onChange={setGran} groupLabel="Bucket size" />
+              <Segmented
+                options={['day', 'week', 'month', 'weekday', 'monthyear'] as const}
+                value={gran}
+                onChange={setGran}
+                groupLabel="Bucket size"
+                optionMeta={{
+                  weekday: { label: 'Weekday', title: 'All trades grouped by day of week (Mon–Sun, America/New_York)' },
+                  monthyear: { label: 'Month of Year', title: 'All trades grouped by month of year (Jan–Dec, America/New_York)' },
+                }}
+              />
             </div>
             <ChartContainer config={wlConfig} className="h-56 w-full" aria-label={`Win/loss bar chart per ${gran}`}>
               <BarChart data={wlRows} margin={{ top: 8, right: 4, left: -14, bottom: 0 }}>
@@ -478,7 +606,11 @@ export default function ReportTab() {
               </BarChart>
             </ChartContainer>
             <p className="mt-1 text-[11px] text-zinc-500">
-              Buckets by exit time · {gran === 'day' ? 'last 31 active days' : gran === 'week' ? 'last 26 active weeks' : 'last 24 active months'}
+              {gran === 'weekday'
+                ? 'By weekday of exit (America/New_York) · fixed Mon–Sun · zero buckets included · all trades'
+                : gran === 'monthyear'
+                  ? 'By month of exit (America/New_York) · fixed Jan–Dec · zero buckets included · all trades'
+                  : `Buckets by exit time · ${gran === 'day' ? 'last 31 active days' : gran === 'week' ? 'last 26 active weeks' : 'last 24 active months'}`}
             </p>
           </section>
 
@@ -517,6 +649,84 @@ export default function ReportTab() {
                 <span aria-hidden="true" className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: SHORT_C }} />
                 Short {agg.shorts} <span className={cn('tabular-nums', pnlClass(agg.shortPnl))}>({signedMoney(agg.shortPnl)})</span>
               </span>
+            </div>
+          </section>
+
+          <section
+            className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 xl:col-span-2"
+            aria-label="Manual vs algo profit and loss"
+          >
+            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-400">Manual vs Algo — profit / loss</h2>
+            <ChartContainer config={srcConfig} className="h-52 w-full" aria-label="Manual and algo gross profit and loss bar chart">
+              <BarChart data={src.chart} margin={{ top: 8, right: 4, left: -8, bottom: 0 }}>
+                <CartesianGrid vertical={false} stroke="#27272a" />
+                <XAxis
+                  dataKey="name"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={6}
+                  tick={{ fontSize: 11, fill: '#a1a1aa' }}
+                />
+                <YAxis
+                  allowDecimals={false}
+                  tickLine={false}
+                  axisLine={false}
+                  width={44}
+                  tick={{ fontSize: 10, fill: '#71717a' }}
+                  tickFormatter={(v: number) => (Math.abs(v) >= 1000 ? `$${(v / 1000).toFixed(1)}k` : `$${v}`)}
+                />
+                <ChartTooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} content={<ChartTooltipContent />} />
+                <Bar dataKey="profit" fill={WIN_C} radius={[2, 2, 0, 0]} />
+                <Bar dataKey="loss" fill={LOSS_C} radius={[2, 2, 0, 0]} />
+              </BarChart>
+            </ChartContainer>
+            <p className="mt-1 text-[11px] text-zinc-500">
+              Gross profit vs gross loss by placement source · Manual {src.acc.manual.trades} trade{src.acc.manual.trades === 1 ? '' : 's'} ({signedMoney(src.acc.manual.net)}) · Algo {src.acc.algo.trades} trade{src.acc.algo.trades === 1 ? '' : 's'} ({signedMoney(src.acc.algo.net)})
+            </p>
+          </section>
+
+          <section className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-4" aria-label="Trade source breakdown">
+            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-400">Trade source breakdown</h2>
+            <div className="flex flex-col gap-1.5 text-xs">
+              <div className="flex items-center gap-2 rounded-md border border-zinc-800 bg-zinc-950/40 px-2.5 py-2">
+                <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-[2px]" style={{ backgroundColor: MANUAL_C }} />
+                <span className="font-semibold text-zinc-100">Manual</span>
+                <span className="ml-auto tabular-nums text-zinc-400">
+                  {src.acc.manual.trades} trade{src.acc.manual.trades === 1 ? '' : 's'} · {src.acc.manual.wins}W/{src.acc.manual.losses}L
+                </span>
+                <span className={cn('w-20 text-right font-semibold tabular-nums', pnlClass(src.acc.manual.net))}>
+                  {signedMoney(src.acc.manual.net)}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 rounded-md border border-violet-500/25 bg-violet-500/5 px-2.5 py-2">
+                <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-[2px]" style={{ backgroundColor: ALGO_C }} />
+                <span className="font-semibold text-zinc-100">Algo</span>
+                <span className="ml-auto tabular-nums text-zinc-400">
+                  {src.acc.algo.trades} trade{src.acc.algo.trades === 1 ? '' : 's'} · {src.acc.algo.wins}W/{src.acc.algo.losses}L
+                </span>
+                <span className={cn('w-20 text-right font-semibold tabular-nums', pnlClass(src.acc.algo.net))}>
+                  {signedMoney(src.acc.algo.net)}
+                </span>
+              </div>
+              {src.strategies.length > 0 && (
+                <div className="mt-1 border-t border-zinc-800/80 pt-2">
+                  <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-zinc-500">By strategy</div>
+                  {src.strategies.map(([name, s]) => (
+                    <div key={name} className="flex items-center gap-2 px-1 py-1 text-[11px]">
+                      <span className="truncate text-violet-300" title={name}>{name}</span>
+                      <span className="ml-auto tabular-nums text-zinc-500">{s.trades} trade{s.trades === 1 ? '' : 's'} · {s.wins}W/{s.losses}L</span>
+                      <span className={cn('w-20 text-right font-semibold tabular-nums', pnlClass(s.net))}>
+                        {signedMoney(s.net)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {src.acc.algo.trades === 0 && (
+                <p className="mt-1 text-[11px] leading-relaxed text-zinc-600">
+                  No algo trades yet — entries placed by Algo Trading runs are attributed automatically.
+                </p>
+              )}
             </div>
           </section>
 

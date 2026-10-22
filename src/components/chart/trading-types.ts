@@ -10,6 +10,9 @@ export interface ExitInfo {
   qty: string
   side: string
   type: string
+  /** Alpaca order status — 'held' marks the ARMED sibling of a live OCO
+   * family (editable only after it activates when the sibling fills) */
+  status?: string
 }
 
 /** Open (unfilled) entry order + its planned/attached TP/SL, for chart lines. */
@@ -25,6 +28,10 @@ export interface PendingOrderInfo {
   tpPrice: number | null
   slPrice: number | null
   managed: boolean
+  /** placement source: algo entries carry a `ttr-` client_order_id */
+  source: 'manual' | 'algo'
+  /** strategy display name when source === 'algo' */
+  strategy?: string
   createdAt: string | null
 }
 

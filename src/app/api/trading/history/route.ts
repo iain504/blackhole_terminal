@@ -1,12 +1,14 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, resolveTradeMode } from '@/lib/trading'
-import { matchClosedTrades } from '@/lib/trade-history'
+import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
 import { handleError } from '@/lib/api-helpers'
 
 // GET /api/trading/history?mode=paper&limit=100 — realized round-trip trades
 // (FIFO-matched from the broker's filled closed orders) with realized P&L.
-// Powers the Positions tab "Trade history" group.
+// Powers the Positions tab "Trade history" group + the Performance Report.
+// Each trade carries `source: 'manual' | 'algo'` (decoded from the entry
+// order's client_order_id) and, for algo trades, the resolved strategy name.
 export async function GET(req: Request) {
   try {
     const user = await getSessionUser()
@@ -26,7 +28,16 @@ export async function GET(req: Request) {
     }
     const orderList = Array.isArray(r.data) ? r.data : []
     const trades = matchClosedTrades(orderList, limit)
-    return NextResponse.json({ mode, trades, configured: true })
+    // resolve algo run refs → strategy display names via the SHARED resolver
+    // (refs are 8-char id prefixes so `startsWith` is unique in practice)
+    const refs = [...new Set(trades.map((t) => t.runRef).filter((x): x is string => !!x))]
+    const stratNames = await resolveRunStrategyNames(refs)
+    const enriched = trades.map((t) =>
+      t.source === 'algo' && t.runRef
+        ? { ...t, strategy: stratNames.get(t.runRef) ?? 'Algo' }
+        : t,
+    )
+    return NextResponse.json({ mode, trades: enriched, configured: true })
   } catch (e) {
     return handleError(e)
   }

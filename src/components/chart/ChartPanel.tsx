@@ -11,6 +11,8 @@ import {
   IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
 import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS, Alert } from '@/store/terminal'
+import { detectSrLevels, SrBar } from '@/lib/sr'
+import { sessionOf } from '@/lib/sessions'
 import { useShallow } from 'zustand/react/shallow'
 import { TIMEFRAMES, fmtPrice, isCryptoSymbol, Bar, Timeframe } from '@/lib/market-types'
 import {
@@ -23,12 +25,13 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
 import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
-  Briefcase, Sigma, Square, Type,
+  Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -42,6 +45,20 @@ const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 /** Suggested price for a not-yet-created TP/SL (ghost chip default). */
 function ghostDefaultPrice(kind: 'tp' | 'sl', entry: number, long: boolean): number {
   return kind === 'tp' ? entry * (long ? 1.05 : 0.95) : entry * (long ? 0.95 : 1.05)
+}
+
+/** Alpaca-legal trailing-stop range (probed live 2026-10: 0.05 → 422 "trail_percent
+ * must be greater than or equal to 0.1"; 0.1 / 10 / 15 / 20 all accepted). The drag
+ * converts a stop level into a %, so it must land inside this band. */
+const TRAIL_PCT_MIN = 0.1
+const TRAIL_PCT_MAX = 20
+
+/** Dragged stop level → trail % of the reference (live) price, clamped to the
+ * Alpaca-legal band and rounded to the 0.1 step the ghost chip displays. */
+function trailPctFromDrag(level: number, refPx: number): number | null {
+  if (!(refPx > 0) || !Number.isFinite(level)) return null
+  const pct = (Math.abs(level - refPx) / refPx) * 100
+  return Math.round(Math.min(TRAIL_PCT_MAX, Math.max(TRAIL_PCT_MIN, pct)) * 10) / 10
 }
 
 type Hit =
@@ -74,6 +91,9 @@ interface DragState {
   orig: DrawingPoint[]
   origPixels: ({ x: number; y: number } | null)[]
   moved: boolean
+  /** trailing-stop drag: the exit being re-trailed + the LIVE price frozen at
+   * drag start (the trail % is the dragged level's distance from that price) */
+  trail?: { exit: ExitInfo; refPx: number }
 }
 
 const KIND_LABEL: Record<DrawingKind, string> = {
@@ -249,6 +269,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // choice survives reloads and travels with export/import (Task 52.1)
   const showDrawings = useTerminal((s) => s.showDrawings)
   const setShowDrawingsStore = useTerminal((s) => s.setShowDrawings)
+  // extended trading hours (Task 59): show/hide pre-market + after-hours bars
+  // on STOCK intraday charts — persisted in the layout blob like showDrawings
+  const showExtendedHours = useTerminal((s) => s.showExtendedHours)
+  const setShowExtendedHoursStore = useTerminal((s) => s.setShowExtendedHours)
+  // session gate: ETH only means something for stocks on intraday timeframes
+  // (crypto is 24/7; daily+ bars can't be split by session)
+  const sessionGate = !isCryptoSymbol(symbol) && TIMEFRAMES[tf].seconds < 86400
+  const ethShown = sessionGate && showExtendedHours
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const activeColorRef = useRef(activeColor)
   activeColorRef.current = activeColor
@@ -274,6 +302,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // was already open used to be silently ignored ("didn't pop up"). A key
   // change forces a fresh mount with the new prefill.
   const [ticketSeq, setTicketSeq] = useState(0)
+  // ---- Auto S/R (Task 58) — analyzer popover options ----
+  const [srOpen, setSrOpen] = useState(false)
+  const [srDays, setSrDays] = useState(730)
+  const [srMinTouches, setSrMinTouches] = useState(3)
+  const [srTfs, setSrTfs] = useState({ d: true, h4: true, h1: true })
+  const [srReplace, setSrReplace] = useState(true)
+  const [srBusy, setSrBusy] = useState(false)
   const { toast } = useToast()
 
   // trading positions + SL/TP exits for this symbol (polls every 15s)
@@ -281,7 +316,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const posRefresh = posData.refresh
   const posRef = useRef(posData.data)
   posRef.current = posData.data
-  const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null } | null>(null)
+  // live quote ref for the S/R analyzer (side classification uses the price
+  // the user actually sees, not a possibly-lagging intraday feed's last close)
+  const quoteRef = useRef(quote)
+  quoteRef.current = quote
+  const exitDragRef = useRef<{ kind: 'sl' | 'tp'; price: number | null; trailPct?: number | null } | null>(null)
   // pending-order drag (entry / planned TP / planned SL of an unfilled order).
   // `pl` freezes the P/L baseline (entry limit, qty, side) at drag start so the
   // predicted profit/loss chip can be drawn between the line and its entry.
@@ -600,6 +639,53 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     if (!ctx) return
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, w, h)
+
+    // ---- extended-hours shading (Task 59) — TradingView-style translucent
+    // gray bands behind every pre/post-market bar while ETH is shown. Drawn
+    // FIRST so candles, drawings and chrome stay on top of the wash. ----
+    if (ethShown) {
+      const tsShade = chartRef.current?.timeScale()
+      if (tsShade) {
+        try {
+          const half = Math.max(1, (tsShade.options().barSpacing ?? 6) / 2)
+          let paneH = h
+          try {
+            const ps = chartRef.current?.paneSize()
+            if (ps && ps.height > 0) paneH = ps.height
+          } catch { /* keep full height */ }
+          // collect x-intervals of extended-session bars, merging neighbors —
+          // timeToCoordinate is monotonic and returns null only outside the
+          // visible window, so skipping nulls never tears a band apart
+          let curA: number | null = null
+          let curB: number | null = null
+          const bands: { a: number; b: number }[] = []
+          const flush = () => {
+            if (curA != null && curB != null) bands.push({ a: curA, b: curB })
+            curA = null
+            curB = null
+          }
+          for (const b of barsRef.current) {
+            if (sessionOf(b.time) !== 'extended') {
+              flush()
+              continue
+            }
+            const x = tsShade.timeToCoordinate(b.time as UTCTimestamp)
+            if (x == null) continue
+            if (curA != null && curB != null && x - half <= curB + 1.5) curB = x + half
+            else {
+              flush()
+              curA = x - half
+              curB = x + half
+            }
+          }
+          flush()
+          if (bands.length > 0) {
+            ctx.fillStyle = 'rgba(113,113,122,0.13)'
+            for (const band of bands) ctx.fillRect(band.a, 0, band.b - band.a, paneH)
+          }
+        } catch { /* chart disposed mid-pass */ }
+      }
+    }
 
     const st = useTerminal.getState()
     const ds = st.drawingsBySymbol[symbol] || []
@@ -957,16 +1043,23 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         hlinePath(ctx, yD, w)
         ctx.setLineDash([])
         ctx.restore()
-        drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
-        // predicted P/L (user spec): profit for TP / loss for SL, drawn BETWEEN
-        // the dragged line and the position's entry price, sign-colored
-        if (myPos && myPos.avgEntry > 0 && Math.abs(myPos.qty) > 0) {
-          const yEntry = yOf(myPos.avgEntry)
-          if (yEntry != null) {
-            const perUnit = myPos.side === 'short' ? myPos.avgEntry - exDrag.price : exDrag.price - myPos.avgEntry
-            const total = perUnit * Math.abs(myPos.qty)
-            const pct = (perUnit / myPos.avgEntry) * 100
-            drawPlChip(ctx, w, (yD + yEntry) / 2, total, pct)
+        if (exDrag.trailPct != null) {
+          // trailing-stop drag: the ghost chip shows the COMMITTED value (the
+          // trail %) — the ratcheted stop re-anchors to the live price on
+          // commit, so a fixed "new SL <price>" would promise the wrong level
+          drawChip(ctx, w - 122, yD, `SL trail ${exDrag.trailPct.toFixed(1)}%`, '#fb7185', true)
+        } else {
+          drawChip(ctx, w - 122, yD, `new ${exDrag.kind.toUpperCase()} ${fmtPrice(exDrag.price)}`, exDrag.kind === 'sl' ? '#fb7185' : '#4ade80', true)
+          // predicted P/L (user spec): profit for TP / loss for SL, drawn BETWEEN
+          // the dragged line and the position's entry price, sign-colored
+          if (myPos && myPos.avgEntry > 0 && Math.abs(myPos.qty) > 0) {
+            const yEntry = yOf(myPos.avgEntry)
+            if (yEntry != null) {
+              const perUnit = myPos.side === 'short' ? myPos.avgEntry - exDrag.price : exDrag.price - myPos.avgEntry
+              const total = perUnit * Math.abs(myPos.qty)
+              const pct = (perUnit / myPos.avgEntry) * 100
+              drawPlChip(ctx, w, (yD + yEntry) / 2, total, pct)
+            }
           }
         }
       }
@@ -1202,7 +1295,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       ctx.globalAlpha = 0.75
       ctx.setLineDash([5, 4])
       ctx.lineWidth = 1.5
-      if (draft.kind === 'hline' && p1) hlinePath(ctx, p1.y, w)
+      if (draft.kind === 'hline' && p1) {
+        ctx.save()
+        clipToPane(ctx, draft.p1.pane ?? 'price', w)
+        hlinePath(ctx, p1.y, w)
+        ctx.restore()
+      }
       else if (draft.kind === 'vline' && p1) vlinePath(ctx, p1.x, h)
       else if (draft.kind === 'rect' && p1 && p2) {
         ctx.strokeRect(
@@ -1216,7 +1314,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       ctx.restore()
     }
      
-  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt])
+  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt, ethShown])
   // keep the redraw scheduler pointed at the freshest overlay renderer
   // (see the stale-closure note above scheduleRedraw)
   renderOverlayRef.current = renderOverlay
@@ -1227,6 +1325,47 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const y = yOfPane(pt.pane ?? 'price', pt.price)
     if (x == null || y == null) return null
     return { x, y }
+  }
+
+  /** Vertical bounds (px, container space) a pane's horizontal lines may
+   *  occupy. All strips live in ONE lightweight-charts pane: volume / RSI /
+   *  MACD are hidden price scales squeezed into stacked bottom strips
+   *  (stripMargins). priceToCoordinate() extrapolates LINEARLY beyond a
+   *  series' autoscale range, so a price-pane hline whose level is far
+   *  outside the visible zoom used to render INSIDE the vol/RSI/MACD strips
+   *  (Task 60 — auto S/R lines overflowing the sub-panes). Horizontal lines
+   *  are therefore clipped to their own pane region:
+   *  price → [0, first strip top) · vol → [vol.top, next strip) · etc.
+   *  Returns null when the chart geometry is unavailable (no clipping). */
+  function paneYBounds(pane: DrawingPane): { top: number; bottom: number } | null {
+    const strips = indStripsRef.current
+    const chart = chartRef.current
+    if (!strips || !chart) return null
+    let paneH = 0
+    try { paneH = chart.paneSize().height } catch { return null }
+    if (!(paneH > 0)) return null
+    const volTop = strips.vol.top * paneH
+    const rsiTop = strips.rsi ? strips.rsi.top * paneH : Infinity
+    const macdTop = strips.macd ? strips.macd.top * paneH : Infinity
+    const nextTop = Math.min(rsiTop, macdTop)
+    switch (pane) {
+      case 'price': return { top: 0, bottom: volTop }
+      case 'vol': return { top: volTop, bottom: Number.isFinite(nextTop) ? nextTop : paneH }
+      case 'rsi': return { top: rsiTop, bottom: Number.isFinite(macdTop) ? macdTop : paneH }
+      case 'macd': return { top: macdTop, bottom: paneH }
+    }
+  }
+
+  /** Clip a pane's horizontal-line rendering to that pane's region so lines
+   *  whose mapped y falls outside (off-scale prices) never bleed into the
+   *  neighbouring strips. No-op when geometry is unavailable. */
+  function clipToPane(ctx: CanvasRenderingContext2D, pane: DrawingPane, w: number): boolean {
+    const b = paneYBounds(pane)
+    if (!b || b.bottom <= b.top) return false
+    ctx.beginPath()
+    ctx.rect(0, b.top, w, b.bottom - b.top)
+    ctx.clip()
+    return true
   }
 
   function hlinePath(ctx: CanvasRenderingContext2D, y: number, w: number) {
@@ -1267,10 +1406,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const pane = d.points[0]?.pane ?? 'price'
       const y = yOfPane(pane, d.points[0]?.price ?? 0)
       if (y != null) {
+        // Task 60: a level far outside the visible zoom extrapolates into the
+        // vol/RSI/MACD strips — clip the line + price chip + grip to the pane
+        ctx.save()
+        clipToPane(ctx, pane, w)
         hlinePath(ctx, y, w)
         drawChip(ctx, w - 74, y, fmtPaneValue(pane, d.points[0].price), d.color, highlighted)
         // move grip dots at center
         dot(ctx, w / 2, y, d.color, highlighted)
+        ctx.restore()
       }
     } else if (d.kind === 'vline') {
       const x = xOf(d.points[0]?.time ?? null)
@@ -1440,6 +1584,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const y = yOf(a.price)
     if (y == null) return
     ctx.save()
+    // Task 60: alert levels live in the price pane — clip so an off-scale
+    // alert line can't render inside the vol/RSI/MACD strips either
+    clipToPane(ctx, 'price', w)
     ctx.strokeStyle = a.color
     ctx.lineWidth = 1.5
     ctx.setLineDash(a.status === 'paused' ? [2, 5] : [7, 5])
@@ -1525,8 +1672,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const slPrice = myExits.sl.stopPrice ?? myExits.sl.limitPrice!
       const yl = yOf(slPrice)
       if (yl != null && Math.abs(y - yl) < 7 * tolMul) {
-        // trailing stops are hittable too (menu / double-click → trail %);
-        // their drag is a no-op (no fixed price)
+        // trailing stops are hittable too: right-click/dblclick edit the trail
+        // %, and DRAGGING the line adjusts it (stop level → % of live price).
+        // HELD (armed OCO sibling) legs stay hittable so the menu can explain
+        // them — their handlers refuse to edit/drag (see onPointerDown).
         return { type: 'exit', id: myExits.sl.orderId, part: 'sl', origPrice: slPrice, exit: myExits.sl }
       }
     }
@@ -1557,7 +1706,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (d.kind === 'hline') {
           const pane = d.points[0]?.pane ?? 'price'
           const yl = yOfPane(pane, d.points[0]?.price ?? 0)
-          if (yl != null && Math.abs(y - yl) < 7 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
+          // Task 60: a line clipped out of its pane (off-scale level) is
+          // invisible — it must not be hittable inside the vol/RSI strips
+          const b = yl != null ? paneYBounds(pane) : null
+          const visible = !b || (yl! >= b.top && yl! < b.bottom)
+          if (yl != null && visible && Math.abs(y - yl) < 7 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
         } else if (d.kind === 'vline') {
           const xl = xOf(d.points[0]?.time ?? null)
           if (xl != null && Math.abs(x - xl) < 7 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
@@ -1613,9 +1766,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }
       }
     }
+    const priceB = paneYBounds('price')
     for (let i = als.length - 1; i >= 0; i--) {
       const yl = yOf(als[i].price)
-      if (yl != null && Math.abs(y - yl) < 7 * tolMul) return { type: 'alert', id: als[i].id, part: 'whole' }
+      const vis = !priceB || (yl != null && yl >= priceB.top && yl < priceB.bottom)
+      if (yl != null && vis && Math.abs(y - yl) < 7 * tolMul) return { type: 'alert', id: als[i].id, part: 'whole' }
     }
     return null
      
@@ -1662,6 +1817,68 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     removeDrawingLocal(id, symbol)
     await fetch(`/api/drawings/${id}`, { method: 'DELETE' }).catch(() => { /* offline */ })
   }, [symbol, removeDrawingLocal])
+
+  // ---- Auto S/R (Task 58) ----
+  // Delete every auto-generated S/R hline of THIS symbol (meta.auto === 'sr').
+  const removeAutoSr = useCallback(async (): Promise<number> => {
+    const old = (useTerminal.getState().drawingsBySymbol[symbol] || []).filter(
+      (d) => d.kind === 'hline' && (d.meta as { auto?: unknown } | null)?.auto === 'sr',
+    )
+    await Promise.all(old.map((d) => deleteDrawing(d.id)))
+    return old.length
+  }, [symbol, deleteDrawing])
+
+  // Fetch history per selected timeframe, detect levels with >= N touches and
+  // draw each one as a normal (draggable/alarm-able) hline colored by TF:
+  // 1D red · 4H yellow · 1H green (Task 58).
+  const runAutoSr = useCallback(async () => {
+    setSrBusy(true)
+    try {
+      if (srReplace) {
+        const n = await removeAutoSr()
+        if (n > 0) void n // replaced silently — the toast below reports the fresh lines
+      }
+      const tfs: { key: Timeframe; on: boolean; color: string; tol: number; label: string }[] = [
+        { key: '1D', on: srTfs.d, color: '#ef4444', tol: 0.012, label: '1D' },
+        { key: '4h', on: srTfs.h4, color: '#f59e0b', tol: 0.009, label: '4H' },
+        { key: '1h', on: srTfs.h1, color: '#22c55e', tol: 0.006, label: '1H' },
+      ]
+      const parts: string[] = []
+      let created = 0
+      for (const cfg of tfs) {
+        if (!cfg.on) continue
+        const res = await fetch(`/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${cfg.key}&days=${Math.round(srDays)}`)
+          .then((r) => r.json()).catch(() => null)
+        const bars: SrBar[] = ((res?.bars ?? []) as Bar[]).map((b) => ({ time: b.time, high: b.high, low: b.low, close: b.close }))
+        if (bars.length === 0) {
+          parts.push(`${cfg.label}: no data`)
+          continue
+        }
+        const levels = detectSrLevels(bars, { minTouches: srMinTouches, maxLevels: 6, tolPct: cfg.tol, refPrice: quoteRef.current?.price })
+        await Promise.all(levels.map((lv) =>
+          createDrawing('hline', [{ time: null, price: lv.price, pane: 'price' }], {
+            color: cfg.color,
+            meta: { auto: 'sr', tf: cfg.label, touches: lv.touches, side: lv.side },
+          }),
+        ))
+        created += levels.length
+        parts.push(`${cfg.label} ${levels.length}`)
+      }
+      if (created === 0) {
+        toast({
+          title: 'No S/R levels found',
+          description: `No level had ≥${srMinTouches} touches in the last ${Math.round(srDays)} days. Try more days or fewer required touches.`,
+        })
+      } else {
+        toast({
+          title: `Drew ${created} S/R line${created === 1 ? '' : 's'}`,
+          description: `${parts.join(' · ')} · ≥${srMinTouches} touches · red 1D / yellow 4H / green 1H`,
+        })
+      }
+    } finally {
+      setSrBusy(false)
+    }
+  }, [symbol, srDays, srMinTouches, srTfs, srReplace, removeAutoSr, createDrawing, toast])
 
   const patchAlert = useCallback(async (id: string, patch: Record<string, unknown>) => {
     patchAlertLocal(id, patch)
@@ -2183,6 +2400,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const st = useTerminal.getState()
         let orig: DrawingPoint[] = []
         let origPixels: ({ x: number; y: number } | null)[] = []
+        let trailDrag: { exit: ExitInfo; refPx: number } | undefined
         if (hit.type === 'drawing') {
           const d = (st.drawingsBySymbol[symbol] || []).find((dd) => dd.id === hit.id)
           if (!d) return
@@ -2201,13 +2419,30 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           orig = [{ time: null, price: a.price }]
           origPixels = [{ x: 0, y: yOf(a.price) ?? y }]
         } else if (hit.type === 'exit') {
-          if (hit.exit.type === 'trailing_stop') {
-            return // no fixed price — dragging a trailing stop is meaningless
+          if (hit.exit.status === 'held') {
+            // ARMED OCO sibling: the stop is Alpaca-managed until the sibling
+            // fills. Editing here would either 422 or (via the cancel+re-place
+            // fallback) tear down the whole family — stay read-only; the
+            // context menu explains (right-click / long-press on the line).
+            return
           }
-          // exit line drag (SL/TP) — preview handled in onMove via exitDragRef
-          orig = [{ time: null, price: hit.origPrice }]
-          origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
-          exitDragRef.current = { kind: hit.part, price: hit.origPrice }
+          if (hit.exit.type === 'trailing_stop') {
+            // TRAILING-STOP DRAG: the line has no fixed price — dragging it
+            // adjusts the trail % (dragged level's distance from the LIVE
+            // price), committed on drop through the same patch path as the
+            // ✏️ Change trail % editor (cancel+re-place with stale-id heal)
+            const pos = posRef.current?.positions.find((pp) => normSym(pp.symbol) === normSym(symbol))
+            const refPx = quoteRef.current?.price ?? pos?.current ?? hit.origPrice
+            orig = [{ time: null, price: hit.origPrice }]
+            origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
+            exitDragRef.current = { kind: hit.part, price: hit.origPrice, trailPct: hit.exit.trailPercent }
+            trailDrag = { exit: hit.exit, refPx }
+          } else {
+            // exit line drag (SL/TP) — preview handled in onMove via exitDragRef
+            orig = [{ time: null, price: hit.origPrice }]
+            origPixels = [{ x: 0, y: yOf(hit.origPrice) ?? y }]
+            exitDragRef.current = { kind: hit.part, price: hit.origPrice }
+          }
         } else if (hit.type === 'pending') {
           // pending entry / planned TP/SL line drag — relative move like exits
           orig = [{ time: null, price: hit.origPrice }]
@@ -2231,7 +2466,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           origPixels = [{ x: 0, y: yOf(def) ?? y }]
           exitDragRef.current = { kind: hit.part, price: def }
         }
-        dragRef.current = { hit, x0: x, y0: y, orig, origPixels, moved: false }
+        dragRef.current = { hit, x0: x, y0: y, orig, origPixels, moved: false, trail: trailDrag }
 
         const onMove = (ev: PointerEvent) => {
           const drag = dragRef.current
@@ -2245,8 +2480,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const oy = drag.origPixels[0]?.y
             if (oy != null) {
               const np = priceAt(oy + dy)
-              exitDragRef.current = { kind: drag.hit.part, price: np }
-              scheduleRedraw()
+              if (drag.trail) {
+                // trailing stop: recompute the trail % from the dragged level
+                // vs the live price (frozen at drag start) — the ghost chip
+                // tracks it; clamped to the Alpaca-legal 0.1..20 band
+                const pct = np != null ? trailPctFromDrag(np, drag.trail.refPx) : null
+                if (np != null) {
+                  exitDragRef.current = { kind: drag.hit.part, price: np, trailPct: pct }
+                  scheduleRedraw()
+                }
+              } else if (np != null) {
+                exitDragRef.current = { kind: drag.hit.part, price: np }
+                scheduleRedraw()
+              }
             }
             return
           }
@@ -2313,7 +2559,35 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const d = exitDragRef.current
             exitDragRef.current = null
             scheduleRedraw()
-            if (drag.moved && d?.price != null) {
+            if (!drag.moved) return
+            if (drag.trail) {
+              // trailing stop drop: commit the dragged trail % through the SAME
+              // path as the ✏️ editor (cancel+re-place + stale-id heal + toast).
+              // Sub-threshold deltas (< 0.05pt) skip the churn entirely.
+              const pct = d?.trailPct
+              const level = d?.price
+              // DIRECTION GUARD: an SL must stay on its own side of the live
+              // price (sell-stop below for a long, buy-stop above for a short).
+              // The % is |level − refPx|, so dragging ACROSS the price would
+              // silently commit a trail on the wrong side — refuse instead.
+              const refPx = drag.trail.refPx
+              const wrongSide =
+                level != null && refPx > 0 &&
+                (drag.trail.exit.side === 'sell' ? level > refPx : level < refPx)
+              if (wrongSide) {
+                toast({
+                  title: 'Trail stop stays on its side',
+                  description:
+                    drag.trail.exit.side === 'sell'
+                      ? 'A long trailing stop must sit below the current price — drag the line down.'
+                      : 'A short trailing stop must sit above the current price — drag the line up.',
+                })
+              } else if (pct != null && Math.abs(pct - (drag.trail.exit.trailPercent ?? 0)) >= 0.05) {
+                void patchExitTrailPct(drag.trail.exit, pct)
+              }
+              return
+            }
+            if (d?.price != null) {
               void patchExitPrice(drag.hit.exit, drag.hit.part, d.price)
             }
             return
@@ -2436,9 +2710,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const a = st.alerts.find((aa) => aa.id === hit.id)
         if (a) setEditValue({ type: 'alert', id: a.id, price: a.price })
       } else if (hit.type === 'exit') {
-        if (hit.exit.type === 'trailing_stop') {
+        if (hit.exit.status === 'held') {
+          // armed OCO sibling — nothing is editable yet; say why instead of
+          // silently doing nothing
+          toast({
+            title: 'Armed OCO leg',
+            description: 'This stop activates automatically when the sibling fills — edit it after it becomes active.',
+          })
+        } else if (hit.exit.type === 'trailing_stop') {
           // trailing stop: edit the trail PERCENT, not a fixed price
-          setEditValue({ type: 'exit', id: hit.id, price: hit.exit.trailPercent ?? 5, pctMode: true, exit: { info: hit.exit, kind: hit.part } })
+          setEditValue({ type: 'exit', id: hit.id, price: Number((hit.exit.trailPercent ?? 5).toFixed(2)), pctMode: true, exit: { info: hit.exit, kind: hit.part } })
         } else {
           setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
         }
@@ -2469,6 +2750,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (dragRef.current) {
+          // abort an in-flight line drag (exit/ghost/pending): nulling the drag
+          // makes the trailing pointerup commit nothing and onMove a no-op
+          dragRef.current = null
+          exitDragRef.current = null
+          pendingDragRef.current = null
+        }
         if (draftRef.current) {
           draftRef.current = null
           scheduleRedraw()
@@ -2497,7 +2785,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       el.removeEventListener('dblclick', onDoubleClick)
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, yOfPane, valueAtPane, paneAt, scheduleRedraw, setDrawingTool])
+  }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, yOfPane, valueAtPane, paneAt, scheduleRedraw, setDrawingTool, toast])
 
   // ---------- chart lifecycle ----------
   useEffect(() => {
@@ -2702,6 +2990,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // Closure flags reset automatically on symbol/timeframe change.
     let loadingOlder = false
     let olderExhausted = false
+    // RTH-only mode (ETH off): the RAW oldest fetched bar can sit days before
+    // the DISPLAYED oldest bar (weekend/holiday gaps are all extended bars) —
+    // pagination pages on this raw cursor so a chunk of pure pre/post bars
+    // can neither stall the scroll-back nor mark the history exhausted.
+    let oldestRawTime: number | null = null
     const seriesDataFor = (clean: Bar[]) =>
       clean.map((b) =>
         chartType === 'candles'
@@ -2724,33 +3017,42 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const bars = barsRef.current
       if (loadingOlder || olderExhausted || cancelled || bars.length === 0) return
       const oldest = bars[0].time
+      // raw cursor: never NEWER than the displayed oldest bar
+      const cursor = oldestRawTime != null ? Math.min(oldestRawTime, oldest) : oldest
       loadingOlder = true
       try {
         const res = await fetch(
-          `/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}&before=${oldest}`,
+          `/api/market/bars?symbol=${encodeURIComponent(symbol)}&tf=${tf}&before=${cursor}`,
         )
         if (!res.ok) throw new Error('older bars fetch failed')
         const json = await res.json()
         if (cancelled) return
         const incoming: Bar[] = (json.bars as Bar[]) || []
-        // only bars STRICTLY older than what is loaded (server windows can overlap)
-        const fresh = incoming.filter((b) => b.time < oldest)
-        if (fresh.length === 0) {
+        // only bars STRICTLY older than the raw cursor (server windows overlap)
+        const rawFresh = incoming.filter((b) => b.time < cursor)
+        if (rawFresh.length === 0) {
           // nothing older exists — stop asking (until symbol/tf changes)
           olderExhausted = true
           return
         }
+        oldestRawTime = Math.min(...rawFresh.map((b) => b.time))
+        // ETH off → only regular-session bars reach the chart (Task 59)
+        const rthOnly = sessionGate && !showExtendedHours
         const map = new Map<number, Bar>()
         for (const b of bars) map.set(b.time, b)
-        for (const b of fresh) map.set(b.time, b)
+        for (const b of rawFresh) {
+          if (rthOnly && sessionOf(b.time) !== 'regular') continue
+          map.set(b.time, b)
+        }
         const merged = [...map.values()].sort((a, b) => a.time - b.time)
         barsRef.current = merged
         // prepending N bars shifts every logical index by N — restore the exact
         // visible window so the view doesn't jump while the user is scrolling
+        // (a chunk that filtered down to zero new bars must NOT shift anything)
         const prev = chart.timeScale().getVisibleLogicalRange()
         applyBars(merged)
         const added = merged.length - bars.length
-        if (prev) {
+        if (prev && added > 0) {
           chart.timeScale().setVisibleLogicalRange({ from: prev.from + added, to: prev.to + added })
         }
         scheduleRedraw()
@@ -2814,13 +3116,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const map = new Map<number, Bar>()
         for (const b of bars) map.set(b.time, b)
         const clean = [...map.values()].sort((a, b) => a.time - b.time)
-        barsRef.current = clean
+        // ETH option (Task 59): RTH-only mode hides pre/post-market bars on
+        // stock intraday charts (crypto is 24/7, daily+ bars have no session)
+        const shown = sessionGate && !showExtendedHours
+          ? clean.filter((b) => sessionOf(b.time) === 'regular')
+          : clean
+        barsRef.current = shown
 
-        applyBars(clean)
+        applyBars(shown)
         // TradingView-like: show recent window, not the whole history
-        if (clean.length > 0) {
-          const from = Math.max(0, clean.length - 150)
-          chart.timeScale().setVisibleLogicalRange({ from, to: clean.length + 6 })
+        if (shown.length > 0) {
+          const from = Math.max(0, shown.length - 150)
+          chart.timeScale().setVisibleLogicalRange({ from, to: shown.length + 6 })
         }
 
         // bars are on screen — dismiss loading NOW and let the [E]/⚡ markers
@@ -2878,6 +3185,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       yOf,
       // scroll-back pagination probes (Task 28 #1)
       bars: () => barsRef.current.length,
+      // ETH (Task 59): gate state + session of the last displayed bar
+      eth: () => ({
+        gate: sessionGate,
+        shown: ethShown,
+        persisted: useTerminal.getState().showExtendedHours,
+        bars: barsRef.current.length,
+        lastBarSession: barsRef.current.length ? sessionOf(barsRef.current[barsRef.current.length - 1].time) : null,
+        extBarCount: barsRef.current.filter((b) => sessionOf(b.time) === 'extended').length,
+      }),
       ind: () => {
         const b = indSeriesRef.current
         if (!b) return null
@@ -2913,6 +3229,35 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange)
       chart.timeScale().unsubscribeVisibleTimeRangeChange(onTimeRangeChange)
       window.removeEventListener('tt:xsync', onExternalSync)
+      // lw-charts 4.2.3 teardown race: destroy() only cancels the paint rAF
+      // that was planned BEFORE remove() — but any invalidation that lands
+      // during/after the teardown (resize events as the chart's DOM leaves
+      // the layout) still schedules a fresh paint, and that late paint reads
+      // the DISPOSED fancy-canvas binding and throws an uncaught "Object is
+      // disposed" (Next dev overlay pops a Runtime Error and the chart looks
+      // broken — seen on every ETH toggle because showExtendedHours
+      // recreates this effect). Neuter the dying instance's paint scheduler
+      // before remove(): nothing post-destroy can schedule a paint anymore,
+      // anything already queued is canceled inside remove(). NB the widget
+      // method alone is NOT enough — ChartModel captured a `.bind()` copy of
+      // it at construction, so the MODEL's stored handler must be replaced
+      // too. Property names are pinned by the exact 4.2.3 dependency.
+      const dying = chart as unknown as {
+        _private__chartWidget?: {
+          _private__invalidateHandler?: unknown
+          _private__model?: { _private__invalidateHandler?: unknown }
+        }
+      }
+      const dyingWidget = dying._private__chartWidget
+      if (dyingWidget) {
+        const dyingModel = dyingWidget._private__model
+        if (dyingModel && typeof dyingModel._private__invalidateHandler === 'function') {
+          dyingModel._private__invalidateHandler = () => {}
+        }
+        if (typeof dyingWidget._private__invalidateHandler === 'function') {
+          dyingWidget._private__invalidateHandler = () => {}
+        }
+      }
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
@@ -2921,7 +3266,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       markersRef.current = { earnings: [], news: [] }
       axisIconsRef.current = []
     }
-  }, [symbol, tf, chartType, settingsVer, scheduleRedraw])
+  }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours])
 
   // ---------- technical indicators: series lifecycle ----------
   // lightweight-charts v4 has no real multi-pane support: SMA/EMA/BB are line
@@ -3021,7 +3366,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const lastB = bars[bars.length - 1]
     const tfSec = TIMEFRAMES[tf].seconds
     const aligned = Math.floor(t.t / tfSec) * tfSec
-    if (aligned > lastB.time) {
+    // ETH off (Task 59): stock intraday charts show the regular session only —
+    // pre/post-market ticks must not roll or mutate RTH bars (quote still moves)
+    if (sessionGate && !showExtendedHours && sessionOf(aligned) !== 'regular') {
+      // skip bar mutation entirely — the header quote update below still runs
+    } else if (aligned > lastB.time) {
       const nb: Bar = {
         time: aligned,
         open: lastB.close,
@@ -3097,6 +3446,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   useEffect(() => {
     const onSearch = () => setSearchOpen(true)
     const onIndicators = () => setIndOpen((v) => !v)
+    const onSr = () => setSrOpen(true)
     const onTicket = () => {
       setTicketPrefill(null)
       setTradeOpen(true)
@@ -3112,17 +3462,26 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         onChartTypeChangeRef.current?.(t)
       }
     }
+    // mobile More sheet "Extended trading hours" row (Task 59)
+    const onToggleEth = () => {
+      const st = useTerminal.getState()
+      st.setShowExtendedHours(!st.showExtendedHours)
+    }
     window.addEventListener('tt:open-symbol-search', onSearch)
     window.addEventListener('tt:toggle-indicators', onIndicators)
+    window.addEventListener('tt:open-sr', onSr)
     window.addEventListener('tt:open-ticket', onTicket)
     window.addEventListener('tt:set-color', onColor)
     window.addEventListener('tt:set-chart-type', onChartType)
+    window.addEventListener('tt:toggle-eth', onToggleEth)
     return () => {
       window.removeEventListener('tt:open-symbol-search', onSearch)
       window.removeEventListener('tt:toggle-indicators', onIndicators)
+      window.removeEventListener('tt:open-sr', onSr)
       window.removeEventListener('tt:open-ticket', onTicket)
       window.removeEventListener('tt:set-color', onColor)
       window.removeEventListener('tt:set-chart-type', onChartType)
+      window.removeEventListener('tt:toggle-eth', onToggleEth)
     }
   }, [])
 
@@ -3147,7 +3506,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             setQuote({ price: q.price, changePct: q.changePct, change: q.change, prevClose: q.prevClose })
             const bars = barsRef.current
             const s = seriesRef.current
-            if (bars.length > 0 && s && json.meta?.demo !== true) {
+            // ETH off (Task 59): don't stamp the live (possibly post-market)
+            // price onto the last REGULAR-session bar in RTH-only mode
+            if (bars.length > 0 && s && json.meta?.demo !== true && !(sessionGate && !showExtendedHours && sessionOf(bars[bars.length - 1].time) !== 'regular')) {
               const lastB = bars[bars.length - 1]
               const close = q.price as number
               const high = Math.max(lastB.high, close)
@@ -3179,7 +3540,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       alive = false
       clearInterval(timer)
     }
-  }, [symbol, chartType, scheduleRedraw])
+  }, [symbol, chartType, scheduleRedraw, sessionGate, showExtendedHours])
 
   const up = (quote?.changePct ?? 0) >= 0
   const indActiveCount = indicatorsActive(ind)
@@ -3362,7 +3723,110 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             </PopoverContent>
           </Popover>
         </div>
+        <div className="pointer-events-auto">
+          <Popover open={srOpen} onOpenChange={setSrOpen}>
+            <PopoverTrigger asChild>
+              <button
+                className={cn(
+                  'flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors',
+                  srOpen
+                    ? 'border-zinc-700 bg-zinc-800 text-emerald-400'
+                    : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-zinc-200',
+                )}
+                aria-label="Auto support resistance"
+                aria-expanded={srOpen}
+                title="Auto support/resistance lines (≥ N touches)"
+              >
+                <AlignHorizontalJustifyCenter className="h-3.5 w-3.5" />
+                S/R
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" sideOffset={6} className="w-[272px] border-zinc-800 bg-zinc-950/95 p-3 text-xs text-zinc-200 backdrop-blur-sm">
+              <div className="flex items-center justify-between px-0.5 pb-1.5">
+                <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Auto S/R lines</span>
+                <AlignHorizontalJustifyCenter className="h-3.5 w-3.5 text-zinc-600" />
+              </div>
+              <div className="flex flex-col gap-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-zinc-400">History</span>
+                  <label className="flex items-center gap-1.5 text-zinc-500">
+                    last
+                    <NumField label="S/R lookback days" value={srDays} min={30} max={3000} onCommit={(v) => setSrDays(Math.min(3000, Math.max(30, Math.round(v))))} />
+                    days
+                  </label>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-zinc-400">Min touches</span>
+                  <NumField label="S/R minimum touches" value={srMinTouches} min={2} max={10} onCommit={(v) => setSrMinTouches(Math.min(10, Math.max(2, Math.round(v))))} />
+                </div>
+                <div className="rounded-md border border-zinc-800/80 bg-zinc-900/40 p-2">
+                  <div className="pb-1 text-[9px] font-semibold uppercase tracking-widest text-zinc-600">Timeframes</div>
+                  {([
+                    { on: 'd' as const, label: '1D', color: '#ef4444' },
+                    { on: 'h4' as const, label: '4H', color: '#f59e0b' },
+                    { on: 'h1' as const, label: '1H', color: '#22c55e' },
+                  ]).map(({ on, label, color }) => (
+                    <label key={on} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 transition-colors hover:bg-zinc-900/70">
+                      <Checkbox
+                        checked={srTfs[on]}
+                        onCheckedChange={(v) => setSrTfs((p) => ({ ...p, [on]: v === true }))}
+                        aria-label={`Include ${label} S/R lines`}
+                        className="h-3.5 w-3.5 border-zinc-700"
+                      />
+                      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} aria-hidden />
+                      <span className="font-medium text-zinc-300">{label}</span>
+                    </label>
+                  ))}
+                </div>
+                <label className="flex items-center justify-between gap-2">
+                  <span className="text-zinc-400">Replace previous auto lines</span>
+                  <Switch checked={srReplace} onCheckedChange={setSrReplace} aria-label="Replace previous auto S/R lines" />
+                </label>
+                <div className="flex items-center gap-2 pt-0.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 flex-1 border-zinc-800 px-2 text-[11px] text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200"
+                    disabled={srBusy}
+                    onClick={() => { void removeAutoSr().then((n) => toast({ title: n > 0 ? `Removed ${n} auto S/R line${n === 1 ? '' : 's'}` : 'No auto S/R lines on this chart' })) }}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Remove
+                  </Button>
+                  <Button
+                    size="sm"
+                    className="h-7 flex-1 gap-1 bg-emerald-500 px-2 text-[11px] font-semibold text-zinc-950 hover:bg-emerald-400"
+                    disabled={srBusy}
+                    onClick={() => void runAutoSr()}
+                  >
+                    {srBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                    {srBusy ? 'Analyzing…' : 'Draw S/R'}
+                  </Button>
+                </div>
+                <div className="text-[9px] leading-4 text-zinc-600">
+                  Levels with ≥ N touches, max 6 per timeframe · red 1D / yellow 4H / green 1H · lines are normal drawings (drag, alarm, delete).
+                </div>
+              </div>
+            </PopoverContent>
+          </Popover>
+        </div>
         <div className="ml-auto flex items-center gap-2 pr-1">
+          {sessionGate && !compact && (
+            <button
+              onClick={() => setShowExtendedHoursStore(!showExtendedHours)}
+              title="Extended trading hours — show pre/post-market bars (Alt+Shift+E)"
+              aria-label="Extended trading hours"
+              aria-pressed={showExtendedHours}
+              className={cn(
+                'pointer-events-auto rounded border px-1.5 py-0.5 text-[10px] font-semibold transition-colors',
+                ethShown
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                  : 'border-zinc-800 bg-zinc-900/80 text-zinc-500 hover:text-zinc-300',
+              )}
+            >
+              ETH
+            </button>
+          )}
           {liveBadge && (
             <span
               title="Streaming live prices (websocket)"
@@ -3532,7 +3996,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           } else if (hit.type === 'exit') {
             if (hit.exit.type === 'trailing_stop') {
               // trailing stop: edit the trail PERCENT, not a fixed price
-              setEditValue({ type: 'exit', id: hit.id, price: hit.exit.trailPercent ?? 5, pctMode: true, exit: { info: hit.exit, kind: hit.part } })
+              setEditValue({ type: 'exit', id: hit.id, price: Number((hit.exit.trailPercent ?? 5).toFixed(2)), pctMode: true, exit: { info: hit.exit, kind: hit.part } })
             } else {
               setEditValue({ type: 'exit', id: hit.id, price: hit.origPrice, exit: { info: hit.exit, kind: hit.part } })
             }
@@ -3750,6 +4214,12 @@ function ContextMenu({
     const lineAlert = isPriceTrend
       ? alerts.find((a) => a.kind === 'trend' && a.params?.drawingId === d.id && a.status !== 'triggered')
       : undefined
+    // auto S/R lines (Task 58) carry their touch count in meta — show it in the
+    // menu header so the user can see WHY the level was drawn
+    const srMeta = (d.meta ?? null) as { auto?: unknown; touches?: unknown } | null
+    const srTag = srMeta?.auto === 'sr' && typeof srMeta.touches === 'number'
+      ? ` · S/R · ${srMeta.touches} touches`
+      : ''
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -3758,7 +4228,7 @@ function ContextMenu({
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-          {KIND_LABEL[d.kind]}
+          {KIND_LABEL[d.kind]}{srTag}
           {d.kind === 'hline' && alertPane !== 'price' ? ` · ${alertPane.toUpperCase()} ${fmtPaneValue(alertPane, alertValue)}` : ''}
         </div>
         {d.kind !== 'vline' && d.kind !== 'text' && alertPane !== 'vol' && !isPriceTrend && (
@@ -3867,6 +4337,7 @@ function ContextMenu({
     const hit = menu.hit
     const label = hit.part === 'sl' ? 'Stop loss' : 'Take profit'
     const isTrail = hit.exit.type === 'trailing_stop'
+    const held = hit.exit.status === 'held'
     return (
       <div
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
@@ -3877,18 +4348,24 @@ function ContextMenu({
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           {isTrail ? `${label} · trail ${hit.exit.trailPercent ?? '?'}%` : `${label} · ${fmtPrice(hit.origPrice)}`}
           {!isTrail && <span className="text-zinc-600"> ({hit.exit.type})</span>}
+          {held && <span className="text-amber-400"> · armed</span>}
         </div>
+        {held && (
+          <div className="mx-2 mb-1 rounded bg-amber-500/10 px-2 py-1.5 text-[10px] leading-snug text-amber-400" role="note">
+            Armed OCO leg — this leg activates automatically when the sibling fills; edit it after it becomes active. Canceling it would tear down the whole OCO family.
+          </div>
+        )}
         {isTrail ? (
-          <MenuItem label="✏️ Change trail %…" onClick={() => { onEditValue(hit); onClose() }} />
+          <MenuItem label="✏️ Change trail %…" disabled={held} onClick={() => { onEditValue(hit); onClose() }} />
         ) : (
-          <MenuItem label="✏️ Change value…" onClick={() => { onEditValue(hit); onClose() }} />
+          <MenuItem label="✏️ Change value…" disabled={held} onClick={() => { onEditValue(hit); onClose() }} />
         )}
         <MenuItem
           label="🧾 Trade ticket…"
           onClick={() => { onOpenTicket(); onClose() }}
         />
         <div className="my-1 h-px bg-zinc-800" />
-        <MenuItem label={`🗑 Cancel ${hit.part.toUpperCase()} order`} danger onClick={() => { onCancelExit(hit.exit.orderId); onClose() }} />
+        <MenuItem label={`🗑 Cancel ${hit.part.toUpperCase()} order`} danger disabled={held} onClick={() => { onCancelExit(hit.exit.orderId); onClose() }} />
       </div>
     )
   }
@@ -4107,12 +4584,14 @@ function ContextMenu({
   return null
 }
 
-function MenuItem({ label, onClick, danger }: { label: React.ReactNode; onClick: () => void; danger?: boolean }) {
+function MenuItem({ label, onClick, danger, disabled }: { label: React.ReactNode; onClick: () => void; danger?: boolean; disabled?: boolean }) {
   return (
     <button
+      disabled={disabled}
       className={cn(
         'flex w-full items-center px-3 py-1.5 text-left text-zinc-200 hover:bg-zinc-800',
         danger && 'text-rose-400 hover:text-rose-300',
+        disabled && 'pointer-events-none opacity-40',
       )}
       onClick={onClick}
       role="menuitem"

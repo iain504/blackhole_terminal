@@ -197,15 +197,18 @@ interface PagedBars {
 
 /**
  * Alpaca PAGINATES bar responses via `next_page_token` even below the limit
- * param (observed caps vary per feed/timeframe). Ignoring the token silently
- * truncates to the OLDEST page — the chart then "ends" days/weeks before now.
- * This helper follows the token until the last page (bounded for safety).
+ * param (observed caps vary per feed/timeframe — IEX stocks ~2k bars/page,
+ * crypto ~1k bars/page). Ignoring the token silently truncates to the OLDEST
+ * page — the chart then "ends" days/weeks before now. This helper follows the
+ * token until the last page. Default cap 60 pages (~60–120k bars) is sized to
+ * cover the deepest legit window (730 days of 5m) without ballooning latency;
+ * truncation is logged so a silently short window can never go unnoticed.
  */
 async function fetchBarsPaged(
   path: string,
   keys: AlpacaKeys,
   symbol: string,
-  maxPages = 15,
+  maxPages = 60,
 ): Promise<{ bars: AlpacaBar[]; status: number; truncated: boolean }> {
   let all: AlpacaBar[] = []
   let token: string | undefined = undefined
@@ -223,12 +226,68 @@ async function fetchBarsPaged(
     token = data.next_page_token
     if (!token) return { bars: all, status, truncated: false }
   }
+  console.warn(`[bars] ${symbol}: pagination hit the ${maxPages}-page cap — window is TRUNCATED (oldest pages kept, newest dropped)`)
   return { bars: all, status, truncated: true }
 }
 
 export interface GetBarsOptions {
   /** unix seconds — fetch bars ENDING just before this instant (scroll-back pagination) */
   before?: number
+  /** fetch this many CALENDAR days of history (bounded by API limits) — used by
+   * the S/R analyzer; default = the timeframe's chart barCount */
+  lookbackDays?: number
+  /** override the pagination page cap (default 60) */
+  maxPages?: number
+}
+
+/**
+ * Deep crypto history via Alpaca v1beta3, fetched BACKWARD in time slices
+ * anchored at `end` so the NEWEST bars are always complete. v1beta3 pages walk
+ * forward from `start` (~1k bars/page, size varies), so one forward walk over a
+ * huge window truncates the most recent bars when the page cap is hit — fatal
+ * for backtests (they'd silently replay data ending months ago). Slices are
+ * sized to fit the page cap; the loop stops when the requested window is
+ * covered, history is exhausted, a slice truncates, or the wall-clock budget
+ * runs out — the result always spans [.. → end] contiguously.
+ */
+async function getAlpacaCryptoBarsDeep(
+  symbol: string,
+  timeframe: Timeframe,
+  keys: AlpacaKeys,
+  lookbackDays: number,
+  endC: Date,
+): Promise<Bar[]> {
+  const tf = TIMEFRAMES[timeframe]
+  const cryptoTf = timeframe === '1W' || timeframe === '1M' ? '1Day' : tf.alpaca
+  // slice ≈ 28k bars max (≈ 27–33 pages @ ~0.9–1.5k/page — inside the 40 cap)
+  const sliceDays = Math.max(7, Math.min(lookbackDays, 180, Math.floor((28_000 * tf.seconds) / 86400)))
+  const deadline = Date.now() + 45_000
+  const slices: Bar[][] = []
+  let endCursorMs = endC.getTime()
+  let coveredMs = 0
+  const lookbackMs = lookbackDays * 86400 * 1000
+  for (let seg = 0; seg < 40; seg++) {
+    const segStartMs = endCursorMs - sliceDays * 86400 * 1000
+    const path =
+      `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}` +
+      `&start=${new Date(segStartMs).toISOString().slice(0, 19) + 'Z'}` +
+      `&end=${new Date(endCursorMs).toISOString().slice(0, 19) + 'Z'}&limit=10000`
+    const { bars: raw, truncated } = await fetchBarsPaged(path, keys, symbol, 40)
+    const mapped = mapBars(raw).filter((b) => b.close > 0)
+    if (mapped.length === 0) break // history exhausted (or slice feed down)
+    slices.push(mapped)
+    coveredMs += endCursorMs - segStartMs
+    if (truncated) break // slice itself hit the page cap — stop honestly
+    if (coveredMs >= lookbackMs) break // requested window covered
+    endCursorMs = mapped[0].time * 1000 - 1 // continue strictly before this slice
+    if (Date.now() > deadline) break // wall-clock budget — newest data stays complete
+  }
+  const seen = new Set<number>()
+  return slices.reverse().flat().filter((b) => {
+    if (seen.has(b.time)) return false
+    seen.add(b.time)
+    return true
+  })
 }
 
 export async function getBars(
@@ -242,8 +301,29 @@ export async function getBars(
   const before = opts?.before
   // Crypto: Binance FIRST — free public klines, no API key, so charts stream
   // real crypto data even before the user logs in / saves their Alpaca keys.
+  // EXCEPTION: deep lookbacks (>9k bars — Binance pages cap at 10k bars ≈ 104d
+  // on 15m) go to Alpaca's crypto API first, which paginates years of history;
+  // Binance stays the fallback for chart-width windows and when Alpaca fails.
+  const tf = TIMEFRAMES[timeframe]
+  // Days of history needed. tf.barCount is a BAR count — a 900-bar 5m chart
+  // is ~3 days, NOT 900. Using barCount as days inflated needCryptoBars to
+  // 259,200 and sent every ordinary crypto chart down the 45s deep-fetch path
+  // the moment Binance rate-limited us (the "ETH chart did not show up" bug).
+  const cryptoLookbackDays = opts?.lookbackDays
+    ?? (timeframe === '1W' || timeframe === '1M'
+      ? Math.ceil((tf.barCount * tf.seconds) / 86400) + 20
+      : Math.ceil((tf.barCount * tf.seconds) / 86400) + 1)
+  const needCryptoBars = Math.ceil((cryptoLookbackDays * 86400) / tf.seconds)
+  if (isCryptoSymbol(symbol) && needCryptoBars > 9000 && !before) {
+    const keys = await getAlpacaKeys(userId)
+    if (keys) {
+      const barsC = await getAlpacaCryptoBarsDeep(symbol, timeframe, keys, cryptoLookbackDays, new Date())
+      if (barsC.length > 0) return { bars: barsC, demo: false, source: 'alpaca' }
+      // Alpaca empty (feed down / rate-limited) -> Binance fallback below.
+    }
+  }
   if (isCryptoSymbol(symbol)) {
-    const bin = await getBinanceBars(symbol, timeframe, before != null ? before * 1000 : undefined)
+    const bin = await getBinanceBars(symbol, timeframe, before != null ? before * 1000 : undefined, opts?.lookbackDays)
     if (bin.length > 0) return { bars: bin, demo: false, source: 'binance' }
     // Binance unreachable -> fall through to Alpaca (if keys) or demo below.
   }
@@ -258,7 +338,6 @@ export async function getBars(
       'no-keys',
     )
   }
-  const tf = TIMEFRAMES[timeframe]
   const end = new Date()
   const endIso = before != null
     ? new Date(before * 1000).toISOString().slice(0, 19) + 'Z'
@@ -267,9 +346,8 @@ export async function getBars(
   if (isCryptoSymbol(symbol)) {
     // Crypto API: v1beta3 — supports up to 1Day; aggregate 1W/1M from daily.
     const cryptoTf = timeframe === '1W' || timeframe === '1M' ? '1Day' : tf.alpaca
-    const lookback = timeframe === '1W' || timeframe === '1M'
-      ? Math.ceil(tf.barCount * 7 * tf.seconds / 86400) + 20
-      : tf.barCount
+    // same days derivation as the deep-path guard above (barCount ≠ days)
+    const lookback = cryptoLookbackDays
     const s = new Date((before ?? Date.now() / 1000) * 1000 - lookback * 86400 * 1000).toISOString().slice(0, 19) + 'Z'
     const path =
       `/v1beta3/crypto/us/bars?symbols=${encodeURIComponent(symbol)}&timeframe=${cryptoTf}&start=${s}&end=${endIso}&limit=10000`
@@ -309,8 +387,12 @@ export async function getBars(
   let rawBars: AlpacaBar[] = []
   let status = 200
   let truncated = false
+  // window width: explicit day-lookback (S/R analyzer) or the chart's barCount
+  const windowMs = opts?.lookbackDays != null
+    ? opts.lookbackDays * 86400 * 1000
+    : tf.barCount * tf.seconds * 1000
   for (const mult of [1, 5, 40]) {
-    const s = new Date((before ?? end.getTime() / 1000) * 1000 - tf.barCount * tf.seconds * 1000 * mult)
+    const s = new Date((before ?? end.getTime() / 1000) * 1000 - windowMs * mult)
     const res = await fetchBarsPaged(makePath(s.toISOString().slice(0, 19) + 'Z'), keys, symbol)
     rawBars = res.bars
     status = res.status

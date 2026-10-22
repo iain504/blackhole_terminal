@@ -2,7 +2,9 @@
 // positions, bracket/OCO exits, order replacement for SL/TP drag updates.
 //
 // Verified against the paper API (2026-10):
-// - Stocks support order_class=bracket (entry + take_profit/stop_loss legs).
+// - Stocks support order_class=bracket (entry + BOTH legs) and oto (entry +
+//   ONE leg — bracket 422s "bracket orders require take_profit.limit_price"
+//   when only stop_loss or only take_profit is sent).
 // - Crypto rejects ALL advanced order classes (order_class=oco -> 40010001
 //   "invalid order type for crypto order"; bracket -> 42210000) AND plain
 //   `stop` type. Sell exits also CANNOT be reserved against a PENDING buy
@@ -219,7 +221,15 @@ export async function getPositions(userId: string, mode: TradeMode) {
   return tradeFetch<TradingPosition[]>(userId, mode, '/v2/positions')
 }
 
-export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: string) {
+/** Statuses that count as "still working" when merging the held-leg recovery
+ *  sweep into the open-order list. 'held' = the armed sibling of a live OCO
+ *  pair — Alpaca keeps exactly ONE leg working (status new/open) and holds
+ *  the other one. */
+const WORKING_ORDER_STATUSES = new Set([
+  'new', 'accepted', 'pending_new', 'accepted_for_bidding', 'pending_replace', 'held', 'done_for_day',
+])
+
+export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: string, heldSymbols?: string[]) {
   const q = symbol ? `&symbols=${encodeURIComponent(symbol)}` : ''
   // Alpaca hides bracket legs from the DEFAULT (nested=false) list: an open
   // bracket parent comes back with legs=null, so pending-entry TP/SL (and any
@@ -227,15 +237,36 @@ export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: st
   // nests the legs under the parent — but a FILLED parent's ACTIVE legs only
   // show in the flat list. Fetch BOTH and merge by id (nested wins when it
   // carries legs) so both shapes are always covered.
-  const [flat, nested] = await Promise.all([
+  // Held exit legs of FILLED bracket families: Alpaca excludes 'held' orders
+  // from status=open UNLESS they nest under an OPEN parent — and the parent of
+  // a filled bracket is itself closed, so the armed stop-loss leg (status
+  // 'held', flat in the list, no parent) is INVISIBLE to a status=open query.
+  // It shows up only in status=all. Recover it with a symbols-scoped sweep
+  // (limited to symbols that actually have positions → small payload) and
+  // merge by id. Without this, an algo/manual stock bracket shows its TP on
+  // the position but the SL column stays empty ("+ SL") even though the stop
+  // is very much live on the broker.
+  const sweepSyms = [...new Set((heldSymbols ?? []).map((s) => s.trim()).filter(Boolean))].slice(0, 30)
+  const [flat, nested, sweep] = await Promise.all([
     tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100${q}`),
     tradeFetch<TradingOrder[]>(userId, mode, `/v2/orders?status=open&limit=100&nested=true${q}`),
+    // (parallel with the open fetches — the sweep list is known upfront)
+    sweepSyms.length > 0
+      ? tradeFetch<TradingOrder[]>(
+          userId,
+          mode,
+          `/v2/orders?status=all&limit=500&direction=desc&symbols=${encodeURIComponent(sweepSyms.join(','))}`,
+        )
+      : Promise.resolve({ data: [] as TradingOrder[], status: 0 }),
   ])
   const flatRows: TradingOrder[] = Array.isArray(flat.data) ? flat.data : []
   const nestedRows: TradingOrder[] = Array.isArray(nested.data) ? nested.data : []
-  if (nestedRows.length === 0) return flat
+  const sweepRows: TradingOrder[] = (Array.isArray(sweep.data) ? sweep.data : []).filter((o) =>
+    WORKING_ORDER_STATUSES.has(o.status),
+  )
+  if (nestedRows.length === 0 && sweepRows.length === 0) return flat
   const byId = new Map<string, TradingOrder>()
-  for (const o of flatRows) byId.set(o.id, o)
+  for (const o of [...flatRows, ...sweepRows]) byId.set(o.id, o)
   for (const o of nestedRows) {
     const prev = byId.get(o.id)
     byId.set(o.id, !prev || (o.legs?.length ?? 0) > 0 ? o : prev)
@@ -262,6 +293,8 @@ export interface PlaceOrderBody {
   stop_loss?: number
   trail_percent?: number
   client_order_id?: string
+  /** short algo source tag (first 8 of the AlgoRun id) — embeds `ttr-` attribution in the client_order_id */
+  sourceRef?: string
 }
 
 /**
@@ -302,17 +335,22 @@ export async function placeOrderWithExits(
   const results: TradingOrder[] = []
 
   if (!isCrypto) {
-    // Stocks: bracket handles entry + legs atomically.
+    // Stocks: bracket handles entry + legs atomically. Alpaca's 'bracket'
+    // class REQUIRES BOTH legs — sending stop_loss alone (or take_profit
+    // alone) 422s with "bracket orders require take_profit.limit_price" and
+    // the WHOLE entry dies (a VWAP/BB algo run configured with only SL 1%
+    // used to submit nothing at all, and manual one-sided tickets failed the
+    // same way). A one-sided exit plan must use 'oto' (one-triggers-other).
     const hasTp = typeof body.take_profit === 'number' && body.take_profit > 0
     const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
     if (hasTp || hasSl) {
-      entry.order_class = 'bracket'
+      entry.order_class = hasTp && hasSl ? 'bracket' : 'oto'
       if (hasTp) entry.take_profit = { limit_price: body.take_profit!.toFixed(2) }
       if (hasSl) entry.stop_loss = { stop_price: body.stop_loss!.toFixed(2) }
       // encode the plan for the chart's pending display: Alpaca materializes
       // bracket LEGS only when the entry activates, so a queued (weekend /
       // pre-market) bracket would otherwise render without its TP/SL lines
-      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
+      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef)
     }
     const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
       method: 'POST',
@@ -329,7 +367,7 @@ export async function placeOrderWithExits(
   if (hasTp || hasSl) {
     // encode the planned exits so the chart can render them while the entry
     // is pending AND the supervisor can attach the legs without extra state
-    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null)
+    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef)
   }
   const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
     method: 'POST',
@@ -384,20 +422,43 @@ function exitLegClientId(entryOrderId: string, kind: 'tp' | 'sl'): string {
   return `tte-${entryOrderId}-${kind}`
 }
 
-/** Encode the OCO/bracket plan (mode + TP/SL prices) into the entry's client_order_id. */
-function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null): string {
-  const rand = Math.random().toString(36).slice(2, 8)
-  return `ttb-${mode[0]}-tp${tp != null && tp > 0 ? encP(tp) : '0'}-sl${sl != null && sl > 0 ? encP(sl) : '0'}-${rand}`
+/**
+ * Encode the OCO/bracket plan (mode + TP/SL prices) into the entry's
+ * client_order_id. Grammar (Alpaca caps client_order_id at 48 chars):
+ *   manual/plan entry:  ttb-<m>-tp<enc>-sl<enc>-<rand6>
+ *   ALGO RUN entry:     ttr-<m>-<runRef>-tp<enc>-sl<enc>-<rand4>
+ * `ttb-` powers the chart's pending TP/SL display and the crypto OCO
+ * supervisor; `ttr-` additionally carries the first 8 chars of the AlgoRun id
+ * so every trade can be attributed Manual vs Algo (which strategy).
+ */
+export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null, runRef?: string | null): string {
+  const tpE = tp != null && tp > 0 ? encP(tp) : '0'
+  const slE = sl != null && sl > 0 ? encP(sl) : '0'
+  if (runRef) {
+    const coid = `ttr-${mode[0]}-${runRef}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 6)}`
+    if (coid.length <= 48) return coid
+    // absurd prices (≥$100k with both legs) can overflow the 48-char cap —
+    // fall back to the manual grammar (attribution lost, order stays valid)
+  }
+  return `ttb-${mode[0]}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 8)}`
 }
 
-/** Decode the plan from a `ttb-…` client_order_id. Returns null when not ours. */
-function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null } | null {
-  const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(clientOrderId || '')
+/**
+ * Decode the plan (and the algo source tag) from a `ttb-…`/`ttr-…`
+ * client_order_id. Returns null when the order was not placed by this
+ * terminal (external orders — Alpaca dashboard, mobile app — carry uuid coids).
+ */
+export function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null; runRef: string | null } | null {
+  const coid = clientOrderId || ''
+  const pos = (s: string | undefined) => {
+    const v = s ? parseInt(s, 10) / 1e6 : 0
+    return v > 0 ? v : null
+  }
+  const algo = /^ttr-[a-z]-([a-z0-9]{6,12})-tp(\d+)-sl(\d+)-/.exec(coid)
+  if (algo) return { tp: pos(algo[2]), sl: pos(algo[3]), runRef: algo[1] }
+  const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(coid)
   if (!m) return null
-  const dec = (s: string | undefined) => (s ? parseInt(s, 10) / 1e6 : 0)
-  const tp = dec(m[1])
-  const sl = dec(m[2])
-  return { tp: tp > 0 ? tp : null, sl: sl > 0 ? sl : null }
+  return { tp: pos(m[1]), sl: pos(m[2]), runRef: null }
 }
 
 /**
@@ -571,7 +632,10 @@ async function runOcoCycle(userId: string, mode: TradeMode): Promise<void> {
     const nowMs = Date.now()
     for (const o of orders) {
       if (isCrypto(o) || o.status !== 'filled') continue
-      if (String(o.order_class || '') !== 'bracket' && o.group_role !== 'entry') continue
+      // one-sided plans are placed as order_class 'oto' (see placeOrderWithExits)
+      // — their filled parents need the same naked-position leg-heal
+      const oc = String(o.order_class || '')
+      if (oc !== 'bracket' && oc !== 'oto' && o.group_role !== 'entry') continue
       const filledAt = o.filled_at ? Date.parse(o.filled_at) : NaN
       if (!Number.isFinite(filledAt) || nowMs - filledAt > HEAL_WINDOW_MS) continue
       const family = orders.filter((x) => x.group_id && x.group_id === o.group_id && x.id !== o.id)
@@ -798,6 +862,35 @@ export interface ReplaceExitResult {
  *   universal fallback (canceling one OCO leg can cascade-cancel the sibling,
  *   which we detect and regenerate).
  */
+/**
+ * True when the order already carries every value the patch asks for (each
+ * compared at the precision the PATCH body was formatted with).
+ *
+ * REQUIRED before trusting Alpaca's 422 "order parameters are not changed":
+ * Alpaca emits that same message when it IGNORES a field — and it refuses
+ * trail_percent changes on a trailing_stop PATCH entirely (verified 2026-10,
+ * Task 67: PATCH {trail_percent:"2.5"} on a trail-2% order → 422 "not
+ * changed"). Without the value check the shortcut swallowed the edit and the
+ * trail never moved; with it, the request falls through to the
+ * cancel+re-place fallback, which re-places the order with the new trail.
+ */
+function patchAlreadyApplied(
+  cur: TradingOrder,
+  patch: { stop_price?: number; limit_price?: number; trail_percent?: number; crypto?: boolean },
+): boolean {
+  const closeTo = (curVal: string | null | undefined, want: number) => {
+    if (curVal == null) return false
+    const c = parseFloat(curVal)
+    if (!Number.isFinite(c)) return false
+    const dp = patch.crypto ? (want >= 1 ? 6 : 8) : want >= 1 ? 2 : 4
+    return Math.abs(c - want) <= Math.pow(10, -dp) / 2 + 1e-9
+  }
+  if (patch.trail_percent != null && !closeTo(cur.trail_percent, patch.trail_percent)) return false
+  if (patch.stop_price != null && !closeTo(cur.stop_price, patch.stop_price)) return false
+  if (patch.limit_price != null && !closeTo(cur.limit_price, patch.limit_price)) return false
+  return true
+}
+
 export async function replaceExitOrderSmart(
   userId: string,
   mode: TradeMode,
@@ -826,10 +919,12 @@ export async function replaceExitOrderSmart(
     // 422 "order parameters are not changed" — the order ALREADY carries the
     // requested value (e.g. a second drag to the same level). That IS the
     // desired end state: return the current order instead of churning a
-    // cancel+re-place cycle.
+    // cancel+re-place cycle. But VERIFY the current values first — Alpaca
+    // fires this message even when it silently ignored the field (trailing
+    // stop % — see patchAlreadyApplied).
     if (r.status === 422 && String(r.error || '').includes('not changed')) {
       const cur = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`)
-      if (cur.data) {
+      if (cur.data && patchAlreadyApplied(cur.data, patch)) {
         return { data: cur.data, status: 200, mode: m, method: 'replace', note: 'Order already at this value' }
       }
     }
@@ -861,7 +956,7 @@ export async function replaceExitOrderSmart(
         if (retry.data && (retry.data as TradingOrder).id) {
           return { data: retry.data, status: 200, mode: errHost, method: 'replace', note: 'Applied to the replacement order' }
         }
-        if (retry.status === 422 && String(retry.error || '').includes('not changed')) {
+        if (retry.status === 422 && String(retry.error || '').includes('not changed') && patchAlreadyApplied(od, patch)) {
           return { data: od, status: 200, mode: errHost, method: 'replace', note: 'Order already at this value' }
         }
         last = retry
@@ -1375,10 +1470,14 @@ export async function replacePendingEntrySmart(
     if (orig.type === 'stop' && sl != null) b.stop_price = fmtPx(sl, crypto)
     if (hadPlan) {
       if (isCrypto) {
-        // re-encode the plan — the supervisor attaches legs from it on fill
-        b.client_order_id = encodePlanClientId(host, tp ?? null, sl ?? null)
+        // re-encode the plan — the supervisor attaches legs from it on fill;
+        // keep the original's algo source tag so edits never de-attribute a run
+        b.client_order_id = encodePlanClientId(host, tp ?? null, sl ?? null, plan?.runRef ?? undefined)
       } else {
-        b.order_class = 'bracket'
+        // mirror placeOrderWithExits: a one-sided plan must rebuild as 'oto' —
+        // a bracket with a single leg 422s ("bracket orders require
+        // take_profit.limit_price") and the re-place dies with no exits
+        b.order_class = tp != null && sl != null ? 'bracket' : 'oto'
         if (tp != null) b.take_profit = { limit_price: fmtPx(tp, false) }
         if (sl != null) b.stop_loss = { stop_price: fmtPx(sl, false) }
       }

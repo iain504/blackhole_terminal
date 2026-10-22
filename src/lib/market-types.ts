@@ -195,6 +195,12 @@ export interface ClosedTrade {
   orderIds: string[]
   /** bracket/OCO family ids involved, when known */
   groupIds: string[]
+  /** placement source, decoded from the entry order's client_order_id ('ttb-' manual vs 'ttr-' algo run) */
+  source?: 'manual' | 'algo'
+  /** when source === 'algo': the first 8 chars of the originating AlgoRun id */
+  runRef?: string | null
+  /** when source === 'algo': resolved strategy display name (server-side join with AlgoRun) */
+  strategy?: string
 }
 
 /** "2d 4h" / "3h 12m" / "5m 20s" — compact held-duration label. */

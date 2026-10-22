@@ -15,6 +15,8 @@ const TIMEOUT_MS = 6000
 let activeBase = BASES[0]
 let activeBaseAt = 0
 const BASE_STICKY_MS = 10 * 60 * 1000
+/** Circuit-breaker gate (see binanceFetch): while set, all Binance calls no-op. */
+let binanceBannedUntil = 0
 
 /** 'BTC/USD' -> 'BTCUSDT' (Binance quotes USD pairs as USDT), 'ETH/EUR' -> 'ETHEUR'. */
 export function toBinanceSymbol(symbol: string): string | null {
@@ -25,6 +27,11 @@ export function toBinanceSymbol(symbol: string): string | null {
 }
 
 async function binanceFetch<T>(path: string): Promise<T | null> {
+  // Circuit breaker: Binance responds 418 (IP auto-ban) / 429 (weight limit)
+  // when we poll too fast — retrying every 15s per open chart KEEPS the ban
+  // alive. After a ban signal, go quiet for 5 minutes (quotes fall back to
+  // Alpaca snapshots; charts fall back to Alpaca bars) instead of hammering.
+  if (Date.now() < binanceBannedUntil) return null
   // start from the sticky base (re-try the primary every 10min) and fall over
   // to the remaining bases on rate-limit / hard errors
   const bases = Date.now() - activeBaseAt < BASE_STICKY_MS
@@ -42,6 +49,7 @@ async function binanceFetch<T>(path: string): Promise<T | null> {
       if (!res.ok) {
         // 4xx that won't change with another host (bad symbol etc.) — stop early
         console.error(`Binance ${base}${path} -> HTTP ${res.status}`)
+        if (res.status === 418 || res.status === 429) binanceBannedUntil = Date.now() + 5 * 60_000
         if (res.status >= 400 && res.status < 500 && res.status !== 418 && res.status !== 429) return null
         continue
       }
@@ -160,36 +168,59 @@ type Kline = [number, string, string, string, string, string, ...unknown[]]
  * instant — powers the chart's scroll-back pagination (older history).
  * Cached 15s keyed by symbol+tf(+endTime) (multi-pane grids poll this a lot).
  */
-export async function getBinanceBars(symbol: string, timeframe: Timeframe, endTimeMs?: number): Promise<Bar[]> {
-  const cacheKey = endTimeMs ? `${symbol}|${timeframe}|b${endTimeMs}` : `${symbol}|${timeframe}`
-  const hit = barsCache.get(cacheKey)
-  if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.data ?? []
-
+export async function getBinanceBars(symbol: string, timeframe: Timeframe, endTimeMs?: number, lookbackDays?: number): Promise<Bar[]> {
   const pair = toBinanceSymbol(symbol)
   if (!pair) return []
   const tf = TIMEFRAMES[timeframe]
-  const q = new URLSearchParams({
-    symbol: pair,
-    interval: KLINE_INTERVAL[timeframe],
-    limit: '1000',
-  })
-  // Binance endTime is inclusive on kline OPEN time; subtract 1ms so the
-  // candle that opens exactly at `endTimeMs` (already on the chart) is excluded.
-  if (endTimeMs != null) q.set('endTime', String(endTimeMs - 1))
-  const data = await binanceFetch<Kline[]>(`/api/v3/klines?${q.toString()}`)
-  if (!data || !Array.isArray(data)) {
+  // lookbackDays (S/R analyzer) pages BACKWARD through klines up to 10k bars;
+  // the default stays a single most-recent 1000-bar page (chart scroll-back)
+  const target = lookbackDays != null
+    ? Math.min(Math.max(1, Math.ceil((lookbackDays * 86400) / tf.seconds)), 10000)
+    : 1000
+  const cacheKey = lookbackDays != null
+    ? `${symbol}|${timeframe}|lb${lookbackDays}`
+    : endTimeMs ? `${symbol}|${timeframe}|b${endTimeMs}` : `${symbol}|${timeframe}`
+  const hit = barsCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.data ?? []
+
+  const mapKlines = (data: Kline[]): Bar[] =>
+    data.map((k) => ({
+      time: Math.floor(k[0] / 1000), // kline open time (ms) -> seconds
+      open: num(k[1] as string),
+      high: num(k[2] as string),
+      low: num(k[3] as string),
+      close: num(k[4] as string),
+      volume: num(k[5] as string),
+    }))
+
+  let acc: Bar[] = []
+  // endTime is inclusive on kline OPEN time — subtract 1ms so the candle that
+  // opens exactly at `end` (already on the chart / previous page) is excluded.
+  let end = endTimeMs != null ? endTimeMs - 1 : undefined
+  const maxPages = lookbackDays != null ? 12 : 1
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams({ symbol: pair, interval: KLINE_INTERVAL[timeframe], limit: '1000' })
+    if (end != null) q.set('endTime', String(end))
+    const data = await binanceFetch<Kline[]>(`/api/v3/klines?${q.toString()}`)
+    if (!data || !Array.isArray(data) || data.length === 0) break
+    const bars = mapKlines(data)
+    acc = [...bars, ...acc] // each page is OLDER — prepend
+    if (acc.length >= target || data.length < 1000) break // enough / history exhausted
+    end = bars[0].time * 1000 // next page ends strictly before the oldest bar
+  }
+  if (acc.length === 0) {
     barsCache.set(cacheKey, { at: Date.now(), data: null })
     return []
   }
-  const bars: Bar[] = data.map((k) => ({
-    time: Math.floor(k[0] / 1000), // kline open time (ms) -> seconds
-    open: num(k[1] as string),
-    high: num(k[2] as string),
-    low: num(k[3] as string),
-    close: num(k[4] as string),
-    volume: num(k[5] as string),
-  }))
-  const clean = bars.filter((b) => b.close > 0)
+  const seen = new Set<number>()
+  const clean = acc
+    .filter((b) => b.close > 0)
+    .filter((b) => {
+      if (seen.has(b.time)) return false
+      seen.add(b.time)
+      return true
+    })
+    .sort((a, b) => a.time - b.time)
   barsCache.set(cacheKey, { at: Date.now(), data: clean })
   // endTime-keyed entries accumulate as the user scrolls back — prune stale ones
   if (barsCache.size > 64) {

@@ -2,18 +2,19 @@
 
 // Positions console tab: account strip (balance, buying power, daily P&L,
 // equity curve Hour..Year, full account details) + every open paper + live
-// position in one table — symbol, market, side/qty, entry price, TP, SL,
-// trailing, P&L — with a per-row close button (market-close via the Alpaca
-// Trading API). Below it: every PENDING (unfilled) entry order with its
-// planned TP/SL — click any price to edit it (same PATCH the chart drags
-// use) — and a cancel action. Missing TP/SL cells offer a [+ TP]/[+ SL]
-// button that attaches the exit to the position (drag-to-price also exists
-// on the chart).
+// position in one table — symbol, market, source, side/qty, entry price,
+// opened, last, TP, SL, trailing, P&L — with a per-row close button (market
+// close via the Alpaca Trading API). Below it: every PENDING (unfilled) entry
+// order with its planned TP/SL — click any price to edit it (same PATCH the
+// chart drags use) — and a cancel action. Missing TP/SL cells offer a
+// [+ TP]/[+ SL] button that attaches the exit to the position (drag-to-price
+// also exists on the chart).
 // Task 52.2: the three panels (Positions / Pending orders / Trade history)
 // are separated by DRAGGABLE splitters — the flex weights persist in the
 // layout blob (autosave + config export/import). Task 52.3: every table's
 // columns sort asc/desc by clicking the header (click again cycles desc →
-// back to the default order).
+// back to the default order). Task 70: positions gained OPENED (oldest
+// still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -30,7 +31,7 @@ type Mode = 'paper' | 'live'
 
 interface ModeData {
   mode: Mode
-  positions: PositionRow[]
+  positions: PositionRowExt[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderInfo[]
   error?: string
@@ -46,9 +47,18 @@ interface HistoryData {
 
 interface PosConsoleRow {
   mode: Mode
-  pos: PositionRow
+  pos: PositionRowExt
   sl?: ExitInfo
   tp?: ExitInfo
+}
+
+/** Position row + open-lot attribution fields (OPENED / SOURCE — served by
+ * /api/trading/positions from the FIFO matcher's oldest open entry lot;
+ * kept as a local extension so the shared trading-types file stays stable). */
+type PositionRowExt = PositionRow & {
+  openedAt?: string | null
+  source?: 'manual' | 'algo'
+  strategy?: string
 }
 
 const MODES: Mode[] = ['paper', 'live']
@@ -79,6 +89,36 @@ function sortRows<T>(arr: T[], sort: SortState, val: (r: T) => string | number |
 
 const numOr = (v: string | number | null | undefined): number =>
   typeof v === 'number' ? v : parseFloat(String(v ?? '')) || 0
+
+/** Compact "21 Oct, 16:39" datetime — same style as the history table's
+ * Closed column; full ISO rides in the cell's title/tooltip. */
+function fmtCompactDT(iso: string | null | undefined): string {
+  const t = iso != null ? new Date(iso).getTime() : NaN
+  if (!Number.isFinite(t)) return '—'
+  return new Date(t).toLocaleString('en-GB', {
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+
+/** Manual vs Algo source badge (Task 65): algo rows show which strategy placed it. */
+function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | undefined; strategy?: string }) {
+  if (source === 'algo') {
+    return (
+      <Badge
+        variant="outline"
+        className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300"
+        title={strategy ? `Placed by the ${strategy} algo run` : 'Placed by an algo run'}
+      >
+        {strategy ? `Algo · ${strategy}` : 'Algo'}
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400" title="Placed manually from the chart / ticket">
+      Manual
+    </Badge>
+  )
+}
 
 export default function PositionsTab() {
   const { toast } = useToast()
@@ -186,7 +226,7 @@ export default function PositionsTab() {
         const errs: string[] | undefined = json.errors
         return {
           mode,
-          positions: (json.positions || []) as PositionRow[],
+          positions: (json.positions || []) as PositionRowExt[],
           exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
           pending: (json.pending || []) as PendingOrderInfo[],
           error: errs?.length ? errs.join(', ') : undefined,
@@ -244,10 +284,12 @@ export default function PositionsTab() {
     switch (posSort?.key) {
       case 'symbol': return r.pos.symbol
       case 'market': return r.mode
+      case 'source': return r.pos.source ?? null
       case 'side': return r.pos.side
       case 'qty': return Math.abs(numOr(r.pos.qty))
       case 'entry': return r.pos.avgEntry
       case 'last': return r.pos.current
+      case 'opened': return r.pos.openedAt ? new Date(r.pos.openedAt).getTime() : null
       case 'tp': return r.tp?.limitPrice ?? null
       case 'sl': return r.sl?.stopPrice ?? r.sl?.limitPrice ?? null
       case 'trailing': return r.sl?.trailPercent ?? null
@@ -267,6 +309,7 @@ export default function PositionsTab() {
       case 'tp': return p.tpPrice ?? null
       case 'sl': return p.slPrice ?? null
       case 'status': return p.status
+      case 'placed': return p.createdAt ? new Date(p.createdAt).getTime() || null : null
       default: return null
     }
   })
@@ -399,15 +442,17 @@ export default function PositionsTab() {
         className="flex min-h-[150px] flex-col overflow-hidden rounded-md border border-zinc-800/80 bg-zinc-900/70"
       >
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
-        <table className="w-full min-w-[900px] border-collapse text-xs">
+        <table className="w-full min-w-[1060px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
             <tr className="border-b border-zinc-800">
               <SortTh label="Symbol" k="symbol" sort={posSort} onSort={setPosSort} />
               <SortTh label="Market" k="market" sort={posSort} onSort={setPosSort} />
+              <SortTh label="Source" k="source" sort={posSort} onSort={setPosSort} />
               <SortTh label="Side" k="side" sort={posSort} onSort={setPosSort} />
               <SortTh label="Qty" k="qty" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="Entry price" k="entry" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="Last" k="last" sort={posSort} onSort={setPosSort} align="right" />
+              <SortTh label="Opened" k="opened" sort={posSort} onSort={setPosSort} />
               <SortTh label="TP" k="tp" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="SL" k="sl" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="Trailing" k="trailing" sort={posSort} onSort={setPosSort} align="right" />
@@ -418,7 +463,7 @@ export default function PositionsTab() {
           <tbody>
             {sortedRows.length === 0 && (
               <tr>
-                <td colSpan={11} className="px-3 py-10 text-center text-zinc-500">
+                <td colSpan={13} className="px-3 py-10 text-center text-zinc-500">
                   {data.paper.loaded && data.live.loaded ? (
                     <>
                       No open positions on paper or live.
@@ -451,12 +496,29 @@ export default function PositionsTab() {
                       {r.mode}
                     </Badge>
                   </td>
+                  <td className="px-3 py-2">
+                    {r.pos.source ? (
+                      <SourceBadge source={r.pos.source} strategy={r.pos.strategy} />
+                    ) : (
+                      <span className="text-zinc-600">—</span>
+                    )}
+                  </td>
                   <td className={cn('px-3 py-2 font-medium', long ? 'text-emerald-400' : 'text-rose-400')}>
                     {long ? 'LONG' : 'SHORT'}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{r.pos.qty}</td>
                   <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.avgEntry)}</td>
                   <td className="px-3 py-2 text-right tabular-nums text-zinc-300">{fmtPrice(r.pos.current)}</td>
+                  <td
+                    className="whitespace-nowrap px-3 py-2 text-zinc-400"
+                    title={r.pos.openedAt ? `Entry fill ${r.pos.openedAt}` : undefined}
+                  >
+                    {r.pos.openedAt ? (
+                      fmtCompactDT(r.pos.openedAt)
+                    ) : (
+                      <span className="text-zinc-600">—</span>
+                    )}
+                  </td>
                   <td className="px-3 py-2 text-right tabular-nums text-emerald-300">
                     {r.tp?.limitPrice != null ? (
                       fmtPrice(r.tp.limitPrice)
@@ -520,11 +582,12 @@ export default function PositionsTab() {
           <span className="ml-auto text-[10px] text-zinc-600">unfilled entries · TP/SL plan shown until filled</span>
         </div>
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
-          <table className="w-full min-w-[820px] border-collapse text-xs">
+          <table className="w-full min-w-[920px] border-collapse text-xs">
             <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
               <tr className="border-b border-zinc-800">
                 <SortTh label="Symbol" k="symbol" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Market" k="market" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Source" k="source" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Side" k="side" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Type" k="type" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Qty" k="qty" sort={pendSort} onSort={setPendSort} align="right" />
@@ -533,13 +596,14 @@ export default function PositionsTab() {
                 <SortTh label="TP" k="tp" sort={pendSort} onSort={setPendSort} align="right" />
                 <SortTh label="SL" k="sl" sort={pendSort} onSort={setPendSort} align="right" />
                 <SortTh label="Status" k="status" sort={pendSort} onSort={setPendSort} />
+                <SortTh label="Placed" k="placed" sort={pendSort} onSort={setPendSort} />
                 <th className="px-3 py-1.5 text-right font-semibold">Action</th>
               </tr>
             </thead>
             <tbody>
               {sortedPending.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
+                  <td colSpan={13} className="px-3 py-6 text-center text-zinc-600">
                     No pending orders.
                   </td>
                 </tr>
@@ -554,6 +618,9 @@ export default function PositionsTab() {
                     >
                       {mode}
                     </Badge>
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <SourceBadge source={p.source} strategy={p.strategy} />
                   </td>
                   <td className={cn('px-3 py-1.5 font-medium', p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
                     {p.side.toUpperCase()}
@@ -578,6 +645,16 @@ export default function PositionsTab() {
                     <PendingPriceCell mode={mode} p={p} field="sl" onSaved={() => void refresh()} />
                   </td>
                   <td className="px-3 py-1.5 text-zinc-400">{p.status}</td>
+                  <td
+                    className="whitespace-nowrap px-3 py-1.5 text-zinc-400"
+                    title={p.createdAt ? `Placed ${p.createdAt}` : undefined}
+                  >
+                    {p.createdAt ? (
+                      fmtCompactDT(p.createdAt)
+                    ) : (
+                      <span className="text-zinc-600">—</span>
+                    )}
+                  </td>
                   <td className="px-3 py-1.5 text-right">
                     <Button
                       size="sm"
@@ -635,6 +712,7 @@ export default function PositionsTab() {
                 <SortTh label="Closed" k="closed" sort={histSort} onSort={setHistSort} />
                 <SortTh label="Symbol" k="symbol" sort={histSort} onSort={setHistSort} />
                 <SortTh label="Market" k="market" sort={histSort} onSort={setHistSort} />
+                <SortTh label="Source" k="source" sort={histSort} onSort={setHistSort} />
                 <SortTh label="Side" k="side" sort={histSort} onSort={setHistSort} />
                 <SortTh label="Qty" k="qty" sort={histSort} onSort={setHistSort} align="right" />
                 <SortTh label="Entry" k="entry" sort={histSort} onSort={setHistSort} align="right" />
@@ -647,7 +725,7 @@ export default function PositionsTab() {
             <tbody>
               {sortedHistory.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="px-3 py-6 text-center text-zinc-600">
+                  <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
                     {!history.paper.loaded && !history.live.loaded ? (
                       <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading trade history…</span>
                     ) : history.paper.configured === false && history.live.configured === false ? (
@@ -675,6 +753,9 @@ export default function PositionsTab() {
                       >
                         {mode}
                       </Badge>
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <SourceBadge source={t.source} strategy={t.strategy} />
                     </td>
                     <td className={cn('px-3 py-1.5 font-medium', t.side === 'long' ? 'text-emerald-400' : 'text-rose-400')}>
                       {t.side === 'long' ? 'LONG' : 'SHORT'}

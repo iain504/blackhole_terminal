@@ -16,17 +16,24 @@ import PositionsTab from '../tabs/PositionsTab'
 import ReportTab from '../tabs/ReportTab'
 import HeatmapTab from '../tabs/HeatmapTab'
 import CalendarTab from '../tabs/CalendarTab'
+import AlgoTab from '../tabs/AlgoTab'
 import { ConsoleDrawer } from '../ConsoleDrawer'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import {
   Bookmark, CandlestickChart, Layers, ChartColumnBig, Menu as MenuIcon,
   Settings2, BellRing, Bot, Flame, CalendarDays, LogOut, Home,
-  ChevronLeft, ChevronRight, ShieldCheck,
+  ChevronLeft, ChevronRight, ShieldCheck, Rocket,
 } from 'lucide-react'
 
 type MobileView = 'watchlist' | 'chart' | 'trades' | 'report' | 'menu' | 'tool'
-type ToolTab = 'heatmap' | 'calendar'
+type ToolTab = 'heatmap' | 'calendar' | 'algo'
+
+const TOOL_TITLES: Record<ToolTab, string> = {
+  heatmap: 'Heat Map',
+  calendar: 'Economic Calendar',
+  algo: 'Algo Trading',
+}
 
 const VIEW_KEY = 'tt:mobileView'
 
@@ -156,11 +163,11 @@ export function MobileShell({
                 <ChevronLeft className="h-4.5 w-4.5" /> Menu
               </button>
               <span className="ml-1 text-sm font-semibold text-zinc-100">
-                {toolTab === 'heatmap' ? 'Heat Map' : 'Economic Calendar'}
+                {TOOL_TITLES[toolTab] ?? 'Tool'}
               </span>
             </div>
             <div className="min-h-0 flex-1">
-              {toolTab === 'heatmap' ? <HeatmapTab /> : <CalendarTab />}
+              {toolTab === 'heatmap' ? <HeatmapTab /> : toolTab === 'calendar' ? <CalendarTab /> : <AlgoTab />}
             </div>
           </div>
         )}
@@ -185,6 +192,7 @@ export function MobileShell({
               {menuRow('Settings', Settings2, onOpenSettings)}
               {menuRow('Alerts', BellRing, onOpenAlerts, { badge: activeAlerts, badgeClass: 'border-amber-500/40 text-amber-400' })}
               {menuRow('Strategy orders', Bot, onOpenStrategies, { badge: armedStrategies, badgeClass: 'border-violet-500/40 text-violet-400' })}
+              {menuRow('Algo Trading', Rocket, () => { setToolTab('algo'); go('tool') })}
               {menuRow('Heat Map', Flame, () => { setToolTab('heatmap'); go('tool') })}
               {menuRow('Economic Calendar', CalendarDays, () => { setToolTab('calendar'); go('tool') })}
               {onExit && menuRow('Back to landing page', Home, onExit)}

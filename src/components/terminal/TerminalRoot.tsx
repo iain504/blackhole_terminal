@@ -14,6 +14,7 @@ import HeatmapTab from './tabs/HeatmapTab'
 import PositionsTab from './tabs/PositionsTab'
 import StrategyTab from './tabs/StrategyTab'
 import ReportTab from './tabs/ReportTab'
+import AlgoTab from './tabs/AlgoTab'
 import { StrategyDrawer } from './StrategyDrawer'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
@@ -102,6 +103,21 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
   }, [user])
+
+  // Extended trading hours toggle — TradingView's Alt+Shift+E shortcut
+  // (Task 59). Registered ONCE at the terminal root: N chart panes would
+  // otherwise each flip the shared store and cancel each other out.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.altKey || !e.shiftKey || (e.key !== 'E' && e.key !== 'e')) return
+      if (e.target instanceof Element && (e.target.closest('input, textarea, select, [contenteditable]'))) return
+      e.preventDefault()
+      const st = useTerminal.getState()
+      st.setShowExtendedHours(!st.showExtendedHours)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   // Alert engine polling (Task 14 #2 / 16 #6) — every 30s
   useEffect(() => {
@@ -418,6 +434,7 @@ function ActiveTabContent() {
   if (active.type === 'positions') return <PositionsTab />
   if (active.type === 'strategy') return <StrategyTab />
   if (active.type === 'report') return <ReportTab />
+  if (active.type === 'algo') return <AlgoTab />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 
