@@ -18,7 +18,10 @@ import { TIMEFRAMES } from '@/lib/market-types'
 // Import semantics: REPLACE per section present in the file. A section that is
 // absent from the file is left untouched (partial backups are safe). Runtime
 // state (crossing memory, triggered-at, broker order ids) is never exported —
-// alarms/rules are re-armed fresh on import so they fire on the NEXT crossing.
+// alarms re-arm fresh on import so they fire on the NEXT crossing. Strategy
+// Orders keep their ARM STATE (Task 79): armed stays armed, paused stays
+// paused, and rules caught mid-fire/failed (placing/triggered/failed) import
+// PAUSED for review instead of surprise-firing again on the next crossing.
 // ---------------------------------------------------------------------------
 
 const FILE_KIND = 'blackhole-terminal-config'
@@ -102,6 +105,10 @@ export async function GET() {
           timeframe: r.timeframe, params: r.params, action: r.action, qty: r.qty,
           tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
           repeat: r.repeat,
+          // Task 79 — the enable/disable state rides the export so an import
+          // recreates the same armed/paused state (runtime states below are
+          // mapped on import)
+          status: r.status,
         })),
         drawings: drawings.map((d) => ({
           // id rides the export so TREND-line alarms (params.drawingId) re-bind
@@ -133,6 +140,7 @@ interface SanitizedStrategy {
   timeframe: string; params: Prisma.InputJsonValue; action: string; qty: number
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
   repeat: boolean
+  status: string
 }
 
 interface SanitizedDrawing {
@@ -210,11 +218,19 @@ function sanitizeStrategy(raw: unknown): SanitizedStrategy | null {
     if (slow <= fast) return null
     params = { fast, slow, signal: clampInt(asRecord(r.params)?.signal, 1, 200, 9) }
   }
+  // Task 79 — carry the enable/disable state across the round-trip: armed
+  // stays armed, paused stays paused; runtime/transient states (placing/
+  // triggered/failed) import PAUSED for review — re-arming a fired one-shot
+  // here would surprise-fire it again on the next crossing. Legacy files
+  // without a status field default to armed (the previous import behavior).
+  const st = str(r.status)
+  const status = st === 'paused' || st === 'triggered' || st === 'failed' ? 'paused' : 'armed'
   return {
     symbol, kind, condition, level: Math.round(level * 100) / 100,
     timeframe: validTf(r.timeframe), params, action, qty: Math.round(qty * 1e8) / 1e8,
     tpMode, tpValue, slMode, slValue,
     repeat: Boolean(r.repeat),
+    status,
   }
 }
 
@@ -331,6 +347,9 @@ export async function POST(req: Request) {
         }
       })
       summary.strategies = rules.length
+      // Task 79 — armed/paused split so the client can show what came back live
+      summary.strategiesArmed = rules.filter((r) => r.status === 'armed').length
+      summary.strategiesPaused = rules.filter((r) => r.status === 'paused').length
     }
 
     // ---- drawings ----

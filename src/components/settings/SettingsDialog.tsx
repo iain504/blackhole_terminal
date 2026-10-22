@@ -132,7 +132,12 @@ export default function SettingsDialog({
       if (data.layout) parts.push('layout (tabs, chart layouts & symbols, panels)');
       if (count('watchlists')) parts.push(`${count('watchlists')} watchlist(s)`);
       if (count('alerts')) parts.push(`${count('alerts')} alert(s)`);
-      if (count('strategies')) parts.push(`${count('strategies')} strategy rule(s)`);
+      // Task 79 — show the arm-state split: armed rules come back live,
+      // paused rules stay paused (status round-trips through the file)
+      const stratRows = Array.isArray(data.strategies) ? (data.strategies as unknown[]) : [];
+      const armedCount = stratRows.filter((s) => s && typeof s === 'object' && (s as Record<string, unknown>).status !== 'paused').length;
+      const pausedCount = stratRows.length - armedCount;
+      if (stratRows.length > 0) parts.push(`${stratRows.length} strategy rule(s) (${armedCount} armed, ${pausedCount} paused — arm state preserved)`);
       if (count('drawings')) parts.push(`${count('drawings')} drawing(s)`);
       if (count('calendarAlarms')) parts.push(`${count('calendarAlarms')} calendar alarm(s)`);
       if (data.settings) parts.push('settings (API keys, Telegram, trading defaults)');

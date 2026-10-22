@@ -23,6 +23,10 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
@@ -125,14 +129,29 @@ export default function AlgoTab() {
     }
   }, [data, expanded])
 
-  const start = async () => {
+  const start = async (ignoreDup = false) => {
+    // Task 79 — starting a SECOND enabled run on a symbol that already has one
+    // is legal but usually a mistake (two engines trade the same book
+    // independently → double exposure). Confirm with a warning first.
+    const sym = symbol.trim().toUpperCase()
+    if (!ignoreDup) {
+      const dup = dupRunning(sym)
+      if (dup.length > 0) {
+        setDupWarn({
+          kind: 'start',
+          symbol: sym,
+          others: dup.map((r) => `${ALGO_STRATEGIES[r.strategy]?.name ?? r.strategy} · ${r.symbol} ${r.timeframe}`),
+        })
+        return
+      }
+    }
     setStarting(true)
     try {
       const res = await fetch('/api/algo', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          symbol: symbol.trim().toUpperCase(),
+          symbol: sym,
           timeframe,
           strategy,
           params,
@@ -167,7 +186,20 @@ export default function AlgoTab() {
     }
   }
 
-  const act = async (id: string, action: 'stop' | 'start' | 'delete', flatten = false, label = '') => {
+  const act = async (id: string, action: 'stop' | 'start' | 'delete', flatten = false, label = '', ignoreDup = false) => {
+    if (action === 'start' && !ignoreDup) {
+      const run = (data?.runs ?? []).find((r) => r.id === id)
+      const dup = run ? dupRunning(run.symbol, id) : []
+      if (run && dup.length > 0) {
+        setDupWarn({
+          kind: 'restart',
+          symbol: run.symbol,
+          runId: id,
+          others: dup.map((r) => `${ALGO_STRATEGIES[r.strategy]?.name ?? r.strategy} · ${r.symbol} ${r.timeframe}`),
+        })
+        return
+      }
+    }
     setBusyId(id)
     try {
       const res = action === 'start'
@@ -189,6 +221,14 @@ export default function AlgoTab() {
   const runs = data?.runs ?? []
   const ruleRows = data?.rules ?? []
   const running = useMemo(() => runs.filter((r) => r.status === 'running').length, [runs])
+  // Task 79 — symbols with an enabled run, for the duplicate-symbol warning
+  // (start guard) and the import dialog's double-exposure banner
+  const runningSymbols = useMemo(() => new Set(runs.filter((r) => r.status === 'running').map((r) => r.symbol)), [runs])
+  const dupRunning = useCallback((sym: string, excludeId?: string) =>
+    runs.filter((r) => r.status === 'running' && r.symbol === sym && r.id !== excludeId), [runs])
+  // pending duplicate-symbol confirmation (AlertDialog): start from the setup
+  // form or restart a stopped run while another run on the same symbol is live
+  const [dupWarn, setDupWarn] = useState<null | { kind: 'start' | 'restart'; symbol: string; runId?: string; others: string[] }>(null)
   const def = ALGO_STRATEGIES[strategy]
   // risk sizing is only meaningful with an SL % bracket (the stop distance IS
   // the risk unit) — Start/backtest stay disabled until the config is coherent
@@ -235,7 +275,9 @@ export default function AlgoTab() {
     const cfg = runToAlgoConfig(r)
     downloadJsonFile(
       `${algoExportFileBase()}-${r.symbol}-${r.strategy}.json`,
-      buildAlgoConfigExport([{ name: algoConfigSummaryName(cfg), config: cfg }]),
+      // Task 79 — the run's enable/disable state rides the export so an import
+      // on any machine recreates the same stopped/running state
+      buildAlgoConfigExport([{ name: algoConfigSummaryName(cfg), config: cfg, enabled: r.status === 'running' }]),
     )
     toast({ title: 'Run config exported', description: algoConfigSummaryName(cfg) })
   }
@@ -243,7 +285,7 @@ export default function AlgoTab() {
   const exportAllRuns = () => {
     const entries = runs.map((r) => {
       const cfg = runToAlgoConfig(r)
-      return { name: algoConfigSummaryName(cfg), config: cfg }
+      return { name: algoConfigSummaryName(cfg), config: cfg, enabled: r.status === 'running' }
     })
     // v2 envelope — ALL strategy-drawer rules ride along (Task 70-c)
     const ruleEntries: AlgoRuleFileEntry[] = []
@@ -772,9 +814,55 @@ export default function AlgoTab() {
         onOpenChange={setImportOpen}
         mode={data?.mode ?? 'paper'}
         configured={data?.configured ?? false}
+        runningSymbols={runningSymbols}
         onLoadIntoSetup={loadConfigIntoForm}
         onRunsStarted={() => void load()}
       />
+
+      {/* Task 79 — double-exposure warning: the confirmed symbol already has
+          an enabled run. Starting anyway is a deliberate user choice. */}
+      <AlertDialog open={dupWarn !== null} onOpenChange={(o) => { if (!o) setDupWarn(null) }}>
+        <AlertDialogContent className="max-w-md border-zinc-800 bg-zinc-950">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-base text-zinc-100">
+              <CircleAlert className="h-4 w-4 shrink-0 text-amber-400" aria-hidden />
+              {dupWarn?.symbol} already has an enabled run
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-xs leading-relaxed text-zinc-400">
+              <span className="block">Already live on {dupWarn?.symbol}:</span>
+              <span className="mt-1 block space-y-0.5">
+                {dupWarn?.others.map((o) => (
+                  <span key={o} className="block pl-3 text-zinc-300">• {o}</span>
+                ))}
+              </span>
+              <span className="mt-2 block">
+                Each run trades independently — two enabled runs on one symbol mean double exposure and duplicate signals on the same book. Start another one anyway?
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              className="h-8 border-zinc-800 bg-zinc-950 text-xs text-zinc-200 hover:bg-zinc-900 hover:text-zinc-100"
+              onClick={() => setDupWarn(null)}
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-8 bg-amber-600 text-xs text-white hover:bg-amber-500"
+              onClick={(e) => {
+                e.preventDefault()
+                const w = dupWarn
+                setDupWarn(null)
+                if (!w) return
+                if (w.kind === 'start') void start(true)
+                else if (w.runId) void act(w.runId, 'start', false, '', true)
+              }}
+            >
+              Start anyway
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

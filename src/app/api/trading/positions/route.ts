@@ -4,7 +4,7 @@ import {
   getPositions, getOpenOrders, getClosedOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
   TradingOrder, TradingPosition, parseCryptoPlan,
 } from '@/lib/trading'
-import { matchFifo, resolveRunStrategyNames } from '@/lib/trade-history'
+import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
 import { handleError } from '@/lib/api-helpers'
 
@@ -124,13 +124,22 @@ export async function GET(req: Request) {
     const closedOrders: TradingOrder[] = Array.isArray(closedRes.data) ? closedRes.data : []
     // max=0: closed TRADES are not needed here — only the open lots per symbol
     const openLots = matchFifo(closedOrders, 0).openLots
+    // Task 79 — FIFO lot keys keep the crypto slash (ORDER symbols are
+    // 'BTC/USD') while POSITION symbols drop it ('BTCUSD'), so the direct
+    // `openLots.get(p.symbol)` lookup missed EVERY crypto position and their
+    // source degraded to unknown/Manual even for algo-placed entries. Index
+    // the lots by the normalized key (slash stripped, uppercased) so both
+    // spellings resolve to the same bucket.
+    const openLotsByNorm = new Map<string, OpenLot[]>()
+    for (const [sym, lots] of openLots) openLotsByNorm.set(normSymbol(sym), lots)
 
     const rows: PositionRow[] = positions
       .filter((p) => !symbolParam || normSymbol(p.symbol) === normSymbol(symbolParam))
       .map((p) => {
         // OLDEST still-open FIFO entry lot for this symbol → when the position
-        // was opened + who placed it (ttb-… manual · ttr-… algo run)
-        const lot = openLots.get(p.symbol)?.[0]
+        // was opened + who placed it (ttb-… manual · ttr-… algo run). Lookup is
+        // normalized (Task 79) so crypto 'BTCUSD' positions find 'BTC/USD' lots.
+        const lot = openLotsByNorm.get(normSymbol(p.symbol))?.[0]
         const lotPlan = lot ? parseCryptoPlan(lot.clientOrderId) : null
         return {
           symbol: p.symbol.includes('/') ? p.symbol : p.asset_class === 'crypto' ? p.symbol.replace(/USD$/, '/USD') : p.symbol,

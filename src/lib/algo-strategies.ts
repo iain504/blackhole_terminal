@@ -218,15 +218,22 @@ export interface AlpoRunConfig {
 
 const CONFIG_ENVELOPE_KIND = 'blackhole-algo-config'
 // v2 (Task 70-c): adds `rules` (strategy-drawer StrategyRule rows) alongside
-// `configs`. v1 files (configs only) remain importable.
+// `configs`. v1 files (configs only) remain importable. Task 79: entries may
+// carry `enabled` (export-time run state) — still version 2, purely additive
+// (older terminals ignore the field; legacy files import as running).
 const CONFIG_ENVELOPE_VERSION = 2
 /** Envelope versions parseAlgoConfigImport accepts. */
 const SUPPORTED_ENVELOPE_VERSIONS = [1, 2]
 
-/** One named config inside an export file. */
+/** One named config inside an export file. `enabled` (Task 79) records the
+ *  RUN-STATE at export time — true = the run was RUNNING, false = it was
+ *  STOPPED — so an import can recreate the same enable/disable state instead
+ *  of blindly starting every config. Legacy files omit it → imports behave
+ *  exactly as before (start on import). */
 export interface AlgoConfigFileEntry {
   name: string
   config: AlpoRunConfig
+  enabled?: boolean
 }
 
 /** One named strategy-drawer rule inside an export file (v2). */
@@ -464,6 +471,9 @@ export function parseAlgoConfigImport(raw: unknown): AlgoImportResult {
       && 'config' in (item as Record<string, unknown>)
     const cfgRaw = wrapped ? (item as Record<string, unknown>).config : item
     const nameRaw = wrapped ? (item as Record<string, unknown>).name : undefined
+    // Task 79 — the export-time run state rides the wrapper (absent on legacy
+    // files / bare configs, which then import as startable as before)
+    const enabledRaw = wrapped ? (item as Record<string, unknown>).enabled : undefined
     const norm = normalizeAlgoRunConfig(cfgRaw)
     if (typeof norm === 'string') {
       errors.push({ index: i, reason: norm })
@@ -471,7 +481,11 @@ export function parseAlgoConfigImport(raw: unknown): AlgoImportResult {
       const name = typeof nameRaw === 'string' && nameRaw.trim()
         ? nameRaw.trim().slice(0, 80)
         : algoConfigSummaryName(norm)
-      entries.push({ name, config: norm })
+      entries.push({
+        name,
+        config: norm,
+        ...(typeof enabledRaw === 'boolean' ? { enabled: enabledRaw } : {}),
+      })
     }
   })
 

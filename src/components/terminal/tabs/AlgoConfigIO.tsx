@@ -48,6 +48,9 @@ export interface AlgoImportDialogProps {
   mode: string
   /** whether Alpaca keys are configured */
   configured: boolean
+  /** Task 79 — symbols that currently have an ENABLED run; selected configs
+   *  targeting one of them trigger the double-exposure warning banner */
+  runningSymbols?: Set<string>
   onLoadIntoSetup: (cfg: AlpoRunConfig) => void
   /** called after runs were started so the parent refreshes the runs list */
   onRunsStarted: () => void
@@ -65,7 +68,7 @@ interface ParsedState {
 const canStartRuns = (mode: string, configured: boolean) => configured && mode !== 'live'
 
 export default function AlgoImportDialog({
-  open, onOpenChange, mode, configured, onLoadIntoSetup, onRunsStarted,
+  open, onOpenChange, mode, configured, runningSymbols, onLoadIntoSetup, onRunsStarted,
 }: AlgoImportDialogProps) {
   const { toast } = useToast()
   const fileRef = useRef<HTMLInputElement | null>(null)
@@ -133,6 +136,13 @@ export default function AlgoImportDialog({
   const selectedConfigs = parsed ? parsed.entries.filter((_, i) => selected.has(i)) : []
   const selectedRuleList = parsed ? parsed.rules.filter((_, i) => selectedRules.has(i)) : []
   const startable = canStartRuns(mode, configured)
+  // Task 79 — how many selected entries start right away vs recreate as STOPPED
+  const nStart = selectedConfigs.filter((e) => e.enabled !== false).length
+  const nStopped = selectedConfigs.length - nStart
+  // Task 79 — selected entries whose symbol already has an ENABLED run
+  const dupSymbols = runningSymbols
+    ? [...new Set(selectedConfigs.map((e) => e.config.symbol).filter((s) => runningSymbols.has(s)))]
+    : []
 
   const loadIntoSetup = () => {
     if (selectedConfigs.length === 0) return
@@ -145,17 +155,24 @@ export default function AlgoImportDialog({
     if (selectedConfigs.length === 0 || starting) return
     setStarting(true)
     let ok = 0
+    let stopped = 0
     let fail = 0
     let firstErr = ''
     for (const e of selectedConfigs) {
+      // Task 79 — entries exported from a STOPPED run are recreated as stopped
+      // (autoStart: false → the run is created paused, trading starts only
+      // when the user presses Start); everything else starts right away.
+      const createStopped = e.enabled === false
       try {
         const res = await fetch('/api/algo', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(e.config),
+          body: JSON.stringify({ ...e.config, autoStart: !createStopped }),
         })
-        if (res.ok) ok += 1
-        else {
+        if (res.ok) {
+          if (createStopped) stopped += 1
+          else ok += 1
+        } else {
           fail += 1
           const j = await res.json().catch(() => null)
           if (!firstErr) firstErr = j?.error ?? `HTTP ${res.status}`
@@ -166,11 +183,19 @@ export default function AlgoImportDialog({
       }
     }
     setStarting(false)
-    if (ok > 0) toast({ title: `Started ${ok} run${ok === 1 ? '' : 's'}`, description: fail > 0 ? `${fail} failed: ${firstErr}` : undefined })
-    else toast({ title: 'Could not start runs', description: firstErr, variant: 'destructive' })
-    if (ok > 0) {
+    if (ok + stopped > 0) {
+      toast({
+        title: ok > 0 && stopped > 0
+          ? `Started ${ok} · Imported ${stopped} stopped`
+          : ok > 0
+            ? `Started ${ok} run${ok === 1 ? '' : 's'}`
+            : `Imported ${stopped} run${stopped === 1 ? '' : 's'} (stopped — press Start to trade)`,
+        description: fail > 0 ? `${fail} failed: ${firstErr}` : undefined,
+      })
       onRunsStarted()
       onOpenChange(false)
+    } else {
+      toast({ title: 'Could not start runs', description: firstErr, variant: 'destructive' })
     }
   }
 
@@ -317,6 +342,16 @@ export default function AlgoImportDialog({
                         {e.config.flattenEod && <span>EOD</span>}
                         {(e.config.cooldownMin ?? 0) > 0 && <span className="text-sky-400/80">cooldown {e.config.cooldownMin}m</span>}
                         {e.config.requireNewSignal && <span className="text-amber-400/80">fresh-signal</span>}
+                        {e.enabled === true && (
+                          <Badge variant="outline" className="h-3.5 border-emerald-500/40 px-1 text-[9px] text-emerald-400" title="The run was RUNNING when exported — importing starts it right away (paper mode only)">
+                            was RUNNING
+                          </Badge>
+                        )}
+                        {e.enabled === false && (
+                          <Badge variant="outline" className="h-3.5 border-zinc-600 px-1 text-[9px] text-zinc-400" title="The run was STOPPED when exported — it will be recreated as a stopped run you can start later">
+                            was STOPPED
+                          </Badge>
+                        )}
                       </span>
                     </span>
                   </label>
@@ -393,6 +428,13 @@ export default function AlgoImportDialog({
               </p>
             )}
 
+            {startable && dupSymbols.length > 0 && (
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-[11px] leading-snug text-amber-400" role="alert">
+                <TriangleAlert className="mr-1 inline h-3 w-3 align-[-1px]" aria-hidden />
+                Already enabled on {dupSymbols.join(', ')}: another run is live on this symbol. Multiple enabled runs on one symbol trade independently — double exposure.
+              </p>
+            )}
+
             <DialogFooter className="flex-row flex-wrap items-center gap-2 sm:justify-between">
               <Button
                 variant="outline"
@@ -422,10 +464,14 @@ export default function AlgoImportDialog({
                   className="h-8 gap-1.5 bg-sky-600 text-[11px] text-white hover:bg-sky-500"
                   disabled={selectedConfigs.length === 0 || !startable || starting}
                   onClick={() => void startRuns()}
-                  title={!startable ? 'Starting runs requires paper mode + Alpaca keys' : undefined}
+                  title={!startable ? 'Starting runs requires paper mode + Alpaca keys' : nStopped > 0 ? 'Configs exported from stopped runs are recreated as stopped (press Start on the run card to trade)' : undefined}
                 >
                   <Upload className="h-3 w-3" aria-hidden />
-                  Start {selectedConfigs.length} run{selectedConfigs.length === 1 ? '' : 's'}
+                  {nStopped === 0
+                    ? `Start ${selectedConfigs.length} run${selectedConfigs.length === 1 ? '' : 's'}`
+                    : nStart === 0
+                      ? `Import ${nStopped} stopped`
+                      : `Import ${selectedConfigs.length} (start ${nStart})`}
                 </Button>
               </span>
             </DialogFooter>

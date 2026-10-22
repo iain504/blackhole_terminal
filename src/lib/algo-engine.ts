@@ -592,7 +592,9 @@ export function stopEngine(runId: string) {
   console.log(`[algo] engine stopped for run ${runId}`)
 }
 
-/** Create + start a run. */
+/** Create a run row (and start its engine — unless `opts.autostart === false`,
+ *  Task 79: importing a STOPPED config creates the run paused so trading only
+ *  begins when the user explicitly presses Start). */
 export async function startAlgoRun(cfg: {
   userId: string
   symbol: string
@@ -613,7 +615,8 @@ export async function startAlgoRun(cfg: {
   flattenEod: boolean
   cooldownMin: number
   requireNewSignal: boolean
-}) {
+}, opts?: { autostart?: boolean }) {
+  const autostart = opts?.autostart !== false
   const run = await db.algoRun.create({
     data: {
       userId: cfg.userId,
@@ -635,15 +638,18 @@ export async function startAlgoRun(cfg: {
       flattenEod: cfg.flattenEod,
       cooldownMin: cfg.cooldownMin,
       requireNewSignal: cfg.requireNewSignal,
-      status: 'running',
+      status: autostart ? 'running' : 'stopped',
+      ...(autostart ? {} : { stoppedAt: new Date() }),
       state: {} as unknown as object,
     },
   })
   const sizing = cfg.sizingMode === 'risk'
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
-  await log(run.id, cfg.userId, 'info', `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`)
-  startEngine(run.id)
+  await log(run.id, cfg.userId, 'info', autostart
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`
+    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''} — press Start to begin trading`)
+  if (autostart) startEngine(run.id)
   return run
 }
 

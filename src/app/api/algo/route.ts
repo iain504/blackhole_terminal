@@ -128,6 +128,9 @@ interface AlgoStartBody {
   flattenEod?: boolean
   cooldownMin?: number
   requireNewSignal?: boolean
+  // Task 79 — false = create the run STOPPED (imports of stopped configs);
+  // no engine, no orders. Only STARTING runs stays paper-only.
+  autoStart?: boolean
 }
 
 // POST /api/algo — create + start a run
@@ -155,7 +158,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'No Alpaca keys — add them in Settings first (algo runs place real paper/live orders)' }, { status: 400 })
     }
     const mode = await resolveTradeMode(user.id)
-    if (mode === 'live') {
+    // Task 79 — a STOPPED run places no orders, so importing configs as
+    // stopped runs is safe even in live mode; only STARTING runs is paper-only.
+    const autoStart = body?.autoStart !== false
+    if (autoStart && mode === 'live') {
       return NextResponse.json({ error: 'Refusing to start algo runs in LIVE mode — switch the trade mode to paper' }, { status: 400 })
     }
     const clampPct = (v: unknown): number | null => {
@@ -201,7 +207,7 @@ export async function POST(req: NextRequest) {
       // re-entry control (Task 70-c) — clamped like the other numeric fields
       cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body?.cooldownMin) || 0))),
       requireNewSignal: body?.requireNewSignal === true,
-    })
+    }, { autostart: autoStart })
     return NextResponse.json({ run: toDto(run, []) }, { status: 201 })
   } catch (e) {
     return handleError(e)

@@ -100,7 +100,11 @@ function fmtCompactDT(iso: string | null | undefined): string {
   })
 }
 
-/** Manual vs Algo source badge (Task 65): algo rows show which strategy placed it. */
+/** Manual vs Algo source badge (Task 65): algo rows show which strategy placed it.
+ *  Task 79 — an UNKNOWN source (no open entry lot in the recent closed-orders
+ *  window, e.g. an old position or a pre-dating fill) used to render as
+ *  "Manual" — a wrong attribution. It now shows a dim "—" like other
+ *  unknown columns; only a decoded `ttb-`/external coid renders "Manual". */
 function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | undefined; strategy?: string }) {
   if (source === 'algo') {
     return (
@@ -110,6 +114,17 @@ function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | undefin
         title={strategy ? `Placed by the ${strategy} algo run` : 'Placed by an algo run'}
       >
         {strategy ? `Algo · ${strategy}` : 'Algo'}
+      </Badge>
+    )
+  }
+  if (source == null) {
+    return (
+      <Badge
+        variant="outline"
+        className="border-zinc-800 text-[10px] text-zinc-600"
+        title="Source unknown — the entry fill is outside the recent closed-orders window, or the order predates source tagging"
+      >
+        —
       </Badge>
     )
   }
