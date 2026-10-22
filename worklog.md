@@ -1484,3 +1484,17 @@ Work Log:
 
 Stage Summary:
 - VERDICT: the ETH toggle works correctly — pre-market bars ARE included when ETH is on (57/219 bars on TSLA 1h). What's missing is FEED COVERAGE, not toggle logic: the free Alpaca feed (feed=iex) only carries IEX's own extended-hours prints (pre-market 08:00–09:30 ET, after-hours 16:00–17:00 ET), so the 04:00–08:00 window is always empty and extended bars are sparse (some days just 1–2). Full TradingView-style 04:00–20:00 pre/post coverage requires a paid SIP subscription (feed=sip → 403 on the current plan). Added an in-console ETH coverage notice so this is explained in-product at toggle time.
+
+---
+Task ID: 77
+Agent: Z.ai Code (main)
+Task: "can you check this in to my github?"
+
+Work Log:
+- Verified local git state: main @ 33c786c, 57 commits, working tree clean except runtime churn in db/custom.db (tracked historically via platform auto-commits; NOT committed now).
+- Confirmed Task 75 (73a5983, MobileShell algo tab) and Task 76 (295fb3b, ETH pre-market verification + console notice) are both committed — "this" is fully checked in locally.
+- Audited every credential surface for GitHub access: `gh` CLI (absent), git remotes (none configured), env vars GITHUB_TOKEN/GH_* (none), ~/.ssh (empty), ~/.netrc, ~/.git-credentials, ~/.config/gh (all absent), package.json repository field (none). Hard blocker: sandbox has zero GitHub credentials.
+- Security flag identified: db/custom.db is tracked in history and contains user password hashes + TOTP/2FA secret + encrypted broker/Telegram creds — dangerous if pushed to a PUBLIC GitHub repo. Recommended untracking before first push; awaiting user choice.
+
+Stage Summary:
+- All source work is committed locally and push-ready; the ONLY missing piece is GitHub credentials (repo URL + fine-grained PAT with Contents: read/write, or SSH key). Presented the user with two routes: (A) paste repo URL + PAT here and I add remote + push; (B) run the 3 commands themselves. Flagged db/custom.db secret-exposure risk and offered `git rm --cached db/custom.db` + .gitignore before the first push (recommended for public repos).
