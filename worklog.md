@@ -1558,3 +1558,4 @@ Work Log:
 
 Stage Summary:
 - 4 commits staged locally and push-verified as far as auth; awaiting a fresh fine-grained PAT (Contents: Read and Write) to complete the push. Old PAT #1/#2 are dead.
+- RESULT (same session): user supplied fresh fine-grained PAT; `git push origin main` succeeded — a019b68..9a884ea; remote tip 9a884ea == local HEAD (ls-remote verified), 0 unpushed, worktree clean. Remote now contains Task 78 (66416ed) + Task 78e (75c9cca) + the 78-push worklog record (via auto-commit 9a884ea). Token hygiene: token used only as env var through /tmp/gh-askpass.sh, never written to any tracked file.
