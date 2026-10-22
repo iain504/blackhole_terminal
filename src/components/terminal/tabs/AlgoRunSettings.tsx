@@ -26,7 +26,7 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
   ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES, isAlgoStrategyId,
-  normalizeAlgoParams, type AlgoSizingMode, type AlgoStrategyId, type AlgoTimeframe,
+  normalizeAlgoParams, type AlgoRiskBasis, type AlgoSizingMode, type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
 import type { AlgoRunDto } from '@/app/api/algo/route'
@@ -45,10 +45,12 @@ export default function AlgoRunSettingsDialog({
   const [strategy, setStrategy] = useState<AlgoStrategyId>('bb-reversion')
   const [symbol, setSymbol] = useState('')
   const [timeframe, setTimeframe] = useState<AlgoTimeframe>('5m')
-  // position sizing (Task 78 — Risk Money)
+  // position sizing (Task 78 — Risk Money; Task 78e — $ or % of equity basis)
   const [sizingMode, setSizingMode] = useState<AlgoSizingMode>('fixed')
+  const [riskBasis, setRiskBasis] = useState<AlgoRiskBasis>('usd')
   const [qty, setQty] = useState('10')
   const [riskMoney, setRiskMoney] = useState('200')
+  const [riskPct, setRiskPct] = useState('1')
   const [tpOn, setTpOn] = useState(true)
   const [tpPct, setTpPct] = useState('1.5')
   const [slOn, setSlOn] = useState(true)
@@ -73,7 +75,9 @@ export default function AlgoRunSettingsDialog({
     setTimeframe((ALGO_TIMEFRAMES as readonly string[]).includes(run.timeframe) ? (run.timeframe as AlgoTimeframe) : '5m')
     setQty(String(run.qty))
     setSizingMode(run.sizingMode === 'risk' ? 'risk' : 'fixed')
+    setRiskBasis(run.riskBasis === 'pct' ? 'pct' : 'usd')
     setRiskMoney(run.riskMoney != null ? String(run.riskMoney) : '200')
+    setRiskPct(run.riskMoneyPct != null ? String(run.riskMoneyPct) : '1')
     setTpOn(run.tpMode === 'pct' && run.tpValue != null)
     setTpPct(run.tpValue != null ? String(run.tpValue) : '1.5')
     setSlOn(run.slMode === 'pct' && run.slValue != null)
@@ -99,7 +103,8 @@ export default function AlgoRunSettingsDialog({
   const def = ALGO_STRATEGIES[strategy]
   const identityChanged = !!run && (symbol.trim().toUpperCase() !== run.symbol || timeframe !== run.timeframe || strategy !== run.strategy)
   // risk sizing requires an SL % bracket — mirror the run setup's Start gate
-  const riskOk = sizingMode === 'fixed' || (Number(riskMoney) > 0 && slOn && Number(slPct) > 0)
+  const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
+  const riskOk = sizingMode === 'fixed' || (riskBudgetOk && slOn && Number(slPct) > 0)
 
   const save = async () => {
     if (!run) return
@@ -115,7 +120,9 @@ export default function AlgoRunSettingsDialog({
           params,
           qty: Number(qty),
           sizingMode,
-          riskMoney: sizingMode === 'risk' ? Number(riskMoney) : null,
+          riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+          riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? Number(riskMoney) : null,
+          riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? Number(riskPct) : null,
           tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
           tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -228,7 +235,7 @@ export default function AlgoRunSettingsDialog({
             </div>
           </div>
 
-          {/* size + cap (Task 78 — Risk Money sizing modes) */}
+          {/* size + cap (Task 78 — Risk Money sizing modes; Task 78e — $ or % basis) */}
           <div className="rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
             <div className="flex items-center justify-between gap-2">
               <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Position sizing</p>
@@ -239,7 +246,7 @@ export default function AlgoRunSettingsDialog({
                 onChange={setSizingMode}
                 options={[
                   { value: 'fixed', label: 'Fixed qty', title: 'Trade a fixed quantity every entry' },
-                  { value: 'risk', label: 'Risk $ / trade', title: 'Risk-Money sizing — dollars at risk per trade, size derived from the SL % distance at entry' },
+                  { value: 'risk', label: 'Risk money', title: 'Risk-Money sizing — a $ amount or % of equity at risk per trade, size derived from the SL % distance at entry' },
                 ]}
               />
             </div>
@@ -251,24 +258,43 @@ export default function AlgoRunSettingsDialog({
                 </div>
               ) : (
                 <div className="min-w-0">
-                  <Label htmlFor="rs-risk" className="text-[11px] text-zinc-300">Risk money per trade ($)</Label>
+                  <Label htmlFor="rs-risk" className="text-[11px] text-zinc-300">
+                    {riskBasis === 'pct' ? 'Risk per trade (% of equity)' : 'Risk money per trade ($)'}
+                  </Label>
                   <p className={cn('text-[10px] leading-snug', slOn && Number(slPct) > 0 ? 'text-zinc-500' : 'text-amber-400')}>
-                    $ at risk per trade — qty = risk ÷ (entry × SL%) · applies to new entries
+                    {riskBasis === 'pct'
+                      ? `% of account equity at risk per trade — resolved at each entry`
+                      : `$ at risk per trade — qty = risk ÷ (entry × SL%)`}
+                    {' '}· applies to new entries
                   </p>
                 </div>
               )}
               {sizingMode === 'fixed' ? (
                 <Input id="rs-qty" value={qty} onChange={(e) => setQty(e.target.value)} inputMode="decimal" className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs" />
               ) : (
-                <Input
-                  id="rs-risk"
-                  value={riskMoney}
-                  onChange={(e) => setRiskMoney(e.target.value)}
-                  onBlur={() => setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0))))}
-                  inputMode="decimal"
-                  aria-label="Risk money per trade in dollars"
-                  className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
-                />
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Segmented
+                    ariaLabel="Risk money basis — dollars or percent of equity"
+                    size="sm"
+                    value={riskBasis}
+                    onChange={setRiskBasis}
+                    options={[
+                      { value: 'usd', label: '$', title: 'Fixed dollars at risk per trade' },
+                      { value: 'pct', label: '%', title: 'Percent of account equity at risk per trade — resolved to dollars at each entry' },
+                    ]}
+                  />
+                  <Input
+                    id="rs-risk"
+                    value={riskBasis === 'pct' ? riskPct : riskMoney}
+                    onChange={(e) => (riskBasis === 'pct' ? setRiskPct(e.target.value) : setRiskMoney(e.target.value))}
+                    onBlur={() => (riskBasis === 'pct'
+                      ? setRiskPct(String(Math.min(100, Math.max(0, Number(riskPct) || 0))))
+                      : setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0)))))}
+                    inputMode="decimal"
+                    aria-label={riskBasis === 'pct' ? 'Risk per trade as percent of account equity' : 'Risk money per trade in dollars'}
+                    className="h-7 w-14 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
+                  />
+                </div>
               )}
             </div>
           </div>
@@ -397,7 +423,7 @@ export default function AlgoRunSettingsDialog({
             size="sm"
             className="h-8 gap-1.5 bg-sky-600 px-3 text-[11px] text-white hover:bg-sky-500"
             disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
-            title={!riskOk ? 'Risk sizing needs a positive risk $ and an SL % bracket' : undefined}
+            title={!riskOk ? 'Risk sizing needs a positive risk $ / % and an SL % bracket' : undefined}
             onClick={() => void save()}
           >
             {saving ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Settings2 className="h-3 w-3" />}

@@ -14,7 +14,7 @@ const check = (name: string, cond: boolean, extra = '') => {
 const cfg: AlpoRunConfig = {
   symbol: 'tsla', timeframe: '5m', strategy: 'bb-reversion',
   params: { bbPeriod: 25, bbStd: 9, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1 },
-  qty: 10, sizingMode: 'fixed' as const, riskMoney: null, tpMode: 'pct', tpValue: 1.5, slMode: 'pct', slValue: 1,
+  qty: 10, sizingMode: 'fixed' as const, riskBasis: 'usd' as const, riskMoney: null, riskMoneyPct: null, tpMode: 'pct', tpValue: 1.5, slMode: 'pct', slValue: 1,
   maxTradesDay: 3, rthOnly: true, flattenEod: true, cooldownMin: 0, requireNewSignal: false,
 }
 

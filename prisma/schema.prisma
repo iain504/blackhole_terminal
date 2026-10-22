@@ -191,13 +191,20 @@ model AlgoRun {
   params       Json
   qty          Float
   // Position sizing (Task 78 — "Risk Money"): 'fixed' trades `qty` units per
-  // entry (legacy behavior) · 'risk' treats `riskMoney` as the DOLLARS AT RISK
-  // per trade and derives the position size at entry time:
-  //   qty = riskMoney / (entryPrice × slValue/100)
+  // entry (legacy behavior) · 'risk' treats the risk budget as the DOLLARS AT
+  // RISK per trade and derives the position size at entry time:
+  //   qty = riskBudget / (entryPrice × slValue/100)
   // Risk sizing requires an SL % bracket — without one the engine falls back
-  // to `qty` and journals why. `riskMoney` is null in fixed mode.
+  // to `qty` and journals why.
   sizingMode   String    @default("fixed")
+  // Task 78e — how the Risk-Money budget is expressed: 'usd' = `riskMoney`
+  // is a fixed dollar amount per trade · 'pct' = `riskMoneyPct` is a percent
+  // of ACCOUNT EQUITY per trade, resolved to a dollar budget at each entry
+  // (live: broker account equity · backtest: the simulated equity curve, so
+  // risk compounds with the account). Null fields follow the basis.
+  riskBasis    String    @default("usd")
   riskMoney    Float?
+  riskMoneyPct Float?
   // exits: 'none' (strategy logic closes) | 'pct' (bracket % from entry)
   tpMode       String    @default("none")
   tpValue      Float?

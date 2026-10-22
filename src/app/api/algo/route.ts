@@ -19,7 +19,9 @@ export interface AlgoRunDto {
   params: Record<string, number>
   qty: number
   sizingMode: string
+  riskBasis: string
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -38,7 +40,8 @@ export interface AlgoRunDto {
 
 export function toDto(r: {
   id: string; symbol: string; timeframe: string; strategy: string; params: unknown
-  qty: number; sizingMode?: string; riskMoney?: number | null
+  qty: number; sizingMode?: string; riskBasis?: string
+  riskMoney?: number | null; riskMoneyPct?: number | null
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
   maxTradesDay: number; rthOnly: boolean; flattenEod: boolean
   cooldownMin?: number; requireNewSignal?: boolean
@@ -51,7 +54,9 @@ export function toDto(r: {
     params: (r.params as Record<string, number>) ?? {},
     qty: r.qty,
     sizingMode: r.sizingMode === 'risk' ? 'risk' : 'fixed',
-    riskMoney: r.sizingMode === 'risk' ? (r.riskMoney ?? null) : null,
+    riskBasis: r.sizingMode === 'risk' && r.riskBasis === 'pct' ? 'pct' : 'usd',
+    riskMoney: r.sizingMode === 'risk' && r.riskBasis !== 'pct' ? (r.riskMoney ?? null) : null,
+    riskMoneyPct: r.sizingMode === 'risk' && r.riskBasis === 'pct' ? (r.riskMoneyPct ?? null) : null,
     tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
     maxTradesDay: r.maxTradesDay, rthOnly: r.rthOnly, flattenEod: r.flattenEod,
     cooldownMin: r.cooldownMin ?? 0, requireNewSignal: r.requireNewSignal === true,
@@ -111,7 +116,9 @@ interface AlgoStartBody {
   params?: Record<string, number>
   qty?: number
   sizingMode?: string
+  riskBasis?: string
   riskMoney?: number
+  riskMoneyPct?: number
   tpMode?: string
   tpValue?: number
   slMode?: string
@@ -155,13 +162,22 @@ export async function POST(req: NextRequest) {
       const n = Number(v)
       return Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(0.01, n)) : null
     }
-    // Task 78 — Risk Money sizing (riskMoney required > 0 when 'risk')
+    // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
+    // risk+usd requires riskMoney > 0 · risk+pct requires riskMoneyPct > 0.
     const sizingMode = body?.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskBasis = body?.riskBasis === 'pct' ? 'pct' : 'usd'
     const riskMoneyRaw = Number(body?.riskMoney)
     const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
       ? Math.min(10_000_000, riskMoneyRaw)
       : null
-    if (sizingMode === 'risk' && riskMoney == null) {
+    const riskPctRaw = Number(body?.riskMoneyPct)
+    const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0
+      ? Math.min(100, riskPctRaw)
+      : null
+    if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
+      return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
+    }
+    if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
     const run = await startAlgoRun({
@@ -172,7 +188,9 @@ export async function POST(req: NextRequest) {
       params: body?.params,
       qty,
       sizingMode,
+      riskBasis,
       riskMoney,
+      riskMoneyPct,
       tpMode: body?.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body?.tpMode === 'pct' ? clampPct(body?.tpValue) : null,
       slMode: body?.slMode === 'pct' ? 'pct' : 'none',

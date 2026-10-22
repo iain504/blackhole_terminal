@@ -32,7 +32,7 @@ import {
 } from '@/lib/algo-strategies'
 import type { BacktestResult, OptimizeResult } from '@/lib/backtest'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
-import { type AlgoSizingMode } from '@/lib/algo-strategies'
+import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 
 export interface AlgoSetupCfg {
   strategy: AlgoStrategyId
@@ -40,9 +40,12 @@ export interface AlgoSetupCfg {
   timeframe: AlgoTimeframe
   params: Record<string, number>
   qty: number
-  // Task 78 — Risk Money sizing (mirrors the live run config)
+  // Task 78 — Risk Money sizing (mirrors the live run config); Task 78e —
+  // budget basis: 'usd' → riskMoney $ · 'pct' → riskMoneyPct % of equity
   sizingMode: AlgoSizingMode
+  riskBasis: AlgoRiskBasis
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: 'none' | 'pct'
   tpValue: number | null
   slMode: 'none' | 'pct'
@@ -138,7 +141,9 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     params: cfg.params,
     qty: cfg.qty,
     sizingMode: cfg.sizingMode,
-    riskMoney: cfg.sizingMode === 'risk' ? cfg.riskMoney : null,
+    riskBasis: cfg.sizingMode === 'risk' ? cfg.riskBasis : 'usd',
+    riskMoney: cfg.sizingMode === 'risk' && cfg.riskBasis !== 'pct' ? cfg.riskMoney : null,
+    riskMoneyPct: cfg.sizingMode === 'risk' && cfg.riskBasis === 'pct' ? cfg.riskMoneyPct : null,
     tpMode: cfg.tpMode,
     tpValue: cfg.tpValue,
     slMode: cfg.slMode,
@@ -222,10 +227,14 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   const m = runRes?.metrics
   const pnlColor = (v: number) => (v > 0 ? 'text-emerald-400' : v < 0 ? 'text-rose-400' : 'text-zinc-300')
 
-  // coherent sizing gate (Task 78): risk mode needs a positive risk $ AND an
-  // SL % bracket (the stop distance is the risk unit); fixed needs qty > 0
+  // coherent sizing gate (Task 78): risk mode needs a positive risk budget ($
+  // or % — Task 78e) AND an SL % bracket (the stop distance is the risk unit);
+  // fixed needs qty > 0
+  const riskBudget = cfg.sizingMode === 'risk'
+    ? (cfg.riskBasis === 'pct' ? (cfg.riskMoneyPct ?? 0) : (cfg.riskMoney ?? 0))
+    : 0
   const sizingOk = cfg.sizingMode === 'risk'
-    ? (cfg.riskMoney ?? 0) > 0 && cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0
+    ? riskBudget > 0 && cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0
     : cfg.qty > 0
 
   // fixed win/loss buckets by EXIT time (America/New_York, Task 71-2) —
@@ -309,8 +318,8 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
               Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · no slippage/fees. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
-              {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && (cfg.riskMoney ?? 0) > 0 && (
-                <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ ${cfg.riskMoney} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
+              {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
+                <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
               )}
               {cfg.sizingMode === 'risk' && !(cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0) && (
                 <> <span className="text-amber-400">Risk Money sizing needs an SL % — turn Stop loss % ON in the run setup.</span></>
@@ -323,7 +332,7 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           <Button
             className="h-8 gap-2 bg-sky-600 px-3 text-xs text-white hover:bg-sky-500"
             disabled={busy !== null || !cfg.symbol || !sizingOk}
-            title={!sizingOk ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ and SL % ON in the run setup' : 'Set a positive quantity in the run setup') : undefined}
+            title={!sizingOk ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup') : undefined}
             onClick={() => void post('run')}
           >
             {busy === 'run' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <TrendingUp className="h-3.5 w-3.5" />}

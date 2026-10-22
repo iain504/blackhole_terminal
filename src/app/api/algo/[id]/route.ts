@@ -44,7 +44,9 @@ interface AlgoPatchBody {
   params?: Record<string, number>
   qty?: number
   sizingMode?: string
+  riskBasis?: string
   riskMoney?: number
+  riskMoneyPct?: number
   tpMode?: string
   tpValue?: number
   slMode?: string
@@ -91,13 +93,22 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       const n = Number(v)
       return Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(0.01, n)) : null
     }
-    // Task 78 — Risk Money sizing (riskMoney required > 0 when 'risk')
+    // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
+    // Validation mirrors POST /api/algo exactly.
     const sizingMode = body?.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskBasis = body?.riskBasis === 'pct' ? 'pct' : 'usd'
     const riskMoneyRaw = Number(body?.riskMoney)
     const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
       ? Math.min(10_000_000, riskMoneyRaw)
       : null
-    if (sizingMode === 'risk' && riskMoney == null) {
+    const riskPctRaw = Number(body?.riskMoneyPct)
+    const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0
+      ? Math.min(100, riskPctRaw)
+      : null
+    if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
+      return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
+    }
+    if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
     const updated = await updateAlgoRunConfig(id, {
@@ -107,7 +118,9 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       params: body?.params,
       qty,
       sizingMode,
+      riskBasis,
       riskMoney,
+      riskMoneyPct,
       tpMode: body?.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body?.tpMode === 'pct' ? clampPct(body?.tpValue) : null,
       slMode: body?.slMode === 'pct' ? 'pct' : 'none',

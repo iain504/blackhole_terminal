@@ -17,12 +17,12 @@
 // REGULAR-session bars, so engine restarts mid-day rebuild correct state.
 import { db } from '@/lib/db'
 import { barsFor } from '@/lib/bars-cache'
-import { closePositionFull, getPositions, placeOrderWithExits, resolveTradeMode, tradeSymbol, type TradeMode } from '@/lib/trading'
+import { closePositionFull, getAccount, getPositions, placeOrderWithExits, resolveTradeMode, tradeSymbol, type TradeMode } from '@/lib/trading'
 import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
-import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
+import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
 
 const CYCLE_MS = 15000
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
@@ -37,9 +37,13 @@ interface AlgoRunRow {
   strategy: string
   params: unknown
   qty: number
-  // Task 78 — Risk Money sizing ('fixed' legacy · 'risk' derives qty at entry)
+  // Task 78 — Risk Money sizing ('fixed' legacy · 'risk' derives qty at entry).
+  // Task 78e — riskBasis 'usd' = riskMoney $/trade · 'pct' = riskMoneyPct of
+  // account equity per trade (resolved at entry from the broker account).
   sizingMode: string
+  riskBasis: string
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -461,17 +465,28 @@ async function cycle(runId: string) {
           const tp = pctPx(run.tpMode, run.tpValue, 'tp')
           const sl = pctPx(run.slMode, run.slValue, 'sl')
           // ---- position sizing (Task 78 — Risk Money) ----
-          // 'risk' derives the size from the dollars-at-risk budget and the
-          // live quote; anything that makes the derivation impossible (no SL %,
-          // no quote, budget below one increment) falls back to the fixed qty
+          // 'risk' derives the size from the risk budget and the live quote;
+          // anything that makes the derivation impossible (no SL %, no quote,
+          // no equity, budget below one increment) falls back to the fixed qty
           // with a journal line so the sizing behavior is never silent.
           const isCryptoSym = run.symbol.includes('/')
           let qty = isCryptoSym ? run.qty : Math.floor(run.qty)
           let riskSized = false
+          let riskBudget: number | null = null
           if (run.sizingMode === 'risk') {
+            // Task 78e — % basis: resolve the budget from the LIVE account equity
+            let riskEquity: number | null = null
+            if (run.riskBasis === 'pct') {
+              try {
+                const acct = await getAccount(run.userId, await resolveTradeMode(run.userId))
+                const eq = Number(acct.data?.equity)
+                riskEquity = Number.isFinite(eq) && eq > 0 ? eq : null
+              } catch { riskEquity = null }
+            }
+            riskBudget = riskBudgetUsd(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct, riskEquity)
             const slPct = run.slMode === 'pct' ? run.slValue : null
-            const sized = ref != null && slPct != null && sl != null
-              ? riskSizedQty(Number(run.riskMoney), ref, slPct, isCryptoSym)
+            const sized = ref != null && slPct != null && sl != null && riskBudget != null
+              ? riskSizedQty(riskBudget, ref, slPct, isCryptoSym)
               : null
             if (sized != null) {
               qty = sized
@@ -481,7 +496,11 @@ async function cycle(runId: string) {
                 ? 'no SL % bracket — risk needs a stop distance'
                 : ref == null
                   ? 'no live quote'
-                  : `risk $${run.riskMoney} is below one ${isCryptoSym ? '0.0001 unit' : 'share'} at SL ${slPct}%`
+                  : riskBudget == null
+                    ? run.riskBasis === 'pct'
+                      ? 'no account equity for risk %'
+                      : 'risk money is not set'
+                    : `risk ${riskMoneyLabel(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct)} is below one ${isCryptoSym ? '0.0001 unit' : 'share'} at SL ${slPct}%`
               await log(runId, run.userId, 'info', `Risk sizing unavailable (${why}) — using fixed qty ${run.qty}`)
             }
           }
@@ -509,7 +528,9 @@ async function cycle(runId: string) {
                   else st.firedShort = true
                 }
                 const legs = [tp ? `TP ${fmtP(tp)}` : null, sl ? `SL ${fmtP(sl)}` : null].filter(Boolean).join(' · ')
-                const riskNote = riskSized ? ` · sized by risk $${run.riskMoney}/trade` : ''
+                const riskNote = riskSized
+                  ? ` · sized by risk ${riskMoneyLabel(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct)}/trade${run.riskBasis === 'pct' && riskBudget != null ? ` (≈ $${riskBudget.toFixed(2)})` : ''}`
+                  : ''
                 await log(runId, run.userId, 'trade', `ENTRY ${res.entry.side.toUpperCase()} ${qty} ${run.symbol} @ mkt${legs ? ` · ${legs}` : ''}${riskNote} · #${r.results[0].id.slice(-8)} · trade ${st.tradesToday}/${run.maxTradesDay} today`)
                 st.freshGateSide = undefined // fired — a new episode starts after this
                 // never swallow leg problems — a crypto OCO attach failure or
@@ -580,7 +601,9 @@ export async function startAlgoRun(cfg: {
   params: unknown
   qty: number
   sizingMode: string
+  riskBasis: string
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -600,7 +623,9 @@ export async function startAlgoRun(cfg: {
       params: normalizeAlgoParams(cfg.strategy, cfg.params) as unknown as object,
       qty: cfg.qty,
       sizingMode: cfg.sizingMode === 'risk' ? 'risk' : 'fixed',
-      riskMoney: cfg.sizingMode === 'risk' ? cfg.riskMoney : null,
+      riskBasis: cfg.sizingMode === 'risk' && cfg.riskBasis === 'pct' ? 'pct' : 'usd',
+      riskMoney: cfg.sizingMode === 'risk' && cfg.riskBasis !== 'pct' ? cfg.riskMoney : null,
+      riskMoneyPct: cfg.sizingMode === 'risk' && cfg.riskBasis === 'pct' ? cfg.riskMoneyPct : null,
       tpMode: cfg.tpMode,
       tpValue: cfg.tpValue,
       slMode: cfg.slMode,
@@ -614,7 +639,9 @@ export async function startAlgoRun(cfg: {
       state: {} as unknown as object,
     },
   })
-  const sizing = cfg.sizingMode === 'risk' ? `risk $${cfg.riskMoney}/trade` : `qty ${cfg.qty}`
+  const sizing = cfg.sizingMode === 'risk'
+    ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
+    : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`)
   startEngine(run.id)
   return run
@@ -635,7 +662,9 @@ export interface AlgoRunConfigPatch {
   params: unknown
   qty: number
   sizingMode: string
+  riskBasis: string
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: string
   tpValue: number | null
   slMode: string
@@ -679,12 +708,16 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.strategy !== patch.strategy) diffs.push(`strategy ${run.strategy} → ${patch.strategy}`)
   if (run.qty !== patch.qty) diffs.push(`qty ${run.qty} → ${patch.qty}`)
   // Task 78 — sizing diff reads as whole-mode changes when the mode flips,
-  // and as a plain $ change when only the risk budget moves
-  const sizingLabel = (mode: string, qty: number, rm: number | null) =>
-    mode === 'risk' ? `risk $${rm ?? 0}/trade` : `fixed qty ${qty}`
-  if (run.sizingMode !== patch.sizingMode) {
-    diffs.push(`sizing ${sizingLabel(run.sizingMode, run.qty, run.riskMoney)} → ${sizingLabel(patch.sizingMode, patch.qty, patch.riskMoney)}`)
-  } else if (patch.sizingMode === 'risk' && run.riskMoney !== patch.riskMoney) {
+  // and as a plain $ / % change when only the risk budget moves (Task 78e:
+  // a basis flip $ ↔ % is its own mode-level change, never a silent $0).
+  const sizingLabel = (mode: string, basis: string, qty: number, rm: number | null, rp: number | null) =>
+    mode === 'risk' ? `risk ${basis === 'pct' ? `${rp ?? 0}% of equity` : `$${rm ?? 0}`}/trade` : `fixed qty ${qty}`
+  const runBasis = run.riskBasis === 'pct' ? 'pct' : 'usd'
+  if (run.sizingMode !== patch.sizingMode || (patch.sizingMode === 'risk' && runBasis !== patch.riskBasis)) {
+    diffs.push(`sizing ${sizingLabel(run.sizingMode, runBasis, run.qty, run.riskMoney, run.riskMoneyPct)} → ${sizingLabel(patch.sizingMode, patch.riskBasis, patch.qty, patch.riskMoney, patch.riskMoneyPct)}`)
+  } else if (patch.sizingMode === 'risk' && patch.riskBasis === 'pct' && run.riskMoneyPct !== patch.riskMoneyPct) {
+    diffs.push(`risk ${run.riskMoneyPct ?? 0}% → ${patch.riskMoneyPct ?? 0}% of equity/trade`)
+  } else if (patch.sizingMode === 'risk' && patch.riskBasis !== 'pct' && run.riskMoney !== patch.riskMoney) {
     diffs.push(`risk $${run.riskMoney ?? 0} → $${patch.riskMoney ?? 0}/trade`)
   }
   if (run.tpMode !== patch.tpMode || (patch.tpMode === 'pct' && run.tpValue !== patch.tpValue)) {
@@ -711,7 +744,9 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       params: nextParams as unknown as object,
       qty: patch.qty,
       sizingMode: patch.sizingMode === 'risk' ? 'risk' : 'fixed',
-      riskMoney: patch.sizingMode === 'risk' ? patch.riskMoney : null,
+      riskBasis: patch.sizingMode === 'risk' && patch.riskBasis === 'pct' ? 'pct' : 'usd',
+      riskMoney: patch.sizingMode === 'risk' && patch.riskBasis !== 'pct' ? patch.riskMoney : null,
+      riskMoneyPct: patch.sizingMode === 'risk' && patch.riskBasis === 'pct' ? patch.riskMoneyPct : null,
       tpMode: patch.tpMode,
       tpValue: patch.tpMode === 'pct' ? patch.tpValue : null,
       slMode: patch.slMode,

@@ -47,7 +47,13 @@ export interface BacktestConfig {
   // dollars-at-risk budget and THIS bar's open/stop distance (so every trade
   // risks ≈ riskMoney). Falls back to `qty` when the config has no SL %.
   sizingMode: 'fixed' | 'risk'
+  // Task 78e — budget basis. 'pct' resolves the budget per trade from the
+  // CURRENT simulated equity (cash) × riskMoneyPct/100, so risk compounds
+  // with the account exactly like the live % basis. Optional for backward
+  // compatibility with pre-78e probes — undefined reads as 'usd'.
+  riskBasis?: 'usd' | 'pct'
   riskMoney: number | null
+  riskMoneyPct?: number | null
   isCrypto: boolean // risk sizing floors to whole shares for stocks, 4dp for crypto
   tpMode: 'none' | 'pct'
   tpValue: number | null
@@ -388,19 +394,27 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       }
       const slPx = cfg.slMode === 'pct' ? pctPx(cfg.slValue, false) : null
       // Risk-Money sizing (Task 78) — size each trade so the loss to THIS
-      // trade's stop ≈ riskMoney, using the actual fill price. Risk-sized
-      // trades therefore breathe with volatility exactly like the live engine.
+      // trade's stop ≈ the risk budget, using the actual fill price. Risk-
+      // sized trades therefore breathe with volatility exactly like the live
+      // engine. Task 78e — % basis resolves the budget from the CURRENT
+      // simulated equity (compounds with the curve, like a live account).
       let qty = cfg.qty
-      if (cfg.sizingMode === 'risk' && slPx != null && cfg.riskMoney != null && cfg.riskMoney > 0) {
-        const riskPerUnit = Math.abs(fill - slPx)
-        if (riskPerUnit > 0) {
-          const raw = cfg.riskMoney / riskPerUnit
-          if (cfg.isCrypto) {
-            const q = Math.floor(raw * 1e4) / 1e4
-            if (q >= 0.0001) qty = q
-          } else {
-            const q = Math.floor(raw)
-            if (q >= 1) qty = q
+      if (cfg.sizingMode === 'risk' && slPx != null) {
+        const pct = cfg.riskBasis === 'pct'
+        const budget = pct
+          ? (cfg.riskMoneyPct != null && cfg.riskMoneyPct > 0 && cash > 0 ? (cash * Math.min(100, cfg.riskMoneyPct)) / 100 : null)
+          : (cfg.riskMoney != null && cfg.riskMoney > 0 ? cfg.riskMoney : null)
+        if (budget != null) {
+          const riskPerUnit = Math.abs(fill - slPx)
+          if (riskPerUnit > 0) {
+            const raw = budget / riskPerUnit
+            if (cfg.isCrypto) {
+              const q = Math.floor(raw * 1e4) / 1e4
+              if (q >= 0.0001) qty = q
+            } else {
+              const q = Math.floor(raw)
+              if (q >= 1) qty = q
+            }
           }
         }
       }

@@ -149,11 +149,18 @@ export function normalizeAlgoParams(strategy: AlgoStrategyId, raw: unknown): Rec
 export type AlgoExitMode = 'none' | 'pct'
 
 /** Position sizing (Task 78 — "Risk Money"): 'fixed' trades `qty` units per
- *  entry (legacy) · 'risk' treats `riskMoney` as the DOLLARS AT RISK per trade
- *  and derives the position size at entry: qty = riskMoney / (entry × SL%).
+ *  entry (legacy) · 'risk' treats the risk budget as the DOLLARS AT RISK per
+ *  trade and derives the position size at entry: qty = budget / (entry × SL%).
  *  Risk sizing requires an SL % bracket — without one every consumer (live
  *  engine, backtest) falls back to `qty` and says so. */
 export type AlgoSizingMode = 'fixed' | 'risk'
+
+/** Risk-Money budget basis (Task 78e — "Risk Money accepts Percentage%").
+ *  'usd' = a fixed dollar amount per trade (`riskMoney`) · 'pct' = a percent
+ *  of ACCOUNT EQUITY per trade (`riskMoneyPct`), resolved to dollars at each
+ *  entry so risk scales with the account (live: broker equity · backtest:
+ *  the simulated equity curve — risk compounds). */
+export type AlgoRiskBasis = 'usd' | 'pct'
 
 /** Risk-Money position sizing (Task 78). Returns the entry quantity whose
  *  worst-case loss to the stop ≈ `riskMoney`, or null when sizing is
@@ -182,7 +189,10 @@ export interface AlpoRunConfig {
   qty: number
   // Task 78 — Risk Money sizing ('fixed' keeps qty as the per-entry size)
   sizingMode: AlgoSizingMode
+  // Task 78e — budget basis + payload ('usd' → riskMoney, 'pct' → riskMoneyPct)
+  riskBasis: AlgoRiskBasis
   riskMoney: number | null
+  riskMoneyPct: number | null
   tpMode: AlgoExitMode
   tpValue: number | null
   slMode: AlgoExitMode
@@ -253,13 +263,37 @@ export interface AlgoRunLike {
   // Task 78 — optional so legacy rows/DTOs (pre-Risk-Money) still satisfy it
   sizingMode?: string
   riskMoney?: number | null
+  // Task 78e — optional for the same reason (legacy rows default to 'usd')
+  riskBasis?: string
+  riskMoneyPct?: number | null
 }
 
 /** Human label used as the default entry name ("BB + RSI Mean Reversion · TSLA 5m").
  *  Risk-Money configs carry the sizing in the name so exports/imports stay legible. */
 export function algoConfigSummaryName(cfg: AlpoRunConfig): string {
-  const sizing = cfg.sizingMode === 'risk' && cfg.riskMoney != null ? ` · risk $${cfg.riskMoney}` : ''
+  const sizing = cfg.sizingMode === 'risk'
+    ? (cfg.riskBasis === 'pct'
+        ? (cfg.riskMoneyPct != null ? ` · risk ${cfg.riskMoneyPct}%` : '')
+        : (cfg.riskMoney != null ? ` · risk $${cfg.riskMoney}` : ''))
+    : ''
   return `${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe}${sizing}`
+}
+
+/** Compact risk-budget label for journals/diffs/cards: "$250" or "1%". */
+export function riskMoneyLabel(basis: string, riskMoney: number | null | undefined, riskMoneyPct: number | null | undefined): string {
+  return basis === 'pct' ? `${riskMoneyPct ?? 0}%` : `$${riskMoney ?? 0}`
+}
+
+/** Resolve the USD risk budget for ONE entry (Task 78e). basis 'usd' →
+ *  `riskMoney` as-is · 'pct' → equity × pct/100 (null when equity is unknown
+ *  or the pct is unset). All sizing consumers route through this so the two
+ *  bases stay semantically identical everywhere. */
+export function riskBudgetUsd(basis: string, riskMoney: number | null | undefined, riskMoneyPct: number | null | undefined, equity: number | null | undefined): number | null {
+  if (basis === 'pct') {
+    if (!(equity != null && equity > 0) || !(riskMoneyPct != null && riskMoneyPct > 0)) return null
+    return (equity * Math.min(100, riskMoneyPct)) / 100
+  }
+  return riskMoney != null && riskMoney > 0 ? Math.min(10_000_000, riskMoney) : null
 }
 
 /** Map a persisted run (or its DTO) to a portable config. */
@@ -275,7 +309,9 @@ export function runToAlgoConfig(run: AlgoRunLike): AlpoRunConfig {
     params: normalizeAlgoParams(strategy, run.params),
     qty: run.qty,
     sizingMode: run.sizingMode === 'risk' ? 'risk' : 'fixed',
-    riskMoney: run.sizingMode === 'risk' ? (run.riskMoney ?? null) : null,
+    riskBasis: run.sizingMode === 'risk' && run.riskBasis === 'pct' ? 'pct' : 'usd',
+    riskMoney: run.sizingMode === 'risk' && run.riskBasis !== 'pct' ? (run.riskMoney ?? null) : null,
+    riskMoneyPct: run.sizingMode === 'risk' && run.riskBasis === 'pct' ? (run.riskMoneyPct ?? null) : null,
     tpMode: run.tpMode === 'pct' ? 'pct' : 'none',
     tpValue: run.tpMode === 'pct' ? run.tpValue : null,
     slMode: run.slMode === 'pct' ? 'pct' : 'none',
@@ -354,11 +390,17 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
   const tpRaw = clampPct(r.tpValue)
   const slRaw = clampPct(r.slValue)
   // Task 78 — Risk Money: sizing is an identity field here (silently downgrading
-  // a risk-sized config to fixed qty would change what the engine trades)
+  // a risk-sized config to fixed qty would change what the engine trades).
+  // Task 78e — the budget basis is identity too: '$250' and '1% of equity'
+  // are different risk models, never silently swapped on import.
   const sizingMode: AlgoSizingMode = r.sizingMode === 'risk' ? 'risk' : 'fixed'
+  const riskBasis: AlgoRiskBasis = r.riskBasis === 'pct' ? 'pct' : 'usd'
   const riskRaw = Number(r.riskMoney)
   const riskMoney = Number.isFinite(riskRaw) && riskRaw > 0 ? Math.min(10_000_000, riskRaw) : null
-  if (sizingMode === 'risk' && riskMoney == null) return 'risk sizing requires a positive riskMoney'
+  const riskPctRaw = Number(r.riskMoneyPct)
+  const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0 ? Math.min(100, riskPctRaw) : null
+  if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) return 'risk % sizing requires a positive riskMoneyPct (percent of equity)'
+  if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) return 'risk sizing requires a positive riskMoney'
   return {
     symbol,
     timeframe: tf as AlgoTimeframe,
@@ -366,7 +408,9 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
     params: normalizeAlgoParams(strategy, r.params),
     qty,
     sizingMode,
-    riskMoney: sizingMode === 'risk' ? riskMoney : null,
+    riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+    riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
+    riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
     tpMode: r.tpMode === 'pct' && tpRaw != null ? 'pct' : 'none',
     tpValue: r.tpMode === 'pct' ? tpRaw : null,
     slMode: r.slMode === 'pct' && slRaw != null ? 'pct' : 'none',

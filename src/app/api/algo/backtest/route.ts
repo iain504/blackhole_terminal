@@ -11,7 +11,9 @@
 //   cooldownMin?: number                    (Task 70-c) no-entry minutes after a close (0..240, default 0)
 //   requireNewSignal?: boolean              (Task 70-c) edge-triggered re-entry (default false)
 //   sizingMode?: 'fixed'|'risk'             (Task 78) 'risk' = Risk-Money sizing (default 'fixed')
-//   riskMoney?: number                      (Task 78) dollars at risk per trade (required for 'risk')
+//   riskBasis?: 'usd'|'pct'                 (Task 78e) budget basis: dollars (default) or % of equity
+//   riskMoney?: number                      (Task 78) dollars at risk per trade (required for risk+usd)
+//   riskMoneyPct?: number                   (Task 78e) % of equity per trade (required for risk+pct)
 //   capital?: number                       starting equity for % / DD metrics
 //   minTrades?: number                     (optimize) minimum trades to score
 // }
@@ -72,7 +74,9 @@ interface BacktestBody {
   cooldownMin?: number
   requireNewSignal?: boolean
   sizingMode?: string
+  riskBasis?: string
   riskMoney?: number | null
+  riskMoneyPct?: number | null
   capital?: number
   minTrades?: number
 }
@@ -101,13 +105,22 @@ export async function POST(req: NextRequest) {
     }
     const capital = Math.max(100, Math.min(100_000_000, Number(body.capital) || 10000))
     const maxTradesDay = Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
-    // Task 78 — Risk Money sizing (required riskMoney > 0 when 'risk')
+    // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
+    // risk+usd requires riskMoney > 0 · risk+pct requires riskMoneyPct > 0.
     const sizingMode = body.sizingMode === 'risk' ? 'risk' : 'fixed'
+    const riskBasis = body.riskBasis === 'pct' ? 'pct' : 'usd'
     const riskMoneyRaw = Number(body.riskMoney)
     const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
       ? Math.min(10_000_000, riskMoneyRaw)
       : null
-    if (sizingMode === 'risk' && riskMoney == null) {
+    const riskPctRaw = Number(body.riskMoneyPct)
+    const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0
+      ? Math.min(100, riskPctRaw)
+      : null
+    if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
+      return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
+    }
+    if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
 
@@ -142,7 +155,9 @@ export async function POST(req: NextRequest) {
       params: normalizeAlgoParams(strategy, body.params),
       qty: symbol.includes('/') ? qty : Math.max(1, Math.floor(qty)),
       sizingMode,
-      riskMoney: sizingMode === 'risk' ? riskMoney : null,
+      riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+      riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
+      riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
       isCrypto: symbol.includes('/'),
       tpMode: body.tpMode === 'pct' ? 'pct' : 'none',
       tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0 ? Number(body.tpValue) : null,

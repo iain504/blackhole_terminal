@@ -29,7 +29,7 @@ import {
   ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES,
   normalizeAlgoParams, algoConfigSummaryName, algoExportFileBase,
   buildAlgoConfigExport, runToAlgoConfig, ruleToExportEntry,
-  type AlpoRunConfig, type AlgoStrategyId, type AlgoSizingMode, type AlgoTimeframe,
+  type AlpoRunConfig, type AlgoRiskBasis, type AlgoStrategyId, type AlgoSizingMode, type AlgoTimeframe,
   type AlgoRuleFileEntry, type AlgoRuleLike,
 } from '@/lib/algo-strategies'
 import BacktestPanel, { type AlgoSetupCfg } from '@/components/terminal/tabs/BacktestPanel'
@@ -65,11 +65,15 @@ export default function AlgoTab() {
   const [symbol, setSymbol] = useState('TSLA')
   const [timeframe, setTimeframe] = useState<AlgoTimeframe>('5m')
   // position sizing (Task 78 — Risk Money): 'fixed' trades `qty` units per
-  // entry · 'risk' risks `riskMoney` dollars per trade (size derived at entry
-  // from the SL % distance — hence risk sizing requires SL % below)
+  // entry · 'risk' risks the Risk-Money budget per trade (size derived at
+  // entry from the SL % distance — hence risk sizing requires SL % below).
+  // Task 78e — the budget is either $ (riskMoney) or % of account equity
+  // (riskBasis 'pct'), resolved to dollars at each entry.
   const [sizingMode, setSizingMode] = useState<AlgoSizingMode>('fixed')
+  const [riskBasis, setRiskBasis] = useState<AlgoRiskBasis>('usd')
   const [qty, setQty] = useState('10')
   const [riskMoney, setRiskMoney] = useState('200')
+  const [riskPct, setRiskPct] = useState('1')
   const [tpOn, setTpOn] = useState(true)
   const [tpPct, setTpPct] = useState('1.5')
   const [slOn, setSlOn] = useState(true)
@@ -134,7 +138,9 @@ export default function AlgoTab() {
           params,
           qty: Number(qty),
           sizingMode,
-          riskMoney: sizingMode === 'risk' ? Number(riskMoney) : null,
+          riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+          riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? Number(riskMoney) : null,
+          riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? Number(riskPct) : null,
           tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
           tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -186,9 +192,12 @@ export default function AlgoTab() {
   const def = ALGO_STRATEGIES[strategy]
   // risk sizing is only meaningful with an SL % bracket (the stop distance IS
   // the risk unit) — Start/backtest stay disabled until the config is coherent
-  const riskOk = sizingMode === 'fixed' || (Number(riskMoney) > 0 && slOn && Number(slPct) > 0)
+  const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
+  const riskOk = sizingMode === 'fixed' || (riskBudgetOk && slOn && Number(slPct) > 0)
   const sizingHint = sizingMode === 'risk'
-    ? `$ at risk per trade — qty = risk ÷ (entry × SL%)${slOn && Number(slPct) > 0 ? '' : ' · turn SL % ON'}`
+    ? (riskBasis === 'pct'
+        ? `% of account equity at risk per trade — qty = equity×% ÷ (entry × SL%)${slOn && Number(slPct) > 0 ? '' : ' · turn SL % ON'}`
+        : `$ at risk per trade — qty = risk ÷ (entry × SL%)${slOn && Number(slPct) > 0 ? '' : ' · turn SL % ON'}`)
     : 'units traded per entry'
 
   // shared config bundle — the backtest replays EXACTLY what a run would do
@@ -199,7 +208,9 @@ export default function AlgoTab() {
     params,
     qty: Number(qty) || 0,
     sizingMode,
-    riskMoney: sizingMode === 'risk' ? (Number(riskMoney) || 0) : null,
+    riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+    riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? (Number(riskMoney) || 0) : null,
+    riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? (Number(riskPct) || 0) : null,
     tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
     tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
     slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
@@ -209,7 +220,7 @@ export default function AlgoTab() {
     flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
     requireNewSignal,
-  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskMoney, tpOn, tpPct, slOn, slPct, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
+  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, slOn, slPct, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
 
   // ---- config import / export (Task 66) ----
   const exportSetup = () => {
@@ -252,7 +263,9 @@ export default function AlgoTab() {
     setSymbol(cfg.symbol)
     setTimeframe(cfg.timeframe)
     setSizingMode(cfg.sizingMode === 'risk' ? 'risk' : 'fixed')
+    setRiskBasis(cfg.riskBasis === 'pct' ? 'pct' : 'usd')
     setRiskMoney(cfg.riskMoney != null ? String(cfg.riskMoney) : '200')
+    setRiskPct(cfg.riskMoneyPct != null ? String(cfg.riskMoneyPct) : '1')
     setQty(String(cfg.qty))
     setTpOn(cfg.tpMode === 'pct')
     setTpPct(cfg.tpValue != null ? String(cfg.tpValue) : '1.5')
@@ -375,7 +388,7 @@ export default function AlgoTab() {
                   options={ALGO_TIMEFRAMES.map((tf) => ({ value: tf, label: tf }))}
                 />
               </div>
-              {/* position sizing (Task 78 — Risk Money) */}
+              {/* position sizing (Task 78 — Risk Money; Task 78e — $ or % basis) */}
               <div className="col-span-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <div className="flex items-center justify-between gap-2">
                   <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Position sizing</p>
@@ -386,7 +399,7 @@ export default function AlgoTab() {
                     onChange={setSizingMode}
                     options={[
                       { value: 'fixed', label: 'Fixed qty', title: 'Trade a fixed quantity every entry' },
-                      { value: 'risk', label: 'Risk $ / trade', title: 'Risk-Money sizing — dollars at risk per trade, size derived from the SL % distance at entry' },
+                      { value: 'risk', label: 'Risk money', title: 'Risk-Money sizing — a $ amount or % of equity at risk per trade, size derived from the SL % distance at entry' },
                     ]}
                   />
                 </div>
@@ -398,7 +411,9 @@ export default function AlgoTab() {
                     </div>
                   ) : (
                     <div className="min-w-0">
-                      <Label htmlFor="algo-risk" className="text-[11px] text-zinc-300">Risk money per trade ($)</Label>
+                      <Label htmlFor="algo-risk" className="text-[11px] text-zinc-300">
+                        {riskBasis === 'pct' ? 'Risk per trade (% of equity)' : 'Risk money per trade ($)'}
+                      </Label>
                       <p className={cn('text-[10px] leading-snug', slOn && Number(slPct) > 0 ? 'text-zinc-500' : 'text-amber-400')}>{sizingHint}</p>
                     </div>
                   )}
@@ -411,15 +426,29 @@ export default function AlgoTab() {
                       className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
                     />
                   ) : (
-                    <Input
-                      id="algo-risk"
-                      value={riskMoney}
-                      onChange={(e) => setRiskMoney(e.target.value)}
-                      onBlur={() => setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0))))}
-                      inputMode="decimal"
-                      aria-label="Risk money per trade in dollars"
-                      className="h-7 w-16 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
-                    />
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <Segmented
+                        ariaLabel="Risk money basis — dollars or percent of equity"
+                        size="sm"
+                        value={riskBasis}
+                        onChange={setRiskBasis}
+                        options={[
+                          { value: 'usd', label: '$', title: 'Fixed dollars at risk per trade' },
+                          { value: 'pct', label: '%', title: 'Percent of account equity at risk per trade — resolved to dollars at each entry' },
+                        ]}
+                      />
+                      <Input
+                        id="algo-risk"
+                        value={riskBasis === 'pct' ? riskPct : riskMoney}
+                        onChange={(e) => (riskBasis === 'pct' ? setRiskPct(e.target.value) : setRiskMoney(e.target.value))}
+                        onBlur={() => (riskBasis === 'pct'
+                          ? setRiskPct(String(Math.min(100, Math.max(0, Number(riskPct) || 0))))
+                          : setRiskMoney(String(Math.min(10_000_000, Math.max(0, Number(riskMoney) || 0)))))}
+                        inputMode="decimal"
+                        aria-label={riskBasis === 'pct' ? 'Risk per trade as percent of account equity' : 'Risk money per trade in dollars'}
+                        className="h-7 w-14 shrink-0 border-zinc-800 bg-zinc-950 text-xs"
+                      />
+                    </div>
                   )}
                 </div>
               </div>
@@ -529,7 +558,7 @@ export default function AlgoTab() {
             <Button
               className="mt-3 h-9 w-full gap-2 bg-sky-600 text-xs text-white hover:bg-sky-500"
               disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
-              title={!riskOk ? 'Risk sizing needs a positive risk $ and an SL % bracket' : undefined}
+              title={!riskOk ? 'Risk sizing needs a positive risk $ / % and an SL % bracket' : undefined}
               onClick={() => void start()}
             >
               {starting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -600,9 +629,11 @@ export default function AlgoTab() {
                   {r.sizingMode === 'risk' ? (
                     <span
                       className="text-sky-400/90"
-                      title={`Risk-Money sizing — $${r.riskMoney} at risk per trade, position size derived at entry (risk ÷ (entry × SL%)) · fallback qty ${r.qty}`}
+                      title={r.riskBasis === 'pct'
+                        ? `Risk-Money sizing — ${r.riskMoneyPct}% of account equity at risk per trade (resolved to dollars at entry), position size derived from the SL % distance (risk ÷ (entry × SL%)) · fallback qty ${r.qty}`
+                        : `Risk-Money sizing — $${r.riskMoney} at risk per trade, position size derived at entry (risk ÷ (entry × SL%)) · fallback qty ${r.qty}`}
                     >
-                      risk ${r.riskMoney}/trade
+                      risk {r.riskBasis === 'pct' ? `${r.riskMoneyPct}%` : `$${r.riskMoney}`}/trade
                     </span>
                   ) : (
                     <span className="text-zinc-400">qty {r.qty}</span>
