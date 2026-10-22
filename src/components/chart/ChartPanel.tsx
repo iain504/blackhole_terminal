@@ -277,6 +277,23 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // (crypto is 24/7; daily+ bars can't be split by session)
   const sessionGate = !isCryptoSymbol(symbol) && TIMEFRAMES[tf].seconds < 86400
   const ethShown = sessionGate && showExtendedHours
+  // When the user flips ETH on, tell them exactly what the FREE feed covers —
+  // feed=iex only carries IEX's own prints: pre-market 08:00–09:30 ET and
+  // after-hours 16:00–17:00 ET. Unlike TradingView's consolidated SIP view,
+  // most of the 04:00–20:00 extended window legitimately stays empty, and the
+  // bars that do appear are sparse — that's feed coverage, not a toggle bug
+  // (Task 76: verified extBarCount matches IEX prints 1:1).
+  const prevEthRef = useRef(showExtendedHours)
+  useEffect(() => {
+    if (showExtendedHours && !prevEthRef.current && sessionGate) {
+      ttLog(
+        'data',
+        `${symbol} ETH on — free IEX feed prints pre-market 08:00–09:30 ET & after-hours 16:00–17:00 ET only (full 04:00–20:00 coverage needs a SIP subscription)`,
+        'info',
+      )
+    }
+    prevEthRef.current = showExtendedHours
+  }, [showExtendedHours, sessionGate, symbol])
   const [activeColor, setActiveColor] = useState(DRAW_COLORS[4])
   const activeColorRef = useRef(activeColor)
   activeColorRef.current = activeColor
