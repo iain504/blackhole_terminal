@@ -26,7 +26,7 @@ import {
   ChevronLeft, ChevronRight, ShieldCheck, Rocket,
 } from 'lucide-react'
 
-type MobileView = 'watchlist' | 'chart' | 'trades' | 'report' | 'menu' | 'tool'
+type MobileView = 'watchlist' | 'chart' | 'trades' | 'report' | 'menu' | 'tool' | 'algo'
 type ToolTab = 'heatmap' | 'calendar' | 'algo'
 
 const TOOL_TITLES: Record<ToolTab, string> = {
@@ -37,9 +37,12 @@ const TOOL_TITLES: Record<ToolTab, string> = {
 
 const VIEW_KEY = 'tt:mobileView'
 
+// 'algo' is a first-class bottom-nav tab (Task 75) — the algo workspace was
+// previously buried in Menu → Algo Trading; it now sits next to Trades/Report.
 const NAV: { id: Exclude<MobileView, 'tool'>; label: string; icon: typeof Bookmark }[] = [
   { id: 'watchlist', label: 'Watchlist', icon: Bookmark },
   { id: 'chart', label: 'Chart', icon: CandlestickChart },
+  { id: 'algo', label: 'Algo', icon: Rocket },
   { id: 'trades', label: 'Trades', icon: Layers },
   { id: 'report', label: 'Report', icon: ChartColumnBig },
   { id: 'menu', label: 'Menu', icon: MenuIcon },
@@ -63,7 +66,7 @@ export function MobileShell({
     if (typeof window === 'undefined') return 'watchlist'
     try {
       const v = localStorage.getItem(VIEW_KEY)
-      if (v && ['watchlist', 'chart', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
+      if (v && ['watchlist', 'chart', 'algo', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
     } catch {
       /* private mode */
     }
@@ -152,6 +155,14 @@ export function MobileShell({
           </div>
         )}
 
+        {/* first-class Algo tab — same workspace the Menu row opens, rendered
+            directly (AlgoTab scrolls itself: flex-1 + overflow-y-auto) */}
+        {view === 'algo' && (
+          <div className="min-h-0 flex-1">
+            <AlgoTab />
+          </div>
+        )}
+
         {view === 'tool' && (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="flex h-11 shrink-0 items-center gap-1 border-b border-zinc-800 bg-zinc-900/80 px-1.5">
@@ -225,12 +236,12 @@ export function MobileShell({
                 onClick={() => go(id)}
                 aria-current={isActive ? 'page' : undefined}
                 className={cn(
-                  'flex min-h-[56px] flex-1 flex-col items-center justify-center gap-0.5 py-1.5 text-[10px] font-medium transition-colors active:bg-zinc-800/60',
+                  'flex min-h-[56px] min-w-0 flex-1 flex-col items-center justify-center gap-0.5 overflow-hidden px-0.5 py-1.5 text-[10px] font-medium transition-colors active:bg-zinc-800/60',
                   isActive ? 'text-emerald-400' : 'text-zinc-500',
                 )}
               >
-                <Icon className="h-5 w-5" aria-hidden />
-                {label}
+                <Icon className="h-5 w-5 shrink-0" aria-hidden />
+                <span className="max-w-full truncate">{label}</span>
               </button>
             )
           })}
