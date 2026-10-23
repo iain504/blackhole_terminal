@@ -1681,3 +1681,20 @@ Work Log:
 
 Stage Summary:
 - Fib retracement verified correct end-to-end (advisor + manual tool) and hardened: level stack pane-clipped, hit-test pane-guarded, TV-style leg drawn, degenerate-leg NaN fixed. The Trade Advisor plan panel is now draggable by its header with the position persisted in the layout (same mechanics as the trade ticket).
+
+---
+Task ID: 82c
+Agent: Z.ai Code (main)
+Task: "Please check level 1 = s/r anchor, is this a correct usage of FIB retracement? I am in doubt."
+
+Work Log:
+- ANSWER (convention): yes — in a retracement 1.000 sits at the leg ORIGIN and 0.000 at the leg END (the extreme); 0.5–0.618 is measured back from the extreme toward the origin. TradingView labels a fib drawn origin→extreme exactly this way, so "1 = the S/R level, 0 = the swing extreme" is the standard orientation — PROVIDED the level really is where the move started.
+- DOUBT VALIDATED (the real defect): the old code anchored 0.000 on the whole-LOOKBACK extreme (365d high/low), which may belong to a completely different move than the S/R level — a synthetic leg whose golden pocket has no classic meaning (e.g. TSLA showed swing 297.43 vs anchor 383.77 regardless of whether price ever traveled that leg).
+- FIX (real-leg construction, src/components/chart/TradeAdvisor.tsx): new touchEpisodes() (bars within tolPct of the level, gaps ≤3 bars merged = one test) + legFromLevel() — scans episodes newest-first, takes the most recent REAL leg: departure after the episode → subsequent extreme, bounded by the level's next revisit (completed leg) or now (ongoing leg); requires ≥3 bars away and the extreme clearing the zone by 2×tol on the trade side. analyze() now walks candidates strongest-first and uses the first level WITH a real leg; auto-side prefers a real leg before score/proximity. Only if NO candidate has one does it fall back to the whole-lookback extreme — now flagged: Advice.legSource 'leg'|'lookback', panel "Fib leg" row (dates, tooltip) + ⚠ synthetic warning paragraph, toast shows the leg window.
+- DRAWING: the advisor fib's two points now sit at their REAL bars — (departure bar, level) → (swing bar, extreme) — so the drawn fib is a true diagonal like a hand-drawn TradingView fib (ChartPanel's Task 82b leg rendering shows it); fallback still anchors both ends at the swing bar. meta gains legSource.
+- LOGIC PROBE (bun -e, synthetic series): ongoing leg wins by recency over an older bigger leg; flat/no-departure → null (fallback); short side mirrors correctly.
+- E2E (agent-browser, real trader+TOTP, TSLA 1D): plan now SHORT on a REAL leg — anchor 383.77 resistance score 6, leg Oct 12 → Oct 16, swing 349.41 (not the lookback 297.43), pocket 366.59–370.65 = exactly 0.5/0.618 of the 34.36 leg, entry 368.62 (0.559), SL 385.80 (anchor + half pocket), TP 349.41 (the actual leg low), R:R 1.12; chart shows the diagonal leg tracing the real decline with all 7 level labels exact; monitor "price overshot the zone" + marketable warning correct at 374.70 (73.6% retrace). Zero console/page errors; lint clean; tsc clean in src.
+- Files: src/components/chart/TradeAdvisor.tsx. Screenshot: t82c-fib-realleg.png.
+
+Stage Summary:
+- The advisor fib is now a textbook retracement: 1.000 = the S/R level the move actually departed from, 0.000 = that leg's extreme, golden pocket = 0.5–0.618 back from the extreme, drawn as a real diagonal between the two real bars. When no real leg exists the panel says so (⚠ synthetic) instead of silently drawing a meaningless pocket.
