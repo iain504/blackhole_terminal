@@ -1562,6 +1562,23 @@ export async function cancelOrder(userId: string, mode: TradeMode, orderId: stri
   return tradeFetch<null>(userId, mode, `/v2/orders/${orderId}`, { method: 'DELETE' })
 }
 
+/**
+ * Fetch ONE order by id (Task 83 — Trade Advisor order-status polling /
+ * cancel button). Tries the requested host first, then the other mode's host
+ * (same paper/live id-space fallback the replace helpers use) so a drag-time
+ * host mismatch can never 404 a live order.
+ */
+export async function getOrderById(userId: string, mode: TradeMode, orderId: string) {
+  const hosts: TradeMode[] = mode === 'paper' ? ['paper', 'live'] : ['live', 'paper']
+  let last: TradeFetchResult<TradingOrder> | null = null
+  for (const m of hosts) {
+    const r = await tradeFetch<TradingOrder>(userId, m, `/v2/orders/${orderId}`)
+    if (r.data && (r.data as TradingOrder).id) return { ...r, mode: m }
+    last = r
+  }
+  return { data: null, status: last?.status || 404, error: last?.error || 'Order not found on paper or live', mode }
+}
+
 // ---------- attach TP/SL to an EXISTING position (chart [TP]/[SL] drag-add) ----------
 
 export interface AttachExitsResult {

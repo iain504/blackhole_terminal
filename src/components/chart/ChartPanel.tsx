@@ -141,11 +141,12 @@ const fmtPaneValue = (pane: DrawingPane | undefined, v: number) =>
   : pane === 'macd' ? fmtSigned(v)
   : fmtPrice(v)
 
-/** lightweight-charts series for every ENABLED indicator (slots optional). */
+  /** lightweight-charts series for every ENABLED indicator (slots optional). */
 interface IndSeriesBundle {
   settings: IndicatorSettings
   /** last computed value per slot (E2E probe / debug) */
   lastPts: Record<string, number | null>
+  vwap?: ISeriesApi<'Line'>
   sma?: ISeriesApi<'Line'>
   ema?: ISeriesApi<'Line'>
   bbU?: ISeriesApi<'Line'>
@@ -413,6 +414,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
     const s = b.settings
     const ov = computeOverlays(bars, s)
+    put(b.vwap, ov.vwap, 'vwap')
     put(b.sma, ov.sma, 'sma')
     put(b.ema, ov.ema, 'ema')
     put(b.bbU, ov.bbUpper, 'bbU')
@@ -445,6 +447,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       b.lastPts[slot] = p.value
     }
     const ov = computeOverlays(bars, s)
+    updLine(b.vwap, ov.vwap, 'vwap')
     updLine(b.sma, ov.sma, 'sma')
     updLine(b.ema, ov.ema, 'ema')
     updLine(b.bbU, ov.bbUpper, 'bbU')
@@ -2404,6 +2407,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       openMenuAt(lpX, lpY, 2)
     }
 
+    // Floating trade panels (ticket / advisor) live INSIDE this container — a
+    // pointer on them must NEVER touch the chart underneath. These listeners
+    // run in CAPTURE phase on the container, i.e. BEFORE the panel's own React
+    // handlers, so without this pass-through a press on the advisor header
+    // hit-tested the drawing under the cursor and dragged THE LINE instead of
+    // the panel (Task 83 bug report).
+    const inFloatingPanel = (t: EventTarget | null): boolean =>
+      t instanceof Element && (
+        t.closest('[role="menu"]') != null ||
+        t.closest('[role="dialog"][aria-label^="Trade ticket"]') != null ||
+        t.closest('[role="dialog"][aria-label^="Trade advisor"]') != null
+      )
+
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return
       // a chart context menu is open — clicks INSIDE it must pass through.
@@ -2412,7 +2428,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // (e.g. a color swatch sitting on a rectangle edge) and the menu button
       // never receives the click. The trade ticket (incl. its drag header)
       // gets the same pass-through.
-      if (e.target instanceof Element && (e.target.closest('[role="menu"]') || e.target.closest('[role="dialog"][aria-label^="Trade ticket"]'))) return
+      if (inFloatingPanel(e.target)) return
       // arm the touch long-press timer (mobile right-click equivalent).
       // Interactive HTML (header buttons, toolbars) is excluded — a held
       // finger there means a slow tap, not a chart menu.
@@ -2708,6 +2724,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const onPointerMove = (e: PointerEvent) => {
       // finger drifted — this is a pan/zoom, not a hold: cancel the long-press
       if (lpTimer !== null && e.pointerId === lpPointerId && Math.hypot(e.clientX - lpX, e.clientY - lpY) > 10) cancelLongPress()
+      // over a floating panel: no hover hit-testing / cursor games — the
+      // canvas isn't the event owner here (and a drawing under the panel must
+      // not light up or grab the cursor while the panel is used)
+      if (inFloatingPanel(e.target)) {
+        if (hoverRef.current) {
+          hoverRef.current = null
+          scheduleRedraw()
+        }
+        return
+      }
       if (dragRef.current) return
       const { x, y } = rel(e)
       const tool = useTerminal.getState().drawingTool
@@ -2758,6 +2784,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
 
     const onContextMenu = (e: MouseEvent) => {
+      // floating trade panels own their own surface — no chart menu, and the
+      // browser's native menu stays available (inputs inside the panels)
+      if (inFloatingPanel(e.target)) return
       // on Android a touch long-press fires this NATIVE event ~500ms in —
       // remember it so the synthesized timer doesn't open a second menu
       lastNativeCtxAt = Date.now()
@@ -2770,6 +2799,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const onDoubleClick = (e: MouseEvent) => {
       // double-click near a line edits its value quickly
+      if (inFloatingPanel(e.target)) return
       const { x, y } = rel(e)
       const hit = hitTest(x, y)
       if (!hit) return
@@ -2995,6 +3025,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               if (v != null && Number.isFinite(v)) parts.push(`<span class="tabular-nums" style="color:${color}">${label} ${fmtPrice(v)}</span>`)
             }
             const st = ib.settings
+            if (ib.vwap) push('#2dd4bf', 'VWAP', rv(ib.vwap))
             if (ib.sma) push('#f59e0b', `SMA${st.sma.period}`, rv(ib.sma))
             if (ib.ema) push('#a78bfa', `EMA${st.ema.period}`, rv(ib.ema))
             if (ib.bbU) push('#e879f9', `BB${st.bb.period},${st.bb.mult}`, rv(ib.bbM))
@@ -3351,7 +3382,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const destroyBundle = (b: IndSeriesBundle | null) => {
       indSeriesRef.current = null
       if (!b) return
-      for (const ser of [b.sma, b.ema, b.bbU, b.bbM, b.bbL, b.rsi, b.macdLine, b.macdSig, b.macdHist]) {
+      for (const ser of [b.vwap, b.sma, b.ema, b.bbU, b.bbM, b.bbL, b.rsi, b.macdLine, b.macdSig, b.macdHist]) {
         if (!ser) continue
         try { chart.removeSeries(ser) } catch { /* chart already disposed */ }
       }
@@ -3367,6 +3398,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const bundle: IndSeriesBundle = { settings: s, lastPts: {} }
     const overlayOpts = { lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false } as const
     try {
+      if (s.vwap.enabled) bundle.vwap = chart.addLineSeries({ color: '#2dd4bf', lineWidth: 1, ...overlayOpts })
       if (s.sma.enabled) bundle.sma = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, ...overlayOpts })
       if (s.ema.enabled) bundle.ema = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, ...overlayOpts })
       if (s.bb.enabled) {
@@ -3715,6 +3747,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                 </button>
               </div>
               <div className="px-1.5 pb-1 pt-0.5 text-[9px] font-semibold uppercase tracking-widest text-zinc-600">Overlays</div>
+              <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Switch checked={ind.vwap.enabled} onCheckedChange={(v) => setInd((p) => ({ ...p, vwap: { enabled: v } }))} aria-label="Toggle VWAP" />
+                    <span className="font-medium text-teal-400">VWAP</span>
+                  </div>
+                  <span className="text-[10px] text-zinc-600">session · reset daily</span>
+                </div>
+              </div>
               <div className="rounded-md px-1.5 py-1.5 transition-colors hover:bg-zinc-900/70">
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2">

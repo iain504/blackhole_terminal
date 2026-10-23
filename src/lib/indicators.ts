@@ -19,6 +19,7 @@ export interface LinePoint {
 }
 
 export interface IndicatorSettings {
+  vwap: { enabled: boolean }
   sma: { enabled: boolean; period: number }
   ema: { enabled: boolean; period: number }
   bb: { enabled: boolean; period: number; mult: number }
@@ -26,7 +27,10 @@ export interface IndicatorSettings {
   macd: { enabled: boolean; fast: number; slow: number; signal: number }
 }
 
+// VWAP defaults ON — the day-trading community's #1 intraday tool (trend
+// filter: long above / short below; dynamic support/resistance).
 export const DEFAULT_INDICATORS: IndicatorSettings = {
+  vwap: { enabled: true },
   sma: { enabled: true, period: 20 },
   ema: { enabled: true, period: 50 },
   bb: { enabled: false, period: 20, mult: 2 },
@@ -42,6 +46,9 @@ export function normalizeIndicators(raw: unknown): IndicatorSettings {
   const d = DEFAULT_INDICATORS
   const o = (raw ?? {}) as Partial<IndicatorSettings>
   return {
+    vwap: {
+      enabled: Boolean(o.vwap?.enabled ?? d.vwap.enabled),
+    },
     sma: {
       enabled: Boolean(o.sma?.enabled ?? d.sma.enabled),
       period: clampInt(o.sma?.period ?? d.sma.period, 2, 500),
@@ -228,6 +235,7 @@ const zip = (bars: BarInput[], vals: (number | null)[]): LinePoint[] => {
 }
 
 export interface OverlaySeries {
+  vwap?: LinePoint[]
   sma?: LinePoint[]
   ema?: LinePoint[]
   bbUpper?: LinePoint[]
@@ -235,10 +243,38 @@ export interface OverlaySeries {
   bbLower?: LinePoint[]
 }
 
+/**
+ * Session-anchored VWAP (volume-weighted average price): cumulative
+ * Σ(typicalPrice×volume) / Σ(volume), RESET at each session boundary so it
+ * matches the platform-standard "daily VWAP" day traders trade against.
+ * Session = UTC calendar day of the bar time: stocks from Alpaca are regular
+ * hours only (one RTH session per UTC date), crypto trades a UTC day.
+ */
+export function computeVwap(bars: BarInput[]): LinePoint[] {
+  const out: LinePoint[] = []
+  let day = ''
+  let cumPV = 0
+  let cumV = 0
+  for (const b of bars) {
+    const d = new Date(b.time * 1000).toISOString().slice(0, 10)
+    if (d !== day) {
+      day = d
+      cumPV = 0
+      cumV = 0
+    }
+    const v = b.volume > 0 ? b.volume : 0
+    cumPV += ((b.high + b.low + b.close) / 3) * v
+    cumV += v
+    if (cumV > 0) out.push({ time: b.time, value: cumPV / cumV })
+  }
+  return out
+}
+
 /** Price-chart overlay indicators (SMA / EMA / Bollinger). */
 export function computeOverlays(bars: BarInput[], s: IndicatorSettings): OverlaySeries {
   const closes = bars.map((b) => b.close)
   const out: OverlaySeries = {}
+  if (s.vwap.enabled) out.vwap = computeVwap(bars)
   if (s.sma.enabled) out.sma = zip(bars, sma(closes, s.sma.period))
   if (s.ema.enabled) out.ema = zip(bars, ema(closes, s.ema.period))
   if (s.bb.enabled) {
@@ -309,6 +345,7 @@ export function stripMargins(hasRsi: boolean, hasMacd: boolean): StripMargins {
 /** How many tail bars each enabled indicator needs (for tick updates). */
 export function indicatorsActive(s: IndicatorSettings): number {
   let n = 0
+  if (s.vwap.enabled) n++
   if (s.sma.enabled) n++
   if (s.ema.enabled) n++
   if (s.bb.enabled) n++

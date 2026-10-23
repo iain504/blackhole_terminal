@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { replaceExitOrderSmart, replacePendingEntrySmart, cancelOrder, resolveTradeMode } from '@/lib/trading'
+import { replaceExitOrderSmart, replacePendingEntrySmart, cancelOrder, resolveTradeMode, getOrderById } from '@/lib/trading'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface ReplaceBody {
@@ -58,6 +58,27 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
       return NextResponse.json({ error: r.error || 'Replace failed' }, { status: r.status || 502 })
     }
     return NextResponse.json({ mode: r.mode, order: r.data, method: r.method, note: r.note })
+  } catch (e) {
+    return handleError(e)
+  }
+}
+
+// GET /api/trading/orders/[id]?mode=paper — one order's live status (paper→
+// live host fallback inside getOrderById). The Trade Advisor polls this to
+// switch its submitted-order row between OPEN / FILLED / CLOSED and to know
+// whether Cancel still applies.
+export async function GET(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const user = await getSessionUser()
+    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const { id } = await params
+    const { searchParams } = new URL(req.url)
+    const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
+    const r = await getOrderById(user.id, mode, id)
+    if (!r.data) {
+      return NextResponse.json({ error: r.error || 'Order not found' }, { status: r.status || 404 })
+    }
+    return NextResponse.json({ mode: r.mode, order: r.data })
   } catch (e) {
     return handleError(e)
   }

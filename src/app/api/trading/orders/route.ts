@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import {
   placeOrderWithExits, placeTrailingStop, resolveTradeMode, ensureCryptoOcoSupervisor,
-  friendlyExitQtyError, TradeMode,
+  friendlyExitQtyError, getOpenOrders, TradeMode,
 } from '@/lib/trading'
 import { readJson, handleError } from '@/lib/api-helpers'
 
@@ -18,6 +18,23 @@ interface PlaceBody {
   take_profit?: number
   stop_loss?: number
   trail_percent?: number
+}
+
+// GET /api/trading/orders?mode=paper&symbol=TSLA — OPEN orders (merged
+// flat/nested/held-sweep view, same shape the Positions tab uses). The Trade
+// Advisor polls this to keep its cancel button honest.
+export async function GET(req: Request) {
+  try {
+    const user = await getSessionUser()
+    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const { searchParams } = new URL(req.url)
+    const mode: TradeMode = await resolveTradeMode(user.id, searchParams.get('mode'))
+    const symbol = (searchParams.get('symbol') || '').trim().toUpperCase() || undefined
+    const r = await getOpenOrders(user.id, mode, symbol)
+    return NextResponse.json({ mode, orders: Array.isArray(r.data) ? r.data : [], error: r.error ?? null })
+  } catch (e) {
+    return handleError(e)
+  }
 }
 
 // POST /api/trading/orders — place entry (market/limit) with optional SL/TP,
