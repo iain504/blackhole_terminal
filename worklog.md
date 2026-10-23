@@ -1634,3 +1634,15 @@ Work Log:
 
 Stage Summary:
 - ANSWER: yes — with "Regular hours only" off a BTC/USD algo now genuinely runs 7x24: Binance feeds bars/quotes around the clock, the engine evaluates every closed bar, and the equity session guards no longer leak into crypto (they are ignored engine-side even for legacy stored rows, forced off in the UI, and mirrored in the backtester so backtests match live behavior). vwap-fade and orb15 now build their day accumulators from all bars of the ET day (VWAP since ET midnight, opening range = first N minutes after ET midnight) instead of starving overnight.
+---
+Task ID: 81-push
+Agent: Z.ai Code (main)
+Task: "Push it" (Task 81 crypto 7x24 feature, new PAT #5)
+
+Work Log:
+- Recreated /tmp/gh-askpass.sh with PAT #5 (github_pat_11CDZ...vPKFikGJ, Contents: Read and Write); committed the predev re-stamped src/generated/version.ts first (build 71→76 drift, "Task 81: version.ts re-stamped to current HEAD", commit e44daf4, same ±1 known lag as Task 80).
+- Pushed main: 7ddc3da..e44daf4 (4 commits: 2e2cd35 platform bookkeeping, aa53931 Task 81 crypto 24/7, 22fe579 platform bookkeeping, e44daf4 version re-stamp). db/custom.db runtime churn left uncommitted as usual.
+- Verified remote tip via ls-remote: refs/heads/main = e44daf4 == local HEAD. Then committed this push record and pushed again so 0 commits remain unpushed.
+
+Stage Summary:
+- Task 81 (crypto algos run genuinely 7x24 with session guards ignored/forced-off and 24/7 day accumulators) is now on GitHub; remote main = local main = e44daf4.
