@@ -1664,3 +1664,20 @@ Work Log:
 
 Stage Summary:
 - The chart now has a one-click Trade Advisor: high-score higher-timeframe S/R → fib retracement with the 0.5–0.618 golden pocket drawn on the chart → editable entry/TP/SL advice → GTC limit order (works any time, pre-market/weekend included) with bracket or OCO-managed TP/SL → live in-zone monitoring → one-tap cleanup of everything the advisor drew. Not pushed yet (awaiting PAT).
+
+---
+Task ID: 82b
+Agent: Z.ai Code (main)
+Task: "please double check if your FIB retracement is drawing correctly." + "make trade plan panel movable"
+
+Work Log:
+- FIB AUDIT (math verified exact): renderer/hit-test/advisor all share priceLv = price2 + (price1-price2)*lv with points[0]=anchor S/R level, points[1]=swing extreme — identical to the advisor's priceAt (f=0 swing, f=1 level), so the drawn 0.500/0.618 lines and golden band EXACTLY bracket the advised entry (0.559 midpoint). Time units consistent (Alpaca + Binance bars both unix seconds; xOf extrapolates off-screen swing times linearly, x-clamped). Live E2E: advisor fib stored [383.774 anchor, 297.43 swing] → drawn levels 1.000=383.77 / 0.786=365.30 / 0.618★=350.79 / 0.500★=340.60 = panel's golden pocket to the cent; user-drawn fib [376.278, 355.531] → all 7 labels exactly linear in lv (371.84/368.35/365.90/363.46/360.43/355.53). Monitor zone/entry/panel numbers all consistent.
+- FIX 1 (ChartPanel drawDrawing fib): the 7 fib level lines + labels are now clipToPane(fibPane)-ed — an off-scale extreme (0.000/1.000 far outside the visible zoom) used to extrapolate INTO the vol/RSI/MACD strips (Task 60 bug class; the golden band already clipped, the levels didn't). Geometry-unavailable edge falls back to unclipped (hline behavior). Verified: TSLA 0.000 (297.43) off-scale below → cleanly clipped, nothing bleeds into the volume strip.
+- FIX 2 (ChartPanel fib hit-test): paneYBounds visibility guard per level — a clipped (invisible) level can no longer be hit/dragged inside the sub-strips (mirrors the hline Task 60 guard).
+- FIX 3 (ChartPanel fib): TV-style LEG segment p1→p2 now drawn (alpha 0.55, pane-clipped) — user fibs show their diagonal leg like TradingView; the advisor fib (both anchors at the swing bar) reads as a vertical spine connecting swing→S/R anchor. Plus segPath degenerate-leg guard (dx=dy=0 previously produced 0*Infinity=NaN in the fib draft preview).
+- MOVABLE PANEL (TradeAdvisor + store): drag by the header (GripVertical affordance, cursor-move, touch-none for touch drag, data-no-drag close button) — same proven pattern as the trade ticket (Task 54.3): pointer capture, clamp into the chart container (4px margins), position persisted as advisorPos in the terminal layout (layoutSnapshot + hydrateFromServer + LayoutBlob — rides the 5s autosave and export/import). Saved positions re-clamp visually on mount (chart resize / smaller viewport safe).
+- E2E (agent-browser, real trader+TOTP): TSLA SHORT plan re-verified (anchor 383.77 resistance score 5/6, pocket 340.60–350.79, entry 345.696389 → submits px-rounded); panel DRAGGED left by header → moved+committed; close/reopen restores the dragged position; reopened on 390px mobile via More sheet → persisted position re-clamped fully on-screen (114..370 in 390vw); Clean up lines (2) removed exactly the anchor+advisor fib and left the user fib; manual 2-click fib regression-tested with the new leg rendering. Zero console/page errors; lint clean; tsc clean in src (pre-existing scripts-tmp/tests errors only).
+- Files: src/components/chart/ChartPanel.tsx, src/components/chart/TradeAdvisor.tsx, src/store/terminal.ts. Screenshots: t82b-chart-fib.png, t82b-panel-moved.png, t82b-user-fib.png, t82b-mobile-advisor.png.
+
+Stage Summary:
+- Fib retracement verified correct end-to-end (advisor + manual tool) and hardened: level stack pane-clipped, hit-test pane-guarded, TV-style leg drawn, degenerate-leg NaN fixed. The Trade Advisor plan panel is now draggable by its header with the position persisted in the layout (same mechanics as the trade ticket).
