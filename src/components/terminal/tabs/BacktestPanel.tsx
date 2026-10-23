@@ -107,6 +107,9 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   // re-entry control (Task 70-c) — seeded from the run setup, editable here
   const [btCooldown, setBtCooldown] = useState('0')
   const [btFresh, setBtFresh] = useState(false)
+  // Task 84 — execution-cost model (bps; 0 = frictionless, historical default)
+  const [btSlip, setBtSlip] = useState('0')
+  const [btFee, setBtFee] = useState('0')
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
   const [busy, setBusy] = useState<null | 'run' | 'optimize'>(null)
@@ -153,9 +156,11 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     flattenEod: cfg.flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(btCooldown) || 0))),
     requireNewSignal: btFresh,
+    slippageBps: Math.min(500, Math.max(0, Math.round(Number(btSlip) || 0))),
+    feeBps: Math.min(500, Math.max(0, Math.round(Number(btFee) || 0))),
     days: Math.max(1, Math.round(Number(days) || 30)),
     capital: Number(capital) || 10000,
-  }), [cfg, days, capital, btCooldown, btFresh])
+  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee])
 
   const activeRanges = useMemo(() => {
     const out: { key: string; min: number; max: number; step: number }[] = []
@@ -308,6 +313,30 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
               className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
             />
           </div>
+          <div>
+            <Label htmlFor="bt-slip" className="text-[10px] text-zinc-500">Slippage (bps)</Label>
+            <Input
+              id="bt-slip"
+              value={btSlip}
+              onChange={(e) => setBtSlip(e.target.value)}
+              onBlur={() => setBtSlip(String(Math.min(500, Math.max(0, Math.round(Number(btSlip) || 0)))))}
+              inputMode="numeric"
+              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">adverse drift on market/stop fills — TP limits fill clean</p>
+          </div>
+          <div>
+            <Label htmlFor="bt-fee" className="text-[10px] text-zinc-500">Fee (bps / fill)</Label>
+            <Input
+              id="bt-fee"
+              value={btFee}
+              onChange={(e) => setBtFee(e.target.value)}
+              onBlur={() => setBtFee(String(Math.min(500, Math.max(0, Math.round(Number(btFee) || 0)))))}
+              inputMode="numeric"
+              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">notional fee per fill, entry + exit — costs scale with trade count</p>
+          </div>
           <div className="flex flex-col justify-between">
             <div className="flex items-center justify-between gap-2">
               <Label htmlFor="bt-fresh" className="text-[10px] leading-tight text-zinc-500">Require fresh signal</Label>
@@ -317,7 +346,7 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           </div>
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
-              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · no slippage/fees. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close. Slippage bps hits market/stop fills (entries, stops, strategy exits); TP is a resting limit and fills clean; fee bps charges every fill. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the pre-order quote (not the fill), and bars that closed while the engine was down never produce entries (exits are replayed). Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
               {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
                 <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
               )}

@@ -11,11 +11,20 @@
 //   • exits resolve BEFORE entries on the same bar (an exit + fresh entry can
 //     both execute, like the live cycle).
 //
-// EXECUTION MODEL (documented assumptions — no slippage/fees/commission):
+// EXECUTION MODEL (documented assumptions):
 //   • strategy exits decided on a bar close fill at that bar's CLOSE (the live
 //     engine market-orders seconds after the close);
 //   • entry signals fill at the NEXT bar's OPEN (conservative for close-driven
 //     systems) — % TP/SL legs derive from the FILL price;
+//   • OPTIONAL cost model (Task 84): slippageBps applies an adverse fill drift
+//     to every MARKET/STOP fill (entries, SL legs, strategy/EOD/mark exits) —
+//     TP legs are resting LIMIT orders and fill at their price, no drift.
+//     feeBps charges per-fill notional fees on every fill (entry + exit). Both
+//     default to 0 = the historical frictionless model;
+//   • warmup is aligned to the LIVE engine's guards bar-for-bar: the first
+//     decided bar is the first bar whose window satisfies the same `n <
+//     period+2` / `n < trendSma+2` check evalStrategy applies (Task 84 parity
+//     probe — the old +2 warmup let live fire one bar before the backtest);
 //   • TP/SL are resting brackets: checked intrabar against every bar's high/
 //     low INCLUDING the entry bar; when both could hit in one bar the STOP is
 //     assumed first (worst case);
@@ -68,6 +77,9 @@ export interface BacktestConfig {
   cooldownMin: number // no entries within N minutes after a position closes (0 = off)
   requireNewSignal: boolean // fire only on a false→true signal edge vs the previous bar
   capital: number
+  // Task 84 — execution-cost model (both optional, default 0 = frictionless):
+  slippageBps?: number // adverse bps on market/stop fills (entry, SL, strategy/EOD/mark exits)
+  feeBps?: number // per-fill notional fee bps (charged on entry AND exit)
 }
 
 export interface BacktestTrade {
@@ -173,10 +185,23 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   const params = normalizeAlgoParams(cfg.strategy, cfg.params)
   const strategy = cfg.strategy
 
-  // warmup: bars needed before the first decision
+  // warmup: bars needed before the first decision — ALIGNED to the live
+  // engine's evalStrategy guards (`n < period+2` / `n < trendLen+2` allow the
+  // first decision at i = period+1 / trendLen+1, so the backtest must too).
+  // The old +2 here let a live run fire ONE BAR before the backtest on the
+  // same data (Task 84 parity probe).
   let warmup = 1
-  if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 2
-  if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 2
+  if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 1
+  if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 1
+
+  // ---- Task 84 cost model ----
+  const slip = Math.max(0, cfg.slippageBps ?? 0) / 1e4 // adverse drift fraction
+  const fee = Math.max(0, cfg.feeBps ?? 0) / 1e4 // per-fill fee fraction
+  const slipPx = (px: number, exitDir: 1 | -1): number => {
+    // exitDir: +1 = buying back (short exit) → pay up · -1 = selling (long exit) → receive less
+    const p = exitDir === 1 ? px * (1 + slip) : px * (1 - slip)
+    return p > 0 ? p : px
+  }
 
   // ---- Wilder RSI (bb-reversion) — one incremental pass, O(1)/bar ----
   // (live re-seeds from its rolling window start; after ~3×period bars both
@@ -313,6 +338,13 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let tradesToday = 0
   let curDay = -1
   let suppressed = 0
+  // timeframe seconds — min positive bar delta over the head of the series
+  // (session/weekend gaps only inflate deltas, so the min is the true tf)
+  let tfSec = 60
+  for (let k = 1; k < Math.min(n, 61); k++) {
+    const d = bars[k].time - bars[k - 1].time
+    if (d > 0 && d < tfSec) tfSec = d
+  }
   // re-entry control (Task 70-c)
   let cooldownUntil: number | null = null // bar-time seconds — no entries before this
   let prevLongSig = false // raw entry signal on the previously decided bar
@@ -320,9 +352,13 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   const trades: BacktestTrade[] = []
   const equity: { t: number; equity: number }[] = [{ t: bars[0]?.time ?? 0, equity: cash }]
 
-  const closeTrade = (p: Pos, exitPx: number, exitTime: number, reason: string) => {
+  const closeTrade = (p: Pos, exitPxRaw: number, exitTime: number, reason: string) => {
     const dir = p.side
-    const pnl = (exitPx - p.entryPx) * p.qty * dir
+    const pnl0 = (exitPxRaw - p.entryPx) * p.qty * dir
+    // Task 84 — per-fill notional fees on entry + exit (entry notional uses
+    // the SLIPPED entry price the position actually carries)
+    const feeCost = fee > 0 ? (p.entryPx + exitPxRaw) * p.qty * fee : 0
+    const pnl = pnl0 - feeCost
     cash += pnl
     equity.push({ t: exitTime, equity: cash })
     if (cash > peak) peak = cash
@@ -331,17 +367,18 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       maxDD = dd
       maxDDPct = peak > 0 ? (dd / peak) * 100 : 0
     }
-    // cooldown gate: block entries for N minutes after ANY position close
-    // (wall-clock equivalent: bar timestamps — a signal bar may not OPEN
-    // before the cooldown expires)
-    if (cfg.cooldownMin > 0) cooldownUntil = exitTime + cfg.cooldownMin * 60
+    // cooldown gate: block entries for N minutes after ANY position close.
+    // Anchored at the closing bar's CLOSE (exitTime is the bar OPEN — add the
+    // bar duration), matching the live engine's wall-clock gate which arms at
+    // detection ≈ bar close (Task 84 parity).
+    if (cfg.cooldownMin > 0) cooldownUntil = exitTime + tfSec + cfg.cooldownMin * 60
     trades.push({
       entryTime: p.entryTime,
       exitTime,
       side: dir === 1 ? 'long' : 'short',
       qty: p.qty,
       entryPx: p.entryPx,
-      exitPx,
+      exitPx: exitPxRaw,
       pnl,
       pnlPct: p.entryPx * p.qty > 0 ? (pnl / (p.entryPx * p.qty)) * 100 : 0,
       exitReason: reason,
@@ -388,8 +425,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
 
     // ---- 1) fill the pending entry at THIS bar's open ----
     if (pending && Number.isFinite(bar.open) && bar.open > 0) {
-      const fill = bar.open
       const dir = pending.side
+      // market order fill — adverse slippage against the position direction
+      const fill = slip > 0 ? (dir === 1 ? bar.open * (1 + slip) : bar.open * (1 - slip)) : bar.open
       const pctPx = (v: number | null, tp: boolean): number | null => {
         if (v == null || !(v > 0)) return null
         const p = Math.min(100, Math.max(0.01, Math.abs(v)))
@@ -440,18 +478,18 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       let reason = ''
       if (pos.side === 1) {
         if (pos.slPx != null && bar.low <= pos.slPx) {
-          exitPx = pos.slPx
+          exitPx = slipPx(pos.slPx, -1) // stop-market sell — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.high >= pos.tpPx) {
-          exitPx = pos.tpPx
+          exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
           reason = 'take profit'
         }
       } else {
         if (pos.slPx != null && bar.high >= pos.slPx) {
-          exitPx = pos.slPx
+          exitPx = slipPx(pos.slPx, 1) // stop-market buy-back — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.low <= pos.tpPx) {
-          exitPx = pos.tpPx
+          exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
           reason = 'take profit'
         }
       }
@@ -463,14 +501,14 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
 
     // ---- 3) EOD flatten (equity symbols only — crypto never force-flattens) ----
     if (pos && cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) {
-      closeTrade(pos, bar.close, bar.time, 'EOD flatten')
+      closeTrade(pos, slipPx(bar.close, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
       pos = null
     }
 
     // ---- 4) evaluate the strategy on this closed bar (exits → entries) ----
     const dec = decide(i)
     if (dec.exit && pos) {
-      closeTrade(pos, bar.close, bar.time, dec.exit)
+      closeTrade(pos, slipPx(bar.close, pos.side === 1 ? -1 : 1), bar.time, dec.exit)
       pos = null
     }
     if (dec.entry && !pos && !pending) {
@@ -503,7 +541,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let openAtEnd = false
   if (pos) {
     const lastBar = bars[n - 1]
-    closeTrade(pos, lastBar.close, lastBar.time, 'open at end of data (marked)')
+    closeTrade(pos, slipPx(lastBar.close, pos.side === 1 ? -1 : 1), lastBar.time, 'open at end of data (marked)')
     openAtEnd = true
   }
 

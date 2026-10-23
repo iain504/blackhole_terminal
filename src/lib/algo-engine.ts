@@ -147,7 +147,9 @@ async function flattenPosition(userId: string, mode: TradeMode, symbol: string):
 
 // ---- strategy evaluation ----------------------------------------------------
 
-function evalStrategy(
+// Exported for parity probes (scripts-tmp) — must stay PURE (no I/O) so the
+// backtest engine can diff its own decide() against this live evaluator.
+export function evalStrategy(
   strategy: AlgoStrategyId,
   params: Record<string, number>,
   bars: BarRow[],
@@ -411,11 +413,13 @@ async function cycle(runId: string) {
 
     // ---- re-entry control (Task 70-c): cooldown after the position closes ----
     // Detect the open→closed transition between cycles (broker position seen
-    // last cycle, flat now) and arm the wall-clock gate. Both the gate window
-    // and the per-side signal memory live in run.state, so dev-server
+    // last cycle, flat now) and arm the wall-clock gate. Anchored at the eval
+    // bar's CLOSE (like the backtest, which anchors at the closing bar's
+    // close) rather than raw detection time — Task 84 parity. Both the gate
+    // window and the per-side signal memory live in run.state, so dev-server
     // restarts / hot reloads keep them.
     if (!pos && st.hadPosition && run.cooldownMin > 0) {
-      st.cooldownUntil = Date.now() + Math.round(run.cooldownMin) * 60000
+      st.cooldownUntil = (evalBar.time + tfSec) * 1000 + Math.round(run.cooldownMin) * 60000
       const until = new Date(st.cooldownUntil).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
       await log(runId, run.userId, 'info', `Cooldown gate engaged — no entries for ${run.cooldownMin}m after the position close (until ${until})`)
     }
@@ -427,6 +431,36 @@ async function cycle(runId: string) {
 
     // ---- evaluate on the closed bar (once per bar) ----
     if (isNewBar) {
+      // ---- missed-bar replay (Task 84 backtest-parity) ----
+      // The engine only decides while the process is cycling; bars that closed
+      // during downtime (restart, hot reload, feed gap) used to be SKIPPED for
+      // decisions — a strategy exit firing on a missed bar left the position
+      // open until the exit condition happened to repeat, which the backtest
+      // (that evaluates every bar) shows as a clean exit. Replay unseen bars
+      // oldest→newest (capped): EXITS execute immediately (late, at market —
+      // logged as such); entries stay suppressed (stale price). The per-side
+      // signal memory is refreshed per replayed bar so the fresh-signal edge
+      // gate stays honest.
+      const missedFrom = Math.max(0, lastClosedIdx - 30)
+      for (let i = missedFrom; i < lastClosedIdx; i++) {
+        if (st.lastBarTime && bars[i].time <= st.lastBarTime) continue
+        const r = evalStrategy(strategy, params, bars.slice(0, i + 1), st)
+        if (r.exit && pos) {
+          const f = await flattenPosition(run.userId, mode, run.symbol)
+          if (f.ok) {
+            await log(runId, run.userId, 'trade', `EXIT ${pos.side} ${pos.qty} ${run.symbol} — ${r.exit} · replayed missed bar ${new Date(bars[i].time * 1000).toISOString().slice(5, 16).replace('T', ' ')} UTC (executed late — bar closed during downtime)`)
+            pos = null
+          } else {
+            await log(runId, run.userId, 'error', `Replayed exit failed: ${f.note}`)
+          }
+        }
+        if (r.entry && !pos) {
+          await log(runId, run.userId, 'info', `Entry signal on a missed bar suppressed (stale price): ${r.entry.side.toUpperCase()} — ${r.entry.reason}`)
+        }
+        st.prevLongSignal = r.entry?.side === 'buy'
+        st.prevShortSignal = r.entry?.side === 'sell'
+      }
+
       const closed = bars.slice(0, lastClosedIdx + 1)
       const res = evalStrategy(strategy, params, closed, st)
       if (res.note) await log(runId, run.userId, 'info', res.note)

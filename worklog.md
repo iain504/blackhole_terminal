@@ -1715,3 +1715,28 @@ Work Log:
 
 Stage Summary:
 - The Trade Advisor is now a genuine day-trading cockpit: a DAY mode built on the community's actual toolkit (session VWAP curve on the chart + OR 5/15/30m + PDH/PDL + RVOL + ATR-sized stops + R:R≥1.5 discipline, rendered as an explainable checklist and a deterministic resting-limit plan), the classic Swing (S/R + fib) mode preserved and regression-verified, the panel-drag-moves-the-line-underneath bug killed at the capture-phase root (all floating trade panels now fully opaque to chart pointer handling), and every advisor-submitted order gets live status (OPEN/FILLED/closed) with a working Cancel button. Version 1.80.0. Not pushed yet (awaiting PAT).
+
+---
+Task ID: 84
+Agent: main
+Task: Investigate live-vs-backtest discrepancy ("the result and the actual is different") and fix parity gaps.
+
+Work Log:
+- Read both engines end-to-end: src/lib/backtest.ts (replay) vs src/lib/algo-engine.ts (live 15s cycle) + data paths (backtest route, bars-cache, alpaca getBars, binance) + trading.ts fill path.
+- Exported evalStrategy from algo-engine.ts (pure, unchanged behavior) so probes can diff live decisions against backtest decisions.
+- Built scripts-tmp/parity-probe.ts — replays the SAME real bars (BTC/USD 5m via Binance, no keys) through runBacktest (gates off) AND a faithful live-cycle sim (evalStrategy + accumulators, exits-before-entries), diffing accepted-entry sequences per strategy.
+- First run surfaced 3 apparent mismatches; debugging (scripts-tmp/parity-debug2.ts) proved 2 were probe artifacts (my sim forgot the per-day VWAP/OR accumulator reset; orb marked-trade filter). ONE genuine engine divergence remained: warmup off-by-one — live guard `n < period+2` allows the first decision at i=period+1, backtest warmup `+2` started at i=period+2, so a live run could fire ONE BAR before the backtest on identical data.
+- Fixed backtest.ts warmup: bb-reversion and rsi2-connors now `+1` (aligned bar-for-bar to evalStrategy guards); header PARITY CONTRACT updated.
+- Quantified execution divergence on the same data (rsi2, 52 trades): fill-timing alone ≈ 0% delta; +2bps slippage → −17.3pp; +2bps slip +10bps fees → −103.8pp vs backtest. THE discrepancy is costs + live friction, not signals.
+- Added Task 84 cost model to backtest.ts: slippageBps (adverse drift on market/stop fills: entries, SL legs, strategy/EOD/mark exits — TP resting limits fill clean) + feeBps (per-fill notional fee, entry+exit). Both optional, default 0 = byte-identical historical behavior. closeTrade now nets fees into pnl/equity; cooldown anchor moved to the closing bar's CLOSE (tfSec derived from min positive bar delta) to match the live wall-clock gate.
+- Fixed the LIVE engine for the mirrored blind spot: bars that closed while the process was down (restart/hot-reload/feed gap) were skipped for decisions — a strategy exit firing on a missed bar left the position open until the condition repeated. algo-engine.ts now replays unseen closed bars (cap 30, oldest→newest): exits execute late-at-market (journaled "replayed missed bar"), entries suppressed as stale, per-side signal memory refreshed per bar so the fresh-signal edge gate stays honest.
+- Live cooldown gate now arms at eval-bar close instead of raw detection time (backtest parity).
+- Route /api/algo/backtest accepts slippageBps/feeBps (clamped 0..500); BacktestPanel got "Slippage (bps)" + "Fee (bps / fill)" inputs and an honest fill-model note (market orders seconds after close, % legs anchor on pre-order quote, missed-bar entries never fire, IEX-vs-SIP paper fills, crypto deep-window source split Alpaca-vs-Binance).
+- Verified: scripts-tmp/costmodel-verify.ts — engine cost model $-9575.80 vs probe's independent re-pricing $-9575.95 (15¢ apart, model-anchoring difference); cooldown probe: 30m cooldown → 30 trades, 0 violations. Parity probe after fixes: ALL 4 strategies diffs=0 (bb 9/9, rsi2 52/52, vwap 7/7, orb 1/1).
+- E2E (agent-browser, logged in as trader): Backtest panel renders the new inputs; TSLA 5m rsi2 30d with slip 2/fee 10 → NET P&L −$151.18 (−1.51%), frictionless re-run → +$106.29 (+1.06%) — the exact live-vs-backtest gap, now visible/modelable in the UI. dev.log clean, lint clean. (Auth note: browser TOTP flow kept 401ing; injected the curl-obtained session cookie — server-side login verified fine via API.)
+
+Stage Summary:
+- DECISION RULES ARE IN PARITY: backtest decide() ≡ live evalStrategy() bar-for-bar on all 4 strategies (probe-verified). The user-perceived discrepancy is EXECUTION: costs (zero-cost backtest vs real fills), fill timing, % legs anchored on quote not fill, missed-bar blindness after restarts (live), IEX-bars-vs-SIP-fills, crypto source split on deep windows.
+- Fixed: warmup off-by-one (backtest could start 1 bar late vs live), missed-bar exit replay (live could leave positions stuck), cooldown anchor mismatch.
+- New: optional slippageBps/feeBps cost model in engine+route+UI (default 0, frictionless preserved). Probe tools kept in scripts-tmp/ (parity-probe.ts, costmodel-verify.ts, cooldown-verify.ts, parity-debug*.ts).
+- Files: src/lib/backtest.ts, src/lib/algo-engine.ts, src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx, + probes.
