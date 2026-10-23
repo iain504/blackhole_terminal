@@ -31,10 +31,11 @@ import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
-  Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter,
+  Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
+import { TradeAdvisor } from './TradeAdvisor'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, PendingOrderInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
@@ -313,6 +314,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [searchOpen, setSearchOpen] = useState(false)
   const [tradeOpen, setTradeOpen] = useState(false)
   const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
+  const [advisorOpen, setAdvisorOpen] = useState(false)
   // Bumping this REMOUNTS the trade ticket. The ticket intentionally keeps its
   // state while open (stays open after placing an order), but its prefill is
   // only read on mount — so a right-click "Sell limit @ …" while the ticket
@@ -1456,21 +1458,39 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           const fibPane = d.points[0]?.pane ?? 'price'
           const price1 = d.points[0].price
           const price2 = d.points[1].price
+          const golden = (d.meta as { golden?: unknown } | null)?.golden === true
           ctx.font = '10px ui-monospace, monospace'
+          // golden pocket (Task 82): translucent band across the 0.5–0.618 span
+          if (golden) {
+            const yA = yOfPane(fibPane, price2 + (price1 - price2) * 0.5)
+            const yB = yOfPane(fibPane, price2 + (price1 - price2) * 0.618)
+            if (yA != null && yB != null && yA !== yB) {
+              ctx.save()
+              clipToPane(ctx, fibPane, w)
+              ctx.globalAlpha = 0.13
+              ctx.fillStyle = d.color
+              // xLeft can extrapolate off-screen left (swing anchored to a
+              // higher-timeframe bar outside the zoom) — clamp to the pane
+              const bx = Math.max(xLeft, 0)
+              ctx.fillRect(bx, Math.min(yA, yB), w - bx, Math.abs(yB - yA))
+              ctx.restore()
+            }
+          }
           for (const lv of FIB_LEVELS) {
             const priceLv = price2 + (price1 - price2) * lv
             const y = yOfPane(fibPane, priceLv)
             if (y == null) continue
-            ctx.globalAlpha = lv === 0 || lv === 1 ? 0.9 : 0.6
-            ctx.setLineDash(lv === 0.5 ? [6, 3] : [])
+            const emph = golden && (lv === 0.5 || lv === 0.618)
+            ctx.globalAlpha = lv === 0 || lv === 1 ? 0.9 : emph ? 0.95 : 0.6
+            ctx.setLineDash(lv === 0.5 || emph ? [6, 3] : [])
             ctx.beginPath()
-            ctx.moveTo(xLeft, Math.round(y) + 0.5)
+            ctx.moveTo(Math.max(xLeft, 0), Math.round(y) + 0.5)
             ctx.lineTo(w, Math.round(y) + 0.5)
             ctx.stroke()
             ctx.globalAlpha = 0.95
             ctx.fillStyle = d.color
-            const label = `${lv.toFixed(3)}  ${fmtPaneValue(fibPane, priceLv)}`
-            ctx.fillText(label, xLeft + 4, y - 3)
+            const label = `${lv.toFixed(3)}${emph ? ' ★' : ''}  ${fmtPaneValue(fibPane, priceLv)}`
+            ctx.fillText(label, Math.max(xLeft + 4, 4), y - 3)
           }
         }
         dot(ctx, p1.x, p1.y, d.color, highlighted)
@@ -3464,6 +3484,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const onSearch = () => setSearchOpen(true)
     const onIndicators = () => setIndOpen((v) => !v)
     const onSr = () => setSrOpen(true)
+    const onAdvisor = () => setAdvisorOpen(true)
     const onTicket = () => {
       setTicketPrefill(null)
       setTradeOpen(true)
@@ -3487,6 +3508,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     window.addEventListener('tt:open-symbol-search', onSearch)
     window.addEventListener('tt:toggle-indicators', onIndicators)
     window.addEventListener('tt:open-sr', onSr)
+    window.addEventListener('tt:open-advisor', onAdvisor)
     window.addEventListener('tt:open-ticket', onTicket)
     window.addEventListener('tt:set-color', onColor)
     window.addEventListener('tt:set-chart-type', onChartType)
@@ -3495,6 +3517,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       window.removeEventListener('tt:open-symbol-search', onSearch)
       window.removeEventListener('tt:toggle-indicators', onIndicators)
       window.removeEventListener('tt:open-sr', onSr)
+      window.removeEventListener('tt:open-advisor', onAdvisor)
       window.removeEventListener('tt:open-ticket', onTicket)
       window.removeEventListener('tt:set-color', onColor)
       window.removeEventListener('tt:set-chart-type', onChartType)
@@ -3908,6 +3931,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         >
           <Briefcase className="h-3.5 w-3.5" />
         </button>
+        <button
+          title="Trade Advisor — high-score S/R + fib golden-pocket plan (limit order, any time)"
+          aria-label="Trade Advisor"
+          aria-pressed={advisorOpen}
+          onClick={() => setAdvisorOpen((v) => !v)}
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            advisorOpen ? 'bg-amber-500/25 text-amber-400' : 'text-zinc-300 hover:bg-amber-500/15 hover:text-amber-400',
+          )}
+        >
+          <Lightbulb className="h-3.5 w-3.5" />
+        </button>
         <div className="mx-1 my-0.5 h-px bg-zinc-800" />
         {(
           [
@@ -4112,6 +4147,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           prefill={ticketPrefill}
           onClose={() => setTradeOpen(false)}
           onPlaced={() => void posData.refresh()}
+        />
+      )}
+
+      {/* trade advisor (Task 82): high-score HTF S/R + fib golden pocket →
+          limit-order plan with live monitoring + line cleanup */}
+      {advisorOpen && (
+        <TradeAdvisor
+          key={symbol}
+          symbol={symbol}
+          livePrice={quote?.price ?? null}
+          onClose={() => setAdvisorOpen(false)}
+          createDrawing={createDrawing}
+          deleteDrawing={deleteDrawing}
         />
       )}
 

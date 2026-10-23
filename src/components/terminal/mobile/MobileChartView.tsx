@@ -21,7 +21,7 @@ import {
   ChevronDown, Pencil, Sigma, Briefcase, Ellipsis, X, Plus,
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Square, Type,
   CandlestickChart as CandlestickIcon, LineChart as LineChartIcon,
-  AlignHorizontalJustifyCenter, Clock,
+  AlignHorizontalJustifyCenter, Clock, Lightbulb,
 } from 'lucide-react'
 
 const TOOLS: { id: DrawingKind | 'cursor'; label: string; icon: typeof MousePointer2; hint?: string }[] = [
@@ -298,6 +298,17 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
                 <span className="h-2 w-2 rounded-full bg-[#f59e0b]" aria-hidden />4H
                 <span className="h-2 w-2 rounded-full bg-[#22c55e]" aria-hidden />1H
               </span>
+            </button>
+            <button
+              onClick={() => {
+                setMoreOpen(false)
+                window.dispatchEvent(new CustomEvent('tt:open-advisor'))
+              }}
+              className="flex h-11 items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950 px-3 text-sm text-zinc-200 active:bg-zinc-800"
+            >
+              <Lightbulb className="h-4 w-4 text-amber-400" aria-hidden />
+              Trade Advisor
+              <span className="ml-auto text-[10px] text-zinc-500">S/R + fib plan</span>
             </button>
             {ethApplies && (
               <button
