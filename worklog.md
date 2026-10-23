@@ -1608,3 +1608,14 @@ Work Log:
 Stage Summary:
 - Every dev/build now carries a distinct git-derived version (v1.79.0+{commit-count}, full {base}+{count}.{sha} in the tooltip), stamped automatically by predev/prebuild and displayed in the terminal bottom bar right next to the clock.
 - Version check against the GitHub backup: local == remote tip 15ee66f (Task 79) — up to date, no pull needed.
+---
+Task ID: 80-push
+Agent: Z.ai Code (main)
+Task: "push it" (Task 80 build-version feature, new PAT #4)
+
+Work Log:
+- Recreated /tmp/gh-askpass.sh with PAT #4 (github_pat_11CDZ...nFnpbg9O, Contents: Read and Write); pushed main: 15ee66f..f3949e6 (3 commits: fead176 + 587a586 Task 80 + f3949e6 platform bookkeeping).
+- Verified remote tip f3949e6 == local HEAD via ls-remote; 0 unpushed after bookkeeping.
+
+Stage Summary:
+- Task 80 (git-derived build version in the bottom bar next to the clock) is now on GitHub; remote main = local main.
