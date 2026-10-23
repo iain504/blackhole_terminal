@@ -178,6 +178,9 @@ export interface LayoutBlob {
   /** Trade ticket position: absolute left/top px inside the chart container
    *  (draggable header, Task 54.3) — null = default anchor (right-2 top-12) */
   ticketPos?: { x: number; y: number } | null
+  /** Trade Advisor panel position (draggable header, Task 82b) — same
+   *  semantics as ticketPos, null = default anchor (right-2 top-12) */
+  advisorPos?: { x: number; y: number } | null
 }
 
 export const DRAW_COLORS = [
@@ -239,6 +242,9 @@ interface TerminalState {
   /** trade ticket drag position (null = default anchor) */
   ticketPos: { x: number; y: number } | null
   setTicketPos: (p: { x: number; y: number } | null) => void
+  /** trade advisor panel drag position (null = default anchor) */
+  advisorPos: { x: number; y: number } | null
+  setAdvisorPos: (p: { x: number; y: number } | null) => void
 
   // watchlists
   watchlists: Watchlist[]
@@ -516,6 +522,9 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   ticketPos: null,
   setTicketPos: (p) => set({ ticketPos: p, layoutDirty: true }),
 
+  advisorPos: null,
+  setAdvisorPos: (p) => set({ advisorPos: p, layoutDirty: true }),
+
   layoutSnapshot: () => {
     const s = get()
     return {
@@ -534,6 +543,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       showExtendedHours: s.showExtendedHours,
       positionsPanelSizes: s.positionsPanelSizes,
       ticketPos: s.ticketPos,
+      advisorPos: s.advisorPos,
     }
   },
 
@@ -606,11 +616,16 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       Array.isArray(rawSizes) && rawSizes.length === 3 && rawSizes.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0.5 && n <= 12)
         ? [rawSizes[0], rawSizes[1], rawSizes[2]]
         : [5, 3, 3]
-    // trade ticket drag position: finite px offsets, clamped into a sane range
+    // trade ticket / advisor drag positions: finite px offsets, clamped sane
     const rawTicket = blob.ticketPos
     const ticketPos: { x: number; y: number } | null =
       rawTicket && typeof rawTicket.x === 'number' && typeof rawTicket.y === 'number' && Number.isFinite(rawTicket.x) && Number.isFinite(rawTicket.y)
         ? { x: Math.min(8000, Math.max(0, rawTicket.x)), y: Math.min(8000, Math.max(0, rawTicket.y)) }
+        : null
+    const rawAdvisor = blob.advisorPos
+    const advisorPos: { x: number; y: number } | null =
+      rawAdvisor && typeof rawAdvisor.x === 'number' && typeof rawAdvisor.y === 'number' && Number.isFinite(rawAdvisor.x) && Number.isFinite(rawAdvisor.y)
+        ? { x: Math.min(8000, Math.max(0, rawAdvisor.x)), y: Math.min(8000, Math.max(0, rawAdvisor.y)) }
         : null
     set({
       tabs,
@@ -622,6 +637,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       showExtendedHours: blob.showExtendedHours !== false,
       positionsPanelSizes: panelSizes,
       ticketPos,
+      advisorPos,
       layoutDirty: false,
     })
   },

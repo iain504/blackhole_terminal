@@ -1405,6 +1405,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     if (extendRight) {
       const dx = p2.x - p1.x
       const dy = p2.y - p1.y
+      // degenerate leg (both anchors on the same bar — advisor fibs anchor
+      // the whole leg at the swing time): dx*farX would be 0*Infinity = NaN
+      // and the preview silently vanishes — fall back to a plain segment
+      if (dx === 0 && dy === 0) {
+        ctx.lineTo(p2.x, p2.y)
+        ctx.stroke()
+        return
+      }
       const farX = dx !== 0 ? (w - p1.x) / dx : Infinity
       const ex = farX >= 0 ? w : p1.x - dx * 100
       const ey = p1.y + dy * (farX >= 0 ? farX : -100)
@@ -1460,6 +1468,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           const price2 = d.points[1].price
           const golden = (d.meta as { golden?: unknown } | null)?.golden === true
           ctx.font = '10px ui-monospace, monospace'
+          // the fib LEG (p1→p2): a user-drawn fib shows its diagonal leg like
+          // TradingView; the advisor fib anchors both ends at the swing bar so
+          // the leg reads as a vertical spine connecting swing→S/R anchor.
+          // Clipped to the pane like the levels (off-scale extremes would
+          // otherwise extrapolate into the vol/RSI strips — Task 60 class).
+          ctx.save()
+          clipToPane(ctx, fibPane, w)
+          ctx.globalAlpha = 0.55
+          segPath(ctx, p1, p2, w, false)
+          ctx.restore()
           // golden pocket (Task 82): translucent band across the 0.5–0.618 span
           if (golden) {
             const yA = yOfPane(fibPane, price2 + (price1 - price2) * 0.5)
@@ -1481,6 +1499,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             const y = yOfPane(fibPane, priceLv)
             if (y == null) continue
             const emph = golden && (lv === 0.5 || lv === 0.618)
+            // Task 82b: the whole level stack clips to its own pane — an
+            // off-scale extreme (0.000/1.000 far outside the visible zoom)
+            // extrapolated INTO the vol/RSI/MACD strips (same Task 60 class
+            // as unclipped hlines). When pane geometry is unavailable the
+            // clip is a no-op and the level draws unclipped (hline behavior).
+            ctx.save()
+            clipToPane(ctx, fibPane, w)
             ctx.globalAlpha = lv === 0 || lv === 1 ? 0.9 : emph ? 0.95 : 0.6
             ctx.setLineDash(lv === 0.5 || emph ? [6, 3] : [])
             ctx.beginPath()
@@ -1491,6 +1516,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             ctx.fillStyle = d.color
             const label = `${lv.toFixed(3)}${emph ? ' ★' : ''}  ${fmtPaneValue(fibPane, priceLv)}`
             ctx.fillText(label, Math.max(xLeft + 4, 4), y - 3)
+            ctx.restore()
           }
         }
         dot(ctx, p1.x, p1.y, d.color, highlighted)
@@ -1765,9 +1791,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
               const fibPane = d.points[0]?.pane ?? 'price'
               const price1 = d.points[0].price
               const price2 = d.points[1].price
+              // Task 82b: mirror the hline Task 60 guard — a level clipped
+              // out of its pane is invisible and must not be hittable inside
+              // the vol/RSI/MACD strips
+              const bnd = paneYBounds(fibPane)
               for (const lv of FIB_LEVELS) {
                 const yl = yOfPane(fibPane, price2 + (price1 - price2) * lv)
-                if (yl != null && Math.abs(y - yl) < 6 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
+                const vis = !bnd || (yl != null && yl >= bnd.top && yl < bnd.bottom)
+                if (yl != null && vis && Math.abs(y - yl) < 6 * tolMul) return { type: 'drawing', id: d.id, part: 'whole' }
               }
             }
           }
