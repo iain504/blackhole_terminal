@@ -3,8 +3,9 @@
 // One timer per AlgoRun (15s cadence). Each cycle:
 //   1. re-read the run row (the DB is the single source of truth — config
 //      edits, stops and dev-server restarts are all reflected next cycle)
-//   2. session gate: RTH-only runs skip entries outside 09:30–16:00 ET and
-//      flatten their position near the close (flattenEod)
+//   2. session gate: RTH-only EQUITY runs skip entries outside 09:30–16:00 ET
+//      and flatten near the close (flattenEod); crypto runs ("BTC/USD")
+//      ignore both guards and trade 24/7 on their 24/7 data feed
 //   3. evaluate the strategy on the last CLOSED bar (never the forming bar)
 //      — a per-run `state.lastBarTime` cursor makes each bar fire at most once
 //   4. exits run BEFORE entries; entries require a flat book on the symbol,
@@ -13,8 +14,9 @@
 //
 // Runs survive restarts: ensureAlgoEngines() re-registers every status
 // 'running' row the first time any /api/algo route is touched after boot.
-// Day accumulators (session VWAP, opening range) only consume TODAY's
-// REGULAR-session bars, so engine restarts mid-day rebuild correct state.
+// Day accumulators (session VWAP, opening range) only consume TODAY's bars
+// (regular-session for equities, all bars for crypto), so engine restarts
+// mid-day rebuild correct state.
 import { db } from '@/lib/db'
 import { barsFor } from '@/lib/bars-cache'
 import { closePositionFull, getAccount, getPositions, placeOrderWithExits, resolveTradeMode, tradeSymbol, type TradeMode } from '@/lib/trading'
@@ -63,6 +65,7 @@ interface AlgoState {
   tradesToday?: number
   lastGate?: string // last session-gate note (log transitions only)
   demoNoted?: boolean
+  cryptoNoted?: boolean // one-time "crypto runs 24/7, session guards ignored" journal line
   lastBeat?: number // last heartbeat epoch ms
   // session accumulators (reset each ET day, regular-session bars only)
   vwapNum?: number
@@ -254,10 +257,15 @@ function evalStrategy(
 }
 
 /** Feed ONE closed bar into the day accumulators (session VWAP + opening
- *  range). Only TODAY's REGULAR-session bars count — restart-safe. */
-function feedAccumulators(strategy: AlgoStrategyId, orMinutes: number, bar: BarRow, st: AlgoState, dayKey: string) {
+ *  range). Equity symbols: only TODAY's REGULAR-session bars count —
+ *  restart-safe. Crypto symbols: ALL bars of the ET day count (crypto trades
+ *  24/7 — "session VWAP" is the running VWAP since ET midnight and the
+ *  opening range is the first orMinutes after ET midnight), otherwise the
+ *  accumulators would starve overnight and the strategy could never fire
+ *  outside 09:30–16:00 ET. */
+function feedAccumulators(strategy: AlgoStrategyId, orMinutes: number, bar: BarRow, st: AlgoState, dayKey: string, isCrypto: boolean) {
   if (etDateKey(bar.time) !== dayKey) return
-  if (sessionOf(bar.time) !== 'regular') return
+  if (!isCrypto && sessionOf(bar.time) !== 'regular') return
   const typ = (bar.high + bar.low + bar.close) / 3
   if (strategy === 'vwap-fade') {
     st.vwapNum = (st.vwapNum ?? 0) + typ * bar.volume
@@ -265,10 +273,13 @@ function feedAccumulators(strategy: AlgoStrategyId, orMinutes: number, bar: BarR
   }
   if (strategy === 'orb15' && !st.orDone) {
     const minutes = etMinutesOfDay(bar.time)
-    if (minutes >= RTH_START_MIN && minutes < RTH_START_MIN + orMinutes) {
+    // OR window anchor: equities → 09:30 ET open; crypto → ET midnight (the
+    // day's first bars — there is no "opening bell" in a 24/7 market)
+    const orAnchor = isCrypto ? 0 : RTH_START_MIN
+    if (minutes >= orAnchor && minutes < orAnchor + orMinutes) {
       st.orHigh = st.orHigh == null ? bar.high : Math.max(st.orHigh, bar.high)
       st.orLow = st.orLow == null ? bar.low : Math.min(st.orLow, bar.low)
-    } else if (minutes >= RTH_START_MIN + orMinutes && st.orHigh != null && st.orLow != null) {
+    } else if (minutes >= orAnchor + orMinutes && st.orHigh != null && st.orLow != null) {
       st.orDone = true
     }
   }
@@ -301,9 +312,20 @@ async function cycle(runId: string) {
     const st = (run.state && typeof run.state === 'object' ? run.state : {}) as AlgoState
 
     // ---- session gate ----
+    // Crypto symbols (contain '/') trade 24/7 on Binance data — the equity
+    // session guards (RTH-only entries, 15:45 ET flatten) are stock-market
+    // concepts and are IGNORED for them, whatever the stored flags say, so a
+    // crypto algo genuinely runs around the clock, weekends included.
+    const isCrypto = run.symbol.includes('/')
+    if (isCrypto && (run.rthOnly || run.flattenEod) && !st.cryptoNoted) {
+      await log(runId, run.userId, 'info', `Crypto symbol — equity session guards (RTH-only / EOD flatten) ignored — this run trades 24/7`)
+      st.cryptoNoted = true
+    }
+    const rthGateActive = run.rthOnly && !isCrypto
+    const eodActive = run.flattenEod && !isCrypto
     const nowMinEt = etMinutesOfDay(Math.floor(Date.now() / 1000))
     const inRth = sessionOf(Math.floor(Date.now() / 1000)) === 'regular'
-    const gateNote = run.rthOnly && !inRth ? (nowMinEt < RTH_START_MIN ? 'waiting for the 09:30 ET open' : 'regular session closed — entries paused') : null
+    const gateNote = rthGateActive && !inRth ? (nowMinEt < RTH_START_MIN ? 'waiting for the 09:30 ET open' : 'regular session closed — entries paused') : null
     // log session-gate TRANSITIONS only (empty string = no gate)
     const gateKey = gateNote ?? ''
     if (gateKey !== (st.lastGate ?? '')) {
@@ -361,7 +383,7 @@ async function cycle(runId: string) {
       const fromIdx = Math.max(1, lastClosedIdx - 400)
       for (let i = fromIdx; i <= lastClosedIdx; i++) {
         if (!st.lastBarTime || bars[i].time > (st.lastBarTime as number)) {
-          feedAccumulators(strategy, orMinutes, bars[i], st, dayKey)
+          feedAccumulators(strategy, orMinutes, bars[i], st, dayKey, isCrypto)
         }
       }
     }
@@ -376,8 +398,8 @@ async function cycle(runId: string) {
       if (mine && Math.abs(q) > 1e-9) pos = { side: mine.side === 'short' ? 'short' : 'long', qty: Math.abs(q) }
     } catch { /* positions unavailable — assume flat */ }
 
-    // ---- EOD flatten ----
-    if (run.flattenEod && pos && nowMinEt >= EOD_FLATTEN_MIN) {
+    // ---- EOD flatten (equity symbols only — crypto never force-flattens) ----
+    if (eodActive && pos && nowMinEt >= EOD_FLATTEN_MIN) {
       const f = await flattenPosition(run.userId, mode, run.symbol)
       if (f.ok) {
         await log(runId, run.userId, 'trade', `EOD flatten — closed ${pos.side} ${pos.qty} ${run.symbol}${f.note}`)
@@ -431,7 +453,7 @@ async function cycle(runId: string) {
           (res.entry.side === 'sell' && st.prevShortSignal === true))
         if (gateNote) {
           await log(runId, run.userId, 'info', `Signal suppressed (session gate): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
-        } else if (run.flattenEod && nowMinEt >= EOD_FLATTEN_MIN) {
+        } else if (eodActive && nowMinEt >= EOD_FLATTEN_MIN) {
           await log(runId, run.userId, 'info', `Signal suppressed (past 15:45 ET flatten window): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
         } else if (cooldownActive) {
           // quiet on purpose — the engage line already announced the window

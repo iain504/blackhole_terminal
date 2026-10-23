@@ -6,7 +6,8 @@
 //     comparisons, thresholds and exit strings (rsi2's RSI reads the LAST rp
 //     changes, orb15 marks one-per-side on entry — keep both sides in sync);
 //   • day accumulators (session VWAP / opening range) consume only the current
-//     ET day's REGULAR-session bars, reset on every ET day change;
+//     ET day's bars — REGULAR-session bars for equities, ALL bars for crypto
+//     (cfg.isCrypto) — and reset on every ET day change;
 //   • exits resolve BEFORE entries on the same bar (an exit + fresh entry can
 //     both execute, like the live cycle).
 //
@@ -19,9 +20,10 @@
 //     low INCLUDING the entry bar; when both could hit in one bar the STOP is
 //     assumed first (worst case);
 //   • flattenEod closes the position at the first bar opening at/after 15:45
-//     ET (fill at that bar's close) and suppresses entries from 15:45 ET;
+//     ET (fill at that bar's close) and suppresses entries from 15:45 ET —
+//     EQUITY symbols only (crypto runs 24/7, guards ignored like the engine);
 //   • rthOnly gates entries to regular-session bars (exits/brackets run 24h,
-//     like the live engine);
+//     like the live engine) — EQUITY symbols only, ignored for crypto;
 //   • re-entry control (Task 70-c, mirrored from algo-engine.ts): cooldownMin
 //     blocks entries on bars that OPEN within N minutes after a position
 //     closes; requireNewSignal fires an entry only on a false→true signal
@@ -361,8 +363,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       firedLong = false
       firedShort = false
     }
-    // ---- feed day accumulators (regular-session bars only) ----
-    if (rth[i] === 1) {
+    // ---- feed day accumulators (equities: regular-session bars only ·
+    // crypto: ALL bars of the ET day — 24/7 VWAP / midnight-anchored OR) ----
+    if (rth[i] === 1 || cfg.isCrypto) {
       const typ = (bar.high + bar.low + bar.close) / 3
       if (strategy === 'vwap-fade') {
         vwapNum += typ * bar.volume
@@ -370,10 +373,12 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       }
       if (strategy === 'orb15' && !orDone) {
         const m = minutes[i]
-        if (m >= RTH_START_MIN && m < RTH_START_MIN + orMinutes) {
+        // OR window anchor: equities → 09:30 ET open; crypto → ET midnight
+        const orAnchor = cfg.isCrypto ? 0 : RTH_START_MIN
+        if (m >= orAnchor && m < orAnchor + orMinutes) {
           orHigh = orHigh == null ? bar.high : Math.max(orHigh, bar.high)
           orLow = orLow == null ? bar.low : Math.min(orLow, bar.low)
-        } else if (m >= RTH_START_MIN + orMinutes && orHigh != null && orLow != null) {
+        } else if (m >= orAnchor + orMinutes && orHigh != null && orLow != null) {
           orDone = true
         }
       }
@@ -456,8 +461,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       }
     }
 
-    // ---- 3) EOD flatten (any session, like the live engine's clock gate) ----
-    if (pos && cfg.flattenEod && minutes[i] >= EOD_FLATTEN_MIN) {
+    // ---- 3) EOD flatten (equity symbols only — crypto never force-flattens) ----
+    if (pos && cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) {
       closeTrade(pos, bar.close, bar.time, 'EOD flatten')
       pos = null
     }
@@ -474,8 +479,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       const edgeBlocked = cfg.requireNewSignal && (
         (dec.entry.side === 'buy' && prevLongSig) ||
         (dec.entry.side === 'sell' && prevShortSig))
-      if (cfg.rthOnly && rth[i] !== 1) suppressed++
-      else if (cfg.flattenEod && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
+      if (cfg.rthOnly && !cfg.isCrypto && rth[i] !== 1) suppressed++
+      else if (cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
       else if (cooldownBlocked) suppressed++
       else if (edgeBlocked) suppressed++
       else if (tradesToday >= cfg.maxTradesDay) suppressed++

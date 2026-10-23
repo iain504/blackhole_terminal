@@ -101,6 +101,8 @@ export default function AlgoRunSettingsDialog({
   }
 
   const def = ALGO_STRATEGIES[strategy]
+  // crypto symbols trade 24/7 — equity session guards are forced off + disabled
+  const isCryptoRun = (run?.symbol ?? '').includes('/')
   const identityChanged = !!run && (symbol.trim().toUpperCase() !== run.symbol || timeframe !== run.timeframe || strategy !== run.strategy)
   // risk sizing requires an SL % bracket — mirror the run setup's Start gate
   const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
@@ -128,8 +130,9 @@ export default function AlgoRunSettingsDialog({
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
           slValue: slOn && Number(slPct) > 0 ? Number(slPct) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
-          rthOnly,
-          flattenEod,
+          // crypto symbols trade 24/7 — the equity session guards never apply
+          rthOnly: !isCryptoRun && rthOnly,
+          flattenEod: !isCryptoRun && flattenEod,
           cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
           requireNewSignal,
         }),
@@ -211,7 +214,7 @@ export default function AlgoRunSettingsDialog({
           {/* instrument */}
           <div className="grid grid-cols-2 gap-2">
             <div className="col-span-1">
-              <Label htmlFor="rs-symbol" className="text-[10px] text-zinc-500">Symbol (US stock)</Label>
+              <Label htmlFor="rs-symbol" className="text-[10px] text-zinc-500">Symbol — stock or crypto</Label>
               <Input id="rs-symbol" value={symbol} onChange={(e) => setSymbol(e.target.value)} className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs uppercase" />
             </div>
             <div className="col-span-1">
@@ -317,21 +320,21 @@ export default function AlgoRunSettingsDialog({
             </div>
           </div>
 
-          {/* session guards */}
+          {/* session guards — equity concepts; crypto runs 24/7 and shows them disabled */}
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
               <div>
                 <p className="text-[11px] text-zinc-300">Regular hours only</p>
-                <p className="text-[10px] text-zinc-500">enter only 09:30–16:00 ET (Mon–Fri)</p>
+                <p className="text-[10px] text-zinc-500">{isCryptoRun ? 'crypto trades 24/7 — session guard not applicable' : 'enter only 09:30–16:00 ET (Mon–Fri)'}</p>
               </div>
-              <Switch checked={rthOnly} onCheckedChange={setRthOnly} className="scale-90" aria-label="Regular hours only" />
+              <Switch checked={isCryptoRun ? false : rthOnly} disabled={isCryptoRun} onCheckedChange={setRthOnly} className="scale-90" aria-label="Regular hours only" />
             </div>
             <div className="flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
               <div>
                 <p className="text-[11px] text-zinc-300">Flatten before close</p>
-                <p className="text-[10px] text-zinc-500">no entries after 15:45 ET · close open position</p>
+                <p className="text-[10px] text-zinc-500">{isCryptoRun ? 'crypto trades 24/7 — no daily close to flatten at' : 'no entries after 15:45 ET · close open position'}</p>
               </div>
-              <Switch checked={flattenEod} onCheckedChange={setFlattenEod} className="scale-90" aria-label="Flatten before close" />
+              <Switch checked={isCryptoRun ? false : flattenEod} disabled={isCryptoRun} onCheckedChange={setFlattenEod} className="scale-90" aria-label="Flatten before close" />
             </div>
           </div>
 

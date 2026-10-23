@@ -108,6 +108,11 @@ export default function AlgoTab() {
     setParamDraft({})
   }
 
+  // crypto symbols ("BTC/USD") trade 24/7 — the equity session guards
+  // (RTH-only entries, 15:45 ET flatten) are stock-market concepts and are
+  // forced off + disabled in the UI whenever the symbol is crypto
+  const isCryptoSym = symbol.trim().toUpperCase().includes('/')
+
   const load = useCallback(async () => {
     try {
       const res = await fetch('/api/algo')
@@ -165,8 +170,9 @@ export default function AlgoTab() {
           slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
           slValue: slOn && Number(slPct) > 0 ? Number(slPct) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
-          rthOnly,
-          flattenEod,
+          // crypto symbols trade 24/7 — the equity session guards never apply
+          rthOnly: !sym.includes('/') && rthOnly,
+          flattenEod: !sym.includes('/') && flattenEod,
           cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
           requireNewSignal,
         }),
@@ -415,8 +421,8 @@ export default function AlgoTab() {
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Run setup</p>
             <div className="grid grid-cols-2 gap-2">
               <div className="col-span-1">
-                <Label htmlFor="algo-symbol" className="text-[10px] text-zinc-500">Symbol (US stock)</Label>
-                <Input id="algo-symbol" value={symbol} onChange={(e) => setSymbol(e.target.value)} className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs uppercase" placeholder="TSLA" />
+                <Label htmlFor="algo-symbol" className="text-[10px] text-zinc-500">Symbol — stock or crypto</Label>
+                <Input id="algo-symbol" value={symbol} onChange={(e) => setSymbol(e.target.value)} className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs uppercase" placeholder="TSLA · BTC/USD" />
               </div>
               <div className="col-span-1">
                 <Label htmlFor="algo-tf" className="text-[10px] text-zinc-500">Timeframe</Label>
@@ -511,16 +517,16 @@ export default function AlgoTab() {
               <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <div>
                   <p className="text-[11px] text-zinc-300">Regular hours only</p>
-                  <p className="text-[10px] text-zinc-500">enter only 09:30–16:00 ET (Mon–Fri)</p>
+                  <p className="text-[10px] text-zinc-500">{isCryptoSym ? 'crypto trades 24/7 — session guard not applicable' : 'enter only 09:30–16:00 ET (Mon–Fri)'}</p>
                 </div>
-                <Switch checked={rthOnly} onCheckedChange={setRthOnly} className="scale-90" />
+                <Switch checked={isCryptoSym ? false : rthOnly} disabled={isCryptoSym} onCheckedChange={setRthOnly} className="scale-90" />
               </div>
               <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <div>
                   <p className="text-[11px] text-zinc-300">Flatten before close</p>
-                  <p className="text-[10px] text-zinc-500">no entries after 15:45 ET · close open position</p>
+                  <p className="text-[10px] text-zinc-500">{isCryptoSym ? 'crypto trades 24/7 — no daily close to flatten at' : 'no entries after 15:45 ET · close open position'}</p>
                 </div>
-                <Switch checked={flattenEod} onCheckedChange={setFlattenEod} className="scale-90" />
+                <Switch checked={isCryptoSym ? false : flattenEod} disabled={isCryptoSym} onCheckedChange={setFlattenEod} className="scale-90" />
               </div>
               <div className="col-span-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Re-entry control</p>
@@ -687,8 +693,9 @@ export default function AlgoTab() {
                       {r.slMode === 'pct' && <span className="text-rose-400/80">SL {r.slValue}%</span>}
                     </span>
                   )}
-                  {r.rthOnly && <Badge variant="outline" className="text-[10px] text-zinc-500" title="Entries only during regular hours">RTH</Badge>}
-                  {r.flattenEod && <Badge variant="outline" className="text-[10px] text-zinc-500" title="Flattens before the close">EOD</Badge>}
+                  {!r.symbol.includes('/') && r.rthOnly && <Badge variant="outline" className="text-[10px] text-zinc-500" title="Entries only during regular hours">RTH</Badge>}
+                  {!r.symbol.includes('/') && r.flattenEod && <Badge variant="outline" className="text-[10px] text-zinc-500" title="Flattens before the close">EOD</Badge>}
+                  {r.symbol.includes('/') && <Badge variant="outline" className="text-[10px] text-amber-400/80" title="Crypto symbol — equity session guards ignored, runs 24/7">24/7</Badge>}
                   {(r.cooldownMin ?? 0) > 0 && (
                     <Badge variant="outline" className="border-sky-500/30 text-[10px] text-sky-400/90" title={`No new entries for ${r.cooldownMin}m after a position closes`}>
                       cooldown {r.cooldownMin}m
