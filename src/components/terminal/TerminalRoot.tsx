@@ -25,6 +25,7 @@ import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
 import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
+import { APP_VERSION } from '@/generated/version'
 
 export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const user = useTerminal((s) => s.user)
@@ -332,10 +333,27 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         </span>
         <span className="flex items-center gap-3">
           <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
+          <AppVersion />
           <LiveClock />
         </span>
       </footer>
     </div>
+  )
+}
+
+// Build version (stamped by scripts/stamp-version.mjs on every dev/build):
+// display "v1.79.0+69" — base semver + git commit count; hover shows the
+// full version (sha, branch, commit date). Static build-time constant, so
+// SSR/CSR markup always matches (no hydration risk, no ticking).
+function AppVersion() {
+  return (
+    <span
+      className="font-mono text-[10px] tabular-nums text-zinc-600"
+      title={`TradeTerminal ${APP_VERSION.full} · branch ${APP_VERSION.branch} · commit ${APP_VERSION.commitDate}`}
+      aria-label={`App version ${APP_VERSION.full}`}
+    >
+      {APP_VERSION.display}
+    </span>
   )
 }
 

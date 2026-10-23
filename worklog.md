@@ -1592,3 +1592,19 @@ Work Log:
 Stage Summary:
 - The terminal is restored to the exact GitHub backup tip (15ee66f, Task 79 included): algo tab, Risk Money + Percentage%, Task 79's export/import enable-state, duplicate-symbol double-exposure warning and positions source attribution are all present and verified working in the browser with zero errors.
 - Root cause was a sandbox re-provision from a stale snapshot, not a code regression — the GitHub backup proved authoritative; no new PAT spend needed (fetch-only).
+---
+Task ID: 80
+Agent: Z.ai Code (main)
+Task: "version check. if not latest, pull from my github. enhence: 1) add version in every build and display at the bottom bar next to clock"
+
+Work Log:
+- VERSION CHECK: fetched origin (askpass had to be recreated — fresh /tmp again); origin/main tip still 15ee66f (Task 79) and `git merge-base --is-ancestor origin/main HEAD` confirms local CONTAINS the remote tip → UP-TO-DATE, nothing to pull (local ahead only by platform bookkeeping auto-commits).
+- VERSION STAMPER (new scripts/stamp-version.mjs): derives a git-based build version on every run — base = package.json "version", build = `git rev-list --count HEAD` (commit count = build number), sha = `git rev-parse --short HEAD`, branch + commit date; emits `v{base}+{build}` display + `{base}+{build}.{sha}` full semver-build metadata; writes src/generated/version.ts ONLY when the derived content changed (a no-op touch would trigger the Next watcher → reload loop), never writes a timestamp-of-stamp so the committed file stays stable per commit; graceful "dev" fallback when git is unavailable (fresh clone without hooks still compiles).
+- WIRING: package.json gets `predev` + `prebuild` hooks (bun runs pre-hooks — verified with a throwaway fixture) so EVERY dev start / production build re-stamps; base version bumped 0.2.1 → 1.79.0 to match the shipped Task-79 milestone; name → blackhole_terminal. src/generated/version.ts is COMMITTED as the no-git fallback (re-stamped locally at dev/build time; known ±1 build-number lag between the committed copy and the commit carrying it, documented in the script header).
+- UI (TerminalRoot.tsx): new AppVersion component rendered in the footer's right cluster immediately before LiveClock ("next to the clock") — 10px mono tabular zinc-600, shows `v1.79.0+69`, title tooltip = "TradeTerminal 1.79.0+69.fead176 · branch main · commit <date>", aria-label for screen readers; static build-time constant → zero hydration risk, no ticking. Footer remains sticky (mt-auto) and unchanged otherwise.
+- E2E (agent-browser 1280×800, real trader+TOTP login): footer innerText = "… 2FA-protected · layout auto-saves every 5s | v1.79.0+69 | 09:50:54 UTC" — version sits directly left of the clock; tooltip attribute verified via eval; screenshot t80-version-footer.png shows the Algo Trading tab + Risk Money toggle intact from the restore. Zero page errors. Lint clean; tsc clean in src (3 pre-existing errors only in scripts-tmp/tests).
+- Files: scripts/stamp-version.mjs (new), package.json (predev/prebuild + base 1.79.0), src/generated/version.ts (new, generated), src/components/terminal/TerminalRoot.tsx (AppVersion + import). Screenshots: t80-version-footer.png.
+
+Stage Summary:
+- Every dev/build now carries a distinct git-derived version (v1.79.0+{commit-count}, full {base}+{count}.{sha} in the tooltip), stamped automatically by predev/prebuild and displayed in the terminal bottom bar right next to the clock.
+- Version check against the GitHub backup: local == remote tip 15ee66f (Task 79) — up to date, no pull needed.
