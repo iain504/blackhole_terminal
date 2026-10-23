@@ -3,9 +3,17 @@
 // Trade Advisor (Task 82) — a one-click technical trade plan on the chart:
 //   1. Reuses the Auto S/R detector (src/lib/sr.ts) on a HIGHER timeframe
 //      (default 1D) and picks the highest-score level (most pivot touches).
-//   2. Anchors a fib retracement between that level and the recent swing
-//      extreme, draws it on the chart, and highlights the 0.5–0.618
-//      "golden pocket" (meta.golden — the canvas renderer fills the band).
+//   2. Anchors a fib retracement on the level's most recent REAL leg (Task
+//      82c): the departure after its last touch episode → the subsequent
+//      extreme (bounded by the level's next revisit). That keeps the standard
+//      retracement convention honest — 1.000 = the leg ORIGIN (here: the S/R
+//      level the move started from), 0.000 = the leg END (the swing extreme),
+//      0.5–0.618 measured back from the extreme = the "golden pocket"
+//      (meta.golden — the canvas renderer fills the band). The two fib points
+//      sit at their real bars, so the drawn leg is a true diagonal like a
+//      hand-drawn TradingView fib. If NO candidate level has a real leg, the
+//      whole-lookback extreme is used as a fallback and flagged ⚠ synthetic
+//      in the panel.
 //   3. Populates the advice panel with the optimal entry (golden-pocket
 //      midpoint), TP (nearest opposite S/R level, fallback swing extreme)
 //      and SL (beyond the anchor by half the pocket height) — every value
@@ -58,6 +66,11 @@ interface Advice {
   /** swing extreme (leg end) */
   swing: number
   swingTime: number
+  /** fib leg: 'leg' = real (level's last departure → extreme, both bars
+   *  real); 'lookback' = synthetic fallback (whole-lookback extreme — the
+   *  level origin is NOT verified, panel shows ⚠) */
+  legStartTime: number
+  legSource: 'leg' | 'lookback'
   /** golden pocket in PRICE space: lo < hi always */
   zoneLo: number
   zoneHi: number
@@ -73,6 +86,62 @@ type MonitorState = 'idle' | 'waiting' | 'zone' | 'stale' | 'invalidated'
 /** price at retracement fraction f of the leg (f=0 → swing extreme, f=1 → level) */
 function priceAt(a: Pick<Advice, 'level' | 'swing'>, f: number): number {
   return a.swing + (a.level - a.swing) * f
+}
+
+/** short UTC-s date for the panel/toast (client-rendered only) */
+const fmtDay = (t: number) => new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+
+/** Bars whose range comes within tolPct of `level` (or straddles it) are "at
+ *  the level"; consecutive ones (gaps ≤3 bars = one shelf/test) merge into a
+ *  touch EPISODE. Chronological order. */
+function touchEpisodes(bars: SrBar[], level: number, tolPct: number) {
+  const tol = Math.abs(level) * tolPct
+  const at = (b: SrBar) => b.low - tol <= level && level <= b.high + tol
+  const eps: { start: number; end: number }[] = []
+  let cur: { start: number; end: number } | null = null
+  for (let i = 0; i < bars.length; i++) {
+    if (!at(bars[i])) continue
+    if (cur && i - cur.end <= 3) cur.end = i
+    else {
+      cur = { start: i, end: i }
+      eps.push(cur)
+    }
+  }
+  return eps
+}
+
+/** The most recent REAL fib leg from `level` (Task 82c): after a touch
+ *  episode price DEPARTS and travels to an extreme — bounded by the level's
+ *  next revisit (a completed leg) or by now (the ongoing leg). Scanned
+ *  newest-first; a leg needs ≥3 bars away from the level and an extreme
+ *  clearing the zone by 2×tol on the trade side. null = this level never
+ *  originated a real leg in the lookback → caller falls back. */
+function legFromLevel(
+  bars: SrBar[],
+  level: number,
+  tolPct: number,
+  side: 'long' | 'short',
+): { swing: number; swingTime: number; legStartTime: number } | null {
+  const eps = touchEpisodes(bars, level, tolPct)
+  const minClear = Math.abs(level) * tolPct * 2
+  for (let i = eps.length - 1; i >= 0; i--) {
+    const from = eps[i].end + 1
+    const to = i + 1 < eps.length ? eps[i + 1].start - 1 : bars.length - 1
+    if (to - from + 1 < 3) continue
+    let swing = side === 'long' ? bars[from].high : bars[from].low
+    let swingTime = bars[from].time
+    for (let j = from + 1; j <= to; j++) {
+      const b = bars[j]
+      if (side === 'long' ? b.high > swing : b.low < swing) {
+        swing = side === 'long' ? b.high : b.low
+        swingTime = b.time
+      }
+    }
+    if (side === 'long' ? swing >= level + minClear : swing <= level - minClear) {
+      return { swing, swingTime, legStartTime: bars[eps[i].end].time }
+    }
+  }
+  return null
 }
 
 function monitorState(a: Advice, p: number | null): MonitorState {
@@ -234,42 +303,74 @@ export function TradeAdvisor({
         return
       }
       const ref = livePrice ?? bars[bars.length - 1].close
-      const levels = detectSrLevels(bars, { minTouches: minT, maxLevels: 8, tolPct: scanTf === '1D' ? 0.012 : 0.009, refPrice: ref })
+      const tolPct = scanTf === '1D' ? 0.012 : 0.009
+      const levels = detectSrLevels(bars, { minTouches: minT, maxLevels: 8, tolPct, refPrice: ref })
       if (levels.length === 0) {
         setErr(`No S/R level with ≥${minT} touches in the last ${d}d (${scanTf}). Lower min touches or extend the lookback.`)
         return
       }
-      const best = (arr: typeof levels) =>
-        [...arr].sort((x, y) => y.touches - x.touches || Math.abs(x.price - ref) - Math.abs(y.price - ref))[0] ?? null
+      const order = (arr: typeof levels) =>
+        [...arr].sort((x, y) => y.touches - x.touches || Math.abs(x.price - ref) - Math.abs(y.price - ref))
       const supports = levels.filter((l) => l.price < ref)
       const resistances = levels.filter((l) => l.price > ref)
-      const longLv = best(supports)
-      const shortLv = best(resistances)
-      const side: 'long' | 'short' =
-        sideSel === 'auto'
-          ? longLv && shortLv
-            ? (longLv.touches >= shortLv.touches ? 'long' : 'short')
-            : longLv ? 'long' : 'short'
-          : sideSel
-      const lv = side === 'long' ? longLv : shortLv
-      if (!lv) {
-        setErr(`No ${side === 'long' ? 'support below' : 'resistance above'} the current price with ≥${minT} touches (${scanTf}).`)
-        return
+
+      // Fib leg construction (Task 82c): the retracement is only meaningful
+      // when its 1.000 origin REALLY is where the move started. Walk each
+      // candidate level (strongest first) and take its most recent REAL leg
+      // (departure → subsequent extreme). Only when NO candidate has one,
+      // fall back to the whole-lookback extreme — flagged ⚠ synthetic.
+      type LegPick = {
+        side: 'long' | 'short'
+        lv: (typeof levels)[number]
+        swing: number
+        swingTime: number
+        legStartTime: number
+        legSource: 'leg' | 'lookback'
       }
-      // swing extreme across the whole lookback window (leg end)
-      let swing = side === 'long' ? bars[0].high : bars[0].low
-      let swingTime = bars[0].time
-      for (const b of bars) {
-        if (side === 'long' ? b.high > swing : b.low < swing) {
-          swing = side === 'long' ? b.high : b.low
-          swingTime = b.time
+      const buildForSide = (side: 'long' | 'short', arr: typeof levels): LegPick | null => {
+        for (const lv of order(arr)) {
+          const leg = legFromLevel(bars, lv.price, tolPct, side)
+          if (leg) return { side, lv, ...leg, legSource: 'leg' }
+        }
+        const lv = order(arr)[0]
+        if (!lv) return null
+        let swing = side === 'long' ? bars[0].high : bars[0].low
+        let swingTime = bars[0].time
+        for (const b of bars) {
+          if (side === 'long' ? b.high > swing : b.low < swing) {
+            swing = side === 'long' ? b.high : b.low
+            swingTime = b.time
+          }
+        }
+        if (side === 'long' ? swing <= lv.price : swing >= lv.price) return null
+        return { side, lv, swing, swingTime, legStartTime: swingTime, legSource: 'lookback' }
+      }
+      const longPick = sideSel === 'short' ? null : buildForSide('long', supports)
+      const shortPick = sideSel === 'long' ? null : buildForSide('short', resistances)
+      // auto: prefer the side with a REAL leg, then score, then proximity
+      const prefer = (a: LegPick | null, b: LegPick | null): LegPick | null => {
+        if (!a) return b
+        if (!b) return a
+        const realA = a.legSource === 'leg' ? 1 : 0
+        const realB = b.legSource === 'leg' ? 1 : 0
+        if (realA !== realB) return realA > realB ? a : b
+        if (a.lv.touches !== b.lv.touches) return a.lv.touches > b.lv.touches ? a : b
+        return Math.abs(a.lv.price - ref) <= Math.abs(b.lv.price - ref) ? a : b
+      }
+      if (sideSel !== 'auto') {
+        const arr = sideSel === 'long' ? supports : resistances
+        if (arr.length === 0) {
+          setErr(`No ${sideSel === 'long' ? 'support below' : 'resistance above'} the current price with ≥${minT} touches (${scanTf}).`)
+          return
         }
       }
-      if (side === 'long' ? swing <= lv.price : swing >= lv.price) {
-        setErr(`${side === 'long' ? 'Swing high is not above the support' : 'Swing low is not below the resistance'} — try another timeframe.`)
+      const pick = sideSel === 'auto' ? prefer(longPick, shortPick) : sideSel === 'long' ? longPick : shortPick
+      if (!pick) {
+        setErr(`${sideSel === 'long' ? 'Swing high is not above the support' : 'Swing low is not below the resistance'} — try another timeframe.`)
         return
       }
-      const a0 = { side, level: lv.price, levelSide: lv.side, touches: lv.touches, tf: scanTf, swing, swingTime }
+      const { side, lv, swing, swingTime, legStartTime, legSource } = pick
+      const a0 = { side, level: lv.price, levelSide: lv.side, touches: lv.touches, tf: scanTf, swing, swingTime, legStartTime, legSource }
       const p5 = priceAt(a0, GOLD_LO)
       const p618 = priceAt(a0, GOLD_HI)
       const zoneLo = Math.min(p5, p618)
@@ -308,20 +409,22 @@ export function TradeAdvisor({
         color: side === 'long' ? '#22d3ee' : '#f472b6',
         meta: { auto: 'advisor', role: 'anchor', side: lv.side, touches: lv.touches, tf: scanTf },
       })
-      // 2) fib retracement level→swing with the golden pocket band
-      //    (renderer: level 0 = swing extreme, level 1 = the S/R anchor)
+      // 2) fib retracement on the REAL leg: 1.000 (origin) at the level's
+      //    departure bar, 0.000 (extreme) at the swing bar — a true diagonal
+      //    like a hand-drawn TradingView fib; fallback anchors both ends at
+      //    the swing bar (synthetic leg ⚠)
       await createDrawing('fib', [
-        { time: swingTime, price: lv.price, pane: 'price' },
+        { time: legStartTime, price: lv.price, pane: 'price' },
         { time: swingTime, price: swing, pane: 'price' },
       ], {
         color: '#a78bfa',
-        meta: { auto: 'advisor', role: 'fib', golden: true, side, tf: scanTf },
+        meta: { auto: 'advisor', role: 'fib', golden: true, side, tf: scanTf, legSource },
       })
       setAdvice(advice)
       setEntryEdits({ entry: String(+entry.toFixed(6)), tp: String(+tp.toFixed(6)), sl: String(+sl.toFixed(6)) })
       toast({
         title: `Advisor: ${side === 'long' ? 'LONG' : 'SHORT'} plan on ${symbol}`,
-        description: `${lv.side} ${fmtPrice(lv.price)} · ${lv.touches} touches ${scanTf} · golden pocket ${fmtPrice(zoneLo)}–${fmtPrice(zoneHi)} · drawn on chart`,
+        description: `${lv.side} ${fmtPrice(lv.price)} · ${lv.touches} touches ${scanTf} · leg ${legSource === 'leg' ? `${fmtDay(legStartTime)}→${fmtDay(swingTime)}` : 'synthetic ⚠'} · pocket ${fmtPrice(zoneLo)}–${fmtPrice(zoneHi)}`,
       })
     } catch {
       setErr('Analysis failed — could not load history.')
@@ -575,10 +678,24 @@ export function TradeAdvisor({
               <span className="tabular-nums text-zinc-200">{fmtPrice(advice.swing)}</span>
             </div>
             <div className="flex justify-between gap-2">
+              <span>Fib leg</span>
+              <span
+                className="tabular-nums text-zinc-200"
+                title={advice.legSource === 'leg' ? 'Real leg: the level’s last departure bar → the swing extreme (standard retracement: 1.000 origin = level, 0.000 = extreme)' : 'Synthetic leg: whole-lookback extreme — the level origin is not verified, treat the pocket as indicative'}
+              >
+                {advice.legSource === 'leg' ? `${fmtDay(advice.legStartTime)} → ${fmtDay(advice.swingTime)}` : 'lookback ⚠'}
+              </span>
+            </div>
+            <div className="flex justify-between gap-2">
               <span>Golden pocket 0.5–0.618</span>
               <span className="tabular-nums text-violet-300">{fmtPrice(advice.zoneLo)} – {fmtPrice(advice.zoneHi)}</span>
             </div>
           </div>
+          {advice.legSource === 'lookback' && (
+            <p className="mt-1 text-[10px] leading-snug text-amber-400/90">
+              ⚠ Synthetic leg — price never left this level and made the swing in one move; the pocket is indicative only.
+            </p>
+          )}
           <div className="mt-1.5 grid grid-cols-3 gap-1.5">
             {([
               { k: 'entry' as const, label: 'Entry (limit)', v: entryEdits?.entry, def: advice.entry, cls: 'text-amber-400' },
