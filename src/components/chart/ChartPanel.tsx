@@ -5,7 +5,7 @@
 // resizable after drawing, with right-click context menus (Task 14 #1/#4,
 // Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the TIME
 // AXIS (x-axis), TradingView-style.
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, IPriceLine, MouseEventParams, CandlestickData, LineData,
@@ -3463,14 +3463,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // chart or refetches bars/markers.
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours])
 
-  // ---------- grid trades overlay (Task 10-b) ----------
-  // Poll lifecycle: while the toggle is ON, fetch GET /api/grid immediately and
-  // every 5s; any non-OK response (401 logged-out, offline 4xx, 5xx) simply
-  // clears the snapshot → nothing renders, never a toast or a crash. Toggling
-  // OFF (or unmount) clears the interval and the snapshot. Two effects so the
-  // poll keeps running regardless of chart recreation.
+  // ---------- grid trades overlay + live-grid glow (Task 10-b / 10-d) ----------
+  // Poll lifecycle: ALWAYS on while the panel is mounted (the boundary glow
+  // must know about active grids even when the line overlay is off) — fetch
+  // GET /api/grid immediately and every 5s; any non-OK response (401 logged
+  // out, offline 4xx, 5xx) simply clears the snapshot → nothing renders, never
+  // a toast or a crash. Two effects so the poll keeps running regardless of
+  // chart recreation.
   useEffect(() => {
-    if (!gridOverlayOn) return
     let cancelled = false
     const fetchGrids = async () => {
       try {
@@ -3487,7 +3487,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       clearInterval(t)
       setGridOverlayData(null)
     }
-  }, [gridOverlayOn])
+  }, [])
+
+  // Boundary glow: does the CHARTED symbol have an active grid right now?
+  // Independent of the line-overlay toggle (Task 10-d).
+  const gridLiveOnSymbol = useMemo(
+    () =>
+      Array.isArray(gridOverlayData) &&
+      gridOverlayData.some((g) => g.status === 'active' && normSym(String(g.symbol || '')) === normSym(symbol)),
+    [gridOverlayData, symbol],
+  )
 
   // Price-line lifecycle: teardown at the TOP of the effect (not as a cleanup)
   // so chart recreation can never call removePriceLine on a disposed series —
@@ -3848,6 +3857,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const indActiveCount = indicatorsActive(ind)
 
   return (
+    <div className="relative h-full w-full">
     <div
       ref={containerRef}
       className={cn(
@@ -3855,8 +3865,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
       )}
       style={{ background: '#09090b' }}
-      onPointerDownCapture={() => onFocus?.()}
-    >
+      onPointerDownCapture={() => onFocus?.()}>
       {/* chart canvas is injected here by lightweight-charts */}
       {/* h-full/w-full is CRITICAL: a canvas with only inset-0 renders at its
           intrinsic (backing-store) CSS size, so on devicePixelRatio > 1 screens
@@ -4510,6 +4519,12 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         onOpenChange={setSearchOpen}
         onSelect={onSymbolChange}
       />
+    </div>
+    {/* Task 10-d — pulsing boundary glow while this symbol has a live grid.
+        Lives OUTSIDE the overflow-hidden chart container (sibling in the
+        wrapper) so the outer halo is not clipped, and animates opacity only
+        so the chart canvas is never composited per-frame. */}
+    {gridLiveOnSymbol && <div aria-hidden className="grid-live-glow absolute inset-0 z-20" />}
     </div>
   )
 }

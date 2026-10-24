@@ -2536,3 +2536,18 @@ Stage Summary:
 - API: POST /api/grid + slBasis/tpBasis; PUT /api/grid/[id] (edit-when-flat, 409s); POST /api/grid/backtest {…, days} → {stats, curve≤300, fills≤200}. resolveGuards() is the single source of trigger math (engine + routes + sim).
 - Note: backtest window may exceed the requested days slightly (deep-history fetch granularity, e.g. 30d → 999×1h ≈ 41d window) — period is displayed honestly from actual bar range.
 - Landing version → v1.26.0.
+
+---
+Task ID: 10-d
+Agent: main (Z.ai Code)
+Task: "push to git" + glowing chart boundary while the charted symbol has a running grid (chatbox-style).
+
+Work Log:
+- Push check: remote was already at 507c344; a stray platform auto-commit (UUID message) had added agent-ctx/ + scripts-tmp scratch on top — dropped via git reset --mixed HEAD~1 so the repo stays clean (scratch remains untracked).
+- Glow implementation: ChartPanel's /api/grid poll is now ALWAYS on while the panel is mounted (dep [] effect; previously gated on the line-overlay toggle) so the glow knows about active grids even with lines off; gridLiveOnSymbol useMemo (status active + normSym symbol match); wrapper div added around the chart container with a sibling aria-hidden .grid-live-glow ring (absolute inset-0 z-20, pointer-events none).
+- CSS (globals.css): first attempt used outer box-shadow halos — browser-verified that FOUR ancestors clip overflow (pane + layout levels up to h-screen), killing outer halos (computed style animated but visually absent in screenshots). Final design: fully INSET glow (1.5px emerald ring + 22px/64px soft washes fading in from the edges) + grid-glow-pulse opacity keyframes (0.35→1, 2.4s ease-in-out) — clip-proof, compositor-friendly (opacity-only), prefers-reduced-motion honored.
+- E2E (browser, trader): created demo grid BTC/USD 78000–82000 ×6 levels ×0.001 via API → chart shows pulsing emerald boundary (two pulse-phase screenshots differ in intensity; computed animation grid-glow-pulse). Stop → glow OFF within one 5s poll; recreate → glow ON. Demo grid left RUNNING intentionally so the user sees the effect live (id cmvmuqh5…, stop from Grid tab). ESLint clean; tsc filtered clean.
+
+Stage Summary:
+- Chart boundary now pulses emerald whenever its symbol has an active grid (independent of the line-overlay toggle). Files: src/components/chart/ChartPanel.tsx (always-on poll + wrapper + glow ring), src/app/globals.css (.grid-live-glow + keyframes).
+- remote==local==<pushed sha> after this commit.

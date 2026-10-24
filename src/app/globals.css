@@ -140,3 +140,24 @@
   scrollbar-width: thin;
   scrollbar-color: #3f3f46 transparent;
 }
+
+/* Task 10-d — pulsing boundary glow while the charted symbol has a live grid
+   (like a chat-box focus glow). The chart pane and every layout level above it
+   use overflow-hidden, which clips OUTER box-shadows — so the glow is drawn
+   entirely with INSET shadows (ring + soft emerald wash fading in from the
+   edges) and animates opacity only, keeping it compositor-friendly. */
+.grid-live-glow {
+  box-shadow:
+    inset 0 0 0 1.5px rgba(16, 185, 129, 0.55),
+    inset 0 0 22px 2px rgba(16, 185, 129, 0.28),
+    inset 0 0 64px 10px rgba(16, 185, 129, 0.13);
+  animation: grid-glow-pulse 2.4s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes grid-glow-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .grid-live-glow { animation: none; opacity: 0.75; }
+}
