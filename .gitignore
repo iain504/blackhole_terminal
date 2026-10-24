@@ -71,3 +71,7 @@ db/*.db-journal
 screens-tmp/
 /*.png
 .zscripts/dev.pid
+
+# platform/subagent scratch (prevents recurring UUID auto-commits)
+agent-ctx/
+scripts-tmp/
