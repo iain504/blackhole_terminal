@@ -53,6 +53,7 @@
 import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
 import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
 import type { Bar } from '@/lib/market-types'
+import { memoryGuard } from '@/lib/mem-guard'
 
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — same as the live engine
 const RTH_START_MIN = 9 * 60 + 30
@@ -765,6 +766,25 @@ function comboInvalid(strategy: AlgoStrategyId, p: Record<string, number>): bool
   return false
 }
 
+/**
+ * Task 9-p — mid-matrix heap abort (mirrors the reco-matrix guard in
+ * algo-reco.ts): POST-time gates cannot see allocations that happen DURING a
+ * long grid search / sweep. Probing every combo converts a fatal OOM (the
+ * whole dev server dies, user account state and all) into a catchable error
+ * the route surfaces as a plain 500 + toast. 0.78 sits between the 0.70
+ * POST gate and the 1.0 fatal ceiling.
+ */
+const MATRIX_HEAP_ABORT = 0.78
+function heapAbortCheck(context: string): void {
+  const mem = memoryGuard(MATRIX_HEAP_ABORT)
+  if (!mem.ok) {
+    throw new Error(
+      `${context} aborted — heap ${mem.heapUsedMb}MB / ${mem.limitMb}MB cap. ` +
+      `Results so far are lost; retry when the server is quieter (close other backtests first).`,
+    )
+  }
+}
+
 export function optimizeBacktest(
   series: BacktestSeries,
   base: BacktestConfig,
@@ -808,6 +828,8 @@ export function optimizeBacktest(
   const idx = dims.map(() => 0)
   if (totalCombos > 0) {
     for (let combo = 0; combo < totalCombos; combo += stride) {
+      // Task 9-p — per-combo heap probe (see heapAbortCheck)
+      heapAbortCheck('Optimization')
       // odometer decode
       let rem = combo
       for (let d = 0; d < dims.length; d++) {
@@ -983,6 +1005,10 @@ export function sweepStrategies(
   let skipped = 0
   let skippedShorts = 0
   for (const sid of ALGO_STRATEGY_IDS) {
+    // Task 9-p — per-strategy heap probe: the sweep runs every strategy's
+    // optimizer back-to-back; catch the hot heap BETWEEN strategies (see
+    // heapAbortCheck)
+    heapAbortCheck('Strategy sweep')
     const def = ALGO_STRATEGIES[sid]
     const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults }, collectEquity: false }
     // grid bounds per dim (same sanitized value sets the optimizer uses) —

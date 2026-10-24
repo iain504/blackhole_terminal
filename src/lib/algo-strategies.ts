@@ -122,8 +122,12 @@ export type AlgoTimeframe = (typeof ALGO_TIMEFRAMES)[number]
  * Max backtest history (calendar days) per algo timeframe — shared by the API
  * route (clamp) and the Backtest panel (visible hint), so the cap is never
  * applied silently.
+ *
+ * Task 9-p — 1m was 120d ≈ 173k bars for 24/7 crypto (fetch + series + TWO
+ * caches retaining it) — the single most reliable way to OOM the dev box.
+ * 30d ≈ 43k bars keeps 1m studies useful and the heap flat.
  */
-export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> = { '1m': 120, '5m': 365, '15m': 730 }
+export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> = { '1m': 30, '5m': 365, '15m': 730 }
 
 export function isAlgoStrategyId(v: unknown): v is AlgoStrategyId {
   return typeof v === 'string' && v in ALGO_STRATEGIES

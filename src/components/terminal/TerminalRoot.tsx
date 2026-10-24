@@ -15,7 +15,9 @@ import PositionsTab from './tabs/PositionsTab'
 import StrategyTab from './tabs/StrategyTab'
 import ReportTab from './tabs/ReportTab'
 import AlgoTab from './tabs/AlgoTab'
+import GridTab from './tabs/GridTab'
 import { StrategyDrawer } from './StrategyDrawer'
+import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Keyboard, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -241,6 +243,21 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     return () => window.removeEventListener('tt:open-strategies', open)
   }, [user])
 
+  // Grid Trading (Task 9-q) — the chart's Grid tool opens the config dialog
+  // and a successful start dispatches tt:open-grid: focus the Grid tab if it
+  // already exists, otherwise add one.
+  useEffect(() => {
+    if (!user) return
+    const open = () => {
+      const s = useTerminal.getState()
+      const existing = s.tabs.find((t) => t.type === 'grid')
+      if (existing) s.setActiveTab(existing.id)
+      else s.addTab('grid')
+    }
+    window.addEventListener('tt:open-grid', open)
+    return () => window.removeEventListener('tt:open-grid', open)
+  }, [user])
+
   useEffect(() => {
     if (!user) return
     let stopped = false
@@ -387,6 +404,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         strategiesOpen={strategiesOpen}
         setStrategiesOpen={setStrategiesOpen}
       />
+      <ServerDownBanner />
       <main className="flex min-h-0 flex-1 flex-col">
         <ActiveTabContent />
       </main>
@@ -602,6 +620,7 @@ function ActiveTabContent() {
   if (active.type === 'strategy') return <StrategyTab />
   if (active.type === 'report') return <ReportTab />
   if (active.type === 'algo') return <AlgoTab />
+  if (active.type === 'grid') return <GridTab />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 

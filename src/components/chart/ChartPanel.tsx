@@ -33,10 +33,12 @@ import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
   Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
+  LayoutGrid,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { TradeAdvisor } from './TradeAdvisor'
+import GridTradeDialog from './GridTradeDialog'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, PendingOrderInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
@@ -322,6 +324,25 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [tradeOpen, setTradeOpen] = useState(false)
   const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
   const [advisorOpen, setAdvisorOpen] = useState(false)
+  // ---- Grid trade range tool (Task 9-q): arm → the next TWO chart clicks
+  // capture two PRICES (main scale via coordinateToPrice) → config dialog.
+  // Local to this pane; nothing is drawn or persisted on the chart itself.
+  const [gridArm, setGridArm] = useState<'off' | 'lower' | 'upper'>('off')
+  const [gridRange, setGridRange] = useState<{ lowerPrice: number; upperPrice: number } | null>(null)
+  const gridCaptureRef = useRef<{ stage: 0 | 1 | 2; first: number | null }>({ stage: 0, first: null })
+
+  // Esc cancels an armed grid capture (own listener so the big pointer effect
+  // below stays untouched by grid state)
+  useEffect(() => {
+    if (gridArm === 'off') return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      gridCaptureRef.current = { stage: 0, first: null }
+      setGridArm('off')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [gridArm])
   // Bumping this REMOUNTS the trade ticket. The ticket intentionally keeps its
   // state while open (stays open after placing an order), but its prefill is
   // only read on mount — so a right-click "Sell limit @ …" while the ticket
@@ -2450,6 +2471,33 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         }
       }
       const { x, y } = rel(e)
+
+      // ---- Grid range tool armed (Task 9-q): capture two PRICES from the
+      // main scale (series.coordinateToPrice on the click Y). Runs BEFORE the
+      // drawing-tool branch so an armed capture is never eaten by a tool.
+      const gc = gridCaptureRef.current
+      if (gc.stage > 0) {
+        e.stopPropagation()
+        e.preventDefault()
+        cancelLongPress()
+        const p = priceAt(y)
+        if (p == null) return
+        if (gc.stage === 1) {
+          gridCaptureRef.current = { stage: 2, first: p }
+          setGridArm('upper')
+        } else {
+          const first = gc.first
+          gridCaptureRef.current = { stage: 0, first: null }
+          setGridArm('off')
+          if (first != null && first === p) {
+            toast({ title: 'Grid range needs two different prices', description: 'Click the LOWER price first, then the UPPER price.', variant: 'destructive' })
+          } else if (first != null) {
+            setGridRange({ lowerPrice: Math.min(first, p), upperPrice: Math.max(first, p) })
+          }
+        }
+        return
+      }
+
       const tool = useTerminal.getState().drawingTool
 
       if (tool !== 'cursor') {
@@ -4073,6 +4121,26 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         >
           <Lightbulb className="h-3.5 w-3.5" />
         </button>
+        <button
+          title="Grid trade: click two price levels"
+          aria-label="Grid trade: click two price levels"
+          aria-pressed={gridArm !== 'off'}
+          onClick={() => {
+            if (gridArm !== 'off') {
+              gridCaptureRef.current = { stage: 0, first: null }
+              setGridArm('off')
+              return
+            }
+            gridCaptureRef.current = { stage: 1, first: null }
+            setGridArm('lower')
+          }}
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            gridArm !== 'off' ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',
+          )}
+        >
+          <LayoutGrid className="h-3.5 w-3.5" />
+        </button>
         <div className="mx-1 my-0.5 h-px bg-zinc-800" />
         {(
           [
@@ -4138,6 +4206,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         className="pointer-events-none absolute left-12 top-12 z-20 hidden rounded bg-zinc-950/50 px-2 py-1 font-mono text-[11px] leading-4 text-zinc-300 backdrop-blur-sm"
         aria-hidden
       />
+
+      {/* grid range tool hint (Task 9-q) — floating chip while armed */}
+      {gridArm !== 'off' && (
+        <div
+          role="status"
+          className="absolute left-1/2 top-3 z-30 flex -translate-x-1/2 items-center gap-2 rounded-md border border-emerald-500/40 bg-zinc-950/90 px-3 py-1.5 text-xs text-zinc-200 shadow-lg backdrop-blur-sm"
+        >
+          <LayoutGrid className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
+          <span className="font-medium">{gridArm === 'lower' ? 'Grid: click the LOWER price…' : 'Grid: now click the UPPER price'}</span>
+          <span className="text-[10px] text-zinc-500">Esc cancels</span>
+        </div>
+      )}
 
       {/* loading overlay */}
       {loading && (
@@ -4290,6 +4370,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           onClose={() => setAdvisorOpen(false)}
           createDrawing={createDrawing}
           deleteDrawing={deleteDrawing}
+        />
+      )}
+
+      {/* grid trade config dialog (Task 9-q) — opened after the two-click
+          range capture; nothing was persisted yet, this is the commit point */}
+      {gridRange && (
+        <GridTradeDialog
+          open
+          onOpenChange={(v) => { if (!v) setGridRange(null) }}
+          symbol={symbol}
+          lowerPrice={gridRange.lowerPrice}
+          upperPrice={gridRange.upperPrice}
         />
       )}
 

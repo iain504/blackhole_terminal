@@ -26,10 +26,11 @@
 // fanned out to guest sockets. CORS is `origin: true, credentials: true`
 // (same-origin via the gateway) — defense in depth on top of the handshake auth.
 // GET /healthz on the same port returns {"ok":true} for uptime probes.
-import { createServer } from 'http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'http'
 import { createHmac, timingSafeEqual } from 'crypto'
 import { readFileSync } from 'fs'
 import { join } from 'path'
+import { spawn } from 'child_process'
 import { Server, Socket } from 'socket.io'
 
 const PORT = 3030
@@ -51,34 +52,190 @@ const GUEST_EVENT_WINDOW_MS = 60_000
 
 const isCrypto = (s: string) => s.includes('/')
 
+// ------------------------- ops: rescue + restart (9-p) ----------------------
+// The sidecar OUTLIVES the Next dev server: it is a separate, tiny process.
+// That makes it the natural rescue channel — when the main server dies (OOM
+// during a heavy backtest), this service can still (a) serve a recovery page
+// and (b) restart the dev server on behalf of a logged-in user.
+const SVC_DIR = (import.meta as { dir?: string }).dir ?? process.cwd()
+const PROJECT_ROOT = join(SVC_DIR, '..', '..')
+const NEXT_HEALTH_URL = 'http://127.0.0.1:3000/api/health'
+
+async function probeNext(): Promise<'up' | 'down'> {
+  try {
+    // ANY http answer (even a 503 degraded health) means the process lives
+    await fetch(NEXT_HEALTH_URL, { signal: AbortSignal.timeout(3000), cache: 'no-store' })
+    return 'up'
+  } catch {
+    return 'down'
+  }
+}
+
+let lastRestartAt = 0
+function requestNextRestart(): { started: boolean; reason?: string } {
+  const now = Date.now()
+  if (now - lastRestartAt < 20_000) return { started: false, reason: 'recent' }
+  lastRestartAt = now
+  try {
+    const child = spawn('bash', [join(PROJECT_ROOT, 'scripts-tmp', 'restart-next.sh')], {
+      cwd: PROJECT_ROOT,
+      detached: true,
+      stdio: 'ignore',
+    })
+    child.on('error', (e) => console.error('[ops] restart spawn failed:', e instanceof Error ? e.message : e))
+    child.unref()
+    console.log('[ops] dev-server restart requested via /ops/restart-next')
+    return { started: true }
+  } catch (e) {
+    console.error('[ops] restart failed:', e instanceof Error ? e.message : e)
+    return { started: false, reason: 'spawn' }
+  }
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+
+/** Minimal dark rescue page — served for ANY browser GET that is not an API
+ *  path. Reachable at /?XTransformPort=3030 through the gateway (and directly
+ *  on :3030), i.e. even when the main server is completely dead. */
+function rescuePageHtml(): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>BLACKHOLE Terminal — Rescue</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#09090b;color:#e4e4e7;font:15px/1.6 ui-sans-serif,system-ui,sans-serif}
+  .card{width:min(92vw,460px);background:#111113;border:1px solid #27272a;border-radius:14px;padding:28px 26px;box-shadow:0 10px 40px #0008}
+  h1{font-size:19px;margin:0 0 6px;letter-spacing:.3px}
+  p{margin:8px 0;color:#a1a1aa}
+  #st{font-weight:600;color:#e4e4e7;min-height:24px}
+  #st.down{color:#f87171}#st.up{color:#4ade80}#st.busy{color:#facc15}
+  button{margin-top:14px;width:100%;padding:12px 16px;font-size:15px;font-weight:600;border-radius:10px;border:1px solid #3f3f46;background:#fafafa;color:#111113;cursor:pointer}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:not(:disabled):hover{background:#fff}
+  .hint{font-size:12.5px;color:#71717a;border-top:1px solid #27272a;margin-top:18px;padding-top:12px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#f87171;margin-right:6px}
+</style></head><body>
+<div class="card">
+  <h1><span class="dot"></span>BLACKHOLE Terminal — Rescue</h1>
+  <p>The terminal server is not responding. This rescue page is served by the<br/>streaming sidecar, which stays alive when the main server dies.</p>
+  <p id="st">Checking terminal server…</p>
+  <button id="btn" disabled>Restart terminal server</button>
+  <p class="hint">The auto-watchdog usually revives the server within a minute on its own — this button does the same thing on demand. If this page itself is unreachable, a full redeploy (Publish) is the only option left.</p>
+</div>
+<script>
+(() => {
+  const Q = '?XTransformPort=3030'
+  const st = document.getElementById('st'), btn = document.getElementById('btn')
+  let restarting = false
+  const say = (t, c) => { st.textContent = t; st.className = c || '' }
+  async function poll() {
+    if (restarting) return
+    try {
+      const r = await fetch('/ops/status' + Q, { cache: 'no-store' })
+      const j = await r.json()
+      if (j.next === 'up') {
+        say('Terminal server is UP — taking you back…', 'up')
+        btn.disabled = true
+        setTimeout(() => { location.href = '/' }, 1200)
+      } else {
+        say('Terminal server is DOWN.', 'down')
+        btn.disabled = false
+      }
+    } catch {
+      say('Rescue service unreachable — a full redeploy (Publish) is required.', 'down')
+      btn.disabled = true
+    }
+  }
+  btn.addEventListener('click', async () => {
+    restarting = true; btn.disabled = true; say('Restarting… wait up to ~40s', 'busy')
+    try { await fetch('/ops/restart-next' + Q, { method: 'POST' }) } catch {}
+    let waited = 0
+    const t = setInterval(async () => {
+      waited += 3000
+      try {
+        const r = await fetch('/ops/status' + Q, { cache: 'no-store' })
+        const j = await r.json()
+        if (j.next === 'up') {
+          clearInterval(t); say('Terminal server is UP — taking you back…', 'up')
+          setTimeout(() => { location.href = '/' }, 1200)
+        } else if (waited > 120000) {
+          clearInterval(t); restarting = false; say('Still down after 2 minutes — try again or redeploy.', 'down')
+        }
+      } catch {}
+    }, 3000)
+  })
+  setInterval(poll, 3000); poll()
+})()
+</script></body></html>`
+}
+
 // --------------------------- session verification --------------------------
 // Mirrors src/lib/auth.ts EXACTLY (same cookie name, same token format
 // `userId.expiry.HMAC-SHA256(payload)`, same secret resolution chain) so a
 // cookie accepted by the Next app is accepted here and nothing else is.
 const SESSION_COOKIE = 'tt_session'
 
-let AUTH_SECRET = process.env.AUTH_SECRET || ''
-if (!AUTH_SECRET) {
-  // the service may not inherit the app's env — parse the repo-root .env
+// Task 9-p — secret resolution mirrors src/lib/app-secret.ts EXACTLY:
+//   env (APP_ENCRYPTION_SECRET || AUTH_SECRET) wins → else the AppSecret DB
+//   row (key 'master') the app generated at boot → else fail-closed.
+// Getting this wrong is not theoretical: when the app-side chain gained
+// APP_ENCRYPTION_SECRET while this sidecar kept reading AUTH_SECRET only,
+// EVERY genuine session verified as a guest here (crypto streams masked it —
+// guests get those too; stock streaming + /ops/restart-next silently 403'd).
+function envFromDotEnv(name: string): string | null {
   try {
     const svcDir = (import.meta as { dir?: string }).dir ?? process.cwd()
     const envText = readFileSync(join(svcDir, '..', '..', '.env'), 'utf8')
     for (const line of envText.split(/\r?\n/)) {
-      const m = /^\s*AUTH_SECRET\s*=\s*(.*?)\s*$/.exec(line)
-      if (m?.[1]) {
-        AUTH_SECRET = m[1].replace(/^["']|["']$/g, '')
-        break
-      }
+      const m = new RegExp(`^\\s*${name}\\s*=\\s*(.*?)\\s*$`).exec(line)
+      if (m?.[1]) return m[1].replace(/^["']|["']$/g, '')
     }
   } catch {
-    /* no repo-root .env — fall through to the app's hardcoded default */
+    /* no repo-root .env */
+  }
+  return null
+}
+
+/** Last resort — read the app's boot-generated master from SQLite (bun:sqlite,
+ *  readonly). Only reached when neither secret env var exists anywhere. */
+function appSecretFromDb(): string | null {
+  try {
+    const req = (globalThis as { require?: (id: string) => unknown }).require
+    if (!req) return null
+    const { Database } = req('bun:sqlite') as {
+      Database: new (path: string, opts?: { readonly?: boolean }) => {
+        query: (sql: string) => { get: () => Record<string, unknown> | undefined }
+        close: () => void
+      }
+    }
+    const dbUrl = process.env.DATABASE_URL || envFromDotEnv('DATABASE_URL') || 'file:./db/custom.db'
+    const dbPath = dbUrl.replace(/^file:/, '')
+    const db = new Database(dbPath, { readonly: true })
+    const row = db.query("SELECT value FROM AppSecret WHERE key = 'master'").get()
+    db.close()
+    return row && typeof row.value === 'string' ? row.value : null
+  } catch {
+    return null
   }
 }
+
+let AUTH_SECRET =
+  process.env.APP_ENCRYPTION_SECRET ||
+  process.env.AUTH_SECRET ||
+  envFromDotEnv('APP_ENCRYPTION_SECRET') ||
+  envFromDotEnv('AUTH_SECRET') ||
+  appSecretFromDb() ||
+  ''
 if (!AUTH_SECRET) {
   // Fail-closed, mirroring src/lib/auth.ts: never accept tokens signed with a
   // publicly-known default. Without a real secret the service cannot tell a
   // genuine session from a forged one, so it refuses to start.
-  console.error('[stream-service] FATAL: AUTH_SECRET not set and repo-root .env not found — refusing to start (forged-session guard).')
+  console.error('[stream-service] FATAL: no session secret found (env / .env / AppSecret DB) — refusing to start (forged-session guard).')
   process.exit(1)
 }
 
@@ -117,15 +274,55 @@ function cookieValue(cookieHeader: string | undefined, name: string): string | n
 // exactly as before.
 const AUTHED_ROOM = 'authed'
 const httpServer = createServer((req, res) => {
-  // lightweight health probe on the same port (socket.io owns '/socket.io')
-  if ((req.url ?? '').split('?')[0] === '/healthz') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end('{"ok":true}')
-    return
-  }
-  res.writeHead(404, { 'Content-Type': 'application/json' })
-  res.end('{"error":"not found"}')
+  void handleHttp(req, res)
 })
+
+async function handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const path = (req.url ?? '').split('?')[0]
+  try {
+    // lightweight health probe on the same port (socket.io owns '/socket.io')
+    if (path === '/healthz') {
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    // Task 9-p — rescue status: is the main server alive? (no session needed,
+    // no sensitive data — a boolean every visitor may see)
+    if (path === '/ops/status') {
+      const next = await probeNext()
+      sendJson(res, 200, { stream: 'up', next, ts: Date.now() })
+      return
+    }
+    // Task 9-p — browser-triggered restart. A VALID session is required (the
+    // same HMAC cookie the app issues); guests get 403. Fire-and-forget: the
+    // restart script respawns the dev server detached, the page polls /ops/status.
+    if (path === '/ops/restart-next') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'POST only' })
+        return
+      }
+      const token = cookieValue(req.headers.cookie, SESSION_COOKIE)
+      const userId = token ? verifySessionToken(token) : null
+      if (!userId) {
+        sendJson(res, 403, { error: 'a valid session is required to restart the server' })
+        return
+      }
+      const r = requestNextRestart()
+      sendJson(res, r.started ? 202 : 429, r)
+      return
+    }
+    // Task 9-p — recovery page for browser navigation (any path): this is how
+    // a dead server is restarted THROUGH THE BROWSER even when Next is gone.
+    if (req.method === 'GET' && String(req.headers.accept ?? '').includes('text/html')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(rescuePageHtml())
+      return
+    }
+    sendJson(res, 404, { error: 'not found' })
+  } catch (e) {
+    try { sendJson(res, 500, { error: 'internal' }) } catch { /* socket gone */ }
+    console.error('[http]', path, e instanceof Error ? e.message : e)
+  }
+}
 const io = new Server(httpServer, {
   path: '/socket.io',
   cors: { origin: true, credentials: true, methods: ['GET', 'POST'] },

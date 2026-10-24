@@ -76,6 +76,12 @@ const BARS_CACHE_MAX = 6
 const barsCache = new Map<string, { at: number; res: Awaited<ReturnType<typeof getBars>> }>()
 
 async function getBarsCached(symbol: string, tf: Timeframe, userId: string, days: number) {
+  // Task 9-p — NEVER retain a 1m window (30d ≈ 43k bars): the tune→re-run
+  // loop's refetch for 1m costs a couple of seconds, the retained window
+  // costs tens of MB of heap for minutes. This cache duplicated the global
+  // bars-cache — the double retention is exactly what killed the box on
+  // repeated 1m backtests.
+  if (tf === '1m') return getBars(symbol, tf, userId, { lookbackDays: days })
   const key = `${userId}|${symbol}|${tf}|${days}`
   const hit = barsCache.get(key)
   if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.res
@@ -148,6 +154,14 @@ export async function POST(req: NextRequest) {
 
 async function handleBacktest(req: NextRequest, userId: string): Promise<NextResponse> {
   try {
+    // Task 9-p — gate EVERY mode (plain runs included): a deep 1m window is
+    // the heaviest single allocation in the app and 'run' used to be the one
+    // ungated entry (optimize/sweep gated after the fetch). Refusing to start
+    // on a hot heap is a 503; starting is a dead server.
+    const memGate = memoryGuard(0.7)
+    if (!memGate.ok) {
+      return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
+    }
     const body = await readJson<BacktestBody>(req)
     const mode = body.mode === 'optimize' || body.mode === 'sweep' ? body.mode : 'run'
 

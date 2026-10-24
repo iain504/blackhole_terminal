@@ -1,18 +1,37 @@
 'use client';
 
-import { useState } from 'react';
+// Task 9-r — the auth screen also offers "Have a backup? Restore it": on a
+// fresh install (user table empty — the same first-run bootstrap trust level
+// as registration) a backup from the previous install can resurrect the
+// account EXACTLY (username + password + 2FA) with all of its data. Once any
+// account exists the server answers 409 and the affordance points at
+// Settings → Backup & Restore instead.
+
+import { useRef, useState } from 'react';
 import {
   ArrowLeft,
   BarChart3,
   Check,
   Copy,
+  DatabaseBackup,
+  FolderOpen,
   Loader2,
   ShieldCheck,
+  TriangleAlert,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
 
 type AuthUser = { id: string; username: string };
@@ -47,6 +66,98 @@ export default function AuthForms({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+
+  // ---- restore-from-backup dialog (Task 9-r) ----
+  type RestorePhase = 'check' | 'ready' | 'unavailable' | 'done';
+  const [restoreOpen, setRestoreOpen] = useState(false);
+  const [restorePhase, setRestorePhase] = useState<RestorePhase>('check');
+  const [restorePaste, setRestorePaste] = useState('');
+  const [restoreFileName, setRestoreFileName] = useState('');
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreError, setRestoreError] = useState('');
+  const [restoredUser, setRestoredUser] = useState('');
+  const restoreFileRef = useRef<HTMLInputElement | null>(null);
+
+  function openRestore() {
+    setRestorePhase('check');
+    setRestorePaste('');
+    setRestoreFileName('');
+    setRestoreError('');
+    setRestoredUser('');
+    setRestoreBusy(false);
+    if (restoreFileRef.current) restoreFileRef.current.value = '';
+    setRestoreOpen(true);
+    // availability = user table empty (first-run bootstrap). Any other state
+    // points back at Settings → Backup & Restore.
+    fetch('/api/auth/restore')
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`Status ${res.status}`))))
+      .then((data: { available?: boolean }) =>
+        setRestorePhase(data.available ? 'ready' : 'unavailable')
+      )
+      .catch(() => {
+        setRestorePhase('unavailable');
+        setRestoreError('Could not check whether restore is available — try again.');
+      });
+  }
+
+  function handleRestoreFile(file: File) {
+    setRestoreFileName(file.name);
+    file
+      .text()
+      .then((t) => {
+        // parsed at submit; the filename badge is just feedback
+        setRestorePaste(t);
+      })
+      .catch(() => {
+        setRestoreFileName('');
+        setRestoreError('Could not read that file.');
+      });
+  }
+
+  async function handleRestoreSubmit() {
+    if (restorePhase !== 'ready') return;
+    const text = restorePaste.trim();
+    if (!text) {
+      setRestoreError('Choose your backup file or paste its JSON first.');
+      return;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      setRestoreError('That is not valid JSON — check the backup file/text.');
+      return;
+    }
+    setRestoreBusy(true);
+    setRestoreError('');
+    try {
+      const res = await fetch('/api/auth/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(raw),
+      });
+      const data = (await res.json().catch(() => null)) as { error?: string; username?: string } | null;
+      if (res.status === 409) {
+        // accounts appeared meanwhile — flip the dialog to the Settings hint
+        setRestorePhase('unavailable');
+        setRestoreError(data?.error || 'System already has accounts — restore from Settings instead.');
+        return;
+      }
+      if (!res.ok) {
+        throw new Error(data?.error || `Restore failed (${res.status}).`);
+      }
+      // success: land the user on the login form with the restored username
+      // pre-filled (password + 2FA are the old ones — nothing to re-create)
+      setRestoredUser(data?.username || '');
+      setRestorePhase('done');
+      switchMode('login');
+      if (data?.username) setUsername(data.username);
+    } catch (err) {
+      setRestoreError(err instanceof Error ? err.message : 'Something went wrong.');
+    } finally {
+      setRestoreBusy(false);
+    }
+  }
 
   function switchMode(next: Mode) {
     setMode(next);
@@ -438,12 +549,130 @@ export default function AuthForms({
         </form>
 
         <div className="border-t border-zinc-800 px-8 py-4">
+          {step === 1 && (
+            <div className="mb-3 text-center">
+              <button
+                type="button"
+                onClick={openRestore}
+                className="text-xs text-zinc-500 underline-offset-2 transition-colors hover:text-zinc-300 hover:underline"
+              >
+                Have a backup? Restore it
+              </button>
+            </div>
+          )}
           <p className="flex items-start gap-2 text-xs leading-relaxed text-zinc-500">
             <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" />
             Your Alpaca API secret and Telegram token are encrypted at rest; 2FA
             keeps them safe.
           </p>
         </div>
+
+        {/* ---------- Restore-from-backup dialog (Task 9-r) ---------- */}
+        <Dialog open={restoreOpen} onOpenChange={setRestoreOpen}>
+          <DialogContent className="w-[calc(100vw-2rem)] max-w-md border-zinc-800 bg-zinc-900 gap-3">
+            <DialogHeader className="space-y-1">
+              <DialogTitle className="flex items-center gap-2 text-base text-zinc-100">
+                <DatabaseBackup className="h-4 w-4 text-emerald-400" aria-hidden />
+                Restore from backup
+              </DialogTitle>
+              <DialogDescription className="text-xs text-zinc-400">
+                Bring back the account from another install — username, password,
+                2FA and all of its data. Only possible while this system has no
+                accounts yet.
+              </DialogDescription>
+            </DialogHeader>
+
+            {restorePhase === 'check' && (
+              <div className="flex items-center gap-2 py-2 text-sm text-zinc-400">
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                Checking availability…
+              </div>
+            )}
+
+            {restorePhase === 'unavailable' && (
+              <div className="flex items-start gap-2 rounded-md border border-amber-900 bg-amber-950/40 p-3 text-xs leading-relaxed text-amber-300">
+                <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+                <span>
+                  System already has accounts — restore from Settings instead.
+                  Log in, open Settings → Backup &amp; Restore → Restore from backup.
+                </span>
+              </div>
+            )}
+
+            {restorePhase === 'ready' && (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+                    onClick={() => restoreFileRef.current?.click()}
+                  >
+                    <FolderOpen className="h-4 w-4" aria-hidden />
+                    Choose file…
+                  </Button>
+                  <span className="truncate text-xs text-zinc-500" aria-live="polite">
+                    {restoreFileName || 'or paste the JSON below'}
+                  </span>
+                  <input
+                    ref={restoreFileRef}
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleRestoreFile(f);
+                    }}
+                  />
+                </div>
+                <Textarea
+                  value={restorePaste}
+                  onChange={(e) => setRestorePaste(e.target.value)}
+                  placeholder='{"app":"blackhole-terminal","version":1,…}'
+                  className="h-28 resize-y overflow-y-auto border-zinc-800 bg-zinc-950 font-mono text-[10px] leading-snug text-zinc-200 placeholder:text-zinc-600 [field-sizing:fixed]"
+                  aria-label="Paste backup JSON"
+                />
+                <p className="text-[11px] leading-snug text-zinc-500">
+                  The restored account keeps its previous password and 2FA. If
+                  this install uses a different encryption secret, Alpaca keys
+                  / Telegram tokens may need re-entry afterwards.
+                </p>
+                <Button
+                  type="button"
+                  disabled={restoreBusy || !restorePaste.trim()}
+                  className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
+                  onClick={() => void handleRestoreSubmit()}
+                >
+                  {restoreBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <DatabaseBackup className="h-4 w-4" aria-hidden />}
+                  Restore backup
+                </Button>
+              </div>
+            )}
+
+            {restorePhase === 'done' && (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-start gap-2 rounded-md border border-emerald-900 bg-emerald-950/40 p-3 text-xs leading-relaxed text-emerald-300">
+                  <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+                  <span>
+                    Restored{restoredUser ? ` as “${restoredUser}”` : ''} — now log
+                    in with your previous username &amp; password (same 2FA).
+                  </span>
+                </div>
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
+                    onClick={() => setRestoreOpen(false)}
+                  >
+                    Go to sign in
+                  </Button>
+                </DialogFooter>
+              </div>
+            )}
+
+            {restoreError && <p className="text-sm font-medium text-red-500">{restoreError}</p>}
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );

@@ -16,6 +16,7 @@ import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import { useTerminal } from '@/store/terminal';
 import { loadIndicators } from '@/lib/indicators';
+import BackupRestoreCard from '@/components/settings/BackupRestoreCard';
 
 export const SETTINGS_CHANGED_EVENT = 'tt:settings-changed';
 
@@ -662,6 +663,11 @@ export default function SettingsDialog({
               and strategies are re-armed fresh).
             </p>
           </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- Full account backup / restore (Task 9-r) ------- */}
+          <BackupRestoreCard />
 
           <div className="flex items-center justify-between gap-2 border-t border-zinc-800 pt-4">
             {dirty && (

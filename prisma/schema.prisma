@@ -272,6 +272,65 @@ model AlgoRecoCache {
   updatedAt   DateTime @updatedAt
 }
 
+// Grid Trading — a range grid bot: buy dips at lower grid levels, sell the
+// lots as price climbs to the next level. The engine loop (grid-engine.ts)
+// re-reads the row every cycle — the DB is the single source of truth and
+// grids with status 'active' auto-resume after a server restart (same model
+// as AlgoRun).
+model GridTrade {
+  id          String    @id @default(cuid())
+  userId      String
+  symbol      String
+  // ---- range ----
+  lowerPrice  Float
+  upperPrice  Float
+  gridCount   Int // number of grid levels (2..200)
+  // 'arithmetic' (evenly spaced) | 'geometric' (equal ratio)
+  spacing     String    @default("arithmetic")
+  // ---- sizing ----
+  qtyPerGrid  Float
+  // ---- whole-grid guards (absolute prices, optional) ----
+  maxSL       Float? // price falls here → close everything + stop (hard floor)
+  maxTP       Float? // price rises here → close everything + stop (profit ceiling)
+  // when the grid stops (manual or guard), market-close open grid positions
+  closeOnStop Boolean   @default(true)
+  // 'active' | 'stopped' | 'error'
+  status      String    @default("active")
+  stopReason  String?
+  // engine-maintained cached stats (recomputable from fills)
+  realizedPnl Float     @default(0)
+  feePaid     Float     @default(0)
+  // working memory: levels snapshot + open lots — survives restarts
+  state       Json?
+  startedAt   DateTime  @default(now())
+  stoppedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId, status])
+}
+
+// One executed grid order (buy at a level, sell/TP of a lot, or a
+// stop/guard close). Append-only, like StrategyFireLog.
+model GridFill {
+  id          String   @id @default(cuid())
+  gridTradeId String
+  userId      String
+  levelIndex  Int
+  side        String // 'buy' | 'sell'
+  reason      String   @default("grid") // 'grid' | 'tp' | 'sl' | 'maxtp' | 'manual_close'
+  price       Float
+  qty         Float
+  pnl         Float? // realized P&L on sells (vs the paired buy lot)
+  fee         Float    @default(0)
+  orderId     String?
+  note        String?
+  ts          DateTime @default(now())
+
+  @@index([gridTradeId, ts])
+  @@index([userId])
+}
+
 // Task 9-j — per-install master secret store. The platform publish pipeline
 // sanitizes secret lines out of .env; this row (created at boot when env is
 // absent) keeps the install bootable while never using a publicly-known

@@ -7,7 +7,7 @@ import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
-  PanelsTopLeft, Crosshair, Check, Keyboard, Layers, Bot, ChartColumnBig, Rocket,
+  PanelsTopLeft, Crosshair, Check, Keyboard, Layers, Bot, ChartColumnBig, Rocket, LayoutGrid,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -28,6 +28,7 @@ const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart 
   strategy: { label: 'Strategy Orders', icon: Bot },
   report: { label: 'Report', icon: ChartColumnBig },
   algo: { label: 'Algo Trading', icon: Rocket },
+  grid: { label: 'Grid', icon: LayoutGrid },
 }
 
 export function TabBar({
@@ -206,6 +207,9 @@ export function TabBar({
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => addTab('algo')} className="gap-2 text-xs">
               <Rocket className="h-3.5 w-3.5" /> Algo Trading
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTab('grid')} className="gap-2 text-xs">
+              <LayoutGrid className="h-3.5 w-3.5" /> Grid
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
