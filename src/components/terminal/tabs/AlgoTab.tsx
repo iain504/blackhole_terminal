@@ -653,6 +653,16 @@ export default function AlgoTab() {
                 }
                 setShowParams(true)
               }}
+              onApplySetup={(s) => {
+                // Task 89 — a recommendation loads the WHOLE setup in one click:
+                // symbol + timeframe + strategy + full param set
+                if (s.symbol) setSymbol(s.symbol)
+                if (s.timeframe) setTimeframe(s.timeframe)
+                const sid = s.strategy ?? strategy
+                setStrategy(sid)
+                setParams(normalizeAlgoParams(sid, s.params ?? {}))
+                setShowParams(true)
+              }}
             />
           )}
           {view === 'runs' && runs.length === 0 && (

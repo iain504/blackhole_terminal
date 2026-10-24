@@ -1,0 +1,1861 @@
+[
+ {
+  "symbol": "TSLA",
+  "tf": "1m",
+  "bars": 33178,
+  "from": 1782480420,
+  "to": 1792788480,
+  "coveredDays": 120,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1415,
+  "totalMs": 4047,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 25,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 0.67,
+    "netPct": 0.98,
+    "pf": 1.34,
+    "winPct": 58.3,
+    "maxDDPct": 1.46,
+    "trades": 36
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 25,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 0.507,
+    "netPct": 0.83,
+    "pf": 1.14,
+    "winPct": 58,
+    "maxDDPct": 1.64,
+    "trades": 69
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 14,
+     "rsiOversold": 5,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 0.388,
+    "netPct": 0.58,
+    "pf": 1.08,
+    "winPct": 51.8,
+    "maxDDPct": 1.48,
+    "trades": 139
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 0.6695383933896458
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.6040515443050136
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 0.31267904644255684
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 5,
+    "best": -0.36186791831492193
+   }
+  ]
+ },
+ {
+  "symbol": "AAPL",
+  "tf": "1m",
+  "bars": 33482,
+  "from": 1782475320,
+  "to": 1792785540,
+  "coveredDays": 120,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1237,
+  "totalMs": 3038,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 100,
+     "bbStd": 1,
+     "rsiPeriod": 14,
+     "rsiOversold": 15,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 3.372,
+    "netPct": 1.69,
+    "pf": 2.25,
+    "winPct": 65.5,
+    "maxDDPct": 0.49,
+    "trades": 29
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 26,
+     "rsiOversold": 30,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 3.341,
+    "netPct": 1.67,
+    "pf": 4.45,
+    "winPct": 72.7,
+    "maxDDPct": 0.33,
+    "trades": 22
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 2,
+     "rsiPeriod": 38,
+     "rsiOversold": 5,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 3.201,
+    "netPct": 1.6,
+    "pf": 12.25,
+    "winPct": 90.9,
+    "maxDDPct": 0.14,
+    "trades": 11
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 3.3723447155571558
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.8643122232091518
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 0.32723602308562777
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 3,
+    "best": 0.12128407288660284
+   }
+  ]
+ },
+ {
+  "symbol": "NVDA",
+  "tf": "1m",
+  "bars": 33170,
+  "from": 1782477480,
+  "to": 1792788720,
+  "coveredDays": 120,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1692,
+  "totalMs": 3325,
+  "rows": [
+   {
+    "strategy": "orb15",
+    "params": {
+     "orMinutes": 60,
+     "onePerSide": 1
+    },
+    "score": 3.88,
+    "netPct": 2.74,
+    "pf": 1.61,
+    "winPct": 49.3,
+    "maxDDPct": 0.71,
+    "trades": 75
+   },
+   {
+    "strategy": "orb15",
+    "params": {
+     "orMinutes": 20,
+     "onePerSide": 1
+    },
+    "score": 1.223,
+    "netPct": 1.59,
+    "pf": 1.22,
+    "winPct": 49.5,
+    "maxDDPct": 1.3,
+    "trades": 99
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 15,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 1.173,
+    "netPct": 0.62,
+    "pf": 1.43,
+    "winPct": 59.5,
+    "maxDDPct": 0.53,
+    "trades": 37
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 1.1732197559615416
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.7521893796446885
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 3.8796765790623375
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 4,
+    "best": -0.5649223383546503
+   }
+  ]
+ },
+ {
+  "symbol": "SPY",
+  "tf": "1m",
+  "bars": 33291,
+  "from": 1782475740,
+  "to": 1792786140,
+  "coveredDays": 120,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 3132,
+  "totalMs": 4874,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 25,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 1.098,
+    "netPct": 0.55,
+    "pf": 2.72,
+    "winPct": 53.8,
+    "maxDDPct": 0.23,
+    "trades": 13
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 25,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 1.098,
+    "netPct": 0.55,
+    "pf": 2.72,
+    "winPct": 53.8,
+    "maxDDPct": 0.23,
+    "trades": 13
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 0.527,
+    "netPct": 0.29,
+    "pf": 1.39,
+    "winPct": 38.1,
+    "maxDDPct": 0.54,
+    "trades": 21
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 1.0976880000001255
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9888241423553639
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 0.06160964171557878
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 1,
+    "best": -0.98484052724633
+   }
+  ]
+ },
+ {
+  "symbol": "BTC/USD",
+  "tf": "1m",
+  "bars": 120000,
+  "from": 1785237960,
+  "to": 1792835520,
+  "coveredDays": 88,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 1600,
+  "totalMs": 9367,
+  "rows": [
+   {
+    "strategy": "orb15",
+    "params": {
+     "orMinutes": 5,
+     "onePerSide": 1
+    },
+    "score": -0.93,
+    "netPct": -2971.83,
+    "pf": 0.58,
+    "winPct": 36.2,
+    "maxDDPct": 3194.63,
+    "trades": 116
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 20,
+     "bbStd": 1,
+     "rsiPeriod": 50,
+     "rsiOversold": 25,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": -0.999,
+    "netPct": -1164.85,
+    "pf": 0.11,
+    "winPct": 16.2,
+    "maxDDPct": 1166.23,
+    "trades": 37
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 4,
+     "rsiPeriod": 26,
+     "rsiOversold": 15,
+     "rsiOverbought": 65,
+     "allowShort": 1
+    },
+    "score": -0.999,
+    "netPct": -2085.97,
+    "pf": 0.04,
+    "winPct": 15.6,
+    "maxDDPct": 2087.21,
+    "trades": 77
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 78,
+    "best": -0.9988161092650426
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 97,
+    "best": -1
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9302576695609373
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 5,
+    "best": -1
+   }
+  ]
+ },
+ {
+  "symbol": "ETH/USD",
+  "tf": "1m",
+  "bars": 118617,
+  "from": 1781344440,
+  "to": 1792835520,
+  "coveredDays": 133,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 1620,
+  "totalMs": 6934,
+  "rows": [
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 3.8,
+     "allowShort": 1
+    },
+    "score": -0.205,
+    "netPct": -2.62,
+    "pf": 0.87,
+    "winPct": 46.7,
+    "maxDDPct": 12.76,
+    "trades": 15
+   },
+   {
+    "strategy": "orb15",
+    "params": {
+     "orMinutes": 15,
+     "onePerSide": 1
+    },
+    "score": -0.687,
+    "netPct": -53.88,
+    "pf": 0.82,
+    "winPct": 42.7,
+    "maxDDPct": 78.38,
+    "trades": 206
+   },
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 2.6,
+     "allowShort": 1
+    },
+    "score": -0.688,
+    "netPct": -30.89,
+    "pf": 0.65,
+    "winPct": 41.8,
+    "maxDDPct": 44.92,
+    "trades": 67
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 79,
+    "best": -0.738091860805166
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 97,
+    "best": -1
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.6874458562733945
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 6,
+    "best": -0.20533467045128995
+   }
+  ]
+ },
+ {
+  "symbol": "SOL/USD",
+  "tf": "1m",
+  "bars": 120000,
+  "from": 1782343560,
+  "to": 1792835520,
+  "coveredDays": 121,
+  "source": "alpaca",
+  "costs": {
+   "slip": 10,
+   "fee": 10,
+   "spread": 5
+  },
+  "sweepMs": 1520,
+  "totalMs": 7255,
+  "rows": [
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 5,
+     "allowShort": 1
+    },
+    "score": -0.643,
+    "netPct": -0.43,
+    "pf": 0.63,
+    "winPct": 41.2,
+    "maxDDPct": 0.66,
+    "trades": 17
+   },
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 2.6,
+     "allowShort": 1
+    },
+    "score": -0.875,
+    "netPct": -3.93,
+    "pf": 0.46,
+    "winPct": 34.4,
+    "maxDDPct": 4.5,
+    "trades": 93
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 100,
+     "bbStd": 1.8,
+     "rsiPeriod": 50,
+     "rsiOversold": 15,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": -0.89,
+    "netPct": -0.59,
+    "pf": 0.26,
+    "winPct": 30,
+    "maxDDPct": 0.66,
+    "trades": 10
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 76,
+    "best": -0.8898661528451008
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 97,
+    "best": -1
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9128977055483428
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": -0.6426178859708306
+   }
+  ]
+ },
+ {
+  "symbol": "TSLA",
+  "tf": "5m",
+  "bars": 20827,
+  "from": 1761307500,
+  "to": 1792788300,
+  "coveredDays": 365,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1334,
+  "totalMs": 5767,
+  "rows": [
+   {
+    "strategy": "orb15",
+    "params": {
+     "orMinutes": 5,
+     "onePerSide": 1
+    },
+    "score": 4.134,
+    "netPct": 11.23,
+    "pf": 1.18,
+    "winPct": 46.1,
+    "maxDDPct": 2.72,
+    "trades": 321
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 15,
+     "rsiOverbought": 65,
+     "allowShort": 1
+    },
+    "score": 0.497,
+    "netPct": 1.26,
+    "pf": 1.09,
+    "winPct": 54,
+    "maxDDPct": 2.53,
+    "trades": 126
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 5,
+     "rsiOverbought": 65,
+     "allowShort": 1
+    },
+    "score": 0.452,
+    "netPct": 1.14,
+    "pf": 1.08,
+    "winPct": 53.6,
+    "maxDDPct": 2.53,
+    "trades": 125
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 0.49669533484547174
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.8342174630270596
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 4.133583024347521
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 5,
+    "best": -0.6268582429492636
+   }
+  ]
+ },
+ {
+  "symbol": "AAPL",
+  "tf": "5m",
+  "bars": 20534,
+  "from": 1761312600,
+  "to": 1792785300,
+  "coveredDays": 365,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1196,
+  "totalMs": 5238,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 14,
+     "rsiOversold": 5,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 2.708,
+    "netPct": 1.35,
+    "pf": 3.22,
+    "winPct": 61.1,
+    "maxDDPct": 0.29,
+    "trades": 18
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 5,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 0.975,
+    "netPct": 0.95,
+    "pf": 1.6,
+    "winPct": 62.5,
+    "maxDDPct": 0.97,
+    "trades": 32
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 15,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 0.667,
+    "netPct": 0.77,
+    "pf": 1.41,
+    "winPct": 62.9,
+    "maxDDPct": 1.15,
+    "trades": 35
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 2.7076131263918066
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9537150569944168
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 0.3111442360373947
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 4,
+    "best": -0.36043285152302806
+   }
+  ]
+ },
+ {
+  "symbol": "NVDA",
+  "tf": "5m",
+  "bars": 20972,
+  "from": 1761307200,
+  "to": 1792788600,
+  "coveredDays": 365,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1817,
+  "totalMs": 6086,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 26,
+     "rsiOversold": 25,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 3.32,
+    "netPct": 1.66,
+    "pf": 2.04,
+    "winPct": 63.3,
+    "maxDDPct": 0.41,
+    "trades": 49
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 25,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": 3.263,
+    "netPct": 1.63,
+    "pf": 2.39,
+    "winPct": 61.1,
+    "maxDDPct": 0.3,
+    "trades": 36
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 30,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": 3.085,
+    "netPct": 2.1,
+    "pf": 1.79,
+    "winPct": 56.9,
+    "maxDDPct": 0.68,
+    "trades": 65
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 3.3198908893157566
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.7688984166155594
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.019542777789505784
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 4,
+    "best": -0.15821641816948342
+   }
+  ]
+ },
+ {
+  "symbol": "SPY",
+  "tf": "5m",
+  "bars": 21676,
+  "from": 1761309300,
+  "to": 1792785900,
+  "coveredDays": 365,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1810,
+  "totalMs": 5612,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 50,
+     "rsiOversold": 35,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 3.535,
+    "netPct": 2.16,
+    "pf": 2.03,
+    "winPct": 51.2,
+    "maxDDPct": 0.61,
+    "trades": 41
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 50,
+     "rsiOversold": 35,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 3.535,
+    "netPct": 2.16,
+    "pf": 2.03,
+    "winPct": 51.2,
+    "maxDDPct": 0.61,
+    "trades": 41
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 30,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 1.538,
+    "netPct": 0.99,
+    "pf": 2.41,
+    "winPct": 66.7,
+    "maxDDPct": 0.64,
+    "trades": 18
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 3.534693025798966
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9839240476508461
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.7437842581700405
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 3,
+    "best": -0.8678250211311824
+   }
+  ]
+ },
+ {
+  "symbol": "BTC/USD",
+  "tf": "5m",
+  "bars": 111615,
+  "from": 1759313100,
+  "to": 1792835700,
+  "coveredDays": 388,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 1570,
+  "totalMs": 19729,
+  "rows": [
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 5,
+     "allowShort": 1
+    },
+    "score": 61.772,
+    "netPct": 1152.47,
+    "pf": 3.07,
+    "winPct": 73.9,
+    "maxDDPct": 18.66,
+    "trades": 23
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 76,
+     "bbStd": 2,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 23.089,
+    "netPct": 838.44,
+    "pf": 1.4,
+    "winPct": 59,
+    "maxDDPct": 36.31,
+    "trades": 61
+   },
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 3.8,
+     "allowShort": 1
+    },
+    "score": 9.189,
+    "netPct": 2471.98,
+    "pf": 3.3,
+    "winPct": 77.1,
+    "maxDDPct": 269.02,
+    "trades": 48
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 88,
+    "best": 23.08909584141722
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 97,
+    "best": -1
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -4.091290481513891
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": 61.771816345268775
+   }
+  ]
+ },
+ {
+  "symbol": "ETH/USD",
+  "tf": "5m",
+  "bars": 107217,
+  "from": 1759313100,
+  "to": 1792835700,
+  "coveredDays": 388,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 1446,
+  "totalMs": 14491,
+  "rows": [
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 5,
+     "allowShort": 1
+    },
+    "score": 0.021,
+    "netPct": 0.62,
+    "pf": 1.01,
+    "winPct": 53.7,
+    "maxDDPct": 29.89,
+    "trades": 54
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 29,
+     "bbStd": 2,
+     "rsiPeriod": 50,
+     "rsiOversold": 25,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": -0.809,
+    "netPct": -23.27,
+    "pf": 0.38,
+    "winPct": 38.1,
+    "maxDDPct": 28.76,
+    "trades": 21
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 20,
+     "bbStd": 4,
+     "rsiPeriod": 26,
+     "rsiOversold": 45,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": -0.844,
+    "netPct": -27.31,
+    "pf": 0.45,
+    "winPct": 45,
+    "maxDDPct": 32.36,
+    "trades": 40
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 91,
+    "best": -0.8091063279494024
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -1
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9579655541853533
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": 0.020729290793802244
+   }
+  ]
+ },
+ {
+  "symbol": "SOL/USD",
+  "tf": "5m",
+  "bars": 108887,
+  "from": 1759313100,
+  "to": 1792835700,
+  "coveredDays": 388,
+  "source": "alpaca",
+  "costs": {
+   "slip": 10,
+   "fee": 10,
+   "spread": 5
+  },
+  "sweepMs": 1363,
+  "totalMs": 15745,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 100,
+     "bbStd": 3.3,
+     "rsiPeriod": 38,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": -0.822,
+    "netPct": -2.9,
+    "pf": 0.61,
+    "winPct": 42.6,
+    "maxDDPct": 3.53,
+    "trades": 94
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 4,
+     "rsiPeriod": 38,
+     "rsiOversold": 5,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": -0.832,
+    "netPct": -1.07,
+    "pf": 0.57,
+    "winPct": 34.3,
+    "maxDDPct": 1.29,
+    "trades": 35
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 2,
+     "rsiPeriod": 38,
+     "rsiOversold": 5,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": -0.833,
+    "netPct": -1.49,
+    "pf": 0.56,
+    "winPct": 40,
+    "maxDDPct": 1.79,
+    "trades": 45
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 90,
+    "best": -0.8218309340051648
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9999445156945447
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9913445902037422
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": -0.8400356379344517
+   }
+  ]
+ },
+ {
+  "symbol": "TSLA",
+  "tf": "15m",
+  "bars": 14330,
+  "from": 1729773000,
+  "to": 1792788300,
+  "coveredDays": 730,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1279,
+  "totalMs": 12472,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 50,
+     "rsiOversold": 5,
+     "rsiOverbought": 65,
+     "allowShort": 1
+    },
+    "score": 3.115,
+    "netPct": 2.44,
+    "pf": 2.24,
+    "winPct": 57.1,
+    "maxDDPct": 0.78,
+    "trades": 14
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 50,
+     "rsiOversold": 15,
+     "rsiOverbought": 65,
+     "allowShort": 1
+    },
+    "score": 3.115,
+    "netPct": 2.44,
+    "pf": 2.24,
+    "winPct": 57.1,
+    "maxDDPct": 0.78,
+    "trades": 14
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 1.8,
+     "rsiPeriod": 14,
+     "rsiOversold": 30,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": 2.278,
+    "netPct": 8.37,
+    "pf": 1.11,
+    "winPct": 45.5,
+    "maxDDPct": 3.67,
+    "trades": 440
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 3.1149514178077675
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.13238910753777663
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": 1.1991245804978987
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": -0.12022356449318683
+   }
+  ]
+ },
+ {
+  "symbol": "AAPL",
+  "tf": "15m",
+  "bars": 13814,
+  "from": 1729776600,
+  "to": 1792784700,
+  "coveredDays": 730,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1077,
+  "totalMs": 7645,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 38,
+     "rsiOversold": 30,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": 2.951,
+    "netPct": 2.2,
+    "pf": 1.55,
+    "winPct": 55.1,
+    "maxDDPct": 0.74,
+    "trades": 49
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 26,
+     "rsiOversold": 25,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": 2.654,
+    "netPct": 1.98,
+    "pf": 1.49,
+    "winPct": 53.1,
+    "maxDDPct": 0.74,
+    "trades": 49
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 26,
+     "rsiOversold": 35,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": 2.506,
+    "netPct": 2.68,
+    "pf": 1.45,
+    "winPct": 52.1,
+    "maxDDPct": 1.07,
+    "trades": 73
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 2.951392874943344
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.7643841324219687
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.602562062857403
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 5,
+    "best": 0.64071071200804
+   }
+  ]
+ },
+ {
+  "symbol": "NVDA",
+  "tf": "15m",
+  "bars": 15047,
+  "from": 1729776600,
+  "to": 1792788300,
+  "coveredDays": 730,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1540,
+  "totalMs": 8677,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 38,
+     "rsiOversold": 35,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 2.903,
+    "netPct": 1.45,
+    "pf": 2.11,
+    "winPct": 60,
+    "maxDDPct": 0.42,
+    "trades": 25
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 38,
+     "rsiOversold": 35,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": 2.903,
+    "netPct": 1.45,
+    "pf": 2.11,
+    "winPct": 60,
+    "maxDDPct": 0.42,
+    "trades": 25
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 38,
+     "rsiOversold": 35,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 2.903,
+    "netPct": 1.45,
+    "pf": 2.11,
+    "winPct": 60,
+    "maxDDPct": 0.42,
+    "trades": 25
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 2.9032410354875173
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.8857528250821312
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.42942862186697695
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 6,
+    "best": 0.14395538846630554
+   }
+  ]
+ },
+ {
+  "symbol": "SPY",
+  "tf": "15m",
+  "bars": 14899,
+  "from": 1729776600,
+  "to": 1792785600,
+  "coveredDays": 730,
+  "source": "alpaca",
+  "costs": {
+   "slip": 2,
+   "fee": 0,
+   "spread": 2
+  },
+  "sweepMs": 1145,
+  "totalMs": 7569,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 1.8,
+     "rsiPeriod": 26,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 0.921,
+    "netPct": 2.07,
+    "pf": 1.32,
+    "winPct": 45.2,
+    "maxDDPct": 2.25,
+    "trades": 42
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 14,
+     "rsiOversold": 5,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": 0.844,
+    "netPct": 0.42,
+    "pf": 1.28,
+    "winPct": 50,
+    "maxDDPct": 0.46,
+    "trades": 18
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 53,
+     "bbStd": 3.3,
+     "rsiPeriod": 26,
+     "rsiOversold": 5,
+     "rsiOverbought": 55,
+     "allowShort": 1
+    },
+    "score": 0.844,
+    "netPct": 0.42,
+    "pf": 1.28,
+    "winPct": 50,
+    "maxDDPct": 0.46,
+    "trades": 18
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 0.9206451955768751
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9573566939991052
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.7126444333909595
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 4,
+    "best": -0.3170113461023106
+   }
+  ]
+ },
+ {
+  "symbol": "BTC/USD",
+  "tf": "15m",
+  "bars": 86251,
+  "from": 1715076900,
+  "to": 1792835100,
+  "coveredDays": 900,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 1610,
+  "totalMs": 33461,
+  "rows": [
+   {
+    "strategy": "vwap-fade",
+    "params": {
+     "devPct": 5,
+     "allowShort": 1
+    },
+    "score": 22.561,
+    "netPct": 1166.14,
+    "pf": 1.89,
+    "winPct": 62.2,
+    "maxDDPct": 51.69,
+    "trades": 37
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 29,
+     "bbStd": 3.3,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": 16.28,
+    "netPct": 531.25,
+    "pf": 3.08,
+    "winPct": 76.9,
+    "maxDDPct": 32.63,
+    "trades": 13
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 76,
+     "bbStd": 2,
+     "rsiPeriod": 50,
+     "rsiOversold": 25,
+     "rsiOverbought": 75,
+     "allowShort": 1
+    },
+    "score": 12.737,
+    "netPct": 419.24,
+    "pf": 2.18,
+    "winPct": 63.6,
+    "maxDDPct": 32.92,
+    "trades": 11
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": 16.280444087752855
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9996588415676806
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9948687522286866
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": 22.561289728264494
+   }
+  ]
+ },
+ {
+  "symbol": "ETH/USD",
+  "tf": "15m",
+  "bars": 86237,
+  "from": 1715076900,
+  "to": 1792835100,
+  "coveredDays": 900,
+  "source": "alpaca",
+  "costs": {
+   "slip": 3,
+   "fee": 10,
+   "spread": 3
+  },
+  "sweepMs": 2328,
+  "totalMs": 29984,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 20,
+     "bbStd": 3.3,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": -0.02,
+    "netPct": -0.24,
+    "pf": 0.99,
+    "winPct": 50,
+    "maxDDPct": 11.78,
+    "trades": 16
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 20,
+     "bbStd": 1.8,
+     "rsiPeriod": 38,
+     "rsiOversold": 25,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": -0.623,
+    "netPct": -20.36,
+    "pf": 0.69,
+    "winPct": 44.4,
+    "maxDDPct": 32.7,
+    "trades": 36
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 29,
+     "bbStd": 3.3,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": -0.663,
+    "netPct": -15.45,
+    "pf": 0.64,
+    "winPct": 37.5,
+    "maxDDPct": 23.32,
+    "trades": 24
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 101,
+    "best": -0.020051007556344425
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9991339307623558
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9944633943037345
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": -0.9578113724177981
+   }
+  ]
+ },
+ {
+  "symbol": "SOL/USD",
+  "tf": "15m",
+  "bars": 75623,
+  "from": 1724688000,
+  "to": 1792835100,
+  "coveredDays": 789,
+  "source": "alpaca",
+  "costs": {
+   "slip": 10,
+   "fee": 10,
+   "spread": 5
+  },
+  "sweepMs": 1429,
+  "totalMs": 28731,
+  "rows": [
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1.8,
+     "rsiPeriod": 50,
+     "rsiOversold": 5,
+     "rsiOverbought": 70,
+     "allowShort": 1
+    },
+    "score": -0.563,
+    "netPct": -0.37,
+    "pf": 0.55,
+    "winPct": 35.7,
+    "maxDDPct": 0.65,
+    "trades": 14
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1,
+     "rsiPeriod": 38,
+     "rsiOversold": 25,
+     "rsiOverbought": 85,
+     "allowShort": 1
+    },
+    "score": -0.64,
+    "netPct": -0.75,
+    "pf": 0.53,
+    "winPct": 31.6,
+    "maxDDPct": 1.17,
+    "trades": 19
+   },
+   {
+    "strategy": "bb-reversion",
+    "params": {
+     "bbPeriod": 5,
+     "bbStd": 1.8,
+     "rsiPeriod": 50,
+     "rsiOversold": 30,
+     "rsiOverbought": 95,
+     "allowShort": 1
+    },
+    "score": -0.815,
+    "netPct": -1.32,
+    "pf": 0.32,
+    "winPct": 17.6,
+    "maxDDPct": 1.62,
+    "trades": 17
+   }
+  ],
+  "perStrategy": [
+   {
+    "s": "bb-reversion",
+    "scorable": 49,
+    "best": -0.5631499635834155
+   },
+   {
+    "s": "rsi2-connors",
+    "scorable": 101,
+    "best": -0.9994340311071614
+   },
+   {
+    "s": "orb15",
+    "scorable": 7,
+    "best": -0.9947732647364625
+   },
+   {
+    "s": "vwap-fade",
+    "scorable": 7,
+    "best": -0.9616556441159012
+   }
+  ]
+ }
+]

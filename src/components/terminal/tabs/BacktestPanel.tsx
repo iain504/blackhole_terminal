@@ -21,7 +21,7 @@
 //     chips to restore; a customized value is never stomped.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -40,6 +40,15 @@ import {
 import type { BacktestResult, OptimizeResult, SweepResult } from '@/lib/backtest'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
+import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
+
+// Task 89 — a recommendation loads the WHOLE run setup in one click
+export interface AlgoApplySetup {
+  symbol?: string
+  timeframe?: AlgoTimeframe
+  strategy?: AlgoStrategyId
+  params?: Record<string, number>
+}
 
 export interface AlgoSetupCfg {
   strategy: AlgoStrategyId
@@ -120,7 +129,7 @@ const BT_GRAN_TITLES: Record<BtGran, string> = {
 }
 const btWlConfig = { wins: { label: 'Wins' }, losses: { label: 'Losses' } } satisfies ChartConfig
 
-export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void }) {
+export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void; onApplySetup?: (s: AlgoApplySetup) => void }) {
   const { toast } = useToast()
   const [days, setDays] = useState('30')
   const [capital, setCapital] = useState('10000')
@@ -313,6 +322,23 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
       description: strategy && strategy !== cfg.strategy
         ? `${ALGO_STRATEGIES[strategy].name} is now the run setup — review it and start the run when ready.`
         : 'Optimizer values copied into the run setup — start the run when ready.',
+    })
+  }
+
+  // Task 89 — apply a baked-in recommendation: costs first (local state — the
+  // suggestion-seeding effect only rolls fields still holding a previous
+  // suggestion, so these stick), then the whole setup via the parent
+  const applyRec = (rec: AlgoRecommendation) => {
+    setBtSlip(String(rec.slipBps))
+    setBtFee(String(rec.feeBps))
+    setBtSpread(String(rec.spreadBps))
+    // widen the history to the window the setup was MEASURED on (capped per TF)
+    // — otherwise a 30d re-run would not reproduce the baked-in numbers
+    setDays(String(Math.min(ALGO_MAX_DAYS[rec.timeframe] ?? 30, Math.max(1, Math.round(rec.coveredDays)))))
+    onApplySetup?.({ symbol: rec.symbol, timeframe: rec.timeframe, strategy: rec.strategy, params: rec.params })
+    toast({
+      title: 'Recommended setup applied',
+      description: `${rec.symbol} ${rec.timeframe} · ${ALGO_STRATEGIES[rec.strategy].name} — costs seeded ${rec.slipBps}/${rec.feeBps}/${rec.spreadBps} bps. Hit "Run backtest" to verify on fresh bars.`,
     })
   }
 
@@ -922,6 +948,90 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
             stride-sampled — hover the badges above for per-strategy counts). Your qty / sizing / TP-SL / session gates and cost model were held fixed; only strategy
             parameters were optimized. Click a row to apply that strategy + parameters to the run setup, then re-run a single backtest and check the drawdown before
             going live. Past performance ≠ future results.
+          </p>
+        </div>
+      )}
+
+      {/* recommended setups (Task 89) — baked-in full-catalog sweep winners */}
+      {ALGO_RECOMMENDATIONS.length > 0 && (
+        <div className="rounded-md border border-emerald-500/25 bg-zinc-900/70">
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2">
+            <Sparkles className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Recommended setups</span>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">{ALGO_RECOMMENDATIONS.length} configs</Badge>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">
+              swept {new Date(ALGO_RECO_META.generatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+            </Badge>
+            <span className="ml-auto text-[10px] text-zinc-600">click a row to load the whole setup — symbol · TF · strategy · params · costs</span>
+          </div>
+          <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Recommended setups table">
+            <table className="w-full min-w-[760px] text-left text-[11px]">
+              <thead className="sticky top-0 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+                <tr>
+                  <th className="px-2.5 py-1.5 font-medium">#</th>
+                  <th className="px-2 py-1.5 font-medium">Market</th>
+                  <th className="px-2 py-1.5 font-medium">Strategy</th>
+                  <th className="px-2 py-1.5 font-medium">Parameters</th>
+                  <th className="px-2 py-1.5 font-medium text-right" title="slippage / fee / spread (bps) the setup was measured with">Costs bps</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Net %</th>
+                  <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Win %</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Max DD %</th>
+                  <th className="px-2 py-1.5 font-medium text-right">Trades</th>
+                  <th className="px-2.5 py-1.5 font-medium" aria-label="Apply" />
+                </tr>
+              </thead>
+              <tbody>
+                {ALGO_RECOMMENDATIONS.map((rec, i) => {
+                  const isHere = rec.symbol === cfg.symbol && rec.timeframe === cfg.timeframe
+                  return (
+                    <tr
+                      key={`${rec.symbol}-${rec.timeframe}-${rec.strategy}-${i}`}
+                      className={cn('cursor-pointer border-t border-zinc-800/40 hover:bg-zinc-900/60', isHere && 'bg-emerald-500/5')}
+                      onClick={() => applyRec(rec)}
+                      title={`Apply: ${rec.symbol} ${rec.timeframe} · ${ALGO_STRATEGIES[rec.strategy].name} — measured over ${rec.coveredDays}d / ${rec.bars.toLocaleString('en-US')} bars (${rec.source}) with ${rec.slipBps}/${rec.feeBps}/${rec.spreadBps} bps costs`}
+                    >
+                      <td className="px-2.5 py-1.5 tabular-nums text-zinc-500">{i + 1}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-200">
+                        {rec.symbol} <span className="text-zinc-500">{rec.timeframe}</span>
+                        {isHere && <span className="ml-1 text-[9px] uppercase text-emerald-400">this</span>}
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5">
+                        <span className="flex items-center gap-1.5">
+                          <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: ALGO_STRATEGIES[rec.strategy].color }} aria-hidden />
+                          <span className="text-zinc-300">{ALGO_STRATEGIES[rec.strategy].name}</span>
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-zinc-300">
+                        <span className="flex flex-wrap gap-x-2">
+                          {Object.entries(rec.params).map(([k, v]) => (
+                            <span key={k} className="whitespace-nowrap">
+                              <span className="text-zinc-500">{paramLabel(rec.strategy, k)}</span> <span className="tabular-nums text-zinc-200">{v}</span>
+                            </span>
+                          ))}
+                        </span>
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-zinc-400" title="slippage / fee / spread (bps) this setup was measured with">
+                        {rec.slipBps}/{rec.feeBps}/{rec.spreadBps}
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{rec.score.toFixed(2)}</td>
+                      <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(rec.netPct))}>{fmtPct(rec.netPct)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.pf >= 999 ? '∞' : rec.pf.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.winPct.toFixed(0)}%</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-rose-400/80">{rec.maxDDPct.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.trades}</td>
+                      <td className="px-2.5 py-1.5 text-right">
+                        {i === 0 && <Badge variant="outline" className="text-[9px] uppercase text-emerald-300 border-emerald-500/40">best</Badge>}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
+            Baked-in community sweep — {ALGO_RECO_META.method}
           </p>
         </div>
       )}
