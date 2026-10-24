@@ -17,6 +17,7 @@ import { requireUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
 import { getRecoFeed, getRecoJobState, startRecoRefresh } from '@/lib/algo-reco'
 import { rateLimit } from '@/lib/rate-limit'
+import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 
 export const dynamic = 'force-dynamic'
 
@@ -53,6 +54,13 @@ export async function POST(_req: NextRequest) {
         { error: `A refresh was started recently — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },
         { status: 429 },
       )
+    }
+    // Task 9-l — heap guard BEFORE spawning the multi-minute matrix job: the
+    // sweep fetches 21 deep bar windows into caches and sims them; over the
+    // heap ceiling that is a fatal process death. 503 while the heap is hot.
+    const mem = memoryGuard(0.7)
+    if (!mem.ok) {
+      return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
     }
     const started = startRecoRefresh(user.id)
     const job = getRecoJobState()

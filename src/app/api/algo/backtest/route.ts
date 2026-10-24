@@ -39,6 +39,7 @@ import {
   prepareSeries, runBacktest, optimizeBacktest, sweepStrategies,
   type BacktestConfig, type OptimizeRange,
 } from '@/lib/backtest'
+import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 
 export const dynamic = 'force-dynamic'
 
@@ -66,9 +67,12 @@ function downsampleEquity(equity: { t: number; equity: number }[]): { t: number;
  * takes 6–35s to paginate from the feeds, and the tune→re-run→optimize loop
  * would otherwise re-pay that on EVERY request. Historical bars are immutable
  * except the newest (the forming bar is dropped per request anyway), so 2min
- * staleness is invisible to the replay. Bounded to 12 entries (~50MB worst).
+ * staleness is invisible to the replay. Task 9-l: bounded to 6 entries
+ * (~60-80MB worst) — this cache duplicates the global bars-cache, and on the
+ * 1.8GB-heap dev box every retained MB is sweep headroom.
  */
 const BARS_TTL_MS = 120_000
+const BARS_CACHE_MAX = 6
 const barsCache = new Map<string, { at: number; res: Awaited<ReturnType<typeof getBars>> }>()
 
 async function getBarsCached(symbol: string, tf: Timeframe, userId: string, days: number) {
@@ -77,7 +81,7 @@ async function getBarsCached(symbol: string, tf: Timeframe, userId: string, days
   if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.res
   const res = await getBars(symbol, tf, userId, { lookbackDays: days })
   barsCache.set(key, { at: Date.now(), res })
-  if (barsCache.size > 12) {
+  if (barsCache.size > BARS_CACHE_MAX) {
     const oldest = [...barsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
     if (oldest) barsCache.delete(oldest[0])
   }
@@ -259,6 +263,13 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
     }
 
     if (body.mode === 'optimize') {
+      // Task 9-l — heap guard: a grid search cannot downsize mid-flight, and
+      // over the heap ceiling it kills the PROCESS (fatal OOM), so refuse
+      // politely while the heap is hot instead of dying.
+      const mem = memoryGuard(0.7)
+      if (!mem.ok) {
+        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
+      }
       const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
       const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
       const optimize = optimizeBacktest(series, cfg, ranges, { minTrades })
@@ -269,6 +280,14 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
     }
 
     if (mode === 'sweep') {
+      // Task 9-l — heap guard (see optimize branch): the all-strategies sweep
+      // is the heaviest request in the app — hundreds of sims × IS/OOS series
+      // copies. When the heap is already near its cap this is a fatal-OOM
+      // sentence; a 503 the UI can surface is strictly better.
+      const mem = memoryGuard(0.7)
+      if (!mem.ok) {
+        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
+      }
       const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
       const topX = Math.min(20, Math.max(1, Math.round(Number(body.topX) || 8)))
       // Task 3-d — walk-forward fraction (0..0.5, default 0 = off)

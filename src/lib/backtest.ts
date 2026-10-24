@@ -96,6 +96,12 @@ export interface BacktestConfig {
   // derived sizing) is clamped to maxQty = (capital × maxNotionalX) / entryPx;
   // a clamped position worth < $10 is skipped as dust (counted in `suppressed`).
   maxNotionalX?: number
+  // Task 9-l — skip building the realized equity curve for this run (default
+  // true). Sweep/optimize runs consume metrics only, and a multi-hundred-combo
+  // sweep allocating a per-close {t,equity} array each run is pure GC churn.
+  // Metrics (incl. mark-to-market maxDrawdownPct) are unaffected — MTM peak/
+  // trough tracking is separate from this display array.
+  collectEquity?: boolean
 }
 
 export interface BacktestTrade {
@@ -162,6 +168,13 @@ export interface BacktestSeries {
   rth: Uint8Array // 1 = regular session bar
   ps: Float64Array // prefix sums of closes (len n+1) — SMA in O(1)
   ps2: Float64Array // prefix sums of close² — population σ in O(1)
+  // Task 9-l — lazily-allocated REUSABLE scratch for runBacktest's Wilder-RSI
+  // pass (bb-reversion). One array per SERIES instead of one per simulated
+  // combo: a 120k-bar sweep used to allocate ~1MB × hundreds of runs of
+  // short-lived churn — the final straw that fatally OOM'd the 1.8GB-heap dev
+  // box. Safe: runs are sequential/single-threaded and each run re-fills the
+  // whole array before the sim loop reads it.
+  rsiScratch?: Float64Array
 }
 
 export function prepareSeries(bars: Bar[]): BacktestSeries {
@@ -232,7 +245,12 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let rsiArr: Float64Array | null = null
   if (strategy === 'bb-reversion') {
     const rp = Math.max(2, Math.round(params.rsiPeriod ?? 14))
-    const arr = new Float64Array(n).fill(Number.NaN)
+    // Task 9-l — reuse the series-level scratch (see BacktestSeries.rsiScratch)
+    const arr = (series.rsiScratch ??= new Float64Array(n))
+    // re-seed to NaN every run: the fill loop never writes arr[0..rp-1], so a
+    // reused buffer must not carry FINITE leftovers from a previous run (they
+    // could flip entry decisions that NaN comparisons correctly suppress)
+    arr.fill(Number.NaN)
     let ag = 0
     let al = 0
     for (let i = 1; i < n; i++) {
@@ -388,7 +406,10 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let prevLongSig = false // raw entry signal on the previously decided bar
   let prevShortSig = false
   const trades: BacktestTrade[] = []
-  const equity: { t: number; equity: number }[] = [{ t: bars[0]?.time ?? 0, equity: cash }]
+  // Task 9-l — display curve only (metrics DD is MTM); sweep/optimize runs
+  // opt out via cfg.collectEquity === false to cut per-run allocation churn.
+  const collectEquity = cfg.collectEquity !== false
+  const equity: { t: number; equity: number }[] = collectEquity ? [{ t: bars[0]?.time ?? 0, equity: cash }] : []
 
   const closeTrade = (p: Pos, exitPxRaw: number, exitTime: number, reason: string) => {
     const dir = p.side
@@ -398,7 +419,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     const feeCost = fee > 0 ? (p.entryPx + exitPxRaw) * p.qty * fee : 0
     const pnl = pnl0 - feeCost
     cash += pnl
-    equity.push({ t: exitTime, equity: cash })
+    if (collectEquity) equity.push({ t: exitTime, equity: cash })
     mtmTrack(cash) // realized point of the MTM series (peak/DD updated here)
     // cooldown gate: block entries for N minutes after ANY position close.
     // Anchored at the closing bar's CLOSE (exitTime is the bar OPEN — add the
@@ -673,7 +694,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     suppressed,
     skippedShorts,
   }
-  return { metrics, trades, equity, warmupBars: warmup }
+  return { metrics, trades, equity: collectEquity ? equity : [], warmupBars: warmup }
 }
 
 // ---------------------------------------------------------------------------
@@ -800,13 +821,20 @@ export function optimizeBacktest(
         skipped++
         continue
       }
-      const res = runBacktest(series, { ...base, params })
+      const res = runBacktest(series, { ...base, params, collectEquity: false })
       evaluated++
       results.push({
         params: override,
         score: backtestScore(res.metrics, minTrades),
         metrics: res.metrics,
       })
+      // Task 9-l — bounded retention: a dropped row is ranked >160 in its
+      // prefix (≥160 better rows exist), so the global top-100 returned below
+      // is bit-identical — only the never-listed tail is discarded early.
+      if (results.length > 240) {
+        results.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
+        results.length = 160
+      }
     }
   }
   results.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
@@ -956,7 +984,7 @@ export function sweepStrategies(
   let skippedShorts = 0
   for (const sid of ALGO_STRATEGY_IDS) {
     const def = ALGO_STRATEGIES[sid]
-    const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults } }
+    const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults }, collectEquity: false }
     // grid bounds per dim (same sanitized value sets the optimizer uses) —
     // captured BEFORE the runs so every candidate can be boundary-flagged
     const bounds = autoOptimizeRanges(sid).map((r) => {
@@ -1004,6 +1032,13 @@ export function sweepStrategies(
       scorable,
       bestScore,
     })
+    // Task 9-l — bounded retention across strategies: the final selection only
+    // ever needs the global top-20 (topX ≤ 20); rows outside the running
+    // top-200 already have ≥200 better rows ahead of them and can never rank.
+    if (candidates.length > 300) {
+      candidates.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
+      candidates.length = 200
+    }
   }
   // dedupe identical (strategy, params) rows — a grid combo that lands exactly
   // on the defaults would otherwise appear twice with the same score
@@ -1018,7 +1053,7 @@ export function sweepStrategies(
   // ---- walk-forward verification of the SELECTED rows (Task 3-d) ----
   const rows: SweepRow[] = unique.slice(0, topX).map((r) => {
     if (!oosSeries) return { ...r, oos: null }
-    const oosCfg: BacktestConfig = { ...base, strategy: r.strategy, params: { ...r.params } }
+    const oosCfg: BacktestConfig = { ...base, strategy: r.strategy, params: { ...r.params }, collectEquity: false }
     const oosRun = runBacktest(oosSeries, oosCfg)
     const m = oosRun.metrics
     // < 3 OOS trades is not evidence either way → null, never a lucky 1-2er

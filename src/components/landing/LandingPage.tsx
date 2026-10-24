@@ -346,7 +346,7 @@ function StatusBar({ latency }: { latency: number | null }) {
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" aria-hidden />
             Live
           </span>
-          <span className="tabular-nums text-zinc-600">v1.20.0</span>
+          <span className="tabular-nums text-zinc-600">v1.21.0</span>
         </p>
       </div>
     </footer>

@@ -2310,3 +2310,22 @@ Stage Summary:
 - Registration is OPEN (ALLOW_REGISTRATION=true in local .env; ships with project dir on publish since it is not a secret line).
 - Closed-gate UX now fails at step 1 instead of after 2FA setup. First-account bootstrap preserved.
 - All changes committed as v1.20.0; DB clean (only trader); lint clean.
+
+---
+Task ID: 9-l
+Agent: main (Z.ai Code)
+Task: "Test All Strategies" -> server die. Improve: user clicked the Backtest panel's all-strategies sweep and the dev server died (fatal OOM).
+
+Work Log:
+- Evidence: next-server baseline RSS 1535MB vs --max-old-space-size=1800 — headroom ~250MB; ops-watchdog was DEAD (nothing revived crashes → "server die" stayed dead); no OOM text in dev.log (fatal heap OOM kills instantly, uncatchable).
+- Root causes: sweep churn (fresh Float64Array(n) RSI buffer ~1MB per simulated combo × 1168+ runs + per-run equity arrays) + unbounded in-loop retention (optimizeBacktest kept EVERY evaluated row, sweepStrategies kept every scorable candidate) + route barsCache 12 deep windows + heavy request allowed to START on a hot heap.
+- Fixes (src/lib/backtest.ts): (1) BacktestSeries.rsiScratch — one reusable RSI buffer per series, NaN re-seeded per run (stale finite leftovers could flip entry decisions; verified positions 0..rp-1 are never written by the fill loop); (2) BacktestConfig.collectEquity (default true) — sweep/optimize runs skip the display equity array (MTM maxDD unaffected — mtmTrack is separate); (3) bounded retention: optimizeBacktest trims results 240→160, sweepStrategies trims candidates 300→200 — provably lossless (a dropped row has ≥160/≥200 better rows, can never reach top-100/top-20).
+- New src/lib/mem-guard.ts: heapUsed/heap_size_limit probe (v8) → 503 + retry-after when >70% on POST /api/algo/backtest (optimize+sweep) and POST /api/algo/recommendations (refresh job). Converts fatal OOM into a polite retryable error.
+- Route barsCache 12→6 entries (duplicates global bars-cache; every MB is sweep headroom).
+- ops-watchdog.sh restarted (pid file /tmp/bh-watchdog.pid) — auto-revives the dev server with heap cap.
+- Verified: BTC/USD 15m 730d sweep (oos 0.3) HTTP 200 in 2.7s, RSS 1339→1420MB; ETH/USD 5m sweep HTTP 200 in 1.5s, RSS flat 1450MB; browser E2E — logged in as trader, Algo tab → Backtest → Test all strategies → "STRATEGY SWEEP — TOP 8 · 1,168 backtests · 0.6s" results table rendered, server ALIVE (1586MB). NOTE: sandbox feeds are binance-fallback capped at 9990 bars (crypto only — AAPL/TSLA sweeps 400 "no live historical data" here); with real Alpaca keys the windows are ~10× bigger, which is exactly what the guard+churn fixes protect.
+- Known pre-existing quirk (not fixed, noted): panel qty empty on fresh state → 400 "Quantity must be > 0" — user must type a qty once.
+
+Stage Summary:
+- Sweep memory: per-run churn eliminated (RSI scratch + no equity arrays), retention bounded losslessly, heavy endpoints refuse to start on a hot heap (503 + retry-after), watchdog back online as the last-resort reviver.
+- Landing version -> v1.21.0. Lint clean, tsc clean in src/.
