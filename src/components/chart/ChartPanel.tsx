@@ -27,6 +27,7 @@ import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useToast } from '@/hooks/use-toast'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
@@ -258,6 +259,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // technical indicators (persisted globally in localStorage)
   const [ind, setIndState] = useState<IndicatorSettings>(() => loadIndicators())
   const [indDataVer, setIndDataVer] = useState(0) // bumped whenever bars change
+  // mirror for effects that must read the LATEST config without depending on
+  // its identity: the series-set lifecycle below keys on the enabled-SET
+  // signature (indSetSig), so a pure param tweak must not re-run it
+  const indRef = useRef(ind)
+  indRef.current = ind
   const [indOpen, setIndOpen] = useState(false)
   // chart style — seeded from the persisted pane setting, changes are pushed
   // up through onChartTypeChange so the layout autosave carries them
@@ -3137,13 +3143,28 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         oldestRawTime = Math.min(...rawFresh.map((b) => b.time))
         // ETH off → only regular-session bars reach the chart (Task 59)
         const rthOnly = sessionGate && !showExtendedHours
-        const map = new Map<number, Bar>()
-        for (const b of bars) map.set(b.time, b)
-        for (const b of rawFresh) {
-          if (rthOnly && sessionOf(b.time) !== 'regular') continue
-          map.set(b.time, b)
+        const fresh = rthOnly ? rawFresh.filter((b) => sessionOf(b.time) === 'regular') : rawFresh
+        // FAST PATH (perf audit 1-a): the cursor filter above guarantees every
+        // fresh bar is STRICTLY older than the loaded history (time < cursor ≤
+        // bars[0].time), so when the chunk itself is strictly ascending — the
+        // API returns sorted, dup-free bars — a plain concat is already merged
+        // AND sorted. Skips the O(n log n) Map-merge + sort of the ENTIRE
+        // history on every prepend (each scroll-back chunk used to re-serialize
+        // the full series). Fallback keeps the old merge for out-of-order /
+        // duplicate server data (the ascending scan catches both).
+        let freshAscending = true
+        for (let i = 1; i < fresh.length; i++) {
+          if (fresh[i].time <= fresh[i - 1].time) { freshAscending = false; break }
         }
-        const merged = [...map.values()].sort((a, b) => a.time - b.time)
+        let merged: Bar[]
+        if (freshAscending && (fresh.length === 0 || fresh[fresh.length - 1].time < bars[0].time)) {
+          merged = [...fresh, ...bars]
+        } else {
+          const map = new Map<number, Bar>()
+          for (const b of bars) map.set(b.time, b)
+          for (const b of fresh) map.set(b.time, b)
+          merged = [...map.values()].sort((a, b) => a.time - b.time)
+        }
         barsRef.current = merged
         // prepending N bars shifts every logical index by N — restore the exact
         // visible window so the view doesn't jump while the user is scrolling
@@ -3365,19 +3386,34 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       markersRef.current = { earnings: [], news: [] }
       axisIconsRef.current = []
     }
+    // NB settingsVer here = broker-credential changes (tt:settings-changed from
+    // SettingsDialog — see the listener above) and is an INTENTIONAL full
+    // rebuild+refetch with the new keys. Indicator config changes do NOT hit
+    // this effect (`ind` is not a dep): the series-set / data-refill effects
+    // below own indicator params, so tweaking a period never tears down the
+    // chart or refetches bars/markers.
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours])
 
   // ---------- technical indicators: series lifecycle ----------
   // lightweight-charts v4 has no real multi-pane support: SMA/EMA/BB are line
   // overlays on the price scale, RSI/MACD are dedicated price scales squeezed
   // into stacked bottom strips (price · volume · RSI · MACD). This effect owns
-  // series creation/destroy on config or chart change; the effect after it
-  // refills DATA whenever bars change. Declared AFTER the chart effect so a
-  // live chart always exists when it runs.
+  // series creation/destroy; the effect after it refills DATA. Declared AFTER
+  // the chart effect so a live chart always exists when it runs.
+  //
+  // Rebuild triggers (perf audit 1-a #7): the enabled-indicator SET
+  // (indSetSig) or a NEW chart (symbol/tf/chartType/ETH/credentials — the
+  // chart effect re-created chartRef, so the series must be re-added; ETH is
+  // listed explicitly because showExtendedHours recreates the chart WITHOUT
+  // touching symbol/tf). A pure PARAM tweak (SMA/EMA length, BB mult, MACD
+  // fast/slow/signal) changes neither → the series objects survive; the
+  // refill effect after this one refreshes b.settings and recomputes their
+  // data in place.
+  const indSetSig = `${ind.vwap.enabled ? 1 : 0}|${ind.sma.enabled ? 1 : 0}|${ind.ema.enabled ? 1 : 0}|${ind.bb.enabled ? 1 : 0}|${ind.rsi.enabled ? 1 : 0}|${ind.macd.enabled ? 1 : 0}`
   useEffect(() => {
     const chart = chartRef.current
     if (!chart) return
-    const s = ind
+    const s = indRef.current
 
     const destroyBundle = (b: IndSeriesBundle | null) => {
       indSeriesRef.current = null
@@ -3439,13 +3475,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     return () => {
       destroyBundle(indSeriesRef.current)
     }
-  }, [symbol, tf, chartType, settingsVer, ind, fillIndData, scheduleRedraw])
+  }, [symbol, tf, chartType, settingsVer, indSetSig, showExtendedHours, fillIndData, scheduleRedraw])
 
   // indicators: refill data whenever bars change (initial load / scroll-back
-  // prepend) — series lifecycle is owned by the effect above
+  // prepend) or the config changes — series lifecycle is owned by the effect
+  // above. Param-only tweaks land HERE (series objects are kept): refresh the
+  // bundle's settings snapshot FIRST, since fillIndData, the tick path, the
+  // strip titles and the indicator-alarm params all read b.settings.
   useEffect(() => {
     const b = indSeriesRef.current
-    if (b) fillIndData(b)
+    if (b) {
+      b.settings = ind
+      fillIndData(b)
+    }
   }, [ind, indDataVer, fillIndData])
 
   // load drawings for this symbol
@@ -3496,7 +3538,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           ? { time: lastB.time as UTCTimestamp, open: lastB.open, high, low, close: t.p }
           : { time: lastB.time as UTCTimestamp, value: t.p }
       s.update(bar as CandlestickData<Time> | LineData<Time>)
-      barsRef.current = [...bars.slice(0, -1), { ...lastB, close: t.p, high, low }]
+      // in-place last-slot replacement — no O(n) array copy per forming-bar
+      // tick (barsRef is read imperatively everywhere, nothing keys on identity)
+      bars[bars.length - 1] = { ...lastB, close: t.p, high, low }
       scheduleRedraw()
       updateIndicatorsLast()
     }
@@ -3622,7 +3666,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                   : { time: lastB.time as UTCTimestamp, value: close }
               ) as CandlestickData<Time> | LineData<Time>
               s.update(bar)
-              barsRef.current = [...bars.slice(0, -1), { ...lastB, close, high, low }]
+              // in-place last-slot replacement — no O(n) array copy per poll
+              bars[bars.length - 1] = { ...lastB, close, high, low }
               scheduleRedraw()
               updateIndicatorsLast()
             }
@@ -3679,6 +3724,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>
+          {/* feed honesty chip (perf/UX audit): US equities stream via Alpaca's
+              feed=iex — real-time but a PARTIAL tape (IEX prints only, ~2% of
+              consolidated volume). Crypto (Binance) is a full tape → no chip. */}
+          {!isCryptoSymbol(symbol) && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge variant="outline" className="ml-1 cursor-default border-zinc-700 text-[9px] font-semibold tracking-wide text-zinc-400">IEX</Badge>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-[290px] border-zinc-800 bg-zinc-900 text-zinc-200">
+                Interactive.Exchange feed — real-time but partial tape (~2% of consolidated volume). Prices can deviate from the consolidated tape.
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
         <div className="pointer-events-auto flex min-w-0 max-w-[150px] items-center gap-0.5 overflow-x-auto rounded-md border border-zinc-800 bg-zinc-900/80 p-0.5 terminal-scroll sm:max-w-none">
           {(Object.keys(TIMEFRAMES) as (keyof typeof TIMEFRAMES)[]).map((k) => (

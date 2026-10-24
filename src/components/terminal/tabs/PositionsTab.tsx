@@ -20,6 +20,10 @@ import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, X } from 
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
@@ -90,6 +94,11 @@ function sortRows<T>(arr: T[], sort: SortState, val: (r: T) => string | number |
 const numOr = (v: string | number | null | undefined): number =>
   typeof v === 'number' ? v : parseFloat(String(v ?? '')) || 0
 
+/** Whole shares print bare; fractional crypto qty trims float noise (0.157800004 → 0.1578). */
+function fmtQtyLabel(n: number): string {
+  return Number.isInteger(n) ? String(n) : String(+n.toFixed(6))
+}
+
 /** Compact "21 Oct, 16:39" datetime — same style as the history table's
  * Closed column; full ISO rides in the cell's title/tooltip. */
 function fmtCompactDT(iso: string | null | undefined): string {
@@ -150,6 +159,9 @@ export default function PositionsTab() {
   const [refreshing, setRefreshing] = useState(false)
   const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
   const [canceling, setCanceling] = useState<string | null>(null)
+  // Task 4-c: the row pending close-confirmation (a market close must never be
+  // a single misclick — the dialog states the symbol + qty before the order)
+  const [confirmCloseRow, setConfirmCloseRow] = useState<PosConsoleRow | null>(null)
 
   // ---- Task 52.2: draggable panel splitters ----
   // Local (live) weights during a drag; the store copy is committed on release.
@@ -562,7 +574,7 @@ export default function PositionsTab() {
                       size="sm"
                       className="h-6 border border-rose-500/40 bg-rose-500/10 px-2 text-[11px] font-semibold text-rose-400 hover:bg-rose-500/20 hover:text-rose-300"
                       disabled={closing === key}
-                      onClick={() => void closePosition(r)}
+                      onClick={() => setConfirmCloseRow(r)}
                       aria-label={`Close ${r.mode} position ${r.pos.tradeSymbol}`}
                     >
                       {closing === key ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Close position'}
@@ -797,6 +809,44 @@ export default function PositionsTab() {
         <X className="h-3 w-3" aria-hidden />
         Drag the ── handles to resize the panels (saved with your layout) · click a column header to sort asc/desc · Close submits a market order for the full position · refreshes every 10s · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L.
       </p>
+
+      {/* Task 4-c: close-position confirmation — restates symbol + qty so the
+          market order is never one misclick away. The existing close logic and
+          the row's spinner state are untouched inside the confirm handler. */}
+      <AlertDialog
+        open={confirmCloseRow != null}
+        onOpenChange={(o) => { if (!o) setConfirmCloseRow(null) }}
+      >
+        <AlertDialogContent className="border-zinc-800 bg-zinc-900">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-zinc-100">
+              Close {confirmCloseRow?.pos.tradeSymbol ?? ''} position?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400">
+              This places a market order for{' '}
+              <span className="font-semibold text-zinc-200">
+                {confirmCloseRow ? fmtQtyLabel(Math.abs(numOr(confirmCloseRow.pos.qty))) : '0'}
+              </span>{' '}
+              units{confirmCloseRow ? ` (${confirmCloseRow.mode} account)` : ''} and closes the full position at the market price.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-zinc-700 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-rose-600 text-white hover:bg-rose-500"
+              onClick={() => {
+                const row = confirmCloseRow
+                setConfirmCloseRow(null)
+                if (row) void closePosition(row)
+              }}
+            >
+              Close position
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

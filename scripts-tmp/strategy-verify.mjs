@@ -1,7 +1,8 @@
 // Probe: verify strategy-fired orders on Alpaca paper (read-only).
 // Shows recent orders with legs/plan info for the symbols the strategies trade.
-const KEY = 'PK***ROTATED***'
-const SEC = '***ALPACA-SECRET-REMOVED***'
+const KEY = process.env.APCA_API_KEY_ID
+const SEC = process.env.APCA_API_KEY_SECRET
+if (!KEY || !SEC) { console.error('Missing APCA_API_KEY_ID / APCA_API_KEY_SECRET env vars'); process.exit(1) }
 const BASE = 'https://paper-api.alpaca.markets'
 
 const r = await fetch(`${BASE}/v2/orders?status=all&limit=15&direction=desc`, {

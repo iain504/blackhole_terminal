@@ -19,26 +19,30 @@
 //   • Cost suggestions (Task 88) — slippage/fee pre-seeded per market
 //     (crypto majors 3/10, altcoins 10/10, US equities 2/0) with "suggested N"
 //     chips to restore; a customized value is never stomped.
+//   • Honesty surfacing (Task 4-a) — sweep/recommendation rows show their
+//     walk-forward out-of-sample (OOS) re-run and grid-boundary flags, sizing
+//     is leverage-honest (Lev = maxNotionalX), crypto short-skips are reported
+//     as meta, and recharts moved behind next/dynamic (BacktestCharts.tsx).
 import { useEffect, useMemo, useRef, useState } from 'react'
+import dynamic from 'next/dynamic'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
-import { Area, AreaChart, Bar, BarChart, CartesianGrid, XAxis, YAxis } from 'recharts'
-import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from '@/components/ui/chart'
 import {
   ALGO_STRATEGIES,
   ALGO_MAX_DAYS,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import type { BacktestResult, OptimizeResult, SweepResult } from '@/lib/backtest'
-import { Segmented } from '@/components/terminal/tabs/Segmented'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 
@@ -83,6 +87,9 @@ interface BacktestMeta {
   coveredDays?: number
   source?: string
   dataCapped?: boolean
+  // Task 3-d accuracy meta — surfaced by the UI (Task 4-a)
+  mtmDD?: boolean
+  skippedShorts?: number
 }
 
 interface RangeState { on: boolean; min: string; max: string; step: string }
@@ -91,12 +98,9 @@ const fmtUsd = (v: number) =>
   (Math.abs(v) >= 1000 ? `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 })}` : `${v < 0 ? '-' : ''}$${Math.abs(v).toFixed(2)}`)
 const fmtPct = (v: number) => `${v >= 0 ? '' : '-'}${Math.abs(v).toFixed(2)}%`
 const fmtPx = (v: number) => (Math.abs(v) >= 100 ? v.toFixed(2) : v.toFixed(4))
-const fmtDay = (t: number) => new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 const fmtDayY = (t: number) => new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' })
 const fmtClockT = (t: number) =>
   new Date(t * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
-
-const eqConfig = { equity: { label: 'Equity', color: '#34d399' } } satisfies ChartConfig
 
 // Task 88 — market-typical execution costs (bps) so the cost model starts
 // honest instead of frictionless:
@@ -122,12 +126,26 @@ const BT_HOURS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0')
 const BT_WDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const
 const BT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const
 type BtGran = 'hour' | 'weekday' | 'monthyear'
-const BT_GRAN_TITLES: Record<BtGran, string> = {
-  hour: 'hour of day',
-  weekday: 'day of week',
-  monthyear: 'month of year',
-}
-const btWlConfig = { wins: { label: 'Wins' }, losses: { label: 'Losses' } } satisfies ChartConfig
+
+// Task 4-a — recharts (and @/components/ui/chart, which imports it) leave the
+// main bundle: the equity + win/loss charts live in BacktestCharts.tsx and are
+// loaded client-side only, with a matching skeleton while the chunk streams in.
+const EquityChart = dynamic(() => import('./BacktestCharts').then((m) => m.EquityChart), {
+  ssr: false,
+  loading: () => (
+    <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3" aria-hidden>
+      <Skeleton className="h-40 w-full bg-zinc-800/60" />
+    </div>
+  ),
+})
+const WlChart = dynamic(() => import('./BacktestCharts').then((m) => m.WlChart), {
+  ssr: false,
+  loading: () => (
+    <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3" aria-hidden>
+      <Skeleton className="h-52 w-full bg-zinc-800/60" />
+    </div>
+  ),
+})
 
 export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void; onApplySetup?: (s: AlgoApplySetup) => void }) {
   const { toast } = useToast()
@@ -142,6 +160,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [btFee, setBtFee] = useState('0')
   // Task 85 — bid/ask spread (bps): half is charged per market fill
   const [btSpread, setBtSpread] = useState('0')
+  // Task 4-a — leverage-honest sizing: max position notional = capital × Lev
+  // (route clamps 0.1..10; default 1 = cash-only, matching the baked reco runs)
+  const [btLev, setBtLev] = useState('1')
   // Task 85 — live spread probe: the symbol's current bid/ask spread in bps,
   // surfaced next to the input so the cost model is calibrated, not guessed
   const [liveSpreadBps, setLiveSpreadBps] = useState<number | null>(null)
@@ -300,9 +321,11 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     slippageBps: Math.min(500, Math.max(0, Math.round(Number(btSlip) || 0))),
     feeBps: Math.min(500, Math.max(0, Math.round(Number(btFee) || 0))),
     spreadBps: Math.min(500, Math.max(0, Math.round(Number(btSpread) || 0))),
+    // Task 4-a — leverage-honest sizing cap (0.1..10; 1 = notional ≤ capital)
+    maxNotionalX: Number(btLev) > 0 ? Math.min(10, Math.max(0.1, Number(btLev))) : 1,
     days: Math.max(1, Math.round(Number(days) || 30)),
     capital: Number(capital) || 10000,
-  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee, btSpread])
+  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee, btSpread, btLev])
 
   // live spread probe (Task 85) — polls the quote endpoint for cfg.symbol's
   // top of book every 60s and shows "≈X.X bps live" beside the Spread input;
@@ -368,6 +391,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               ? {
                   minTrades: Math.max(1, Math.round(Number(minTrades) || 8)),
                   topX: Math.min(20, Math.max(1, Math.round(Number(topX) || 8))),
+                  // Task 4-a — walk-forward on by default (parity with the reco
+                  // methodology): tune on the first 70% of bars, then re-run
+                  // the winners untouched on the last 30% → rows carry oos/boundary
+                  oosFraction: 0.3,
                 }
               : {}),
         }),
@@ -415,6 +442,8 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setBtSlip(String(rec.slipBps))
     setBtFee(String(rec.feeBps))
     setBtSpread(String(rec.spreadBps))
+    // Task 4-a — baked setups were measured with the honest 1× capital cap
+    setBtLev('1')
     // widen the history to the window the setup was MEASURED on (capped per TF)
     // — otherwise a 30d re-run would not reproduce the baked-in numbers
     setDays(String(Math.min(ALGO_MAX_DAYS[rec.timeframe] ?? 30, Math.max(1, Math.round(rec.coveredDays)))))
@@ -507,6 +536,27 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
           <div>
             <Label htmlFor="bt-capital" className="text-[10px] text-zinc-500">Starting capital $</Label>
             <Input id="bt-capital" value={capital} onChange={(e) => setCapital(e.target.value)} inputMode="decimal" className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs" />
+          </div>
+          <div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Label htmlFor="bt-lev" className="w-fit cursor-help text-[10px] text-zinc-500 underline decoration-dotted decoration-zinc-600 underline-offset-2">
+                  Lev (× capital)
+                </Label>
+              </TooltipTrigger>
+              <TooltipContent className="max-w-60 border-zinc-700 bg-zinc-800 text-zinc-100">
+                Max position notional as × of capital. 1 = cash-only (honest). Crypto baked results use 1×.
+              </TooltipContent>
+            </Tooltip>
+            <Input
+              id="bt-lev"
+              value={btLev}
+              onChange={(e) => setBtLev(e.target.value)}
+              onBlur={() => setBtLev(String(Number(btLev) > 0 ? Math.min(10, Math.max(0.1, Number(btLev))) : 1))}
+              inputMode="decimal"
+              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">notional cap per position — 1 = no leverage</p>
           </div>
           <div>
             <Label htmlFor="bt-cooldown" className="text-[10px] text-zinc-500">Cooldown after close (min)</Label>
@@ -721,6 +771,11 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               the backtest replayed {meta.from != null ? fmtDayY(meta.from) : '—'} → {meta.to != null ? fmtDayY(meta.to) : '—'} instead of the full window.
             </p>
           )}
+          {(meta.skippedShorts ?? 0) > 0 && (
+            <p className="text-[11px] text-zinc-500" role="note">
+              {(meta.skippedShorts ?? 0).toLocaleString('en-US')} crypto short signals skipped (Alpaca crypto is long-only)
+            </p>
+          )}
         </div>
       )}
 
@@ -742,71 +797,17 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <Metric label="Net P&L" value={fmtUsd(m.netPnl)} sub={fmtPct(m.netPct)} cls={pnlColor(m.netPnl)} />
             <Metric label="Win rate" value={`${m.winRate.toFixed(1)}%`} sub={`${m.wins}W / ${m.losses}L`} cls="text-zinc-100" />
             <Metric label="Profit factor" value={m.profitFactor >= 999 ? '∞' : m.profitFactor.toFixed(2)} sub={`${fmtUsd(m.grossWin)} / ${fmtUsd(m.grossLoss)}`} cls={m.profitFactor >= 1 ? 'text-emerald-400' : 'text-rose-400'} />
-            <Metric label="Max drawdown" value={fmtPct(-m.maxDrawdownPct)} sub={fmtUsd(-m.maxDrawdown)} cls="text-rose-400" />
+            <Metric label="Max drawdown (MTM)" value={fmtPct(-m.maxDrawdownPct)} sub={fmtUsd(-m.maxDrawdown)} cls="text-rose-400" />
             <Metric label="Trades" value={String(m.trades)} sub={`${m.longs}L · ${m.shorts}S${m.openAtEnd ? ' · 1 open' : ''}`} cls="text-zinc-100" />
             <Metric label="Expectancy" value={fmtUsd(m.expectancy)} sub="per trade" cls={pnlColor(m.expectancy)} />
             <Metric label="Avg hold" value={`${m.avgHoldMin < 90 ? `${Math.round(m.avgHoldMin)}m` : `${(m.avgHoldMin / 60).toFixed(1)}h`}`} sub={`${m.tradesPerWeek.toFixed(1)} trades/wk`} cls="text-zinc-100" />
             <Metric label="Final equity" value={fmtUsd(m.finalEquity)} sub={m.suppressed > 0 ? `${m.suppressed} signals gated` : 'gates: none hit'} cls="text-zinc-100" />
           </div>
 
-          <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
-            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Equity curve (realized)</p>
-            <ChartContainer config={eqConfig} className="h-40 w-full" aria-label="Backtest equity curve">
-              <AreaChart data={eqData} margin={{ left: 2, right: 8, top: 6, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                <XAxis dataKey="t" tickFormatter={fmtDay} minTickGap={48} stroke="#52525b" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} />
-                <YAxis domain={['auto', 'auto']} tickFormatter={(v: number) => fmtUsd(v)} stroke="#52525b" tick={{ fontSize: 10 }} tickLine={false} axisLine={false} width={58} />
-                <ChartTooltip content={<ChartTooltipContent indicator="line" labelFormatter={(l) => fmtClockT(Number(l))} formatter={(v) => [fmtUsd(Number(v)), 'Equity']} />} />
-                <Area type="monotone" dataKey="equity" stroke="#34d399" fill="#34d399" fillOpacity={0.12} strokeWidth={1.5} isAnimationActive={false} />
-              </AreaChart>
-            </ChartContainer>
-          </div>
+          <EquityChart data={eqData} />
 
           {runRes.trades.length > 0 && (
-            <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Win / Loss breakdown</p>
-                <Segmented
-                  ariaLabel="Win/loss bucket size"
-                  size="sm"
-                  value={wlGran}
-                  onChange={setWlGran}
-                  options={[
-                    { value: 'hour', label: 'Hour of day' },
-                    { value: 'weekday', label: 'Day of week' },
-                    { value: 'monthyear', label: 'Month of year' },
-                  ]}
-                />
-                <span className="ml-auto flex items-center gap-3 text-[10px] text-zinc-500">
-                  <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: '#10b981' }} aria-hidden />Wins</span>
-                  <span className="flex items-center gap-1"><span className="h-2 w-2 rounded-[2px]" style={{ backgroundColor: '#f43f5e' }} aria-hidden />Losses</span>
-                </span>
-              </div>
-              <ChartContainer config={btWlConfig} className="mt-1 h-52 w-full" aria-label={`Backtest win/loss by ${BT_GRAN_TITLES[wlGran]}`}>
-                <BarChart data={wlRows} margin={{ top: 8, right: 4, left: -14, bottom: 0 }}>
-                  <CartesianGrid vertical={false} stroke="#27272a" />
-                  <XAxis dataKey="label" tickLine={false} axisLine={false} tickMargin={6} minTickGap={10} tick={{ fontSize: 10, fill: '#71717a' }} />
-                  <YAxis allowDecimals={false} tickLine={false} axisLine={false} width={34} tick={{ fontSize: 10, fill: '#71717a' }} />
-                  <ChartTooltip
-                    cursor={{ fill: 'rgba(255,255,255,0.05)' }}
-                    content={
-                      <ChartTooltipContent
-                        labelFormatter={(label, payload) => {
-                          const row = payload?.[0]?.payload as { pnl?: number } | undefined
-                          const net = row && typeof row.pnl === 'number' && Number.isFinite(row.pnl) && row.pnl !== 0 ? ` · net ${fmtUsd(row.pnl)}` : ''
-                          return `${String(label)}${net}`
-                        }}
-                      />
-                    }
-                  />
-                  <Bar dataKey="wins" stackId="wl" fill="#10b981" />
-                  <Bar dataKey="losses" stackId="wl" fill="#f43f5e" radius={[2, 2, 0, 0]} />
-                </BarChart>
-              </ChartContainer>
-              <p className="mt-1 text-[11px] text-zinc-500">
-                By exit time in America/New_York · fixed {wlGran === 'hour' ? '00–23 hours' : wlGran === 'weekday' ? 'Mon–Sun' : 'Jan–Dec'} · zero-count buckets included · all {runRes.trades.length} trade{runRes.trades.length === 1 ? '' : 's'}
-              </p>
-            </div>
+            <WlChart rows={wlRows} gran={wlGran} onGran={setWlGran} total={runRes.trades.length} />
           )}
 
           {runRes.trades.length > 0 && (
@@ -891,9 +892,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                   <tr>
                     <th className="px-2.5 py-1.5 font-medium">#</th>
                     <th className="px-2 py-1.5 font-medium">Parameters</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                    <ThTip label="Score" tip="net% ÷ max drawdown% (Calmar-style, higher = better risk-adjusted)" right />
                     <th className="px-2 py-1.5 font-medium text-right">Net %</th>
-                    <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                    <ThTip label="PF" tip="profit factor = gross profit ÷ gross loss" right />
                     <th className="px-2 py-1.5 font-medium text-right">Win %</th>
                     <th className="px-2 py-1.5 font-medium text-right">Max DD %</th>
                     <th className="px-2 py-1.5 font-medium text-right">Trades</th>
@@ -949,6 +950,15 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <Badge variant="outline" className="text-[10px] text-zinc-400">{sweepRes.evaluated.toLocaleString('en-US')} backtests</Badge>
             <Badge variant="outline" className="text-[10px] text-zinc-400">min {sweepRes.minTrades} trades</Badge>
             <span className="text-[10px] text-zinc-600">{(sweepRes.elapsedMs / 1000).toFixed(1)}s</span>
+            {sweepRes.oosFraction != null && sweepRes.oosFraction > 0 && (
+              <Badge
+                variant="outline"
+                className="text-[10px] text-emerald-400/90"
+                title={`Walk-forward: tuning ran on the first ${Math.round((1 - sweepRes.oosFraction) * 100)}% of bars (in-sample) — the top rows were then re-run untouched on the last ${Math.round(sweepRes.oosFraction * 100)}% (out-of-sample → OOS column)`}
+              >
+                {Math.round((1 - sweepRes.oosFraction) * 100)}/{Math.round(sweepRes.oosFraction * 100)} IS/OOS
+              </Badge>
+            )}
           </div>
           {sweepRes.perStrategy.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-3 pb-2">
@@ -971,15 +981,16 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </p>
           ) : (
             <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Strategy sweep result table">
-              <table className="w-full min-w-[680px] text-left text-[11px]">
+              <table className="w-full min-w-[780px] text-left text-[11px]">
                 <thead className="sticky top-0 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
                   <tr>
                     <th className="px-2.5 py-1.5 font-medium">#</th>
                     <th className="px-2 py-1.5 font-medium">Strategy</th>
                     <th className="px-2 py-1.5 font-medium">Parameters</th>
-                    <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                    <ThTip label="Score" tip="net% ÷ max drawdown% (Calmar-style, higher = better risk-adjusted)" right />
+                    <ThTip label="OOS" tip="out-of-sample: metrics re-measured on the most recent 30% of bars, unseen by optimization" right />
                     <th className="px-2 py-1.5 font-medium text-right">Net %</th>
-                    <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                    <ThTip label="PF" tip="profit factor = gross profit ÷ gross loss" right />
                     <th className="px-2 py-1.5 font-medium text-right">Win %</th>
                     <th className="px-2 py-1.5 font-medium text-right">Max DD %</th>
                     <th className="px-2 py-1.5 font-medium text-right">Trades</th>
@@ -1003,15 +1014,17 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                         </span>
                       </td>
                       <td className="px-2 py-1.5 text-zinc-300">
-                        <span className="flex flex-wrap gap-x-2">
+                        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
                           {Object.entries(row.params).map(([k, v]) => (
                             <span key={k} className="whitespace-nowrap">
                               <span className="text-zinc-500">{paramLabel(row.strategy, k)}</span> <span className="tabular-nums text-zinc-200">{v}</span>
                             </span>
                           ))}
+                          {row.boundary && <BoundaryChip />}
                         </span>
                       </td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{row.score.toFixed(2)}</td>
+                      <OosCell oos={row.oos} />
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(row.metrics.netPct))}>{fmtPct(row.metrics.netPct)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.profitFactor >= 999 ? '∞' : row.metrics.profitFactor.toFixed(2)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.winRate.toFixed(0)}%</td>
@@ -1060,18 +1073,22 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </Button>
             </div>
           </div>
+          <p className="px-3 pb-1.5 text-[11px] text-zinc-500">
+            Max 1× capital per position (no leverage) · mark-to-market DD · crypto long-only · 70/30 IS/OOS walk-forward · IEX equity data
+          </p>
           <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Recommended setups table">
-            <table className="w-full min-w-[760px] text-left text-[11px]">
+            <table className="w-full min-w-[860px] text-left text-[11px]">
               <thead className="sticky top-0 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
                 <tr>
                   <th className="px-2.5 py-1.5 font-medium">#</th>
                   <th className="px-2 py-1.5 font-medium">Market</th>
                   <th className="px-2 py-1.5 font-medium">Strategy</th>
                   <th className="px-2 py-1.5 font-medium">Parameters</th>
-                  <th className="px-2 py-1.5 font-medium text-right" title="slippage / fee / spread (bps) the setup was measured with">Costs bps</th>
-                  <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                  <ThTip label="Costs bps" tip="slippage bps / fee bps / spread bps — bps = basis points, 1bp = 0.01% of price" right />
+                  <ThTip label="Score" tip="net% ÷ max drawdown% (Calmar-style, higher = better risk-adjusted)" right />
+                  <ThTip label="OOS" tip="out-of-sample: metrics re-measured on the most recent 30% of bars, unseen by optimization" right />
                   <th className="px-2 py-1.5 font-medium text-right">Net %</th>
-                  <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                  <ThTip label="PF" tip="profit factor = gross profit ÷ gross loss" right />
                   <th className="px-2 py-1.5 font-medium text-right">Win %</th>
                   <th className="px-2 py-1.5 font-medium text-right">Max DD %</th>
                   <th className="px-2 py-1.5 font-medium text-right">Trades</th>
@@ -1100,18 +1117,20 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                         </span>
                       </td>
                       <td className="px-2 py-1.5 text-zinc-300">
-                        <span className="flex flex-wrap gap-x-2">
+                        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
                           {Object.entries(rec.params).map(([k, v]) => (
                             <span key={k} className="whitespace-nowrap">
                               <span className="text-zinc-500">{paramLabel(rec.strategy, k)}</span> <span className="tabular-nums text-zinc-200">{v}</span>
                             </span>
                           ))}
+                          {rec.boundary && <BoundaryChip />}
                         </span>
                       </td>
                       <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-zinc-400" title="slippage / fee / spread (bps) this setup was measured with">
                         {rec.slipBps}/{rec.feeBps}/{rec.spreadBps}
                       </td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{rec.score.toFixed(2)}</td>
+                      <OosCell oos={rec.oos} />
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(rec.netPct))}>{fmtPct(rec.netPct)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.pf >= 999 ? '∞' : rec.pf.toFixed(2)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.winPct.toFixed(0)}%</td>
@@ -1162,5 +1181,91 @@ function Metric({ label, value, sub, cls }: { label: string; value: string; sub:
       <p className={cn('mt-0.5 text-lg font-semibold leading-tight tabular-nums', cls)}>{value}</p>
       <p className="text-[10px] text-zinc-500">{sub}</p>
     </div>
+  )
+}
+
+// Task 4-a — table header with an explanation tooltip (shadcn Tooltip); the
+// dotted underline is the affordance that the header is hoverable.
+function ThTip({ label, tip, right }: { label: string; tip: string; right?: boolean }) {
+  return (
+    <th className={cn('px-2 py-1.5 font-medium', right && 'text-right')}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span tabIndex={0} className="cursor-help underline decoration-dotted decoration-zinc-600 underline-offset-2">
+            {label}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-64 border-zinc-700 bg-zinc-800 text-zinc-100">{tip}</TooltipContent>
+      </Tooltip>
+    </th>
+  )
+}
+
+// Task 4-a — walk-forward OOS cell: signed net % with honest badges.
+//   null      → "—" (OOS window produced < 3 trades — not evidence either way)
+//   undefined → "—" (row was swept before walk-forward existed)
+function OosCell({ oos }: { oos?: { netPct: number } | null }) {
+  if (oos == null) {
+    return (
+      <td
+        className="px-2 py-1.5 text-right tabular-nums text-zinc-600"
+        title={oos === null ? 'insufficient out-of-sample trades' : 'no out-of-sample verification (swept before walk-forward was on)'}
+      >
+        —
+      </td>
+    )
+  }
+  const pos = oos.netPct > 0
+  const neg = oos.netPct < 0
+  return (
+    <td className="px-2 py-1.5 text-right">
+      <span className="inline-flex items-center justify-end gap-1">
+        {pos && (
+          <span className="text-emerald-400" aria-label="OOS re-run also profitable" title="OOS window (last 30% of bars) also profitable — verified">
+            <Check className="h-3 w-3" aria-hidden />
+          </span>
+        )}
+        {neg && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                tabIndex={0}
+                aria-label="OOS window lost money — in-sample flattery"
+                className="flex h-3.5 w-3.5 cursor-help items-center justify-center rounded-full bg-amber-500/15 text-[9px] font-bold leading-none text-amber-400"
+              >
+                !
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-56 border-amber-500/30 bg-zinc-800 text-amber-200">
+              Out-of-sample window (last 30% of bars) lost money — in-sample flattery
+            </TooltipContent>
+          </Tooltip>
+        )}
+        <span className={cn('tabular-nums', pos ? 'text-emerald-400' : neg ? 'text-rose-400' : 'text-zinc-300')}>
+          {pos ? '+' : ''}{oos.netPct.toFixed(2)}%
+        </span>
+      </span>
+    </td>
+  )
+}
+
+// Task 4-a — "edge" chip: a tuned param sits on its search-grid min/max
+// (weakest evidence — the optimum may lie beyond the searched range).
+function BoundaryChip() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          tabIndex={0}
+          aria-label="Optimized parameter on grid boundary"
+          className="inline-flex cursor-help items-center whitespace-nowrap rounded border border-amber-500/30 bg-amber-500/10 px-1 py-px text-[9px] font-medium uppercase leading-tight text-amber-400/90"
+        >
+          edge
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-56 border-amber-500/30 bg-zinc-800 text-amber-200">
+        Optimized param sits on the search-grid boundary — fragile optimum
+      </TooltipContent>
+    </Tooltip>
   )
 }

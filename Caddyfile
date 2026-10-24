@@ -1,10 +1,15 @@
 :81 {
 	@transform_port_query {
-		query XTransformPort=*
+		query XTransformPort=3030
 	}
 
+	encode zstd gzip
+
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "strict-origin-when-cross-origin"
+
 	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
+		reverse_proxy 127.0.0.1:3030 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}
@@ -13,7 +18,7 @@
 	}
 
 	handle {
-		reverse_proxy localhost:3000 {
+		reverse_proxy 127.0.0.1:3000 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}

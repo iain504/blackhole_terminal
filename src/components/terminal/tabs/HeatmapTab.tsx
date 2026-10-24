@@ -18,8 +18,9 @@ import { FilterMultiSelect } from './FilterMultiSelect'
 
 interface HeatTile {
   symbol: string
-  pct: number
-  price: number
+  /** null = no quote data (dead feed) — rendered as "–", never fake-flat 0 */
+  pct: number | null
+  price: number | null
 }
 
 interface HeatGroup {
@@ -36,7 +37,8 @@ interface HeatmapData {
 const REFRESH_MS = 60_000
 
 // Map |pct| (capped at 3%) to a green/red background between 15% and 85% opacity.
-function tileBackground(pct: number): string {
+function tileBackground(pct: number | null): string {
+  if (pct == null) return 'rgba(113, 113, 122, 0.15)' // muted zinc — visibly empty, not green/red-flat
   const t = Math.min(Math.abs(pct) / 3, 1)
   const alpha = 0.18 + t * 0.72
   return pct >= 0
@@ -44,11 +46,13 @@ function tileBackground(pct: number): string {
     : `rgba(244, 63, 94, ${alpha.toFixed(3)})`
 }
 
-function formatPct(pct: number): string {
+function formatPct(pct: number | null): string {
+  if (pct == null) return '–'
   return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
 }
 
-function formatPrice(price: number): string {
+function formatPrice(price: number | null): string {
+  if (price == null) return '–'
   if (price >= 1000) {
     return price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
@@ -56,9 +60,11 @@ function formatPrice(price: number): string {
   return price.toFixed(4)
 }
 
-/** weight of one tile in the treemap (heat-sized mode) */
+/** weight of one tile in the treemap (heat-sized mode; no-data tiles get the
+ *  same minimal weight as flat names so dead feeds collapse to an equal grid) */
 function heatWeight(t: HeatTile, sized: boolean): number {
-  return sized ? Math.max(Math.abs(t.pct), 0.08) : 1
+  if (!sized) return 1
+  return Math.max(Math.abs(t.pct ?? 0), 0.08)
 }
 
 /* ------------------------------------------------- squarified treemap ---- */
@@ -146,12 +152,15 @@ function TreeTile({ tile, rect }: { tile: HeatTile; rect: Rect }) {
   const big = rect.w >= 92 && rect.h >= 46
   const mid = rect.w >= 54 && rect.h >= 30
   const tiny = rect.w < 44 || rect.h < 20
+  const noData = tile.pct == null || tile.price == null
   return (
     <button
       type="button"
       onClick={() => useTerminal.getState().selectSymbol(tile.symbol)}
-      title={`${tile.symbol}  ${formatPct(tile.pct)}  ·  ${formatPrice(tile.price)} — click to chart`}
-      aria-label={`${tile.symbol} ${formatPct(tile.pct)}`}
+      title={noData
+        ? `${tile.symbol} · no data — click to chart`
+        : `${tile.symbol}  ${formatPct(tile.pct)}  ·  ${formatPrice(tile.price)} — click to chart`}
+      aria-label={noData ? `${tile.symbol} no data` : `${tile.symbol} ${formatPct(tile.pct)}`}
       style={{
         position: 'absolute',
         left: Math.round(rect.x),
@@ -169,8 +178,8 @@ function TreeTile({ tile, rect }: { tile: HeatTile; rect: Rect }) {
       <span className={cn('block w-full truncate px-1 pt-0.5 font-bold leading-tight text-white', tiny ? 'text-[9px]' : mid ? 'text-[11px]' : 'text-xs')}>
         {tile.symbol}
       </span>
-      {mid && <span className={cn('block w-full truncate px-1 font-semibold leading-tight text-white/95', big ? 'text-xs' : 'text-[10px]')}>{formatPct(tile.pct)}</span>}
-      {big && <span className="block w-full truncate px-1 text-[10px] leading-tight text-white/70">{formatPrice(tile.price)}</span>}
+      {mid && <span className={cn('block w-full truncate px-1 font-semibold leading-tight', noData ? 'text-zinc-400/80' : 'text-white/95', big ? 'text-xs' : 'text-[10px]')}>{formatPct(tile.pct)}</span>}
+      {big && <span className={cn('block w-full truncate px-1 text-[10px] leading-tight', noData ? 'text-zinc-500' : 'text-white/70')}>{formatPrice(tile.price)}</span>}
     </button>
   )
 }

@@ -4,7 +4,13 @@ import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { encrypt, decrypt, maskKey } from '@/lib/crypt'
 import { validateAlpacaKeys } from '@/lib/alpaca'
-import { readJson, handleError } from '@/lib/api-helpers'
+import { handleError } from '@/lib/api-helpers'
+import {
+  readJsonSafe,
+  settingsBodySchema,
+  settingsBodyTooLarge,
+  zodBadRequest,
+} from '@/lib/validation'
 
 interface UserSettings {
   alpacaKeyIdEnc?: string
@@ -61,11 +67,24 @@ interface PutBody {
   tpslPercent?: number
 }
 
-// PUT /api/settings — update private credentials (stored encrypted, never returned)
+// PUT /api/settings — update private credentials (stored encrypted, never returned).
+// Body is parse-then-validated (zod): bounded JSON object (keys ≤64 chars, string
+// values ≤10k, finite numbers, booleans, scalar arrays ≤500, object depth ≤4),
+// 413 when JSON.stringify length exceeds 256KB, $-prefixed keys stripped. The
+// merge below keeps its EXACT previous semantics: only the known fields are
+// conditionally written into the existing settings object; unknown body keys
+// never reach the DB (strip discipline).
 export async function PUT(req: Request) {
   try {
     const user = await requireUser()
-    const body = await readJson<PutBody>(req)
+    const raw = await readJsonSafe(req)
+    if (raw == null) return NextResponse.json({ error: 'Invalid body' }, { status: 400 })
+    if (settingsBodyTooLarge(raw)) {
+      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    }
+    const parsed = settingsBodySchema.safeParse(raw)
+    if (!parsed.success) return zodBadRequest(parsed.error)
+    const body = parsed.data as PutBody
     const dbUser = await db.user.findUnique({ where: { id: user.id } })
     const s = ((dbUser?.settings as UserSettings | null) || {}) as Record<string, unknown>
     if (typeof body.alpacaKeyId === 'string' && body.alpacaKeyId.trim()) {

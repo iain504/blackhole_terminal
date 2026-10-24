@@ -10,8 +10,8 @@
 import { db } from '@/lib/db'
 import { getBars } from '@/lib/alpaca'
 import { TIMEFRAMES } from '@/lib/market-types'
-import { prepareSeries, sweepStrategies, type BacktestConfig } from '@/lib/backtest'
-import { ALGO_MAX_DAYS, ALGO_TIMEFRAMES, type AlgoTimeframe } from '@/lib/algo-strategies'
+import { prepareSeries, sweepStrategies, type BacktestConfig, type SweepResult } from '@/lib/backtest'
+import { ALGO_MAX_DAYS, ALGO_TIMEFRAMES, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 
 export type { AlgoRecommendation }
@@ -22,6 +22,7 @@ export const RECO_MIN_TRADES = 10
 export const RECO_TOPX = 10
 export const RECO_POOL_TAKE = 3 // rows kept per combo for the global pool
 export const RECO_CAP = 18 // final list size
+export const RECO_OOS_FRACTION = 0.3 // Task 3-d — 70/30 IS/OOS walk-forward
 const MAX_BARS = 120_000 // same hard cap the API route enforces
 const CACHE_ID = 'algo-reco'
 
@@ -35,6 +36,146 @@ export const costsFor = (symbol: string): { slip: number; fee: number; spread: n
 }
 
 export const RECO_TOTAL_COMBOS = ALGO_TIMEFRAMES.length * RECO_SYMBOLS.length
+
+// ---------------------------------------------------------------------------
+// shared matrix pieces — algo-reco.ts and scripts-tmp/reco-sweep.ts MUST run
+// the exact same procedure, so the cfg builder / row shaper / selection live
+// here and the script imports them (no drift).
+// ---------------------------------------------------------------------------
+export interface RecoOos {
+  netPct: number
+  profitFactor: number
+  winRate: number
+  maxDrawdownPct: number
+  trades: number
+}
+
+/** One sweep row as persisted in reco-sweep-results.json / the reco cache. */
+export interface RecoComboRow {
+  strategy: AlgoStrategyId
+  params: Record<string, number>
+  score: number
+  netPct: number
+  pf: number
+  winPct: number
+  maxDDPct: number
+  trades: number
+  oos: RecoOos | null
+  boundary: boolean
+}
+
+/**
+ * The Task 3-d honesty-pass matrix config (identical for lib + script):
+ * $10k capital · qty 10 · TP 1.5%/SL 1% · max 3 trades/day · per-market costs
+ * · maxNotionalX 1 (a position may never exceed 1× capital — no leverage).
+ */
+export function buildRecoBacktestCfg(symbol: string): BacktestConfig {
+  const costs = costsFor(symbol)
+  return {
+    strategy: 'bb-reversion', // placeholder — sweep overrides per strategy
+    params: {},
+    qty: 10,
+    sizingMode: 'fixed',
+    riskBasis: 'usd',
+    riskMoney: null,
+    isCrypto: symbol.includes('/'),
+    // the terminal's default bracket — recommendations apply this as-is
+    tpMode: 'pct',
+    tpValue: 1.5,
+    slMode: 'pct',
+    slValue: 1,
+    maxTradesDay: 3,
+    rthOnly: true,
+    flattenEod: true,
+    cooldownMin: 0,
+    requireNewSignal: false,
+    slippageBps: costs.slip,
+    feeBps: costs.fee,
+    spreadBps: costs.spread,
+    capital: 10000,
+    // Task 3-d — LEVERAGE-HONEST sizing: fixed qty 10 on BTC at $65k used to
+    // be a ~$650k position on $10k capital (~65×). Capped at 1× capital.
+    maxNotionalX: 1,
+  }
+}
+
+/**
+ * Map the sweep's top rows to the persisted combo-row shape. Crypto rows are
+ * reported long-only (params.allowShort = 0): the sweep already RAN long-only
+ * via runBacktest's crypto short-skip (cfg.isCrypto drops sell entries and
+ * counts them in metrics.skippedShorts — sweep.skippedShorts sums them), so
+ * clearing the dead flag changes nothing about the simulated P&L while making
+ * the applied config honest (and the live engine long-only).
+ */
+export function sweepTopRows(sweep: SweepResult, take: number, isCrypto: boolean): RecoComboRow[] {
+  return sweep.rows.slice(0, take).map((r) => {
+    const params = { ...r.params }
+    if (isCrypto && 'allowShort' in params) params.allowShort = 0
+    return {
+      strategy: r.strategy,
+      params,
+      score: Number(r.score.toFixed(3)),
+      netPct: Number(r.metrics.netPct.toFixed(2)),
+      pf: Number(r.metrics.profitFactor.toFixed(2)),
+      winPct: Number(r.metrics.winRate.toFixed(1)),
+      maxDDPct: Number(r.metrics.maxDrawdownPct.toFixed(2)),
+      trades: r.metrics.trades,
+      oos: r.oos ?? null,
+      boundary: r.boundary ?? false,
+    }
+  })
+}
+
+/**
+ * Honest-first selection (Task 3-d): per combo the rank-1 row with a POSITIVE
+ * score claims the slot; remaining positive rows fill a global pool by score;
+ * the final list is capped at `cap` and sorted OOS-positive first, then score
+ * desc — a verified out-of-sample winner outranks a bigger in-sample number.
+ */
+export function pickRecoPicks<C extends { rows: RecoComboRow[] }>(
+  combos: C[],
+  cap: number,
+): { combo: C; row: RecoComboRow }[] {
+  const winners: { combo: C; row: RecoComboRow }[] = []
+  const pool: { combo: C; row: RecoComboRow }[] = []
+  for (const c of combos) {
+    const best = c.rows.find((r) => r.score > 0) // rows are score-sorted → rank-1 positive
+    if (best) winners.push({ combo: c, row: best })
+    for (const r of c.rows) if (r !== best && r.score > 0) pool.push({ combo: c, row: r })
+  }
+  pool.sort((a, b) => b.row.score - a.row.score)
+  // Behavior-signature dedupe: distinct param sets can produce IDENTICAL
+  // results (e.g. an exit threshold that never binds differently) — listing
+  // both would render two indistinguishable rows. Keep the first occurrence
+  // (winners naturally outrank their combo's pool twins).
+  const seen = new Set<string>()
+  const sig = (r: RecoComboRow) => {
+    const o = r.oos
+    return [
+      r.strategy,
+      r.score,
+      r.netPct,
+      r.trades,
+      r.maxDDPct,
+      o ? o.netPct : 'n',
+    ].join('|')
+  }
+  const picked: { combo: C; row: RecoComboRow }[] = []
+  for (const entry of [...winners, ...pool]) {
+    const key = sig(entry.row)
+    if (seen.has(key)) continue
+    seen.add(key)
+    picked.push(entry)
+    if (picked.length >= cap) break
+  }
+  picked.sort((a, b) => {
+    const ao = a.row.oos != null && a.row.oos.netPct > 0 ? 1 : 0
+    const bo = b.row.oos != null && b.row.oos.netPct > 0 ? 1 : 0
+    if (ao !== bo) return bo - ao // walk-forward-verified first
+    return b.row.score - a.row.score
+  })
+  return picked
+}
 
 // ---------------------------------------------------------------------------
 // background job state (module-level — one refresh at a time per process)
@@ -110,16 +251,6 @@ export async function getRecoFeed(): Promise<RecoFeed> {
 // ---------------------------------------------------------------------------
 // the matrix runner — same procedure as scripts-tmp/reco-sweep.ts
 // ---------------------------------------------------------------------------
-interface SweepComboRow {
-  strategy: AlgoRecommendation['strategy']
-  params: Record<string, number>
-  score: number
-  netPct: number
-  pf: number
-  winPct: number
-  maxDDPct: number
-  trades: number
-}
 
 export async function runRecoSweepMatrix(
   userId: string,
@@ -135,7 +266,8 @@ export async function runRecoSweepMatrix(
     coveredDays: number
     source: string
     costs: { slip: number; fee: number; spread: number }
-    rows: SweepComboRow[]
+    rows: RecoComboRow[]
+    skippedShorts: number
   }
   const combos: Combo[] = []
   let completed = 0
@@ -152,31 +284,15 @@ export async function runRecoSweepMatrix(
           const nowSec = Math.floor(Date.now() / 1000)
           while (bars.length > 0 && bars[bars.length - 1].time + tfSec > nowSec) bars = bars.slice(0, -1)
           if (bars.length > MAX_BARS) bars = bars.slice(bars.length - MAX_BARS)
-          const cfg: BacktestConfig = {
-            strategy: 'bb-reversion', // placeholder — sweep overrides per strategy
-            params: {},
-            qty: 10,
-            sizingMode: 'fixed',
-            riskBasis: 'usd',
-            riskMoney: null,
-            isCrypto: symbol.includes('/'),
-            // the terminal's default bracket — recommendations apply this as-is
-            tpMode: 'pct',
-            tpValue: 1.5,
-            slMode: 'pct',
-            slValue: 1,
-            maxTradesDay: 3,
-            rthOnly: true,
-            flattenEod: true,
-            cooldownMin: 0,
-            requireNewSignal: false,
-            slippageBps: costs.slip,
-            feeBps: costs.fee,
-            spreadBps: costs.spread,
-            capital: 10000,
-          }
+          const cfg = buildRecoBacktestCfg(symbol)
           const series = prepareSeries(bars)
-          const sweep = sweepStrategies(series, cfg, { minTrades: RECO_MIN_TRADES, topX: RECO_TOPX })
+          // Task 3-d — 70/30 IS/OOS walk-forward: tune on the first 70% of
+          // bars, re-run the winners untouched on the last 30%
+          const sweep = sweepStrategies(series, cfg, {
+            minTrades: RECO_MIN_TRADES,
+            topX: RECO_TOPX,
+            oosFraction: RECO_OOS_FRACTION,
+          })
           combos.push({
             symbol,
             tf,
@@ -186,16 +302,8 @@ export async function runRecoSweepMatrix(
             coveredDays: Math.max(1, Math.round((nowSec - bars[0].time) / 86400)),
             source: res.source ?? 'alpaca',
             costs,
-            rows: sweep.rows.slice(0, RECO_POOL_TAKE).map((r) => ({
-              strategy: r.strategy,
-              params: r.params,
-              score: Number(r.score.toFixed(3)),
-              netPct: Number(r.metrics.netPct.toFixed(2)),
-              pf: Number(r.metrics.profitFactor.toFixed(2)),
-              winPct: Number(r.metrics.winRate.toFixed(1)),
-              maxDDPct: Number(r.metrics.maxDrawdownPct.toFixed(2)),
-              trades: r.metrics.trades,
-            })),
+            rows: sweepTopRows(sweep, RECO_POOL_TAKE, cfg.isCrypto),
+            skippedShorts: sweep.skippedShorts ?? 0,
           })
         }
       } catch {
@@ -205,37 +313,30 @@ export async function runRecoSweepMatrix(
       onComboDone?.(completed)
     }
   }
-  // selection: per-combo rank-1 winners with a positive score, then globally
-  // best remaining rows until the list is full (same rule as gen-reco.ts)
-  const winners: { combo: Combo; row: SweepComboRow }[] = []
-  const pool: { combo: Combo; row: SweepComboRow }[] = []
-  for (const c of combos) {
-    const [best, ...rest] = c.rows
-    if (best && best.score > 0) winners.push({ combo: c, row: best })
-    for (const r of rest) if (r.score > 0) pool.push({ combo: c, row: r })
-  }
-  pool.sort((a, b) => b.row.score - a.row.score)
-  const picked = [...winners, ...pool].slice(0, RECO_CAP)
-  picked.sort((a, b) => b.row.score - a.row.score)
-  const rows: AlgoRecommendation[] = picked.map((p) => ({
-    symbol: p.combo.symbol,
-    timeframe: p.combo.tf,
-    strategy: p.row.strategy,
-    params: p.row.params,
-    slipBps: p.combo.costs.slip,
-    feeBps: p.combo.costs.fee,
-    spreadBps: p.combo.costs.spread,
-    score: p.row.score,
-    netPct: p.row.netPct,
-    pf: p.row.pf,
-    winPct: p.row.winPct,
-    maxDDPct: p.row.maxDDPct,
-    trades: p.row.trades,
-    bars: p.combo.bars,
-    coveredDays: p.combo.coveredDays,
-    from: p.combo.from,
-    to: p.combo.to,
-    source: p.combo.source,
+  // Task 3-d — honest-first selection (shared with scripts-tmp/gen-reco.ts):
+  // per-combo rank-1 positive rows, then best pool rows, OOS-positive first
+  const picked = pickRecoPicks(combos, RECO_CAP)
+  const rows: AlgoRecommendation[] = picked.map(({ combo: p, row }) => ({
+    symbol: p.symbol,
+    timeframe: p.tf,
+    strategy: row.strategy,
+    params: row.params,
+    slipBps: p.costs.slip,
+    feeBps: p.costs.fee,
+    spreadBps: p.costs.spread,
+    score: row.score,
+    netPct: row.netPct,
+    pf: row.pf,
+    winPct: row.winPct,
+    maxDDPct: row.maxDDPct,
+    trades: row.trades,
+    oos: row.oos,
+    boundary: row.boundary,
+    bars: p.bars,
+    coveredDays: p.coveredDays,
+    from: p.from,
+    to: p.to,
+    source: p.source,
   }))
   if (rows.length === 0) {
     throw new Error('No profitable configuration found across the whole matrix — nothing to recommend')

@@ -7,7 +7,7 @@ import { useState } from 'react'
 import { useTerminal, TabType, tabPanes, tabLayout, GRID_LAYOUTS, GridLayoutId } from '@/store/terminal'
 import {
   CandlestickChart, CalendarDays, Flame, Plus, X, LogOut, Settings2, BellRing, UserRound,
-  PanelsTopLeft, Crosshair, Check, Layers, Bot, ChartColumnBig, Rocket,
+  PanelsTopLeft, Crosshair, Check, Keyboard, Layers, Bot, ChartColumnBig, Rocket,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -302,6 +302,16 @@ export function TabBar({
         </Button>
         <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={onOpenSettings} aria-label="Settings">
           <Settings2 className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 text-zinc-400 hover:text-zinc-100"
+          onClick={() => window.dispatchEvent(new CustomEvent('tt:open-shortcuts'))}
+          aria-label="Keyboard shortcuts"
+          title="Keyboard shortcuts (?)"
+        >
+          <Keyboard className="h-4 w-4" />
         </Button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

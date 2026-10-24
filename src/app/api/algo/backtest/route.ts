@@ -20,6 +20,10 @@
 //   riskBasis?: 'usd'|'pct'                 (Task 78e) budget basis: dollars (default) or % of equity
 //   riskMoney?: number                      (Task 78) dollars at risk per trade (required for risk+usd)
 //   riskMoneyPct?: number                   (Task 78e) % of equity per trade (required for risk+pct)
+//   maxNotionalX?: number                   (Task 3-d) buying-power cap: max position notional =
+//                                           capital × maxNotionalX (0.1..10, default 1 = no leverage)
+//   oosFraction?: number                    (Task 3-d, sweep) walk-forward: tune on the first (1-f)
+//                                           of bars, re-run winners untouched on the tail (0..0.5, default 0)
 //   capital?: number                       starting equity for % / DD metrics
 //   minTrades?: number                     (optimize/sweep) minimum trades to score
 //   topX?: number                          (sweep) how many winners to list (1..20, default 8)
@@ -30,6 +34,7 @@ import { readJson, handleError } from '@/lib/api-helpers'
 import { getBars } from '@/lib/alpaca'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, type AlgoTimeframe } from '@/lib/algo-strategies'
+import { rateLimit } from '@/lib/rate-limit'
 import {
   prepareSeries, runBacktest, optimizeBacktest, sweepStrategies,
   type BacktestConfig, type OptimizeRange,
@@ -38,6 +43,23 @@ import {
 export const dynamic = 'force-dynamic'
 
 const MAX_BARS = 120_000
+
+// Task 3-d — in-process concurrency guard: one backtest AT A TIME per user
+// (each run holds ~50MB of bars + a full sim; parallel runs OOM the box).
+// ALWAYS released in the finally block inside POST().
+const runningBacktests = new Set<string>()
+
+/** Task 3-d — wire format for the equity curve: ≤500 points (stride + first/last). */
+function downsampleEquity(equity: { t: number; equity: number }[]): { t: number; equity: number }[] {
+  if (equity.length <= 500) return equity
+  // stride over n-1 gaps with max-1 slots so first + last + stride points
+  // always fit within 500
+  const stride = Math.ceil((equity.length - 1) / 499)
+  const out = equity.filter((_, i) => i % stride === 0)
+  const last = equity[equity.length - 1]
+  if (last && out[out.length - 1] !== last) out.push(last)
+  return out
+}
 
 /**
  * Short-TTL cache for backtest history — a deep window (730d crypto ≈ 86k bars)
@@ -87,6 +109,8 @@ interface BacktestBody {
   riskBasis?: string
   riskMoney?: number | null
   riskMoneyPct?: number | null
+  maxNotionalX?: number
+  oosFraction?: number
   capital?: number
   minTrades?: number
   topX?: number
@@ -95,6 +119,31 @@ interface BacktestBody {
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
+    // Task 3-d — per-user throttle: 6 runs / minute (CPU-heavy endpoint).
+    const rl = rateLimit(`bt:${user.id}`, 6, 60_000)
+    if (!rl.ok) {
+      return NextResponse.json(
+        { error: `Too many backtests — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },
+        { status: 429 },
+      )
+    }
+    // Task 3-d — one backtest at a time per user; the guard ALWAYS releases.
+    if (runningBacktests.has(user.id)) {
+      return NextResponse.json({ error: 'A backtest is already running' }, { status: 429 })
+    }
+    runningBacktests.add(user.id)
+    try {
+      return await handleBacktest(req, user.id)
+    } finally {
+      runningBacktests.delete(user.id)
+    }
+  } catch (e) {
+    return handleError(e)
+  }
+}
+
+async function handleBacktest(req: NextRequest, userId: string): Promise<NextResponse> {
+  try {
     const body = await readJson<BacktestBody>(req)
     const mode = body.mode === 'optimize' || body.mode === 'sweep' ? body.mode : 'run'
 
@@ -141,7 +190,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ---- fetch the history (same source the live engine polls; TTL-cached) ----
-    const res = await getBarsCached(symbol, tf as Timeframe, user.id, days)
+    const res = await getBarsCached(symbol, tf as Timeframe, userId, days)
     let bars = Array.isArray(res.bars) ? res.bars : []
     if (res.demo || bars.length < 80) {
       return NextResponse.json(
@@ -189,6 +238,10 @@ export async function POST(req: NextRequest) {
       feeBps: Math.min(500, Math.max(0, Math.round(Number(body.feeBps) || 0))),
       // Task 85 — bid/ask spread (bps, half charged per market fill)
       spreadBps: Math.min(500, Math.max(0, Math.round(Number(body.spreadBps) || 0))),
+      // Task 3-d — buying-power cap (0.1..10, default 1 = max 1× capital per position)
+      maxNotionalX: Number.isFinite(Number(body.maxNotionalX)) && Number(body.maxNotionalX) > 0
+        ? Math.min(10, Math.max(0.1, Number(body.maxNotionalX)))
+        : 1,
       capital,
     }
 
@@ -218,12 +271,25 @@ export async function POST(req: NextRequest) {
     if (mode === 'sweep') {
       const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
       const topX = Math.min(20, Math.max(1, Math.round(Number(body.topX) || 8)))
-      const sweep = sweepStrategies(series, cfg, { minTrades, topX })
-      return NextResponse.json({ sweep, meta })
+      // Task 3-d — walk-forward fraction (0..0.5, default 0 = off)
+      const oosFraction = Number.isFinite(Number(body.oosFraction))
+        ? Math.min(0.5, Math.max(0, Number(body.oosFraction)))
+        : 0
+      const sweep = sweepStrategies(series, cfg, { minTrades, topX, oosFraction })
+      return NextResponse.json({
+        sweep,
+        meta: { ...meta, mtmDD: true, skippedShorts: sweep.skippedShorts ?? 0 },
+      })
     }
 
     const result = runBacktest(series, cfg)
-    return NextResponse.json({ result, meta })
+    // Task 3-d — equity curve for the wire: downsampled to ≤500 points
+    // (stride + first/last kept; the point-per-trade array is never shipped)
+    const wire = { ...result, equity: downsampleEquity(result.equity) }
+    return NextResponse.json({
+      result: wire,
+      meta: { ...meta, mtmDD: true, skippedShorts: result.metrics.skippedShorts ?? 0 },
+    })
   } catch (e) {
     return handleError(e)
   }

@@ -1,6 +1,6 @@
 // stream-service — real-time price streaming for the trading terminal.
 //
-// Browser ──socket.io (path '/', port 3030, via Caddy ?XTransformPort=3030)──▶ this service
+// Browser ──socket.io (path '/socket.io', port 3030, via Caddy ?XTransformPort=3030)──▶ this service
 //   ├─ CRYPTO: one shared Binance websocket (free, keyless) → 24h miniTicker ≈ 1 tick/s/symbol
 //   ├─ STOCKS: EXACTLY ONE Alpaca v2 iex websocket per account (Alpaca allows ONE concurrent
 //   │          market-data connection per key — a 2nd gets error 406/403 "connection limit
@@ -15,7 +15,21 @@
 //   ▶ 'sub'   { symbols: string[] }    subscribe (refcounted)
 //   ▶ 'unsub' { symbols: string[] }
 //   ◀ 'tick'  { s, p, t, o?, h?, l?, v? }   throttled ≤ 5 msgs/s per symbol
+//
+// HANDSHAKE AUTH (Task 3-b): every socket handshake is verified against the app's
+// HMAC session cookie (tt_session — token `userId.expiry.HMAC-SHA256(payload)`,
+// mirrors src/lib/auth.ts byte-for-byte, including its AUTH_SECRET resolution:
+// env → repo-root .env → hardcoded default). VALID session → full behavior.
+// INVALID/absent → RESTRICTED GUEST MODE: crypto (public Binance) subs only,
+// ≤10 simultaneous symbols, ≤20 sub/unsub events per minute; stock subs are
+// ignored, no Alpaca keys are ever resolved, and stock ticks are not even
+// fanned out to guest sockets. CORS is `origin: true, credentials: true`
+// (same-origin via the gateway) — defense in depth on top of the handshake auth.
+// GET /healthz on the same port returns {"ok":true} for uptime probes.
 import { createServer } from 'http'
+import { createHmac, timingSafeEqual } from 'crypto'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import { Server, Socket } from 'socket.io'
 
 const PORT = 3030
@@ -30,16 +44,105 @@ const QUOTE_TIMEOUT_MS = 4000
 const ALPACA_SYMBOL_CAP = 30
 const SLOT_COOLDOWN_MS = 2 * 60_000
 
+// guest-mode limits (Task 3-b) — public crypto only, small blast radius
+const GUEST_MAX_SYMBOLS = 10 // simultaneous subscribed symbols per guest socket
+const GUEST_MAX_EVENTS = 20 // sub+unsub events per rolling minute per guest socket
+const GUEST_EVENT_WINDOW_MS = 60_000
+
 const isCrypto = (s: string) => s.includes('/')
 
+// --------------------------- session verification --------------------------
+// Mirrors src/lib/auth.ts EXACTLY (same cookie name, same token format
+// `userId.expiry.HMAC-SHA256(payload)`, same secret resolution chain) so a
+// cookie accepted by the Next app is accepted here and nothing else is.
+const SESSION_COOKIE = 'tt_session'
+
+let AUTH_SECRET = process.env.AUTH_SECRET || ''
+if (!AUTH_SECRET) {
+  // the service may not inherit the app's env — parse the repo-root .env
+  try {
+    const svcDir = (import.meta as { dir?: string }).dir ?? process.cwd()
+    const envText = readFileSync(join(svcDir, '..', '..', '.env'), 'utf8')
+    for (const line of envText.split(/\r?\n/)) {
+      const m = /^\s*AUTH_SECRET\s*=\s*(.*?)\s*$/.exec(line)
+      if (m?.[1]) {
+        AUTH_SECRET = m[1].replace(/^["']|["']$/g, '')
+        break
+      }
+    }
+  } catch {
+    /* no repo-root .env — fall through to the app's hardcoded default */
+  }
+}
+if (!AUTH_SECRET) {
+  // Fail-closed, mirroring src/lib/auth.ts: never accept tokens signed with a
+  // publicly-known default. Without a real secret the service cannot tell a
+  // genuine session from a forged one, so it refuses to start.
+  console.error('[stream-service] FATAL: AUTH_SECRET not set and repo-root .env not found — refusing to start (forged-session guard).')
+  process.exit(1)
+}
+
+function verifySessionToken(token: string): string | null {
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  const [userId, expStr, sig] = parts
+  const payload = `${userId}.${expStr}`
+  const expected = createHmac('sha256', AUTH_SECRET).update(payload).digest('hex')
+  if (sig.length !== expected.length) return null
+  try {
+    if (!timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null
+  } catch {
+    return null
+  }
+  if (parseInt(expStr, 10) * 1000 < Date.now()) return null
+  return userId
+}
+
+function cookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) return null
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq < 0) continue
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim()
+  }
+  return null
+}
+
 // ------------------------------- socket.io ---------------------------------
-const httpServer = createServer()
+// DO NOT change this path back to '/' — engine.io matches requests by path
+// prefix and '/' would swallow EVERY http request on this port (including
+// /healthz). The browser client (src/lib/stream-client.ts) uses socket.io's
+// default path '/socket.io' — only the ?XTransformPort=3030 QUERY decides the
+// Caddy route, so '/socket.io' reaches this service through the gateway
+// exactly as before.
+const AUTHED_ROOM = 'authed'
+const httpServer = createServer((req, res) => {
+  // lightweight health probe on the same port (socket.io owns '/socket.io')
+  if ((req.url ?? '').split('?')[0] === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end('{"ok":true}')
+    return
+  }
+  res.writeHead(404, { 'Content-Type': 'application/json' })
+  res.end('{"error":"not found"}')
+})
 const io = new Server(httpServer, {
-  // DO NOT change the path — Caddy forwards by XTransformPort on '/'
-  path: '/',
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  path: '/socket.io',
+  cors: { origin: true, credentials: true, methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,
+})
+
+// handshake auth: classify every socket as a full user or a restricted guest.
+// NEVER rejects the handshake — anonymous visitors still get public crypto
+// ticks (guest mode), everything else is gated in the event handlers below.
+io.use((socket: Socket, next: (err?: Error) => void) => {
+  const token = cookieValue(socket.handshake.headers.cookie, SESSION_COOKIE)
+  const userId = token ? verifySessionToken(token) : null
+  socket.data.authed = userId != null
+  socket.data.userId = userId
+  if (userId != null) socket.join(AUTHED_ROOM)
+  next()
 })
 
 // ------------------------------ symbol registry ----------------------------
@@ -67,6 +170,21 @@ function release(syms: string[]): string[] {
 }
 const desiredCrypto = () => [...refcounts.keys()].filter(isCrypto)
 
+// --------------------------- guest rate limiting ----------------------------
+// rolling 60s window of sub/unsub events, per guest socket, in memory
+const guestEvents = new Map<Socket, number[]>()
+function guestEventAllowed(socket: Socket): boolean {
+  const now = Date.now()
+  const recent = (guestEvents.get(socket) ?? []).filter((t) => now - t < GUEST_EVENT_WINDOW_MS)
+  if (recent.length >= GUEST_MAX_EVENTS) {
+    guestEvents.set(socket, recent)
+    return false
+  }
+  recent.push(now)
+  guestEvents.set(socket, recent)
+  return true
+}
+
 // ------------------------------ tick fan-out -------------------------------
 interface Tick {
   s: string
@@ -82,7 +200,13 @@ setInterval(() => {
   if (latest.size === 0 || io.engine.clientsCount === 0) return
   const batch = [...latest.values()]
   latest.clear()
-  io.emit('tick', batch) // array of ticks
+  // guests (and sockets generally) may only receive public Binance crypto
+  // ticks globally; stock ticks (other users' Alpaca upstreams) go to the
+  // authed room only so a guest never receives them at all
+  const cryptoTicks = batch.filter((t) => isCrypto(t.s))
+  const stockTicks = batch.filter((t) => !isCrypto(t.s))
+  if (cryptoTicks.length) io.emit('tick', cryptoTicks) // array of ticks
+  if (stockTicks.length) io.to(AUTHED_ROOM).emit('tick', stockTicks)
 }, FLUSH_MS)
 function pushTick(t: Tick) {
   latest.set(t.s, t)
@@ -382,6 +506,7 @@ async function keysForCookie(cookieHeader: string | undefined): Promise<AlpacaKe
 // --------------------------------- wiring ----------------------------------
 io.on('connection', (socket: Socket) => {
   const cookieHeader = socket.handshake.headers.cookie
+  const authed = socket.data.authed === true
 
   // Register ALL handlers SYNCHRONOUSLY first: the client emits 'sub' right on
   // connect, and awaiting the keys fetch before registering used to DROP that
@@ -394,6 +519,30 @@ io.on('connection', (socket: Socket) => {
       set = new Set()
       socketSyms.set(socket, set)
     }
+
+    if (!authed) {
+      // ---- GUEST MODE: public crypto channels only, hard limits ----
+      if (!guestEventAllowed(socket)) {
+        console.log('[guest] rate-limited sub', socket.id, `(${syms.length} sym(s) dropped)`)
+        return
+      }
+      const cryptoSyms = [...new Set(syms.filter(isCrypto))]
+      const fresh = cryptoSyms.filter((s) => !set.has(s))
+      const room = Math.max(0, GUEST_MAX_SYMBOLS - set.size)
+      const accepted = fresh.slice(0, room)
+      const dropped = syms.length - accepted.length
+      if (dropped > 0) {
+        console.log('[guest] rejected sub', socket.id, `${dropped} sym(s) (stocks and/or >${GUEST_MAX_SYMBOLS}-symbol cap)`)
+      }
+      if (accepted.length === 0) return
+      console.log('[guest] sub', socket.id, accepted.join(','))
+      acquire(accepted)
+      for (const s of accepted) set.add(s)
+      if (!binanceWs) binanceConnect()
+      else binanceSync()
+      return
+    }
+
     console.log('[sub]', socket.id, syms.join(','))
     acquire(syms)
     for (const s of syms) set.add(s)
@@ -415,6 +564,23 @@ io.on('connection', (socket: Socket) => {
     const syms = (payload?.symbols ?? []).filter((s) => typeof s === 'string' && s.length > 0)
     if (syms.length === 0) return
     const set = socketSyms.get(socket)
+
+    if (!authed) {
+      // ---- GUEST MODE: rate-limited; may only release its OWN symbols
+      // (never the shared refcounts of other sockets' subscriptions) ----
+      if (!guestEventAllowed(socket)) {
+        console.log('[guest] rate-limited unsub', socket.id)
+        return
+      }
+      if (!set || set.size === 0) return
+      const owned = syms.filter((s) => set.has(s))
+      if (owned.length === 0) return
+      for (const s of owned) set.delete(s)
+      release(owned)
+      binanceSync()
+      return
+    }
+
     if (set) for (const s of syms) set.delete(s)
     release(syms)
     binanceSync()
@@ -424,6 +590,7 @@ io.on('connection', (socket: Socket) => {
   })
 
   socket.on('disconnect', () => {
+    guestEvents.delete(socket)
     const set = socketSyms.get(socket)
     if (set) {
       release([...set])
@@ -443,6 +610,13 @@ io.on('connection', (socket: Socket) => {
       binanceUp = false
     }
   })
+
+  if (!authed) {
+    // guests never resolve Alpaca keys — they only ever get public Binance
+    // ticks (no /api/stream/keys call is made on their behalf)
+    console.log('[conn]', socket.id, 'guest (no valid session)')
+    return
+  }
 
   // keys resolve asynchronously — bind the socket to its (single) Alpaca
   // upstream when they arrive (until then its stock symbols do not stream)
@@ -524,7 +698,10 @@ function getOrCreateAlpacaConn(keys: AlpacaKeys): AlpacaConn {
 }
 
 httpServer.listen(PORT, () => {
-  console.log(`stream-service listening on :${PORT} (socket.io path '/')`)
+  console.log(
+    `stream-service listening on :${PORT} (socket.io path '/socket.io', handshake auth: ` +
+      `${process.env.AUTH_SECRET ? 'env' : 'default/dev'} secret, guests: crypto-only ≤${GUEST_MAX_SYMBOLS} syms, ≤${GUEST_MAX_EVENTS} ev/min)`,
+  )
 })
 
 process.on('SIGTERM', () => {

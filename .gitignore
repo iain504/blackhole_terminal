@@ -30,8 +30,16 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files — never commit real secrets; the example template is tracked
 .env*
+!.env.example
+
+# local secrets & data (also untracked from git history going forward)
+db/*.db
+db/*.db-journal
+db/backups/
+upload/*.tar
+upload/*.zip
 
 # vercel
 .vercel

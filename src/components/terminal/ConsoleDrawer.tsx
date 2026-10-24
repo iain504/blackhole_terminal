@@ -2,7 +2,9 @@
 
 // Foldable bottom console (Task: "create a bottom console small tab. foldable").
 // Collapsed: one slim bar above the footer. Expanded: scrollable event log
-// (alerts, fills, feed status, layout saves). State persists via localStorage.
+// (alerts, fills, feed status, layout saves). Fold state persists via
+// localStorage; the log itself persists via the console-log bus (last ~100
+// entries → sessionStorage, debounced on append, hydrated at module load).
 
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { ChevronDown, ChevronUp, Terminal, Trash2 } from 'lucide-react'

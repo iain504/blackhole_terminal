@@ -17,15 +17,28 @@ import ReportTab from './tabs/ReportTab'
 import AlgoTab from './tabs/AlgoTab'
 import { StrategyDrawer } from './StrategyDrawer'
 import { useToast } from '@/hooks/use-toast'
-import { BellRing, Clock, Home, Loader2, Settings2 } from 'lucide-react'
+import { BellRing, Clock, Home, Keyboard, Loader2, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import {
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog'
 import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
+import { onConnectChange, type StreamStatus } from '@/lib/stream-client'
 import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
 import { APP_VERSION } from '@/generated/version'
+
+// ---- layout autosave conflict tracking (Task 4-c) -------------------------
+// The server (once baseUpdatedAt checking lands) answers a concurrent save
+// with 409 + the latest stored layout in the body. We remember the last
+// updatedAt the server told us about (load/save responses and the 409 body)
+// and send it with every save. Opaque value — ISO string or epoch — whatever
+// the route returns; nothing changes while the server omits it.
+let layoutBaseUpdatedAt: string | number | null = null
+let lastConflictToastAt = 0 // one conflict toast per episode, not per retry
 
 export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const user = useTerminal((s) => s.user)
@@ -37,6 +50,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [alertsOpen, setAlertsOpen] = useState(false)
   const [strategiesOpen, setStrategiesOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const meFetched = useRef(false)
 
   const loadUserData = useCallback(async (u: SessionUser) => {
@@ -46,6 +60,10 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       if (res.ok) {
         const json = await res.json()
         if (json.data) store.hydrateFromServer(json.data)
+        // Task 4-c: remember the server's layout timestamp so the autosave can
+        // send baseUpdatedAt (conflict detection across tabs). The route does
+        // not return updatedAt yet — this stays null until it does.
+        if (json.updatedAt != null) layoutBaseUpdatedAt = json.updatedAt
       }
     } catch { /* offline */ }
     if (!useTerminal.getState().activeTabId) {
@@ -71,7 +89,8 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     })()
   }, [setUser, setHydrated, loadUserData])
 
-  // Autosave layout every 5s when dirty (Task 16 #3)
+  // Autosave layout every 5s when dirty (Task 16 #3); Task 4-c adds
+  // baseUpdatedAt + 409 convergence when another tab saved first.
   useEffect(() => {
     if (!user) return
     const timer = setInterval(() => {
@@ -81,16 +100,55 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       fetch('/api/layout', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ data }),
+        body: JSON.stringify({ data, baseUpdatedAt: layoutBaseUpdatedAt }),
       })
-        .then((r) => {
-          if (r.ok) store.markLayoutClean()
-          else ttLog('layout', `Autosave failed (HTTP ${r.status}) — will retry`, 'warn')
+        .then(async (r) => {
+          if (r.ok) {
+            store.markLayoutClean()
+            // the route may report the new updatedAt once conflict checking lands
+            try {
+              const j = await r.json()
+              if (j && j.updatedAt != null) layoutBaseUpdatedAt = j.updatedAt
+            } catch { /* body optional */ }
+            return
+          }
+          if (r.status === 409) {
+            // Another tab saved first. Adopt the server's newer layout (the
+            // store's hydrateFromServer sanitizes + clears layoutDirty), then
+            // rearm baseUpdatedAt so subsequent saves succeed.
+            const json = (await r.json().catch(() => null)) as { server?: { updatedAt?: string | number; data?: unknown } } | null
+            const server = json?.server
+            const adopt = useTerminal.getState()
+            if (server && server.data != null) {
+              adopt.hydrateFromServer(server.data)
+              if (server.updatedAt != null) layoutBaseUpdatedAt = server.updatedAt
+              adopt.markLayoutClean()
+            } else {
+              // defensive: a 409 without a payload — pull the latest explicitly
+              try {
+                const g = await fetch('/api/layout')
+                if (g.ok) {
+                  const gj = await g.json()
+                  if (gj.data) useTerminal.getState().hydrateFromServer(gj.data)
+                  if (gj.updatedAt != null) layoutBaseUpdatedAt = gj.updatedAt
+                  useTerminal.getState().markLayoutClean()
+                }
+              } catch { /* offline — stay dirty, next tick retries */ }
+            }
+            ttLog('layout', 'Layout conflict (409) — adopted the latest server layout', 'warn')
+            const now = Date.now()
+            if (now - lastConflictToastAt > 15000) {
+              lastConflictToastAt = now
+              toast({ title: 'Layout changed in another tab — loaded the latest' })
+            }
+            return
+          }
+          ttLog('layout', `Autosave failed (HTTP ${r.status}) — will retry`, 'warn')
         })
         .catch(() => ttLog('layout', 'Autosave failed (network) — will retry', 'warn'))
     }, 5000)
     return () => clearInterval(timer)
-  }, [user])
+  }, [user, toast])
 
   // Flush unsaved layout on tab close
   useEffect(() => {
@@ -98,7 +156,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     const handler = () => {
       const store = useTerminal.getState()
       if (!store.layoutDirty) return
-      const data = JSON.stringify({ data: store.layoutSnapshot() })
+      const data = JSON.stringify({ data: store.layoutSnapshot(), baseUpdatedAt: layoutBaseUpdatedAt })
       navigator.sendBeacon?.('/api/layout', new Blob([data], { type: 'application/json' }))
     }
     window.addEventListener('beforeunload', handler)
@@ -118,6 +176,28 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  // Keyboard shortcuts cheatsheet (Task 4-c): "?" (shift+/) opens it whenever
+  // no input/textarea/select/contentEditable is focused; the header's Keyboard
+  // icon button opens it via the tt:open-shortcuts event. Esc/overlay click
+  // close for free with the Dialog primitive (focus trap included).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '?') return
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return
+      e.preventDefault()
+      setShortcutsOpen(true)
+    }
+    const open = () => setShortcutsOpen(true)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('tt:open-shortcuts', open)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('tt:open-shortcuts', open)
+    }
   }, [])
 
   // Alert engine polling (Task 14 #2 / 16 #6) — every 30s
@@ -293,6 +373,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
         {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
         {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
+        <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       </>
     )
   }
@@ -313,6 +394,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
       {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
+      <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       {/* footer stays glued to bottom on short viewports */}
       <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
         <span className="flex min-w-0 items-center">
@@ -329,6 +411,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
           <span className="truncate">
             TradeTerminal · data: <span className="text-zinc-400">Alpaca</span>
             {useTerminal.getState().tabs.length > 0 && <BadgeDemoInline />}
+            <StreamStatusChip />
           </span>
         </span>
         <span className="flex items-center gap-3">
@@ -440,6 +523,72 @@ function useDemoMeta(): { demo: boolean; reason?: string } {
     }
   }, [])
   return meta
+}
+
+// Task 4-c: live/reconnecting indicator for the price stream — purely visual,
+// persists nothing. Emerald "Live" = socket.io connected; amber "Reconnecting…"
+// = socket down and auto-retrying (1s→15s backoff); gray "Polling" = the stream
+// never opened (no subscription yet) and REST polling is the fallback. The
+// aria-live region (with sr-only text) announces status changes to screen
+// readers without shouting (polite).
+function StreamStatusChip() {
+  const [status, setStatus] = useState<StreamStatus>('idle')
+  useEffect(() => onConnectChange(setStatus), [])
+  const meta =
+    status === 'connected'
+      ? { dot: 'bg-emerald-400', text: 'Live', sr: 'Price stream connected — real-time ticks' }
+      : status === 'reconnecting'
+        ? { dot: 'bg-amber-400 animate-pulse', text: 'Reconnecting…', sr: 'Price stream reconnecting — REST polling fallback' }
+        : { dot: 'bg-zinc-500', text: 'Polling', sr: 'Price stream not in use — REST polling' }
+  return (
+    <span className="ml-2 inline-flex items-center gap-1.5 align-middle" title={meta.sr} aria-live="polite">
+      <span className={cn('h-1.5 w-1.5 rounded-full', meta.dot)} aria-hidden="true" />
+      <span>{meta.text}</span>
+      <span className="sr-only">{meta.sr}</span>
+    </span>
+  )
+}
+
+// Task 4-c: keyboard shortcuts cheatsheet. Honest list — only shortcuts that
+// actually exist in the terminal today (grepped keydown/contextmenu handlers).
+const SHORTCUTS: { keys: string; action: string }[] = [
+  { keys: 'Alt + Shift + E', action: 'Toggle extended-hours (pre/post-market) data on all charts' },
+  { keys: 'Right-click on a chart', action: 'Context menu — trade here, set an alarm, clone/delete a drawing, edit exits' },
+  { keys: 'Long-press ~0.5s (touch)', action: 'Same chart context menu on phones and tablets' },
+  { keys: 'Esc', action: 'Cancel an in-progress drawing drag, reset the drawing tool, close dialogs' },
+  { keys: '↑ / ↓ on a splitter', action: 'Nudge the Positions panel splitters (keyboard resize)' },
+  { keys: '?', action: 'Open this shortcuts dialog' },
+]
+
+function ShortcutsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md border-zinc-800 bg-zinc-900 text-zinc-200">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-sm font-semibold text-zinc-100">
+            <Keyboard className="h-4 w-4 text-emerald-500" aria-hidden="true" />
+            Keyboard shortcuts
+          </DialogTitle>
+          <DialogDescription className="text-xs text-zinc-500">
+            Shortcuts are ignored while you are typing in an input.
+          </DialogDescription>
+        </DialogHeader>
+        <ul className="space-y-2.5 pb-1">
+          {SHORTCUTS.map((s) => (
+            <li key={s.keys} className="flex items-start justify-between gap-3">
+              <span className="min-w-0 text-xs leading-snug text-zinc-300">{s.action}</span>
+              <kbd className="shrink-0 whitespace-nowrap rounded border border-zinc-700 bg-zinc-950 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
+                {s.keys}
+              </kbd>
+            </li>
+          ))}
+        </ul>
+        <p className="text-[10px] leading-snug text-zinc-600">
+          Tabs drag to reorder · panels and splitters drag to resize · everything else lives in the menus.
+        </p>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function ActiveTabContent() {

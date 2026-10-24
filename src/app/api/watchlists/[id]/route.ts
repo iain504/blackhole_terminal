@@ -1,28 +1,27 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
-import { readJson, handleError } from '@/lib/api-helpers'
+import { readJsonSafe, watchlistPatchSchema, zodBadRequest } from '@/lib/validation'
+import { handleError } from '@/lib/api-helpers'
 
-interface PatchBody {
-  name?: string
-  color?: string
-  sortOrder?: number
-  items?: string[]
-}
-
-// PATCH /api/watchlists/[id] — rename / recolor / reorder / replace items
+// PATCH /api/watchlists/[id] — rename / recolor / reorder / replace items.
+// Body parse-then-validated (zod): name trimmed 1..60, color hex, sortOrder int,
+// items = plain strings (symbols / "#Group" separators, ≤200) — 400 'Invalid body'.
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireUser()
     const { id } = await params
-    const body = await readJson<PatchBody>(req)
+    const raw = await readJsonSafe(req)
+    const parsed = watchlistPatchSchema.safeParse(raw)
+    if (!parsed.success) return zodBadRequest(parsed.error)
+    const body = parsed.data
     const list = await db.watchlist.findFirst({ where: { id, userId: user.id } })
     if (!list) return NextResponse.json({ error: 'Watchlist not found' }, { status: 404 })
     const data: Record<string, unknown> = {}
-    if (typeof body.name === 'string' && body.name.trim()) data.name = body.name.trim().slice(0, 40)
-    if (typeof body.color === 'string') data.color = body.color
-    if (typeof body.sortOrder === 'number') data.sortOrder = body.sortOrder
-    if (Array.isArray(body.items)) {
+    if (body.name !== undefined && body.name.trim()) data.name = body.name.trim().slice(0, 40)
+    if (body.color !== undefined) data.color = body.color
+    if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder
+    if (body.items !== undefined) {
       // entries starting with '#' are GROUP SEPARATORS, not symbols — keep
       // their case so group names render as the user typed them (real symbols
       // are uppercased)
@@ -30,7 +29,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         ...new Set(
           body.items
             .map((s) => {
-              const t = String(s).trim()
+              const t = s.trim()
               if (!t) return ''
               return t.startsWith('#') ? `#${t.slice(1).trim().slice(0, 30)}` : t.toUpperCase()
             })

@@ -11,6 +11,7 @@ import {
 } from './market-types'
 import { simBars, simQuote, simNews, simMarkers } from './simulator'
 import { getBinanceBars, getBinanceQuotes } from './binance'
+import { saveBars, loadBars, hasCoverage } from './bar-store'
 
 const DATA_BASE = 'https://data.alpaca.markets'
 const ALPACA_TIMEOUT_MS = 9000
@@ -90,6 +91,19 @@ interface UserSettings {
   telegramChatId?: string
 }
 
+/**
+ * Task 3-d (security) — env-key fallback gate. The process-wide
+ * APCA_API_KEY_ID/SECRET pair is only used when ALLOW_SHARED_BROKER === 'true'
+ * (default OFF). Without this gate ANY registered user could silently trade
+ * the shared broker account: this resolver also backs tradeFetch() in
+ * trading.ts (order placement), so the fallback must be an explicit operator
+ * opt-in, not an accident of deployment. Users otherwise trade with the keys
+ * they save in Settings.
+ */
+function sharedBrokerAllowed(): boolean {
+  return process.env.ALLOW_SHARED_BROKER === 'true'
+}
+
 export async function getAlpacaKeys(userId?: string): Promise<AlpacaKeys | null> {
   if (userId) {
     const user = await db.user.findUnique({ where: { id: userId } })
@@ -100,6 +114,7 @@ export async function getAlpacaKeys(userId?: string): Promise<AlpacaKeys | null>
       if (keyId && secret) return { keyId, secret }
     }
   }
+  if (!sharedBrokerAllowed()) return null
   const envId = process.env.APCA_API_KEY_ID
   const envSecret = process.env.APCA_API_SECRET_KEY
   if (envId && envSecret) return { keyId: envId, secret: envSecret }
@@ -241,6 +256,70 @@ export interface GetBarsOptions {
 }
 
 /**
+ * Task 3-d — serve a crypto DEEP window from the local bar store (SQLite)
+ * when it covers the requested span, ALWAYS refreshing the tail from Alpaca
+ * (one slice ≈ last 2 days, the deep fetcher's 7-day slice floor) so the
+ * newest closed bars are present and the store stays fresh. The forming bar
+ * is never persisted (it is still forwarded in the RESPONSE, matching the
+ * pre-store behavior where the route drops it). Returns null when the store
+ * can't serve (no coverage / DB trouble) — the caller then fetches the full
+ * window from Alpaca and saves it. Crypto bars are immutable once closed, so
+ * only the tail can ever change; stock bars stay out of the store entirely
+ * (split-adjustment risk).
+ */
+async function serveCryptoFromBarStore(
+  symbol: string,
+  timeframe: Timeframe,
+  keys: AlpacaKeys | null,
+  lookbackDays: number,
+): Promise<Bar[] | null> {
+  const tfSec = TIMEFRAMES[timeframe].seconds
+  const nowSec = Math.floor(Date.now() / 1000)
+  const fromSec = nowSec - lookbackDays * 86400
+  try {
+    const cov = await hasCoverage(symbol, timeframe, fromSec, nowSec, tfSec)
+    if (!cov.covered) return null
+    const dbBars = await loadBars(symbol, timeframe, fromSec, nowSec)
+    if (dbBars.length === 0) return null
+    // ALWAYS refresh the tail — the store alone can never serve stale bars.
+    let tail: Bar[] = []
+    if (keys) {
+      try {
+        tail = await getAlpacaCryptoBarsDeep(symbol, timeframe, keys, 2, new Date())
+      } catch {
+        tail = []
+      }
+    }
+    // merge: DB bars as the base, fresher tail bars overlay by time, then the
+    // tail's extra (newer) bars append — same ordering contract as the deep fetch
+    const tailMap = new Map<number, Bar>()
+    for (const b of tail) tailMap.set(b.time, b)
+    const merged = [...dbBars]
+    for (let i = 0; i < merged.length; i++) {
+      const t = tailMap.get(merged[i]!.time)
+      if (t) {
+        merged[i] = t
+        tailMap.delete(t.time)
+      }
+    }
+    for (const b of tailMap.values()) merged.push(b)
+    merged.sort((a, b) => a.time - b.time)
+    // persist the CLOSED tail bars (forming bar dropped — never cached)
+    const tailClosed = tail.filter((b) => b.time + tfSec <= nowSec && b.close > 0)
+    if (tailClosed.length > 0) {
+      const t0 = Date.now()
+      const n = await saveBars(symbol, timeframe, tailClosed)
+      console.log(`[bar-store] tail ${symbol} ${timeframe} n=${n} in ${Date.now() - t0}ms`)
+    }
+    console.log(`[bar-store] hit ${symbol} ${timeframe} n=${merged.length}`)
+    return merged
+  } catch (e) {
+    console.warn(`[bar-store] ${symbol} ${timeframe} unavailable:`, e instanceof Error ? e.message : e)
+    return null
+  }
+}
+
+/**
  * Deep crypto history via Alpaca v1beta3, fetched BACKWARD in time slices
  * anchored at `end` so the NEWEST bars are always complete. v1beta3 pages walk
  * forward from `start` (~1k bars/page, size varies), so one forward walk over a
@@ -316,9 +395,32 @@ export async function getBars(
   const needCryptoBars = Math.ceil((cryptoLookbackDays * 86400) / tf.seconds)
   if (isCryptoSymbol(symbol) && needCryptoBars > 9000 && !before) {
     const keys = await getAlpacaKeys(userId)
+    // Task 3-d — crypto bars are immutable: try the local store first (works
+    // even without keys when the cache is fresh). 1W/1M are aggregated from
+    // daily bars, so they never touch the store (raw bars only).
+    if (timeframe !== '1W' && timeframe !== '1M') {
+      const stored = await serveCryptoFromBarStore(symbol, timeframe, keys, cryptoLookbackDays)
+      if (stored && stored.length > 0) return { bars: stored, demo: false, source: 'alpaca' }
+    }
     if (keys) {
       const barsC = await getAlpacaCryptoBarsDeep(symbol, timeframe, keys, cryptoLookbackDays, new Date())
-      if (barsC.length > 0) return { bars: barsC, demo: false, source: 'alpaca' }
+      if (barsC.length > 0) {
+        // persist the complete window (closed bars only — the forming bar is
+        // never cached). Failures are non-fatal: the fetch result still ships.
+        if (timeframe !== '1W' && timeframe !== '1M') {
+          const tfSecS = TIMEFRAMES[timeframe].seconds
+          const nowSecS = Math.floor(Date.now() / 1000)
+          const closed = barsC.filter((b) => b.time + tfSecS <= nowSecS)
+          const t0 = Date.now()
+          try {
+            const nSaved = await saveBars(symbol, timeframe, closed)
+            console.log(`[bar-store] save ${symbol} ${timeframe} n=${nSaved} in ${Date.now() - t0}ms`)
+          } catch (e) {
+            console.warn(`[bar-store] save failed ${symbol} ${timeframe}:`, e instanceof Error ? e.message : e)
+          }
+        }
+        return { bars: barsC, demo: false, source: 'alpaca' }
+      }
       // Alpaca empty (feed down / rate-limited) -> Binance fallback below.
     }
   }

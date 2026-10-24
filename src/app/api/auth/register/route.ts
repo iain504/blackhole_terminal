@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { hashPassword, verifyPassword, setSessionCookie, createLoginTicket } from '@/lib/auth'
-import { verifyTotp } from '@/lib/totp'
+import { hashPassword, verifyPassword, setSessionCookie, createLoginTicket, clientIp } from '@/lib/auth'
+import { verifyTotp, encryptTotpSecret } from '@/lib/totp'
+import { rateLimit, resetRateLimit } from '@/lib/rate-limit'
 import { readJson, handleError } from '@/lib/api-helpers'
 
 interface RegisterBody {
@@ -11,9 +12,25 @@ interface RegisterBody {
   totpCode: string
 }
 
+function registrationEnabled(): boolean {
+  // Default CLOSED when unset — new deployments must opt in explicitly.
+  return (process.env.ALLOW_REGISTRATION || '').trim().toLowerCase() === 'true'
+}
+
 // POST /api/auth/register — creates account (password + TOTP verified), then signs in.
 export async function POST(req: Request) {
   try {
+    const ip = clientIp(req)
+    const rl = rateLimit(`reg:${ip}`, 5, 10 * 60_000)
+    if (!rl.ok) {
+      return NextResponse.json(
+        { error: 'Too many attempts — try again later' },
+        { status: 429, headers: { 'retry-after': String(rl.retryAfterSec) } }
+      )
+    }
+    if (!registrationEnabled()) {
+      return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
+    }
     const body = await readJson<RegisterBody>(req)
     const username = (body.username || '').trim()
     const password = body.password || ''
@@ -28,13 +45,15 @@ export async function POST(req: Request) {
     }
     const existing = await db.user.findUnique({ where: { username } })
     if (existing) {
-      return NextResponse.json({ error: 'Username already taken' }, { status: 409 })
+      // Anti-enumeration: same generic shape as any other failed attempt —
+      // never reveal that the username exists.
+      return NextResponse.json({ error: 'Cannot register' }, { status: 400 })
     }
     const user = await db.user.create({
       data: {
         username,
         passwordHash: hashPassword(password),
-        totpSecret: body.totpSecret,
+        totpSecret: encryptTotpSecret(body.totpSecret), // encrypted at rest
       },
     })
     // Seed default watchlist
@@ -54,13 +73,25 @@ interface LoginBody {
 }
 
 // PUT /api/auth/register — login step 1: password check → login ticket for TOTP step.
+// (NOT gated by ALLOW_REGISTRATION — this is the login flow.)
 export async function PUT(req: Request) {
   try {
+    const ip = clientIp(req)
+    const rl = rateLimit(`reg:${ip}`, 5, 10 * 60_000)
+    if (!rl.ok) {
+      return NextResponse.json(
+        { error: 'Too many attempts — try again later' },
+        { status: 429, headers: { 'retry-after': String(rl.retryAfterSec) } }
+      )
+    }
     const body = await readJson<LoginBody>(req)
     const user = await db.user.findUnique({ where: { username: (body.username || '').trim() } })
     if (!user || !verifyPassword(body.password || '', user.passwordHash)) {
       return NextResponse.json({ error: 'Invalid username or password' }, { status: 401 })
     }
+    // Successful password check clears the IP budget so legitimate logins
+    // never accumulate toward the failure limit.
+    resetRateLimit(`reg:${ip}`)
     return NextResponse.json({ ticket: createLoginTicket(user.id), username: user.username })
   } catch (e) {
     return handleError(e)

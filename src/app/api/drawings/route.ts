@@ -2,7 +2,8 @@ import { NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
-import { readJson, handleError } from '@/lib/api-helpers'
+import { readJsonSafe, drawingCreateSchema, zodBadRequest } from '@/lib/validation'
+import { handleError } from '@/lib/api-helpers'
 
 interface DrawingPoint {
   time?: number | null
@@ -45,24 +46,18 @@ export async function GET(req: Request) {
   }
 }
 
-interface CreateBody {
-  symbol: string
-  kind: string
-  points: DrawingPoint[]
-  color?: string
-  width?: number
-  meta?: Record<string, unknown> | null
-}
-
-// POST /api/drawings — create
+// POST /api/drawings — create.
+// Body parse-then-validated (zod): symbol charset, kind whitelist (matches the
+// client's DrawingKind), point shape ({time, price, pane}), color hex, width
+// 1..10, bounded meta — 400 'Invalid body' with the first issue message.
 export async function POST(req: Request) {
   try {
     const user = await requireUser()
-    const body = await readJson<CreateBody>(req)
-    const symbol = (body.symbol || '').toUpperCase()
-    if (!symbol || !body.kind || !Array.isArray(body.points)) {
-      return NextResponse.json({ error: 'symbol, kind, points required' }, { status: 400 })
-    }
+    const raw = await readJsonSafe(req)
+    const parsed = drawingCreateSchema.safeParse(raw)
+    if (!parsed.success) return zodBadRequest(parsed.error)
+    const body = parsed.data
+    const symbol = body.symbol.toUpperCase()
     const d = await db.drawing.create({
       data: {
         userId: user.id,

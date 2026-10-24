@@ -1,7 +1,8 @@
 // Diagnostic: what does Alpaca report for a SHORT position's qty fields?
 // Read-only — no POST/DELETE/PATCH.
-const KEY = 'PK***ROTATED***'
-const SEC = '***ALPACA-SECRET-REMOVED***'
+const KEY = process.env.APCA_API_KEY_ID
+const SEC = process.env.APCA_API_KEY_SECRET
+if (!KEY || !SEC) { console.error('Missing APCA_API_KEY_ID / APCA_API_KEY_SECRET env vars'); process.exit(1) }
 const BASE = 'https://paper-api.alpaca.markets'
 const H = { 'APCA-API-KEY-ID': KEY, 'APCA-API-SECRET-KEY': SEC, 'content-type': 'application/json' }
 

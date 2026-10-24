@@ -21,7 +21,8 @@ await api('POST', '/api/auth/login/verify', { ticket: (await api('PUT', '/api/au
 const r = await api('DELETE', '/api/trading/positions/BTC%2FUSD?mode=paper')
 console.log('flatten BTC/USD:', r.status, JSON.stringify(r.json).slice(0, 200))
 await new Promise((x) => setTimeout(x, 3000))
-const KEY='PK***ROTATED***', SEC='***ALPACA-SECRET-REMOVED***'
+const KEY = process.env.APCA_API_KEY_ID, SEC = process.env.APCA_API_KEY_SECRET
+if (!KEY || !SEC) { console.error('Missing APCA_API_KEY_ID / APCA_API_KEY_SECRET env vars'); process.exit(1) }
 const h={'APCA-API-KEY-ID':KEY,'APCA-API-SECRET-KEY':SEC}
 const p = await fetch('https://paper-api.alpaca.markets/v2/positions',{headers:h}).then(r=>r.json())
 console.log('positions now:', JSON.stringify(p.map(q=>({sym:q.symbol,qty:q.qty}))))

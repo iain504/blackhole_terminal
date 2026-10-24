@@ -122,6 +122,27 @@ export function TradeTicket({
   // bracket) and SL/TP are ignored
   const trailActive = Number.isFinite(parseFloat(trailPct)) && parseFloat(trailPct) > 0
 
+  // ---- Task 4-c: inline field validation -----------------------------------
+  // Derived from state on EVERY render, so it re-evaluates on each keystroke
+  // (validate-on-change, not just on blur). Mirrors submit()'s own guards —
+  // the submit button is disabled while anything is invalid, and the existing
+  // toast-on-error path stays as a defensive backstop.
+  const qtyNum = parseFloat(qty)
+  const qtyError: string | null =
+    !qty.trim() || !Number.isFinite(qtyNum) || qtyNum <= 0
+      ? 'Quantity must be greater than 0'
+      : !isCrypto && !Number.isInteger(qtyNum)
+        ? 'Stocks require a whole number of shares'
+        : null
+  // limit price only matters for a PLAIN limit order — a trailing stop replaces
+  // the entry type entirely (submit deletes type/limit_price in that mode)
+  const limitNum = parseFloat(limitPrice)
+  const limitError: string | null =
+    orderType === 'limit' && !trailActive && (!limitPrice.trim() || !Number.isFinite(limitNum) || limitNum <= 0)
+      ? 'Limit price is required and must be greater than 0'
+      : null
+  const formInvalid = qtyError != null || limitError != null
+
   // load saved trade mode + default TP/SL percent when opened / mode toggles
   useEffect(() => {
     let alive = true
@@ -434,8 +455,18 @@ export function TradeTicket({
               const n = parseFloat(qty)
               if (Number.isFinite(n) && n > 0 && !Number.isInteger(n)) setQty(String(Math.floor(n)))
             }}
-            className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
+            aria-invalid={qtyError ? true : undefined}
+            aria-describedby={qtyError ? 'tt-qty-error' : undefined}
+            className={cn(
+              'mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs',
+              qtyError && 'border-rose-500/70 focus-visible:ring-rose-500/40',
+            )}
           />
+          {qtyError && (
+            <p id="tt-qty-error" className="mt-0.5 text-[10px] leading-snug text-rose-400">
+              {qtyError}
+            </p>
+          )}
         </div>
         <div className="col-span-1">
           <Label htmlFor="tt-type" className="text-[10px] text-zinc-400">Order type</Label>
@@ -488,8 +519,18 @@ export function TradeTicket({
               value={limitPrice}
               onChange={(e) => setLimitPrice(e.target.value)}
               placeholder={refPrice ? String(refPrice) : ''}
-              className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs"
+              aria-invalid={limitError ? true : undefined}
+              aria-describedby={limitError ? 'tt-limit-error' : undefined}
+              className={cn(
+                'mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs',
+                limitError && 'border-rose-500/70 focus-visible:ring-rose-500/40',
+              )}
             />
+            {limitError && (
+              <p id="tt-limit-error" className="mt-0.5 text-[10px] leading-snug text-rose-400">
+                {limitError}
+              </p>
+            )}
           </div>
         )}
         <div className="col-span-1">
@@ -615,7 +656,7 @@ export function TradeTicket({
 
       <Button
         onClick={() => void submit()}
-        disabled={submitting}
+        disabled={submitting || formInvalid}
         className={cn(
           'mt-2 h-auto min-h-8 w-full whitespace-normal px-2 py-1 font-semibold leading-snug',
           side === 'buy' ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-600 text-white hover:bg-rose-500',

@@ -2,27 +2,26 @@ import { NextResponse } from 'next/server'
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
-import { readJson, handleError } from '@/lib/api-helpers'
+import { readJsonSafe, drawingPatchSchema, zodBadRequest } from '@/lib/validation'
+import { handleError } from '@/lib/api-helpers'
 
-interface PatchBody {
-  points?: { time?: number | null; price: number }[]
-  color?: string
-  width?: number
-  meta?: Record<string, unknown> | null
-}
-
-// PATCH /api/drawings/[id] — move/resize/recolor after draw
+// PATCH /api/drawings/[id] — move/resize/recolor after draw.
+// Body parse-then-validated (zod); present fields are applied exactly as before
+// (points replace, color/width update, meta null clears — meta !== undefined).
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireUser()
     const { id } = await params
-    const body = await readJson<PatchBody>(req)
+    const raw = await readJsonSafe(req)
+    const parsed = drawingPatchSchema.safeParse(raw)
+    if (!parsed.success) return zodBadRequest(parsed.error)
+    const body = parsed.data
     const d = await db.drawing.findFirst({ where: { id, userId: user.id } })
     if (!d) return NextResponse.json({ error: 'Drawing not found' }, { status: 404 })
     const data: Prisma.DrawingUpdateInput = {}
-    if (Array.isArray(body.points)) data.points = body.points as unknown as Prisma.InputJsonValue
-    if (typeof body.color === 'string') data.color = body.color
-    if (typeof body.width === 'number') data.width = body.width
+    if (body.points !== undefined) data.points = body.points as unknown as Prisma.InputJsonValue
+    if (body.color !== undefined) data.color = body.color
+    if (body.width !== undefined) data.width = body.width
     if (body.meta !== undefined) data.meta = body.meta ? (body.meta as unknown as Prisma.InputJsonValue) : Prisma.JsonNull
     const updated = await db.drawing.update({ where: { id }, data })
     return NextResponse.json({

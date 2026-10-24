@@ -1,11 +1,21 @@
 // Lightweight session auth: scrypt password hashing + HMAC-signed cookie tokens.
 // 2FA is enforced with TOTP at login (see /api/auth/*).
 import crypto from 'crypto'
-import { cookies } from 'next/headers'
+import { cookies, headers } from 'next/headers'
 import { db } from '@/lib/db'
 
-const SECRET =
-  process.env.AUTH_SECRET || 'zai-tradeterminal-local-dev-secret'
+// Fail closed: never sign/verify sessions with a missing or publicly-known
+// secret (the old hardcoded default made cookies forgeable). Next.js loads
+// .env at boot, so a missing value here means the deployment is misconfigured.
+const SECRET = process.env.AUTH_SECRET
+if (!SECRET || SECRET === 'zai-tradeterminal-local-dev-secret') {
+  throw new Error(
+    'AUTH_SECRET is not set (or is the known public default). ' +
+      "Generate one with: bun -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\" " +
+      'and put it in .env as AUTH_SECRET=<hex>.'
+  )
+}
+const SESSION_SECRET: string = SECRET
 
 export const SESSION_COOKIE = 'tt_session'
 const SESSION_TTL_S = 60 * 60 * 24 * 30 // 30 days
@@ -29,7 +39,7 @@ export function verifyPassword(password: string, stored: string): boolean {
 }
 
 function sign(data: string): string {
-  return crypto.createHmac('sha256', SECRET).update(data).digest('hex')
+  return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex')
 }
 
 /** Session token: userId.expiry.signature */
@@ -71,18 +81,34 @@ export function verifyLoginTicket(ticket: string): string | null {
 }
 
 export async function setSessionCookie(userId: string) {
-  const store = await cookies()
+  const [store, hdrs] = await Promise.all([cookies(), headers()])
+  const proto = (hdrs.get('x-forwarded-proto') || '').split(',')[0].trim()
   store.set(SESSION_COOKIE, createSessionToken(userId), {
     httpOnly: true,
     sameSite: 'lax',
     path: '/',
     maxAge: SESSION_TTL_S,
+    secure: proto === 'https', // keep http (localhost) working
   })
 }
 
 export async function clearSessionCookie() {
-  const store = await cookies()
-  store.set(SESSION_COOKIE, '', { httpOnly: true, path: '/', maxAge: 0 })
+  const [store, hdrs] = await Promise.all([cookies(), headers()])
+  const proto = (hdrs.get('x-forwarded-proto') || '').split(',')[0].trim()
+  store.set(SESSION_COOKIE, '', {
+    httpOnly: true,
+    path: '/',
+    maxAge: 0,
+    secure: proto === 'https',
+  })
+}
+
+/** Best-effort client IP for rate limiting (Caddy sets x-forwarded-for). */
+export function clientIp(req: Request): string {
+  const xff = req.headers.get('x-forwarded-for')
+  const first = xff?.split(',')[0]?.trim()
+  if (first) return first
+  return req.headers.get('x-real-ip')?.trim() || 'unknown'
 }
 
 export async function getSessionUserId(): Promise<string | null> {

@@ -57,8 +57,9 @@ export interface MarkerData {
 
 export interface HeatSymbol {
   symbol: string
-  pct: number
-  price: number
+  /** null = no quote data (dead feed) — client renders "–", never fake zeros */
+  pct: number | null
+  price: number | null
 }
 
 export interface HeatGroup {

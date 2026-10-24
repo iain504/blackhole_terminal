@@ -91,6 +91,11 @@ export interface BacktestConfig {
   // (buy fills at ask, sell at bid — a round trip pays the full spread);
   // resting TP limits still fill at their price. Stacks with slippageBps.
   spreadBps?: number
+  // Task 3-d — buying-power cap. Max position notional = capital × maxNotionalX
+  // (default 1 = no leverage beyond capital). Every entry (fixed AND risk-
+  // derived sizing) is clamped to maxQty = (capital × maxNotionalX) / entryPx;
+  // a clamped position worth < $10 is skipped as dust (counted in `suppressed`).
+  maxNotionalX?: number
 }
 
 export interface BacktestTrade {
@@ -133,6 +138,9 @@ export interface BacktestMetrics {
   to: number // last bar time (unix s)
   openAtEnd: boolean // position was marked-to-market at the last bar
   suppressed: number // signals suppressed by session/cap/window/cooldown/edge gates
+  // Task 3-d — short entries DROPPED because the market is long-only (Alpaca
+  // crypto has no shorting — trading.ts). 0 when absent/undefined for old data.
+  skippedShorts?: number
 }
 
 export interface BacktestResult {
@@ -347,12 +355,27 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let pos: Pos | null = null
   let pending: Pending | null = null
   let cash = cfg.capital
+  // Task 3-d — MARK-TO-MARKET drawdown: peak/trough are tracked on the
+  // realized+unrealized equity (cash while flat, cash + open P&L at every
+  // bar close while a position is open), so an open trade that dives and
+  // recovers is no longer invisible to maxDrawdownPct. The DISPLAYED equity
+  // curve stays realized-only (unchanged); metrics.maxDrawdown* are MTM.
   let peak = cfg.capital
   let maxDD = 0
   let maxDDPct = 0
+  const mtmTrack = (eq: number): void => {
+    if (!Number.isFinite(eq)) return
+    if (eq > peak) peak = eq
+    const dd = peak - eq
+    if (dd > maxDD) {
+      maxDD = dd
+      maxDDPct = peak > 0 ? (dd / peak) * 100 : 0
+    }
+  }
   let tradesToday = 0
   let curDay = -1
   let suppressed = 0
+  let skippedShorts = 0 // Task 3-d — crypto long-only drops
   // timeframe seconds — min positive bar delta over the head of the series
   // (session/weekend gaps only inflate deltas, so the min is the true tf)
   let tfSec = 60
@@ -376,12 +399,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     const pnl = pnl0 - feeCost
     cash += pnl
     equity.push({ t: exitTime, equity: cash })
-    if (cash > peak) peak = cash
-    const dd = peak - cash
-    if (dd > maxDD) {
-      maxDD = dd
-      maxDDPct = peak > 0 ? (dd / peak) * 100 : 0
-    }
+    mtmTrack(cash) // realized point of the MTM series (peak/DD updated here)
     // cooldown gate: block entries for N minutes after ANY position close.
     // Anchored at the closing bar's CLOSE (exitTime is the bar OPEN — add the
     // bar duration), matching the live engine's wall-clock gate which arms at
@@ -476,13 +494,30 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
           }
         }
       }
-      pos = {
-        side: dir,
-        qty,
-        entryPx: fill,
-        entryTime: bar.time,
-        tpPx: cfg.tpMode === 'pct' ? pctPx(cfg.tpValue, true) : null,
-        slPx,
+      // Task 3-d — NOTIONAL CAP (buying power): effectiveQty is the requested
+      // size clamped to capital × maxNotionalX worth of the fill price, for
+      // BOTH sizing modes. The TP/SL brackets derive from the same fill, so
+      // the capped position carries proportionally capped bracket P&L. A
+      // clamped position worth < $10 is dust → skip the trade entirely.
+      const capX = cfg.maxNotionalX != null && cfg.maxNotionalX > 0 ? cfg.maxNotionalX : 1
+      const maxNotional = cfg.capital * capX
+      const maxQty = cfg.isCrypto
+        ? Math.floor((maxNotional / fill) * 1e4) / 1e4 // crypto granularity 4dp
+        : Math.floor(maxNotional / fill) // stocks stay whole-share
+      const effQty = Math.min(qty, maxQty)
+      if (!(effQty > 0) || effQty * fill < 10) {
+        // dust — notional below the exchange-minimum ballpark: no trade
+        pending = null
+        suppressed++
+      } else {
+        pos = {
+          side: dir,
+          qty: effQty,
+          entryPx: fill,
+          entryTime: bar.time,
+          tpPx: cfg.tpMode === 'pct' ? pctPx(cfg.tpValue, true) : null,
+          slPx,
+        }
       }
       pending = null
     }
@@ -536,22 +571,29 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       pos = null
     }
     if (dec.entry && !pos && !pending) {
-      // gates (mirrored from the engine's entry path) + re-entry control
-      const cooldownBlocked = cooldownUntil != null && bar.time < cooldownUntil
-      const edgeBlocked = cfg.requireNewSignal && (
-        (dec.entry.side === 'buy' && prevLongSig) ||
-        (dec.entry.side === 'sell' && prevShortSig))
-      if (cfg.rthOnly && !cfg.isCrypto && rth[i] !== 1) suppressed++
-      else if (cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
-      else if (cooldownBlocked) suppressed++
-      else if (edgeBlocked) suppressed++
-      else if (tradesToday >= cfg.maxTradesDay) suppressed++
-      else {
-        pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
-        tradesToday++
-        if (strategy === 'orb15') {
-          if (dec.entry.side === 'buy') firedLong = true
-          else firedShort = true
+      // Task 3-d — CRYPTO LONG-ONLY: Alpaca crypto cannot short (trading.ts
+      // emulated exit legs are sell-only, qty clamped ≥ 0). Short signals are
+      // counted and dropped — the live engine is intentionally untouched.
+      if (cfg.isCrypto && dec.entry.side === 'sell') {
+        skippedShorts++
+      } else {
+        // gates (mirrored from the engine's entry path) + re-entry control
+        const cooldownBlocked = cooldownUntil != null && bar.time < cooldownUntil
+        const edgeBlocked = cfg.requireNewSignal && (
+          (dec.entry.side === 'buy' && prevLongSig) ||
+          (dec.entry.side === 'sell' && prevShortSig))
+        if (cfg.rthOnly && !cfg.isCrypto && rth[i] !== 1) suppressed++
+        else if (cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
+        else if (cooldownBlocked) suppressed++
+        else if (edgeBlocked) suppressed++
+        else if (tradesToday >= cfg.maxTradesDay) suppressed++
+        else {
+          pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
+          tradesToday++
+          if (strategy === 'orb15') {
+            if (dec.entry.side === 'buy') firedLong = true
+            else firedShort = true
+          }
         }
       }
     }
@@ -559,6 +601,13 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // gates/outcomes) so the fresh-signal edge fires only on false→true
     prevLongSig = dec.entry?.side === 'buy'
     prevShortSig = dec.entry?.side === 'sell'
+    // ---- Task 3-d — MTM drawdown sample: while a position is open, mark it
+    // to THIS bar's close and track the peak/trough of realized+unrealized
+    // equity (close-based MTM is the standard conservative choice given the
+    // stop-first intrabar rule). Flat bars are already tracked in closeTrade.
+    if (pos) {
+      mtmTrack(cash + (bar.close - pos.entryPx) * pos.qty * pos.side)
+    }
   }
 
   // ---- position still open at the end of data → mark to market ----
@@ -622,6 +671,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     to: bars[n - 1]?.time ?? 0,
     openAtEnd,
     suppressed,
+    skippedShorts,
   }
   return { metrics, trades, equity, warmupBars: warmup }
 }
@@ -777,11 +827,25 @@ export function optimizeBacktest(
 // strategies are ranked for the user to apply.
 // ---------------------------------------------------------------------------
 
+export interface SweepOos {
+  netPct: number
+  profitFactor: number
+  winRate: number
+  maxDrawdownPct: number
+  trades: number
+}
+
 export interface SweepRow {
   strategy: AlgoStrategyId
   params: Record<string, number> // FULL param set (defaults + overrides)
   score: number
   metrics: BacktestMetrics
+  // Task 3-d — walk-forward verification: the SAME row re-run untouched on the
+  // out-of-sample tail (null when OOS produced < 3 trades or OOS is off).
+  oos?: SweepOos | null
+  // Task 3-d — true when ANY tuned param sits on its grid min/max (weakest
+  // evidence: the optimum may lie beyond the searched grid).
+  boundary?: boolean
 }
 
 export interface SweepPerStrategy {
@@ -802,6 +866,10 @@ export interface SweepResult {
   skipped: number
   elapsedMs: number
   perStrategy: SweepPerStrategy[]
+  // Task 3-d — the OOS fraction actually used (0 = walk-forward off) and the
+  // total short signals dropped across every sim by the crypto long-only rule.
+  oosFraction?: number
+  skippedShorts?: number
 }
 
 const SWEEP_VALUES_PER_DIM = 5
@@ -854,40 +922,78 @@ function sweepSig(strategy: AlgoStrategyId, params: Record<string, number>): str
  * the top `topX` rows. Rows that failed minTrades are never listed.
  * The user's cross-cutting config (qty/sizing/TP-SL/session guards/cost
  * model/capital) is held fixed — only strategy params are optimized.
+ *
+ * Task 3-d — walk-forward (OOS) + boundary flags:
+ *   • `oosFraction` (0..0.5, default 0) splits the series at floor(n·(1−f)):
+ *     the sweep runs IN-SAMPLE on bars[0..split) (minTrades applies to IS as
+ *     always), then each selected row is RE-RUN untouched on the OOS tail
+ *     bars[split..n) (warmup from the OOS start) and the row carries `oos`
+ *     metrics (null when the OOS window produced < 3 trades).
+ *   • every row carries `boundary` — true when any tuned param equals its
+ *     grid min/max (the winner sits on the edge of the searched grid).
  */
 export function sweepStrategies(
   series: BacktestSeries,
   base: BacktestConfig,
-  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number },
+  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number },
 ): SweepResult {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const topX = Math.min(20, Math.max(1, Math.round(opts?.topX ?? 8)))
+  const oosFraction = Math.min(0.5, Math.max(0, Number(opts?.oosFraction) || 0))
+  // ---- walk-forward split (Task 3-d) ----
+  // IS = the head (tuning window, ALL sweep runs happen here) · OOS = the
+  // untouched tail used ONLY to re-verify the selected rows afterwards.
+  const split = oosFraction > 0 ? Math.floor(series.n * (1 - oosFraction)) : series.n
+  const oosSeries = oosFraction > 0 && split < series.n && series.n - split >= 30
+    ? prepareSeries(series.bars.slice(split))
+    : null
+  const isSeries = oosSeries ? prepareSeries(series.bars.slice(0, split)) : series
   const perStrategy: SweepPerStrategy[] = []
   const candidates: SweepRow[] = []
   let evaluated = 0
   let skipped = 0
+  let skippedShorts = 0
   for (const sid of ALGO_STRATEGY_IDS) {
     const def = ALGO_STRATEGIES[sid]
     const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults } }
+    // grid bounds per dim (same sanitized value sets the optimizer uses) —
+    // captured BEFORE the runs so every candidate can be boundary-flagged
+    const bounds = autoOptimizeRanges(sid).map((r) => {
+      const vals = dimValues(r)
+      return { key: r.key, min: vals[0], max: vals[vals.length - 1] }
+    })
+    const onBoundary = (params: Record<string, number>): boolean =>
+      bounds.some((b) => {
+        const v = params[b.key]
+        return v != null && (Math.abs(v - b.min) < 1e-9 || Math.abs(v - b.max) < 1e-9)
+      })
     // (1) untouched defaults — always a candidate
-    const baseRun = runBacktest(series, cfg)
+    const baseRun = runBacktest(isSeries, cfg)
     evaluated++
+    skippedShorts += baseRun.metrics.skippedShorts ?? 0
     const baseScore = backtestScore(baseRun.metrics, minTrades)
     if (baseScore > -Infinity) {
-      candidates.push({ strategy: sid, params: { ...def.defaults }, score: baseScore, metrics: baseRun.metrics })
+      candidates.push({ strategy: sid, params: { ...def.defaults }, score: baseScore, metrics: baseRun.metrics, boundary: onBoundary(def.defaults) })
     }
     let scorable = baseScore > -Infinity ? 1 : 0
     let bestScore = baseScore > -Infinity ? baseScore : null
     // (2) auto grid search over the strategy's numeric params
-    const opt = optimizeBacktest(series, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy })
+    const opt = optimizeBacktest(isSeries, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy })
     evaluated += opt.evaluated
     skipped += opt.skipped
     for (const row of opt.results) {
       if (!(row.score > -Infinity)) continue
       scorable++
       if (bestScore == null || row.score > bestScore) bestScore = row.score
-      candidates.push({ strategy: sid, params: { ...def.defaults, ...row.params }, score: row.score, metrics: row.metrics })
+      skippedShorts += row.metrics.skippedShorts ?? 0
+      candidates.push({
+        strategy: sid,
+        params: { ...def.defaults, ...row.params },
+        score: row.score,
+        metrics: row.metrics,
+        boundary: onBoundary({ ...def.defaults, ...row.params }),
+      })
     }
     perStrategy.push({
       strategy: sid,
@@ -909,13 +1015,33 @@ export function sweepStrategies(
     return true
   })
   unique.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
+  // ---- walk-forward verification of the SELECTED rows (Task 3-d) ----
+  const rows: SweepRow[] = unique.slice(0, topX).map((r) => {
+    if (!oosSeries) return { ...r, oos: null }
+    const oosCfg: BacktestConfig = { ...base, strategy: r.strategy, params: { ...r.params } }
+    const oosRun = runBacktest(oosSeries, oosCfg)
+    const m = oosRun.metrics
+    // < 3 OOS trades is not evidence either way → null, never a lucky 1-2er
+    const oos: SweepOos | null = m.trades >= 3
+      ? {
+          netPct: Number(m.netPct.toFixed(2)),
+          profitFactor: Number(m.profitFactor.toFixed(2)),
+          winRate: Number(m.winRate.toFixed(1)),
+          maxDrawdownPct: Number(m.maxDrawdownPct.toFixed(2)),
+          trades: m.trades,
+        }
+      : null
+    return { ...r, oos }
+  })
   return {
-    rows: unique.slice(0, topX),
+    rows,
     topX,
     minTrades,
     evaluated,
     skipped,
     elapsedMs: Date.now() - t0,
     perStrategy,
+    oosFraction: oosSeries ? oosFraction : 0,
+    skippedShorts,
   }
 }

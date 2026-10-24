@@ -16,6 +16,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
 import { getRecoFeed, getRecoJobState, startRecoRefresh } from '@/lib/algo-reco'
+import { rateLimit } from '@/lib/rate-limit'
 
 export const dynamic = 'force-dynamic'
 
@@ -43,6 +44,16 @@ export async function GET() {
 export async function POST(_req: NextRequest) {
   try {
     const user = await requireUser()
+    // Task 3-d — throttle: a full matrix pass is a multi-minute CPU+data job;
+    // 1 refresh per user per 10 min (the mutex below stops concurrency, this
+    // stops repetition).
+    const rl = rateLimit(`reco:${user.id}`, 1, 10 * 60_000)
+    if (!rl.ok) {
+      return NextResponse.json(
+        { error: `A refresh was started recently — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },
+        { status: 429 },
+      )
+    }
     const started = startRecoRefresh(user.id)
     const job = getRecoJobState()
     if (!started) {

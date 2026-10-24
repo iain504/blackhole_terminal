@@ -242,6 +242,25 @@ model AlgoLog {
   @@index([userId, createdAt])
 }
 
+// Task 3-d — local bar cache for CRYPTO history only (crypto bars are
+// immutable once closed; stock bars are NOT cached here because Alpaca stock
+// responses are split-adjusted and the adjustment basis can change over time).
+// time = unix seconds, bar OPEN time (same convention as src/lib/market-types).
+// Composite PK makes saveBars an idempotent upsert (INSERT OR REPLACE).
+model Bar {
+  symbol String
+  tf     String
+  time   Int
+  open   Float
+  high   Float
+  low    Float
+  close  Float
+  volume Float
+
+  @@id([symbol, tf, time])
+  @@index([symbol, tf])
+}
+
 // Task 90 — cached output of the "Recommended setups" sweep matrix. One row
 // (fixed id) holds the newest full-catalog sweep results as JSON; the Backtest
 // page reads it via GET /api/algo/recommendations and a refresh POST rewrites

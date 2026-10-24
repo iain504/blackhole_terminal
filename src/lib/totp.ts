@@ -1,5 +1,8 @@
 // TOTP (RFC 6238) implementation — zero dependency, uses node:crypto.
+// SERVER-ONLY: pulls in the at-rest crypto (node:crypto AES-GCM) — never
+// import from client components.
 import crypto from 'crypto'
+import { encrypt as aesEncrypt, decrypt as aesDecrypt } from './crypt'
 
 const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
 
@@ -53,14 +56,45 @@ export function totpCode(secret: string, timeStep = 30, offset = 0): string {
   return String(code % 1000000).padStart(6, '0')
 }
 
+/** Constant-time string compare: SHA-256 both sides first so every input is
+ * the same 32-byte length (no length leak), then timingSafeEqual. */
+function constantTimeEqual(a: string, b: string): boolean {
+  const ha = crypto.createHash('sha256').update(a).digest()
+  const hb = crypto.createHash('sha256').update(b).digest()
+  return crypto.timingSafeEqual(ha, hb)
+}
+
 /** Verify a 6-digit TOTP code allowing ±1 step clock drift. */
 export function verifyTotp(secret: string, code: string): boolean {
   const clean = (code || '').replace(/\D/g, '')
   if (clean.length !== 6) return false
   for (const off of [-1, 0, 1]) {
-    if (totpCode(secret, 30, off) === clean) return true
+    if (constantTimeEqual(totpCode(secret, 30, off), clean)) return true
   }
   return false
+}
+
+// ---- at-rest encryption for TOTP secrets ----
+// Stored format: `enc:<base64 of crypt.ts AES-256-GCM payload>`.
+// Legacy rows hold the raw base32 plaintext (no prefix) and are decrypted
+// transparently; callers re-encrypt after successful verification.
+const TOTP_ENC_PREFIX = 'enc:'
+
+export function encryptTotpSecret(plain: string): string {
+  return TOTP_ENC_PREFIX + Buffer.from(aesEncrypt(plain), 'utf8').toString('base64')
+}
+
+/** Returns the plaintext TOTP secret for `enc:`-prefixed (decrypted) or legacy
+ * plaintext (passthrough) stored values; null when undecryptable. */
+export function decryptTotpSecret(stored: string): string | null {
+  if (!stored) return null
+  if (!stored.startsWith(TOTP_ENC_PREFIX)) return stored // legacy plaintext
+  try {
+    const payload = Buffer.from(stored.slice(TOTP_ENC_PREFIX.length), 'base64').toString('utf8')
+    return aesDecrypt(payload)
+  } catch {
+    return null
+  }
 }
 
 export function otpauthUri(username: string, secret: string): string {
