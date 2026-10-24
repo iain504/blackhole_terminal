@@ -66,3 +66,8 @@ tool-results/
 db/*.db-shm
 db/*.db-wal
 db/*.db-journal
+
+# runtime state + old E2E screendumps (Task 9-i cleanup)
+screens-tmp/
+/*.png
+.zscripts/dev.pid
