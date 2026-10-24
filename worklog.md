@@ -1809,3 +1809,19 @@ Work Log:
 
 Stage Summary:
 - The Backtest panel now has a one-click "Test all strategies" sweep: every catalog strategy runs at its defaults plus an auto-built optimizer grid (defaults guaranteed in-grid, ≤800 sampled sims per strategy, data fetched once), ranked by the Calmar-style score, and the top X (user-set, default 8) are listed with full labeled parameters for one-click apply — applying a row switches the run setup's strategy AND parameters together. Fills a real gap: previously the user had to manually run backtest/optimizer once per strategy and mentally merge the rankings.
+
+---
+Task ID: 88
+Agent: Z.ai Code (main)
+Task: "put suggested slippage to the backtest accordingly" — seed the Backtest cost model with market-typical values per symbol.
+
+Work Log:
+- New module helper suggestCosts(symbol) in BacktestPanel.tsx: crypto majors (BTC/ETH) → slippage 3 / fee 10; altcoins → 10 / 10; US equities (Alpaca) → 2 / 0. Rationale baked into comments: Binance taker = 0.1% = 10 bps/fill, deep major books ~3 bps slip, thin alt books slip harder, Alpaca commission-free with ~2 bps large-cap slip.
+- Seeding effect: on symbol change, slippage/fee auto-roll to the new suggestion ONLY while the field still holds the previous suggestion (or its untouched 0 default) — a user-customized value is never stomped (sugRef tracks the last applied suggestion; verified: manual 7 survived TSLA→BTC→ETH switches).
+- UI: emerald "suggested N" chips beside the Slippage and Fee labels (mirrors the Task 85 amber "≈X live" spread chip) — click restores the suggestion anytime; fee chip tooltip explains Binance taker vs Alpaca per market; header comment documents the feature.
+- Version stamp bumped to v1.15.0 (LandingPage.tsx).
+- E2E (agent-browser, real trader+TOTP session): TSLA mount → slip 2 / fee 0 pre-seeded with chips; symbol→BTC/USD → auto-rolled 3/10; manual slip 7 + symbol→ETH/USD → 7 SURVIVED; chip click → restored 3; symbol→SOL/USD → 10/10; ran a real SOL/USD 5m backtest with the seeded costs → NET P&L -$345.02 / 27.8% win / PF 0.24 (cost model biting an alt mean-reverter exactly as intended — the honest answer frictionless defaults hid); symbol restored to TSLA → 2/0. Zero console/page errors, dev.log clean, lint clean.
+- Files: src/components/terminal/tabs/BacktestPanel.tsx, src/components/landing/LandingPage.tsx. Screenshot: screens-tmp/t88-cost-suggestions.png.
+
+Stage Summary:
+- The Backtest cost model no longer defaults to frictionless: slippage/fee are pre-seeded from the symbol's market (crypto majors 3/10, alts 10/10, equities 2/0), chips let the user re-apply after customizing, and customized values are never silently overwritten — calibration now matches the Task 85 live-spread chip story: costs are measured/suggested, not guessed.

@@ -16,7 +16,10 @@
 //     every strategy runs at its defaults PLUS an auto-built optimizer grid
 //     (defaults guaranteed in-grid), and the top X rows across all strategies
 //     are ranked for the user to apply (strategy + params, one click).
-import { useEffect, useMemo, useState } from 'react'
+//   • Cost suggestions (Task 88) — slippage/fee pre-seeded per market
+//     (crypto majors 3/10, altcoins 10/10, US equities 2/0) with "suggested N"
+//     chips to restore; a customized value is never stomped.
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap,
 } from 'lucide-react'
@@ -86,6 +89,20 @@ const fmtClockT = (t: number) =>
 
 const eqConfig = { equity: { label: 'Equity', color: '#34d399' } } satisfies ChartConfig
 
+// Task 88 — market-typical execution costs (bps) so the cost model starts
+// honest instead of frictionless:
+//   crypto majors (BTC/ETH) — deep Binance books, ~3 bps slippage; Binance
+//     spot taker fee is 0.1% = 10 bps per fill
+//   altcoins — thinner books slip harder (10 bps), same 10 bps taker fee
+//   US equities (Alpaca) — commission-free, ~2 bps slippage on large caps
+const suggestCosts = (symbol: string): { slip: number; fee: number } => {
+  if (symbol.includes('/')) {
+    const base = symbol.split('/')[0]?.toUpperCase() ?? ''
+    return base === 'BTC' || base === 'ETH' ? { slip: 3, fee: 10 } : { slip: 10, fee: 10 }
+  }
+  return { slip: 2, fee: 0 }
+}
+
 // Win / Loss breakdown (Task 71-2) — buckets by the EXIT bar's time in
 // America/New_York (the terminal's session timezone), fixed buckets with
 // zero-count bars visible (same visual language as the Performance Report).
@@ -119,6 +136,19 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   // Task 85 — live spread probe: the symbol's current bid/ask spread in bps,
   // surfaced next to the input so the cost model is calibrated, not guessed
   const [liveSpreadBps, setLiveSpreadBps] = useState<number | null>(null)
+  // Task 88 — per-market slippage/fee suggestion, pre-seeded per symbol and
+  // re-clickable via the chips beside each input
+  const sugSlip = suggestCosts(cfg.symbol).slip
+  const sugFee = suggestCosts(cfg.symbol).fee
+  const sugRef = useRef<{ slip: number; fee: number } | null>(null)
+  useEffect(() => {
+    const prev = sugRef.current
+    sugRef.current = { slip: sugSlip, fee: sugFee }
+    // roll the suggestion forward only while a field still holds the previous
+    // suggestion (or its untouched 0 default) — never stomp a customized value
+    setBtSlip((p) => (prev == null || Math.round(Number(p) || 0) === prev.slip ? String(sugSlip) : p))
+    setBtFee((p) => (prev == null || Math.round(Number(p) || 0) === prev.fee ? String(sugFee) : p))
+  }, [sugSlip, sugFee])
   // Task 87 — one-click all-strategy sweep
   const [topX, setTopX] = useState('8')
   const [sweepRes, setSweepRes] = useState<SweepResult | null>(null)
@@ -381,7 +411,17 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
             />
           </div>
           <div>
-            <Label htmlFor="bt-slip" className="text-[10px] text-zinc-500">Slippage (bps)</Label>
+            <div className="flex items-center justify-between">
+              <Label htmlFor="bt-slip" className="text-[10px] text-zinc-500">Slippage (bps)</Label>
+              <button
+                type="button"
+                onClick={() => setBtSlip(String(sugSlip))}
+                title={`Market-typical slippage for ${cfg.symbol || 'this market'} — click to use`}
+                className="text-[9px] text-emerald-400/90 hover:text-emerald-300"
+              >
+                suggested {sugSlip}
+              </button>
+            </div>
             <Input
               id="bt-slip"
               value={btSlip}
@@ -417,7 +457,17 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
             <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">bid/ask cost — half per market fill (buy at ask, sell at bid)</p>
           </div>
           <div>
-            <Label htmlFor="bt-fee" className="text-[10px] text-zinc-500">Fee (bps / fill)</Label>
+            <div className="flex items-center justify-between">
+              <Label htmlFor="bt-fee" className="text-[10px] text-zinc-500">Fee (bps / fill)</Label>
+              <button
+                type="button"
+                onClick={() => setBtFee(String(sugFee))}
+                title={cfg.symbol.includes('/') ? 'Binance taker fee 0.1% = 10 bps per fill — click to use' : 'Alpaca is commission-free — click to use'}
+                className="text-[9px] text-emerald-400/90 hover:text-emerald-300"
+              >
+                suggested {sugFee}
+              </button>
+            </div>
             <Input
               id="bt-fee"
               value={btFee}
