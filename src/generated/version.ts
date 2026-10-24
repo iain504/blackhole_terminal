@@ -4,10 +4,10 @@
 export const APP_VERSION = {
   base: '1.80.0',
   build: 136,
-  sha: '77b712d',
+  sha: '14d45c0',
   branch: 'main',
-  commitDate: '2026-10-24T22:35:13Z',
-  full: '1.80.0+136.77b712d',
+  commitDate: '2026-10-24T23:06:01Z',
+  full: '1.80.0+136.14d45c0',
   display: 'v1.80.0+136',
 } as const
 
