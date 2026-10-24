@@ -13,7 +13,7 @@
 //   • load entries back into the run-setup form, or start them directly as
 //     live runs (paper mode only — mirrors the POST /api/algo guards)
 import { useRef, useState } from 'react'
-import { FileJson, PauseCircle, RotateCcw, TriangleAlert, Upload } from 'lucide-react'
+import { Copy, Download, FileJson, PauseCircle, RotateCcw, TriangleAlert, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -39,6 +39,107 @@ export function downloadJsonFile(filename: string, data: unknown) {
   a.click()
   a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 5_000)
+}
+
+// Task 9-n — export no longer relies on the bare anchor download: sandboxed
+// preview iframes silently swallow blob downloads (no `allow-downloads`), so
+// the user saw "Config exported" and NO file — and with no file, import had
+// nothing to import. The dialog ALWAYS shows the JSON (copy path pairs with
+// the import dialog's paste path) and still offers a real download.
+
+export interface AlgoExportDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  filename: string
+  data: unknown
+}
+
+export function AlgoExportDialog({ open, onOpenChange, filename, data }: AlgoExportDialogProps) {
+  const { toast } = useToast()
+  const taRef = useRef<HTMLTextAreaElement | null>(null)
+  const [copied, setCopied] = useState(false)
+  const json = open ? JSON.stringify(data ?? null, null, 2) : ''
+
+  const copyJson = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(json)
+        setCopied(true)
+        toast({ title: 'JSON copied to clipboard', description: 'Open Import configs → paste the JSON to bring it back (or move it to another machine).' })
+        return
+      }
+      throw new Error('clipboard API unavailable')
+    } catch {
+      // sandboxed iframes often deny the async clipboard — fall back to select+execCommand
+      const ta = taRef.current
+      if (ta) {
+        ta.focus()
+        ta.select()
+        let ok = false
+        try { ok = document.execCommand('copy') } catch { ok = false }
+        if (ok) {
+          setCopied(true)
+          toast({ title: 'JSON copied to clipboard' })
+          return
+        }
+      }
+      toast({ title: 'Copy blocked — select the JSON text and copy manually (Ctrl/Cmd+C)', variant: 'destructive' })
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-lg gap-3">
+        <DialogHeader className="space-y-1">
+          <DialogTitle className="flex items-center gap-2 text-base">
+            <FileJson className="h-4 w-4 text-sky-400" aria-hidden />
+            Export algo configs
+          </DialogTitle>
+          <DialogDescription className="text-xs">
+            <span className="font-mono text-zinc-400">{filename}</span> — download the file, or copy the JSON
+            (embeds/previews may block downloads; the copy pairs with Import configs → paste).
+          </DialogDescription>
+        </DialogHeader>
+        <Textarea
+          ref={taRef}
+          readOnly
+          value={json}
+          onFocus={(e) => e.currentTarget.select()}
+          className="min-h-44 resize-y border-zinc-800 bg-zinc-950 font-mono text-[10px] leading-snug"
+          aria-label="Exported config JSON"
+        />
+        <DialogFooter className="flex-row items-center gap-2 sm:justify-between">
+          <span className="text-[10px] text-zinc-500">{new Blob([json]).size.toLocaleString('en-US')} bytes · v2 envelope</span>
+          <span className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 border-zinc-800 bg-zinc-950 text-[11px] text-zinc-200 hover:bg-zinc-900"
+              onClick={() => void copyJson()}
+            >
+              <Copy className="h-3 w-3" aria-hidden />
+              {copied ? 'Copied — copy again' : 'Copy JSON'}
+            </Button>
+            <Button
+              size="sm"
+              className="h-8 gap-1.5 bg-sky-600 text-[11px] text-white hover:bg-sky-500"
+              onClick={() => {
+                try {
+                  downloadJsonFile(filename, data)
+                  toast({ title: 'Download started', description: 'If no file appears, the preview is blocking downloads — use Copy JSON instead.' })
+                } catch {
+                  toast({ title: 'Download blocked here — use Copy JSON', variant: 'destructive' })
+                }
+              }}
+            >
+              <Download className="h-3 w-3" aria-hidden />
+              Download .json
+            </Button>
+          </span>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 export interface AlgoImportDialogProps {

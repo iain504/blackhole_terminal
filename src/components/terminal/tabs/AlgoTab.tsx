@@ -38,7 +38,7 @@ import {
 } from '@/lib/algo-strategies'
 import BacktestPanel, { type AlgoSetupCfg } from '@/components/terminal/tabs/BacktestPanel'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
-import AlgoImportDialog, { downloadJsonFile } from '@/components/terminal/tabs/AlgoConfigIO'
+import AlgoImportDialog, { AlgoExportDialog } from '@/components/terminal/tabs/AlgoConfigIO'
 import AlgoRunSettingsDialog from '@/components/terminal/tabs/AlgoRunSettings'
 import type { AlgoRunDto } from '@/app/api/algo/route'
 
@@ -269,23 +269,27 @@ export default function AlgoTab() {
   }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, slOn, slPct, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
 
   // ---- config import / export (Task 66) ----
+  // Task 9-n — exports open the export DIALOG (JSON preview + copy + download):
+  // sandboxed preview iframes silently swallow blob downloads, so a bare
+  // anchor click produced a toast but no file — and import had nothing to
+  // import. The copy path pairs with the import dialog's paste path.
+  const [exportDlg, setExportDlg] = useState<{ filename: string; data: unknown } | null>(null)
+
   const exportSetup = () => {
-    downloadJsonFile(
-      `${algoExportFileBase()}-${symbol.trim().toUpperCase() || 'setup'}.json`,
-      buildAlgoConfigExport([{ name: algoConfigSummaryName(setupCfg), config: setupCfg }]),
-    )
-    toast({ title: 'Config exported', description: algoConfigSummaryName(setupCfg) })
+    setExportDlg({
+      filename: `${algoExportFileBase()}-${symbol.trim().toUpperCase() || 'setup'}.json`,
+      data: buildAlgoConfigExport([{ name: algoConfigSummaryName(setupCfg), config: setupCfg }]),
+    })
   }
 
   const exportRun = (r: AlgoRunDto) => {
     const cfg = runToAlgoConfig(r)
-    downloadJsonFile(
-      `${algoExportFileBase()}-${r.symbol}-${r.strategy}.json`,
+    setExportDlg({
       // Task 79 — the run's enable/disable state rides the export so an import
       // on any machine recreates the same stopped/running state
-      buildAlgoConfigExport([{ name: algoConfigSummaryName(cfg), config: cfg, enabled: r.status === 'running' }]),
-    )
-    toast({ title: 'Run config exported', description: algoConfigSummaryName(cfg) })
+      filename: `${algoExportFileBase()}-${r.symbol}-${r.strategy}.json`,
+      data: buildAlgoConfigExport([{ name: algoConfigSummaryName(cfg), config: cfg, enabled: r.status === 'running' }]),
+    })
   }
 
   const exportAllRuns = () => {
@@ -299,10 +303,9 @@ export default function AlgoTab() {
       const e = ruleToExportEntry(rule)
       if (typeof e !== 'string') ruleEntries.push(e)
     }
-    downloadJsonFile(`${algoExportFileBase()}-all.json`, buildAlgoConfigExport(entries, ruleEntries))
-    toast({
-      title: 'All run configs exported',
-      description: `${entries.length} config${entries.length === 1 ? '' : 's'} + ${ruleEntries.length} rule${ruleEntries.length === 1 ? '' : 's'}`,
+    setExportDlg({
+      filename: `${algoExportFileBase()}-all.json`,
+      data: buildAlgoConfigExport(entries, ruleEntries),
     })
   }
 
@@ -841,6 +844,12 @@ export default function AlgoTab() {
         runningSymbols={runningSymbols}
         onLoadIntoSetup={loadConfigIntoForm}
         onRunsStarted={() => void load()}
+      />
+      <AlgoExportDialog
+        open={exportDlg !== null}
+        onOpenChange={(v) => { if (!v) setExportDlg(null) }}
+        filename={exportDlg?.filename ?? 'blackhole-algo-configs.json'}
+        data={exportDlg?.data ?? null}
       />
 
       {/* Task 79 — double-exposure warning: the confirmed symbol already has

@@ -2350,3 +2350,20 @@ Stage Summary:
 - Refresh now sweeps the USER'S WATCHLIST (per-user feed, per-user cache) — fallback baked list only for empty watchlists.
 - Death-proofed: POST-time heap gate (0.70) + mid-matrix graceful abort (0.78) + bounded matrix (≤10 symbols × 3 TFs) + watchdog last-resort. A hot heap now costs a toast, not the process.
 - Sandbox reality: equities have NO bar data here, so an all-equity watchlist refresh ends with an honest explanatory toast; crypto symbols sweep fine.
+
+---
+Task ID: 9-n
+Agent: main (Z.ai Code)
+Task: "The export and import of algo config failure" — both Algo config export and import reported broken by the user.
+
+Work Log:
+- Repro first: headless E2E showed the CODE works — export executes (toast + no console errors), import paste→parse→"Load into setup form" roundtrips. Root cause is ENVIRONMENTAL: sandboxed preview iframes (no allow-downloads) silently swallow blob-URL anchor downloads → user clicks Export, sees "Config exported", but NO file lands; with no file, import has nothing to import. Both "fail" together.
+- Fix (AlgoConfigIO.tsx): NEW AlgoExportDialog (named export) — export no longer relies on a naked download. Dialog shows: the pretty-printed envelope in a readOnly textarea (onFocus select-all), byte counter + v2 note, "Copy JSON" (navigator.clipboard → execCommand fallback → graceful "select and copy manually" destructive toast), "Download .json" (kept, with a toast warning if the preview blocks it). Copy path pairs with the import dialog's paste path.
+- AlgoTab.tsx: exportSetup/exportRun/exportAllRuns now setExportDlg({filename, data}) and open the dialog (replaced the three direct downloadJsonFile calls + toasts); exportDlg state; <AlgoExportDialog> rendered beside <AlgoImportDialog>. Import dialog untouched (paste path already worked).
+- E2E roundtrip with ZERO filesystem: Export current setup → dialog (873-char envelope, "BB + RSI Mean Reversion · TSLA 5m") → Copy JSON clicked (headless clipboard denied → graceful instruction toast fired; textarea text selectable) → dialog JSON fed through Import → paste → Parse → entry listed → Load into setup form → toast "Config loaded into the run setup". Server 200, RSS 1404MB, lint clean.
+- Landing version → v1.23.0.
+
+Stage Summary:
+- Export/import is now sandbox-proof: the JSON is always visible and copyable in-app; download is a bonus, not a single point of failure.
+- Copy ↔ paste closes the loop: export dialog → import paste works with no downloads at all.
+- No backend changes; rules-import route untouched and re-validated by parse flow.
