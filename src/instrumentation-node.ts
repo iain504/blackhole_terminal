@@ -14,6 +14,16 @@ export async function bootNode(): Promise<void> {
   console.log('[instrumentation] booted')
 
   try {
+    // 0) Resolve the master app secret BEFORE anything that decrypts or signs
+    //    (algo engine resume decrypts broker keys; session signing needs it).
+    //    env -> DB -> generate-and-persist (Task 9-j, publish-safe).
+    const { resolveAppSecret } = await import('@/lib/app-secret')
+    await resolveAppSecret()
+  } catch (e) {
+    console.warn('[instrumentation] app secret resolution failed:', e instanceof Error ? e.message : e)
+  }
+
+  try {
     // 1) Resume algo engines for all users with running runs at boot.
     //    ensureAlgoEngines(userId) is idempotent per run (startEngine no-ops
     //    on a run already in the registry), so a race with an early /api/algo

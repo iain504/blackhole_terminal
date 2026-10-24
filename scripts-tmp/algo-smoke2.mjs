@@ -35,8 +35,8 @@ function totp(secret) {
   const code = ((hmac[off] & 0x7f) << 24) | (hmac[off + 1] << 16) | (hmac[off + 2] << 8) | hmac[off + 3]
   return String(code % 1e6).padStart(6, '0')
 }
-const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS ?? '', // creds via env (scrubbed from repo) })
-const step2 = await api('POST', '/api/auth/login/verify', { ticket: step1.json?.ticket, code: totp(process.env.TOTP_SECRET ?? '') })
+const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS || '', })
+const step2 = await api('POST', '/api/auth/login/verify', { ticket: step1.json?.ticket, code: totp(process.env.TOTP_SECRET || '') })
 console.log('login', step2.status)
 
 const start = await api('POST', '/api/algo', {

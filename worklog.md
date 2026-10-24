@@ -2265,3 +2265,26 @@ Work Log:
 
 Stage Summary:
 - HEAD 8ffb8f4 == origin/main; tree clean. Tracked PNGs now public/ + upload/ only. Token handling moved out of files into env var; filemode churn permanently muted.
+
+---
+Task ID: 9-j
+Agent: Z.ai Code (main)
+Task: Publish failure root-cause + fix (publish-resilient secret bootstrapping)
+
+Work Log:
+- Root cause: the platform publish pipeline (a) resets the workspace to git state and (b) SANITIZES .env secret lines (observed: .env reduced to DATABASE_URL stub at 14:45, fresh 172KB DB at 14:46, platform relaunch via its own tee pipeline). The Task 91 fail-closed hardening (crypt.ts/auth.ts throw at module evaluation on missing secret) then made every publish build fail.
+- Also wiped by the reset: users/sessions/layouts/alerts/algo runs/TOTP/broker keys (fresh DB), stream-service process, ops-watchdog (died silently; its log is EMPTY = it never fired, innocent).
+- Fix (publish-resilient, still never a public constant):
+  - NEW prisma model AppSecret + src/lib/app-secret.ts: resolveAppSecret() = env (APP_ENCRYPTION_SECRET||AUTH_SECRET, mirrored INTO the DB so later sanitized boots keep the SAME key) -> DB row -> generate 32B random + persist. appSecretSync() on globalThis (Next compiles the lib into multiple module instances; module-scope memo was invisible across them).
+  - crypt.ts: lazy key derivation (module eval side-effect-free so builds cannot crash on import); legacy-default decrypt retry preserved.
+  - auth.ts: sign() uses appSecretSync(); module-eval throw removed.
+  - instrumentation-node.ts: await resolveAppSecret() FIRST (before algo resume/session paths).
+  - register route: first-run bootstrap — when user count == 0 the closed ALLOW_REGISTRATION gate opens for the FIRST account only (otherwise every publish reset = permanent lockout).
+- Restored .env with fresh 64-hex AUTH_SECRET/APP_ENCRYPTION_SECRET (env wins; mirrored to DB). Restarted dev (UP 2s) + stream-service (stream:up).
+- Reseeded trader via the bootstrap register path with the SAME TOTP secret (existing authenticator entries keep working).
+- Fixed my own 9-g lint regression: `??` in .mjs probe scripts unparseable by eslint's espree -> `||` (7 files).
+- E2E: POST quote 200; tsc 8 errors = all pre-existing (examples/scripts-tmp/skills/tests, none in src/); lint PASS; browser login trader+TOTP -> terminal renders 8 canvases, 0 page errors; health {"status":"ok","stream":"up"}.
+
+Stage Summary:
+- Publish now survivable end-to-end: sanitized env + fresh DB -> app boots, generates/persists master, first account self-registrable. Stamp v1.19.1.
+- USER impact of this publish reset: stored Alpaca broker keys + layouts + alerts + algo runs are GONE (fresh DB) — re-enter keys in Settings, re-create layouts; trader password/TOTP unchanged. Alpaca key rotation still pending (user action).

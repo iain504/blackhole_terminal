@@ -3,19 +3,13 @@
 import crypto from 'crypto'
 import { cookies, headers } from 'next/headers'
 import { db } from '@/lib/db'
+import { appSecretSync } from '@/lib/app-secret'
 
-// Fail closed: never sign/verify sessions with a missing or publicly-known
-// secret (the old hardcoded default made cookies forgeable). Next.js loads
-// .env at boot, so a missing value here means the deployment is misconfigured.
-const SECRET = process.env.AUTH_SECRET
-if (!SECRET || SECRET === 'zai-tradeterminal-local-dev-secret') {
-  throw new Error(
-    'AUTH_SECRET is not set (or is the known public default). ' +
-      "Generate one with: bun -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\" " +
-      'and put it in .env as AUTH_SECRET=<hex>.'
-  )
-}
-const SESSION_SECRET: string = SECRET
+// Fail closed, lazily (Task 9-j): sessions are signed with the shared master
+// secret resolved via env -> DB -> generate-and-persist (app-secret.ts). Never
+// a publicly-known constant. Resolution is deferred to first use so module
+// evaluation stays side-effect-free (a sanitized-env BUILD must not crash on
+// import); boot instrumentation awaits resolveAppSecret() before any route.
 
 export const SESSION_COOKIE = 'tt_session'
 const SESSION_TTL_S = 60 * 60 * 24 * 30 // 30 days
@@ -39,7 +33,7 @@ export function verifyPassword(password: string, stored: string): boolean {
 }
 
 function sign(data: string): string {
-  return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('hex')
+  return crypto.createHmac('sha256', appSecretSync()).update(data).digest('hex')
 }
 
 /** Session token: userId.expiry.signature */

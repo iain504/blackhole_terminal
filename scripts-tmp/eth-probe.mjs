@@ -78,8 +78,8 @@ function analyze(label, bars) {
 }
 
 // ---- login ----
-const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS ?? '', // creds via env (scrubbed from repo) })
-const step2 = await api('POST', '/api/auth/login/verify', { ticket: step1.json?.ticket, code: totp(process.env.TOTP_SECRET ?? '') })
+const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS || '', })
+const step2 = await api('POST', '/api/auth/login/verify', { ticket: step1.json?.ticket, code: totp(process.env.TOTP_SECRET || '') })
 console.log('login:', step1.status, step2.status, step2.json?.user ? 'OK' : step2.text)
 
 // ---- TSLA 1h default window (chart barCount) ----

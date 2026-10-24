@@ -28,9 +28,6 @@ export async function POST(req: Request) {
         { status: 429, headers: { 'retry-after': String(rl.retryAfterSec) } }
       )
     }
-    if (!registrationEnabled()) {
-      return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
-    }
     const body = await readJson<RegisterBody>(req)
     const username = (body.username || '').trim()
     const password = body.password || ''
@@ -39,6 +36,15 @@ export async function POST(req: Request) {
     }
     if (password.length < 8) {
       return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 })
+    }
+    // First-run bootstrap (Task 9-j): a fresh deployment — sanitized env, empty
+    // DB, closed registration gate — must be able to create its FIRST account,
+    // or it is permanently locked out after every publish reset. The gate
+    // still applies to every account after the first; rate limiting above caps
+    // abuse of the bootstrap window.
+    const userCount = await db.user.count()
+    if (!registrationEnabled() && userCount > 0) {
+      return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
     }
     if (!body.totpSecret || !verifyTotp(body.totpSecret, body.totpCode)) {
       return NextResponse.json({ error: 'Invalid 2FA code — scan the QR code and enter the 6-digit code' }, { status: 400 })

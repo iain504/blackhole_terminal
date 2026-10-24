@@ -271,3 +271,14 @@ model AlgoRecoCache {
   payload     String
   updatedAt   DateTime @updatedAt
 }
+
+// Task 9-j — per-install master secret store. The platform publish pipeline
+// sanitizes secret lines out of .env; this row (created at boot when env is
+// absent) keeps the install bootable while never using a publicly-known
+// constant. Env (APP_ENCRYPTION_SECRET || AUTH_SECRET) always wins and is
+// mirrored here so later sanitized boots resolve the SAME key.
+model AppSecret {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
