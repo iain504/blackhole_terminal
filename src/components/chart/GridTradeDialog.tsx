@@ -1,9 +1,11 @@
 'use client'
 
-// Grid trade configuration dialog (Task 9-q, extended by Task 10-b) — opened
-// from the chart's two-click "Grid" range tool with the picked lower/upper
-// prices pre-filled, or from the Grid tab's "Edit" action on a flat active
-// grid (editGrid prop → PUT /api/grid/<id>).
+// Grid trade configuration dialog (Task 9-q, extended by Task 10-b/10-f) —
+// opened from the chart's two-click "Grid" range tool with the picked
+// lower/upper prices pre-filled, from the Grid tab's "Edit" action on a flat
+// active grid (editGrid prop → PUT /api/grid/<id>), or from the Grid tab's
+// "Import setup" action (openWithImport → empty form + the import panel
+// expanded so a saved setup JSON can be pasted/uploaded).
 // Everything is editable before the grid starts: level count, spacing model,
 // per-grid size, optional whole-grid SL/TP circuit breakers (absolute price OR
 // percent of the range bounds — resolved exactly like the server:
@@ -16,6 +18,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   LayoutGrid, TriangleAlert, GripHorizontal, FlaskConical, Loader2, ChevronDown, CircleAlert,
+  FileUp,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -35,6 +38,7 @@ import { useToast } from '@/hooks/use-toast'
 // pushed the header above the viewport on short screens.
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
+import { parseGridSetup, type GridSetup } from '@/lib/grid-setup'
 
 /** Full config of a grid being edited (edit-when-flat, Task 10-b).
  * slBasis/tpBasis are optional API strings ('price' | 'percent') — rows created
@@ -65,6 +69,15 @@ export interface GridTradeDialogProps {
   editGrid?: GridEditTarget | null
   /** Called after a successful save (create OR edit) so parents can refresh. */
   onSaved?: () => void
+  /** Grid tab "Import setup" flow: open with an EMPTY range and the import
+   * panel expanded, so a saved setup JSON can be pasted or uploaded to fill
+   * the form (create mode). The grid still runs on this dialog's symbol. */
+  openWithImport?: boolean
+  /** Called when an applied setup names a DIFFERENT symbol than this dialog's
+   * (create mode only). The parent can retarget the new grid to the setup's
+   * own symbol. Absent (chart two-click flow): the config applies to this
+   * dialog's symbol and the mismatch is flagged with a note instead. */
+  onApplySymbol?: (symbol: string) => void
 }
 
 type Basis = 'price' | 'percent'
@@ -100,6 +113,45 @@ interface BacktestResult {
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100
+
+/** Setters bag so the setup→form fill can live at module level (stable — no
+ * exhaustive-deps churn in the init effect). */
+type FormSetters = {
+  setLower: (v: string) => void
+  setUpper: (v: string) => void
+  setGridCount: (v: string) => void
+  setSpacing: (v: 'arithmetic' | 'geometric') => void
+  setQty: (v: string) => void
+  setSlOn: (v: boolean) => void
+  setSlBasis: (v: Basis) => void
+  setSlPrice: (v: string) => void
+  setSlPct: (v: string) => void
+  setTpOn: (v: boolean) => void
+  setTpBasis: (v: Basis) => void
+  setTpPrice: (v: string) => void
+  setTpPct: (v: string) => void
+  setCloseOnStop: (v: boolean) => void
+}
+
+/** Fill every form field from a parsed grid setup (Task 10-f import path). */
+function applySetupToForm(s: GridSetup, st: FormSetters) {
+  const slIsPct = s.slBasis === 'percent'
+  const tpIsPct = s.tpBasis === 'percent'
+  st.setLower(String(s.lowerPrice))
+  st.setUpper(String(s.upperPrice))
+  st.setGridCount(String(s.gridCount))
+  st.setSpacing(s.spacing)
+  st.setQty(String(s.qtyPerGrid))
+  st.setSlOn(s.maxSL != null)
+  st.setSlBasis(slIsPct ? 'percent' : 'price')
+  st.setSlPrice(s.maxSL != null && !slIsPct ? String(s.maxSL) : '')
+  st.setSlPct(s.maxSL != null && slIsPct ? String(s.maxSL) : '')
+  st.setTpOn(s.maxTP != null)
+  st.setTpBasis(tpIsPct ? 'percent' : 'price')
+  st.setTpPrice(s.maxTP != null && !tpIsPct ? String(s.maxTP) : '')
+  st.setTpPct(s.maxTP != null && tpIsPct ? String(s.maxTP) : '')
+  st.setCloseOnStop(s.closeOnStop)
+}
 
 /** "75999.995" → "76000", "100.1" → "100.1", "abc" → "abc" (leave junk alone). */
 const to2dpStr = (v: string) => {
@@ -192,6 +244,7 @@ function BasisToggle({ which, value, onChange, disabled }: {
 
 export default function GridTradeDialog({
   open, onOpenChange, symbol, lowerPrice, upperPrice, editGrid = null, onSaved,
+  openWithImport = false, onApplySymbol,
 }: GridTradeDialogProps) {
   const { toast } = useToast()
   const [lower, setLower] = useState('')
@@ -209,6 +262,15 @@ export default function GridTradeDialog({
   const [tpPct, setTpPct] = useState('')
   const [closeOnStop, setCloseOnStop] = useState(true)
   const [submitting, setSubmitting] = useState(false)
+
+  // ---- setup import (Task 10-f) ----
+  const [importOpen, setImportOpen] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [importError, setImportError] = useState<string | null>(null)
+  /** Symbol the imported setup was saved for — when it differs from this
+   * dialog's symbol, a persistent amber note stays visible after applying. */
+  const [importedFrom, setImportedFrom] = useState<string | null>(null)
+  const importFileRef = useRef<HTMLInputElement>(null)
 
   // ---- draggable header state (Task 10-b) ----
   const contentRef = useRef<HTMLDivElement>(null)
@@ -288,6 +350,10 @@ export default function GridTradeDialog({
   const editRef = useRef(editGrid)
   editRef.current = editGrid
   const editId = editGrid?.id ?? ''
+  const symbolRef = useRef(symbol)
+  symbolRef.current = symbol
+  const openImportRef = useRef(openWithImport)
+  openImportRef.current = openWithImport
   useEffect(() => {
     if (!open) return
     const eg = editRef.current
@@ -297,6 +363,9 @@ export default function GridTradeDialog({
     setBtError(null)
     setBtRanConfig(null)
     setBtFillsOpen(false)
+    setImportError(null)
+    setImportedFrom(null)
+    setImportOpen(!eg && !!openImportRef.current)
     if (eg) {
       setLower(to2dpStr(String(eg.lowerPrice)))
       setUpper(to2dpStr(String(eg.upperPrice)))
@@ -314,9 +383,27 @@ export default function GridTradeDialog({
       setTpPrice(eg.maxTP != null && !tpIsPct ? String(eg.maxTP) : '')
       setTpPct(eg.maxTP != null && tpIsPct ? String(eg.maxTP) : '')
       setCloseOnStop(eg.closeOnStop)
-    } else {
+    } else if (lowerPrice > 0 && upperPrice > 0) {
       setLower(String(Number(lowerPrice.toFixed(6))))
       setUpper(String(Number(upperPrice.toFixed(6))))
+      setGridCount('8')
+      setSpacing('arithmetic')
+      setQty('1')
+      setSlOn(false)
+      setSlBasis('price')
+      setSlPrice('')
+      setSlPct('')
+      setTpOn(false)
+      setTpBasis('price')
+      setTpPrice('')
+      setTpPct('')
+      setCloseOnStop(true)
+    } else {
+      // import-first flow (Grid tab "Import setup"): no picked range — start
+      // with empty price fields so Start stays disabled until a setup is
+      // applied or a range is typed
+      setLower('')
+      setUpper('')
       setGridCount('8')
       setSpacing('arithmetic')
       setQty('1')
@@ -437,6 +524,53 @@ export default function GridTradeDialog({
         ? 'valid quantity required'
         : null
 
+  // ---- setup import (Task 10-f) ----
+  // Parse the pasted/uploaded JSON and fill the whole form. The server ALWAYS
+  // re-validates on submit — parseGridSetup just fails early and honestly.
+  const applyImport = (text: string) => {
+    const r = parseGridSetup(text)
+    if (!r.ok) {
+      setImportError(r.error)
+      return
+    }
+    applySetupToForm(r.setup, {
+      setLower, setUpper, setGridCount, setSpacing, setQty,
+      setSlOn, setSlBasis, setSlPrice, setSlPct,
+      setTpOn, setTpBasis, setTpPrice, setTpPct, setCloseOnStop,
+    })
+    setImportError(null)
+    setBt(null)
+    setBtRanConfig(null)
+    setBtFillsOpen(false)
+    const mismatch = r.setup.symbol !== '' && r.setup.symbol !== symbolRef.current
+    if (mismatch && !editGrid && onApplySymbol) {
+      // import-first flow: the setup's own symbol IS the intent — retarget the
+      // new grid to it (parent swaps the symbol prop; fields stay untouched)
+      onApplySymbol(r.setup.symbol)
+      setImportedFrom(null)
+    } else {
+      setImportedFrom(mismatch ? r.setup.symbol : null)
+    }
+    setImportOpen(false)
+    toast({
+      title: 'Setup imported',
+      description: `${r.setup.symbol || symbolRef.current} · ${r.setup.gridCount} levels`,
+    })
+  }
+
+  const onImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]
+    e.target.value = '' // allow re-picking the same file later
+    if (!f) return
+    const text = await f.text().catch(() => '')
+    if (!text) {
+      setImportError('Could not read the file')
+      return
+    }
+    setImportText(text)
+    applyImport(text)
+  }
+
   const submit = async () => {
     setSubmitting(true)
     try {
@@ -510,6 +644,82 @@ export default function GridTradeDialog({
               : 'Long-only spot grid — buys each dip to a level, sells the lot at the next level up. Paper orders every 5s engine tick.'}
           </DialogDescription>
         </DialogHeader>
+
+        {/* import setup (Task 10-f) — available in create AND edit modes; a
+            file or pasted JSON fills the whole form (server re-validates on
+            submit). The Grid tab's "Import setup" button opens the dialog with
+            this panel already expanded. */}
+        <div className="rounded border border-zinc-800/70 bg-zinc-950/60">
+          <button
+            type="button"
+            className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+            onClick={() => setImportOpen((v) => !v)}
+            aria-expanded={importOpen}
+          >
+            <FileUp className="h-3 w-3 shrink-0" aria-hidden />
+            Import setup <span className="text-zinc-600">(JSON)</span>
+            <ChevronDown className={cn('ml-auto h-3 w-3 transition-transform', importOpen && 'rotate-180')} aria-hidden />
+          </button>
+          {importOpen && (
+            <div className="space-y-2 border-t border-zinc-800/60 px-2.5 py-2">
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 border-zinc-800 bg-zinc-950 px-2 text-[11px] text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
+                  onClick={() => importFileRef.current?.click()}
+                >
+                  <FileUp className="h-3 w-3" aria-hidden />
+                  Choose file…
+                </Button>
+                <input
+                  ref={importFileRef}
+                  type="file"
+                  accept=".json,application/json"
+                  className="hidden"
+                  aria-hidden
+                  tabIndex={-1}
+                  onChange={(e) => void onImportFile(e)}
+                />
+                <span className="text-[10px] text-zinc-600">or paste setup JSON below</span>
+              </div>
+              <textarea
+                value={importText}
+                onChange={(e) => { setImportText(e.target.value); if (importError) setImportError(null) }}
+                rows={4}
+                spellCheck={false}
+                placeholder='{"kind":"blackhole-grid-setup","symbol":"BTC/USD","lowerPrice":78000,…}'
+                aria-label="Grid setup JSON"
+                className="terminal-scroll w-full resize-y rounded border border-zinc-800 bg-zinc-950 px-2 py-1.5 font-mono text-[10px] leading-relaxed text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:ring-1 focus:ring-emerald-500/40"
+              />
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  className="h-7 gap-1.5 bg-emerald-600 px-2 text-[11px] text-white hover:bg-emerald-500"
+                  disabled={!importText.trim()}
+                  onClick={() => applyImport(importText)}
+                >
+                  <FileUp className="h-3 w-3" aria-hidden />
+                  Apply to form
+                </Button>
+                {importError && (
+                  <span className="flex items-center gap-1 text-[11px] text-rose-400">
+                    <CircleAlert className="h-3 w-3 shrink-0" aria-hidden />
+                    {importError}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+        {importedFrom && (
+          <p className="flex items-start gap-1 text-[10px] text-amber-400/90">
+            <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+            Imported setup was saved for {importedFrom} — this grid runs on {symbol}. Adjust the range if needed.
+          </p>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <div>

@@ -1,16 +1,19 @@
 'use client'
 
-// Grid Trading tab (Task 9-q, extended by Task 10-b) — tracks every grid
+// Grid Trading tab (Task 9-q, extended by Task 10-b/10-f) — tracks every grid
 // trade: live status, total realized/unrealized P&L, grid start time and
 // per-fill history. Grids are created from the chart's two-click "Grid" range
 // tool; this tab is the mission control (stop / edit-when-flat / inspect /
-// delete). Polls every 5s like the Algo tab.
-import { useCallback, useEffect, useState } from 'react'
+// delete / export-import setups). Polls every 5s like the Algo tab.
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
+  Download, Upload, Copy,
 } from 'lucide-react'
+import { useShallow } from 'zustand/react/shallow'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { useTerminal } from '@/store/terminal'
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -18,11 +21,16 @@ import {
 import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
 import GridTradeDialog from '@/components/chart/GridTradeDialog'
+import { gridSetupFromRow, downloadGridSetup } from '@/lib/grid-setup'
+import { tabPanes, type Tab } from '@/store/terminal'
 import type { GridTradeDto, GridFillDto } from '@/app/api/grid/route'
 
 /** API rows gain slBasis/tpBasis ('price'|'percent') via Task 10-a — treat as
@@ -86,6 +94,15 @@ interface GridData {
   grids: GridRow[]
 }
 
+/** Mirror ChartWorkspace.focusedPaneSymbol — the symbol the "Import setup"
+ * flow targets (the imported grid runs on the currently focused chart). */
+function focusedSymbol(tab: Tab | null): string {
+  if (!tab) return ''
+  const panes = tabPanes(tab)
+  const idx = Math.min(tab.focusedPane ?? 0, panes.length - 1)
+  return panes[idx]?.symbol ?? tab.symbol
+}
+
 export default function GridTab() {
   const { toast } = useToast()
   const [data, setData] = useState<GridData | null>(null)
@@ -98,6 +115,14 @@ export default function GridTab() {
   const [detailId, setDetailId] = useState<string | null>(null)
   const [detail, setDetail] = useState<{ grid: GridTradeDto; fills: GridFillDto[] } | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  // setup import (Task 10-f): opens the create dialog with the import panel
+  // expanded — the setup JSON fills the form there (paste or file). When the
+  // applied setup names its own symbol, the new grid retargets to it
+  // (importSymbol) instead of the focused chart's symbol.
+  const [importDialogOpen, setImportDialogOpen] = useState(false)
+  const [importSymbol, setImportSymbol] = useState<string | null>(null)
+  const activeTab = useTerminal(useShallow((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? null))
+  const chartSymbol = useMemo(() => focusedSymbol(activeTab), [activeTab])
 
   const load = useCallback(async () => {
     try {
@@ -161,6 +186,17 @@ export default function GridTab() {
     }
   }
 
+  /** Copy a grid's config to the clipboard as a portable setup JSON. */
+  const copySetup = async (grid: GridRow) => {
+    const json = JSON.stringify(gridSetupFromRow(grid), null, 2)
+    try {
+      await navigator.clipboard.writeText(json)
+      toast({ title: 'Setup copied', description: `${grid.symbol} grid config is on the clipboard` })
+    } catch {
+      toast({ title: 'Could not copy', description: 'Clipboard unavailable — use Download instead', variant: 'destructive' })
+    }
+  }
+
   const grids = data?.grids ?? []
   const active = grids.filter((g) => g.status === 'active')
   const totalRealized = grids.reduce((acc, g) => acc + g.realizedPnl, 0)
@@ -182,6 +218,15 @@ export default function GridTab() {
           {openLots} open lot{openLots === 1 ? '' : 's'}
         </Badge>
         <span className="ml-auto text-[11px] text-zinc-500">engine tick every 5s · paper orders</span>
+        <Button
+          variant="ghost" size="sm"
+          className="h-7 gap-1.5 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
+          onClick={() => setImportDialogOpen(true)}
+          title="Import a saved grid setup (JSON) — opens the config dialog with the import panel expanded"
+        >
+          <Upload className="h-3.5 w-3.5" aria-hidden />
+          Import setup
+        </Button>
         <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={() => void load()} aria-label="Refresh grid trades">
           <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
         </Button>
@@ -278,6 +323,26 @@ export default function GridTab() {
                     </span>
                   )}
                   <span className="ml-auto flex items-center gap-0.5">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost" size="sm"
+                          className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                          disabled={busyId === g.id}
+                          title="Export this grid's config as a reusable setup (JSON) — no runtime state, just the range/levels/size/guards"
+                        >
+                          <Download className="h-3 w-3" /> Export
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="border-zinc-800 bg-zinc-900 text-xs text-zinc-200">
+                        <DropdownMenuItem className="gap-1.5" onClick={() => downloadGridSetup(gridSetupFromRow(g))}>
+                          <Download className="h-3 w-3" aria-hidden /> Download .json
+                        </DropdownMenuItem>
+                        <DropdownMenuItem className="gap-1.5" onClick={() => void copySetup(g)}>
+                          <Copy className="h-3 w-3" aria-hidden /> Copy JSON
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                     {isActive && openLotsG === 0 && (
                       <Button
                         variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-emerald-300"
@@ -321,6 +386,22 @@ export default function GridTab() {
             )
           })}
         </div>
+      )}
+
+      {/* setup import (Task 10-f) — opens the create dialog with the import
+          panel expanded; the applied setup retargets the new grid to its own
+          symbol via onApplySymbol (falls back to the focused chart's symbol) */}
+      {importDialogOpen && (
+        <GridTradeDialog
+          open
+          onOpenChange={(v) => { if (!v) { setImportDialogOpen(false); setImportSymbol(null) } }}
+          symbol={(importSymbol ?? chartSymbol) || 'BTC/USD'}
+          lowerPrice={0}
+          upperPrice={0}
+          openWithImport
+          onApplySymbol={(s) => setImportSymbol(s)}
+          onSaved={() => void load()}
+        />
       )}
 
       {/* edit-when-flat (Task 10-b) — reuses the create dialog in edit mode;
