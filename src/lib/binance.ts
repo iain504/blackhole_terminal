@@ -92,6 +92,15 @@ interface BinanceTicker {
   closeTime: number
 }
 
+// Task 85 — best bid/ask stream: /api/v3/ticker/bookTicker returns the top of
+// book for the same symbol list, letting every crypto quote carry a real
+// spread (the 24hr ticker alone is last-trade only).
+interface BinanceBookTicker {
+  symbol: string
+  bidPrice: string
+  askPrice: string
+}
+
 const num = (v: string | undefined): number => (v == null ? 0 : Number.parseFloat(v) || 0)
 
 /**
@@ -110,15 +119,20 @@ export async function getBinanceQuotes(symbols: string[]): Promise<Quote[]> {
   if (valid.length === 0) return []
 
   // Binance expects a URL-encoded JSON array for multi-symbol requests; chunk
-  // to keep the query string comfortably short.
+  // to keep the query string comfortably short. The 24hr ticker (last trade)
+  // and bookTicker (best bid/ask) are fetched in parallel per chunk — a
+  // bookTicker failure only drops the bid/ask, never the whole quote.
   const out: Quote[] = []
   for (let i = 0; i < valid.length; i += 25) {
     const chunk = valid.slice(i, i + 25)
-    const data = await binanceFetch<BinanceTicker[]>(
-      `/api/v3/ticker/24hr?symbols=${encodeURIComponent(JSON.stringify(chunk))}`,
-    )
+    const qs = encodeURIComponent(JSON.stringify(chunk))
+    const [data, book] = await Promise.all([
+      binanceFetch<BinanceTicker[]>(`/api/v3/ticker/24hr?symbols=${qs}`),
+      binanceFetch<BinanceBookTicker[]>(`/api/v3/ticker/bookTicker?symbols=${qs}`).catch(() => null),
+    ])
     if (!data) continue
     const byPair = new Map(data.map((t) => [t.symbol, t]))
+    const bookByPair = new Map((book ?? []).map((b) => [b.symbol, b]))
     symbols.forEach((sym, si) => {
       const pair = pairs[si]
       if (!pair) return
@@ -127,6 +141,9 @@ export async function getBinanceQuotes(symbols: string[]): Promise<Quote[]> {
       const price = num(t.lastPrice)
       const change = num(t.priceChange)
       const prevClose = price - change
+      const bb = bookByPair.get(pair)
+      const bid = bb ? num(bb.bidPrice) : 0
+      const ask = bb ? num(bb.askPrice) : 0
       out.push({
         symbol: sym,
         price,
@@ -138,6 +155,8 @@ export async function getBinanceQuotes(symbols: string[]): Promise<Quote[]> {
         prevClose: prevClose || num(t.openPrice),
         volume: num(t.volume),
         ts: Math.floor((t.closeTime || Date.now()) / 1000),
+        // sanitize: crossed/stale books (ask < bid) drop the spread entirely
+        ...(bid > 0 && ask >= bid ? { bid, ask } : {}),
       })
     })
   }

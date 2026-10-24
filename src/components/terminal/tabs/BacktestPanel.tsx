@@ -110,6 +110,11 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   // Task 84 — execution-cost model (bps; 0 = frictionless, historical default)
   const [btSlip, setBtSlip] = useState('0')
   const [btFee, setBtFee] = useState('0')
+  // Task 85 — bid/ask spread (bps): half is charged per market fill
+  const [btSpread, setBtSpread] = useState('0')
+  // Task 85 — live spread probe: the symbol's current bid/ask spread in bps,
+  // surfaced next to the input so the cost model is calibrated, not guessed
+  const [liveSpreadBps, setLiveSpreadBps] = useState<number | null>(null)
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
   const [busy, setBusy] = useState<null | 'run' | 'optimize'>(null)
@@ -158,9 +163,43 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     requireNewSignal: btFresh,
     slippageBps: Math.min(500, Math.max(0, Math.round(Number(btSlip) || 0))),
     feeBps: Math.min(500, Math.max(0, Math.round(Number(btFee) || 0))),
+    spreadBps: Math.min(500, Math.max(0, Math.round(Number(btSpread) || 0))),
     days: Math.max(1, Math.round(Number(days) || 30)),
     capital: Number(capital) || 10000,
-  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee])
+  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee, btSpread])
+
+  // live spread probe (Task 85) — polls the quote endpoint for cfg.symbol's
+  // top of book every 60s and shows "≈X.X bps live" beside the Spread input;
+  // clicking it seeds the input with the observed spread (best-effort: no
+  // bid/ask from the feed → the hint simply stays hidden)
+  useEffect(() => {
+    setLiveSpreadBps(null)
+    if (!cfg.symbol) return
+    let dead = false
+    const probe = async () => {
+      try {
+        const res = await fetch('/api/market/quote', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ symbols: [cfg.symbol] }),
+        })
+        const json = await res.json().catch(() => null)
+        const q = json?.quotes?.find?.((x: { symbol: string }) => x.symbol === cfg.symbol)
+        const bid = typeof q?.bid === 'number' ? q.bid : null
+        const ask = typeof q?.ask === 'number' ? q.ask : null
+        if (!dead && bid != null && ask != null && bid > 0 && ask > bid) {
+          const bps = ((ask - bid) / ((ask + bid) / 2)) * 1e4
+          // sanity gate (Task 85): IEX-only NBBO can sit percent-wide and stale
+          // off-hours — only hint on books within 100bps of mid, where the
+          // number is a real calibration target rather than a stale print
+          if (bps > 0 && bps <= 100) setLiveSpreadBps(bps)
+        }
+      } catch { /* hint is best-effort */ }
+    }
+    void probe()
+    const iv = setInterval(probe, 60_000)
+    return () => { dead = true; clearInterval(iv) }
+  }, [cfg.symbol])
 
   const activeRanges = useMemo(() => {
     const out: { key: string; min: number; max: number; step: number }[] = []
@@ -323,7 +362,31 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
               inputMode="numeric"
               className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
             />
-            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">adverse drift on market/stop fills — TP limits fill clean</p>
+            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">adverse drift beyond the quote on market/stop fills</p>
+          </div>
+          <div>
+            <div className="flex items-center justify-between">
+              <Label htmlFor="bt-spread" className="text-[10px] text-zinc-500">Spread (bps)</Label>
+              {liveSpreadBps != null && (
+                <button
+                  type="button"
+                  onClick={() => setBtSpread(String(Math.max(1, Math.round(liveSpreadBps))))}
+                  title="Use the current live bid/ask spread"
+                  className="text-[9px] text-amber-400/90 hover:text-amber-300"
+                >
+                  ≈{liveSpreadBps < 10 ? liveSpreadBps.toFixed(1) : Math.round(liveSpreadBps)} live
+                </button>
+              )}
+            </div>
+            <Input
+              id="bt-spread"
+              value={btSpread}
+              onChange={(e) => setBtSpread(e.target.value)}
+              onBlur={() => setBtSpread(String(Math.min(500, Math.max(0, Math.round(Number(btSpread) || 0)))))}
+              inputMode="numeric"
+              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">bid/ask cost — half per market fill (buy at ask, sell at bid)</p>
           </div>
           <div>
             <Label htmlFor="bt-fee" className="text-[10px] text-zinc-500">Fee (bps / fill)</Label>
@@ -346,7 +409,7 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           </div>
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
-              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close. Slippage bps hits market/stop fills (entries, stops, strategy exits); TP is a resting limit and fills clean; fee bps charges every fill. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the pre-order quote (not the fill), and bars that closed while the engine was down never produce entries (exits are replayed). Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close. Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
               {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
                 <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
               )}

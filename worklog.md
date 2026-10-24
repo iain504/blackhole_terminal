@@ -1740,3 +1740,22 @@ Stage Summary:
 - Fixed: warmup off-by-one (backtest could start 1 bar late vs live), missed-bar exit replay (live could leave positions stuck), cooldown anchor mismatch.
 - New: optional slippageBps/feeBps cost model in engine+route+UI (default 0, frictionless preserved). Probe tools kept in scripts-tmp/ (parity-probe.ts, costmodel-verify.ts, cooldown-verify.ts, parity-debug*.ts).
 - Files: src/lib/backtest.ts, src/lib/algo-engine.ts, src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx, + probes.
+
+---
+Task ID: 85
+Agent: Z.ai Code (main)
+Task: User question #2 — "the spread that bid/ask price in live VS backtest env": verify whether bid/ask spread is a live-vs-backtest discrepancy source, and make it measurable + modelable.
+
+Work Log:
+- Confirmed the gap is REAL: backtest fills at bar prices (last-trade: entry=next open, exit=close, TP=limit, SL=stop+slip) while live entries/exits are MARKET orders that cross the book (buy@ask, sell@bid) — every live round trip pays the full spread, backtest paid 0 by default. The app ingested NO bid/ask anywhere (Quote was last-trade only).
+- Data layer (Task 85): Quote type gains optional bid/ask; Binance getBinanceQuotes now merges /api/v3/ticker/bookTicker (parallel per 25-symbol chunk, sanitized uncrossed) onto the 24hr ticker; Alpaca StockSnapshot/CryptoSnapshot parse latestQuote.bp/ap; simQuote synthesizes a tiered spread (1–8bps by price).
+- Backtest engine: new spreadBps config — HALF charged adversely per market/stop fill (round trip = full spread), stacking with slippageBps; TP resting limits stay clean. Route parses/clamps spreadBps (0..500).
+- Live engine (algo-engine): on entry, when the book is SANE (uncrossed, ≤100bps of mid), % TP/SL legs + Risk sizing anchor on the FILL-SIDE quote (buy→ask, sell→bid) instead of last trade, and the ENTRY journal logs "spread X.Xbps". Wide/stale books (IEX-only NBBO can sit 5% wide off-hours, e.g. TSLA bid 353.96/ask 372.98 vs last 372.21) fall back to last-trade anchoring exactly as before — the sanity gate prevents a stale print from dragging legs 5% away.
+- BacktestPanel: new Spread (bps) input (between Slippage and Fee, payload+deps wired); live-spread probe polls /api/market/quote for cfg.symbol every 60s and shows "≈X.X live" chip (≤100bps gate) that seeds the input on click; fill-model note rewritten (spread semantics, fill-side leg anchor, "journal logs the live spread — mirror it here").
+- Verified: bun probe — spreadBps 0 vs 20 on 3000 synthetic bars: netPnl −487 → −926, delta ≈ Σmarket-notional × half-spread (463.79 expected vs 438.49 actual, path-dependent leg shift); E2E via agent-browser: BTC/USD 5m 31d, spread=0 → $18,326 / 183.26% / PF 1.52; chip "≈3.3 live" clicked → spread=3 → $10,228 / 102.28% / PF 1.27 — $238/trade expectancy delta ≈ 3bps × $800k notional (qty 10 BTC) as predicted. TSLA hint correctly hidden (5% wide IEX book). No console/page errors, lint clean.
+
+Stage Summary:
+- ANSWER to the user: yes — spread was a genuine unmodeled discrepancy (live pays ask/bid every fill; backtest was frictionless at bar prices). Now: real bid/ask ingested (Binance bookTicker + Alpaca latestQuote), backtest Spread (bps) input with a LIVE spread hint chip, live journal logs the spread per entry, legs anchor fill-side when the book is sane.
+- Spread semantics: spreadBps = full round-trip cost (half per market fill). For crypto majors expect ~0.5–3bps; large-cap stocks ~1–2bps (SIP); IEX-wide prints are gated out, not trusted.
+- Files: src/lib/market-types.ts, src/lib/binance.ts, src/lib/alpaca.ts, src/lib/simulator.ts, src/lib/backtest.ts, src/lib/algo-engine.ts, src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx.
+- Version stamp v1.13.0 (LandingPage). Commit pending user instruction (push not requested yet).

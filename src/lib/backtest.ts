@@ -20,7 +20,11 @@
 //     to every MARKET/STOP fill (entries, SL legs, strategy/EOD/mark exits) —
 //     TP legs are resting LIMIT orders and fill at their price, no drift.
 //     feeBps charges per-fill notional fees on every fill (entry + exit). Both
-//     default to 0 = the historical frictionless model;
+//     default to 0 = the historical frictionless model. Task 85 adds
+//     spreadBps — the bid/ask spread: a market BUY fills at the ASK and a
+//     SELL at the BID, so each market fill is charged HALF the spread
+//     adversely (a round trip pays the full spread); resting TP limits stay
+//     clean. slippageBps stacks on top as impact/drift beyond the quote;
 //   • warmup is aligned to the LIVE engine's guards bar-for-bar: the first
 //     decided bar is the first bar whose window satisfies the same `n <
 //     period+2` / `n < trendSma+2` check evalStrategy applies (Task 84 parity
@@ -80,6 +84,10 @@ export interface BacktestConfig {
   // Task 84 — execution-cost model (both optional, default 0 = frictionless):
   slippageBps?: number // adverse bps on market/stop fills (entry, SL, strategy/EOD/mark exits)
   feeBps?: number // per-fill notional fee bps (charged on entry AND exit)
+  // Task 85 — bid/ask spread (bps). Market fills pay HALF of it per fill
+  // (buy fills at ask, sell at bid — a round trip pays the full spread);
+  // resting TP limits still fill at their price. Stacks with slippageBps.
+  spreadBps?: number
 }
 
 export interface BacktestTrade {
@@ -194,8 +202,12 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 1
   if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 1
 
-  // ---- Task 84 cost model ----
-  const slip = Math.max(0, cfg.slippageBps ?? 0) / 1e4 // adverse drift fraction
+  // ---- Task 84 cost model · Task 85 spread ----
+  // slip = total adverse drift fraction on every MARKET/STOP fill. The spread
+  // contributes HALF of spreadBps per fill (buy at ask = +half, sell at bid =
+  // −half) — a full round trip therefore pays the entire spread. slippageBps
+  // stacks on top as impact/latency drift beyond the quote.
+  const slip = Math.max(0, (cfg.slippageBps ?? 0) + (cfg.spreadBps ?? 0) / 2) / 1e4
   const fee = Math.max(0, cfg.feeBps ?? 0) / 1e4 // per-fill fee fraction
   const slipPx = (px: number, exitDir: 1 | -1): number => {
     // exitDir: +1 = buying back (short exit) → pay up · -1 = selling (long exit) → receive less

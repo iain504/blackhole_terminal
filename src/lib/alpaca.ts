@@ -429,11 +429,15 @@ export async function getBars(
 
 interface StockSnapshot {
   latestTrade?: { p: number; t: string }
+  // Task 85 — best bid/ask (bp/ap) when the feed returns a quote; IEX-feed
+  // stock quotes are IEX-only NBBO, crypto latestQuote is the Alpaca crypto book
+  latestQuote?: { bp?: number; ap?: number; t?: string }
   dailyBar?: { o: number; h: number; l: number; c: number; v: number; t: string }
   prevDailyBar?: { o: number; h: number; l: number; c: number; v: number; t: string }
 }
 interface CryptoSnapshot {
   latestTrade?: { p: number; t: string }
+  latestQuote?: { bp?: number; ap?: number; t?: string }
   dailyBar?: { o: number; h: number; l: number; c: number; v: number; t: string }
   prevDailyBar?: { o: number; h: number; l: number; c: number; v: number; t: string }
 }
@@ -444,6 +448,9 @@ function snapshotToQuote(symbol: string, snap: StockSnapshot | CryptoSnapshot | 
   const prevClose = snap.prevDailyBar?.c
   if (price == null || prevClose == null || prevClose === 0) return null
   const daily = snap.dailyBar
+  // Task 85 — surface the top of book when it's sane (positive, uncrossed)
+  const qBid = snap.latestQuote?.bp
+  const qAsk = snap.latestQuote?.ap
   return {
     symbol,
     price,
@@ -455,6 +462,7 @@ function snapshotToQuote(symbol: string, snap: StockSnapshot | CryptoSnapshot | 
     prevClose,
     volume: daily?.v ?? 0,
     ts: snap.latestTrade?.t ? Math.floor(new Date(snap.latestTrade.t).getTime() / 1000) : Math.floor(Date.now() / 1000),
+    ...(qBid != null && qAsk != null && qBid > 0 && qAsk >= qBid ? { bid: qBid, ask: qAsk } : {}),
   }
 }
 

@@ -502,20 +502,40 @@ async function cycle(runId: string) {
           await log(runId, run.userId, 'info', `Signal suppressed (daily cap ${run.maxTradesDay}): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
-          // resolve % legs — and Risk-Money sizing — against the live quote
+          // resolve % legs — and Risk-Money sizing — against the live quote.
+          // Task 85 spread parity: a market BUY fills at the ASK, a SELL at
+          // the BID — so when the feed returns a SANE book (uncrossed, within
+          // 100bps of mid; IEX-only NBBO can sit 5% wide and stale off-hours,
+          // which would drag the anchor far worse than the last trade), legs
+          // and sizing anchor on the fill-side quote and the journal records
+          // the live spread. Missing/wide book → last trade stays the anchor,
+          // exactly as before this task.
           let ref: number | null = null
+          let anchorPx: number | null = null
+          let spreadBps: number | null = null
           if (run.tpMode === 'pct' || run.slMode === 'pct' || run.sizingMode === 'risk') {
             try {
               const { quotes } = await getQuotes([run.symbol], run.userId)
-              ref = quotes.find((q) => q.symbol === run.symbol)?.price ?? null
+              const q = quotes.find((x) => x.symbol === run.symbol)
+              ref = q?.price ?? null
+              const b = q?.bid
+              const a = q?.ask
+              if (b != null && a != null && b > 0 && a > b) {
+                const s = ((a - b) / ((a + b) / 2)) * 1e4
+                if (s <= 100) {
+                  spreadBps = s
+                  anchorPx = res.entry!.side === 'buy' ? a : b
+                }
+              }
             } catch { ref = null }
             if (ref == null) await log(runId, run.userId, 'error', 'No live quote for % TP/SL — entering without bracket legs')
           }
+          anchorPx = anchorPx ?? ref
           const pctPx = (m: string, v: number | null, kind: 'tp' | 'sl'): number | undefined => {
-            if (m !== 'pct' || v == null || ref == null || ref <= 0) return undefined
+            if (m !== 'pct' || v == null || anchorPx == null || anchorPx <= 0) return undefined
             const p = Math.min(100, Math.max(0.01, Math.abs(v)))
             const profitSide = kind === 'tp' ? res.entry!.side === 'buy' : res.entry!.side === 'sell'
-            const px = profitSide ? ref * (1 + p / 100) : ref * (1 - p / 100)
+            const px = profitSide ? anchorPx * (1 + p / 100) : anchorPx * (1 - p / 100)
             return px > 0 ? px : undefined
           }
           const tp = pctPx(run.tpMode, run.tpValue, 'tp')
@@ -541,8 +561,8 @@ async function cycle(runId: string) {
             }
             riskBudget = riskBudgetUsd(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct, riskEquity)
             const slPct = run.slMode === 'pct' ? run.slValue : null
-            const sized = ref != null && slPct != null && sl != null && riskBudget != null
-              ? riskSizedQty(riskBudget, ref, slPct, isCryptoSym)
+            const sized = anchorPx != null && slPct != null && sl != null && riskBudget != null
+              ? riskSizedQty(riskBudget, anchorPx, slPct, isCryptoSym)
               : null
             if (sized != null) {
               qty = sized
@@ -584,10 +604,15 @@ async function cycle(runId: string) {
                   else st.firedShort = true
                 }
                 const legs = [tp ? `TP ${fmtP(tp)}` : null, sl ? `SL ${fmtP(sl)}` : null].filter(Boolean).join(' · ')
+                // Task 85 — record the live spread on the entry line (only
+                // set when the book passed the sanity gate): this is the
+                // number to mirror in the backtest's Spread (bps) input — a
+                // round trip pays it in full, half per market fill
+                const spreadNote = spreadBps != null ? ` · spread ${spreadBps.toFixed(1)}bps` : ''
                 const riskNote = riskSized
                   ? ` · sized by risk ${riskMoneyLabel(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct)}/trade${run.riskBasis === 'pct' && riskBudget != null ? ` (≈ $${riskBudget.toFixed(2)})` : ''}`
                   : ''
-                await log(runId, run.userId, 'trade', `ENTRY ${res.entry.side.toUpperCase()} ${qty} ${run.symbol} @ mkt${legs ? ` · ${legs}` : ''}${riskNote} · #${r.results[0].id.slice(-8)} · trade ${st.tradesToday}/${run.maxTradesDay} today`)
+                await log(runId, run.userId, 'trade', `ENTRY ${res.entry.side.toUpperCase()} ${qty} ${run.symbol} @ mkt${legs ? ` · ${legs}` : ''}${spreadNote}${riskNote} · #${r.results[0].id.slice(-8)} · trade ${st.tradesToday}/${run.maxTradesDay} today`)
                 st.freshGateSide = undefined // fired — a new episode starts after this
                 // never swallow leg problems — a crypto OCO attach failure or
                 // a split (attach-on-fill) plan used to be invisible here,

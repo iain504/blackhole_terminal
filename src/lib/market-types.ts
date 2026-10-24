@@ -30,6 +30,11 @@ export interface Quote {
   prevClose: number
   volume: number
   ts: number // quote time (unix seconds)
+  // Task 85 — best bid/ask when the feed provides it (Binance bookTicker,
+  // Alpaca snapshot latestQuote, synthesized in the demo simulator).
+  // Optional everywhere: absent = feed didn't return a usable quote.
+  bid?: number
+  ask?: number
 }
 
 export interface NewsItem {

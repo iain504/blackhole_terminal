@@ -134,6 +134,9 @@ export function simQuote(symbol: string): Quote {
   const high = Math.max(price, open, prevClose) * (1 + rnd2() * 0.006)
   const low = Math.min(price, open, prevClose) * (1 - rnd2() * 0.006)
   const volume = Math.floor((0.5 + rnd2()) * (isCryptoSymbol(symbol) ? 50_000 : 40_000_000))
+  // Task 85 — synthetic spread by price tier (majors ~1bp … penny-ish ~8bp)
+  // so the demo quotes behave like a real top of book downstream
+  const spb = price >= 1000 ? 0.0001 : price >= 100 ? 0.0002 : price >= 10 ? 0.0004 : 0.0008
   return {
     symbol,
     price,
@@ -143,6 +146,8 @@ export function simQuote(symbol: string): Quote {
     prevClose,
     volume,
     ts: Math.floor(Date.now() / 1000),
+    bid: price * (1 - spb / 2),
+    ask: price * (1 + spb / 2),
   }
 }
 

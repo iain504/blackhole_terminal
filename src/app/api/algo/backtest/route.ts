@@ -12,6 +12,7 @@
 //   requireNewSignal?: boolean              (Task 70-c) edge-triggered re-entry (default false)
 //   slippageBps?: number                    (Task 84) adverse bps on market/stop fills (default 0)
 //   feeBps?: number                         (Task 84) per-fill notional fee bps (default 0)
+//   spreadBps?: number                      (Task 85) bid/ask spread bps — half charged per market fill (default 0)
 //   sizingMode?: 'fixed'|'risk'             (Task 78) 'risk' = Risk-Money sizing (default 'fixed')
 //   riskBasis?: 'usd'|'pct'                 (Task 78e) budget basis: dollars (default) or % of equity
 //   riskMoney?: number                      (Task 78) dollars at risk per trade (required for risk+usd)
@@ -77,6 +78,7 @@ interface BacktestBody {
   requireNewSignal?: boolean
   slippageBps?: number
   feeBps?: number
+  spreadBps?: number
   sizingMode?: string
   riskBasis?: string
   riskMoney?: number | null
@@ -175,6 +177,8 @@ export async function POST(req: NextRequest) {
       // Task 84 — execution-cost model (bps, default 0 = frictionless)
       slippageBps: Math.min(500, Math.max(0, Math.round(Number(body.slippageBps) || 0))),
       feeBps: Math.min(500, Math.max(0, Math.round(Number(body.feeBps) || 0))),
+      // Task 85 — bid/ask spread (bps, half charged per market fill)
+      spreadBps: Math.min(500, Math.max(0, Math.round(Number(body.spreadBps) || 0))),
       capital,
     }
 
