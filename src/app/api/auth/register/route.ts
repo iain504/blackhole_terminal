@@ -4,17 +4,13 @@ import { hashPassword, verifyPassword, setSessionCookie, createLoginTicket, clie
 import { verifyTotp, encryptTotpSecret } from '@/lib/totp'
 import { rateLimit, resetRateLimit } from '@/lib/rate-limit'
 import { readJson, handleError } from '@/lib/api-helpers'
+import { registrationOpen } from '@/lib/registration'
 
 interface RegisterBody {
   username: string
   password: string
   totpSecret: string
   totpCode: string
-}
-
-function registrationEnabled(): boolean {
-  // Default CLOSED when unset — new deployments must opt in explicitly.
-  return (process.env.ALLOW_REGISTRATION || '').trim().toLowerCase() === 'true'
 }
 
 // POST /api/auth/register — creates account (password + TOTP verified), then signs in.
@@ -37,13 +33,11 @@ export async function POST(req: Request) {
     if (password.length < 8) {
       return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 })
     }
-    // First-run bootstrap (Task 9-j): a fresh deployment — sanitized env, empty
-    // DB, closed registration gate — must be able to create its FIRST account,
-    // or it is permanently locked out after every publish reset. The gate
-    // still applies to every account after the first; rate limiting above caps
-    // abuse of the bootstrap window.
-    const userCount = await db.user.count()
-    if (!registrationEnabled() && userCount > 0) {
+    // First-run bootstrap (Task 9-j) folded into the shared gate (Task 9-k):
+    // open when ALLOW_REGISTRATION=true, or while the user table is empty so a
+    // sanitized publish reset can always create its FIRST account. Rate
+    // limiting above caps abuse of the bootstrap window.
+    if (!(await registrationOpen())) {
       return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
     }
     if (!body.totpSecret || !verifyTotp(body.totpSecret, body.totpCode)) {

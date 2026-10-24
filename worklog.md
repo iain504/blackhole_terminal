@@ -2288,3 +2288,25 @@ Work Log:
 Stage Summary:
 - Publish now survivable end-to-end: sanitized env + fresh DB -> app boots, generates/persists master, first account self-registrable. Stamp v1.19.1.
 - USER impact of this publish reset: stored Alpaca broker keys + layouts + alerts + algo runs are GONE (fresh DB) — re-enter keys in Settings, re-create layouts; trader password/TOTP unchanged. Alpaca key rotation still pending (user action).
+
+---
+Task ID: 9-k
+Agent: main (Z.ai Code)
+Task: Fix "Registration is disabled" — user reported the registration UI rejected new account creation.
+
+Work Log:
+- Root cause: ALLOW_REGISTRATION unset in .env (fail-closed default from the security pass) + user table non-empty → POST /api/auth/register 403 {"error":"Registration is disabled"}. Gate only fired at the LAST step (after QR/TOTP setup) — bad UX.
+- .env: appended ALLOW_REGISTRATION=true (non-secret line; survives publish-pipeline env sanitization per AppSecret/Task 9-j design). Not committed (gitignored).
+- New src/lib/registration.ts: shared registrationOpen() gate — open when ALLOW_REGISTRATION=true OR user table empty (first-run bootstrap, Task 9-j semantics preserved).
+- register/route.ts: refactored to shared gate (removed local registrationEnabled()).
+- 2fa/setup/route.ts: added the SAME gate at provisioning (registration step 1 "Continue") so a closed gate now fails fast instead of after the QR dance.
+- .env.example: documented bootstrap semantics.
+- Restarted dev server (heap-capped protocol). curl probes: POST register → 400 invalid-TOTP (past gate), GET 2fa/setup → 200.
+- E2E (agent-browser): full UI registration for qa-regtest/qa-regtest2 — Create account tab → step 1 → QR+secret → TOTP typed → POST 200 (dev.log) → terminal rendered with new user button. Landing + terminal render verified, lint clean.
+- Deleted both test accounts (user + seeded watchlist); DB back to only `trader`.
+- Gotchas recorded: (1) input-otp needs keyboard press events, not fill, for re-entry; (2) find --name "Create account" hits the mode TAB (duplicate name) — use form button[type=submit]; (3) TOTP codes expire fast during slow keystroke round-trips (±1 step window).
+
+Stage Summary:
+- Registration is OPEN (ALLOW_REGISTRATION=true in local .env; ships with project dir on publish since it is not a secret line).
+- Closed-gate UX now fails at step 1 instead of after 2FA setup. First-account bootstrap preserved.
+- All changes committed as v1.20.0; DB clean (only trader); lint clean.
