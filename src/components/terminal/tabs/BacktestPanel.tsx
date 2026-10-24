@@ -12,9 +12,13 @@
 //   • Auto-tune — grid-searches user-picked parameter ranges, scores every
 //     combo (Calmar-style: net% over max DD%) and lists the top results with
 //     one-click "apply to run setup".
+//   • Test all strategies (Task 87) — ONE click sweeps the whole catalog:
+//     every strategy runs at its defaults PLUS an auto-built optimizer grid
+//     (defaults guaranteed in-grid), and the top X rows across all strategies
+//     are ranked for the user to apply (strategy + params, one click).
 import { useEffect, useMemo, useState } from 'react'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -30,7 +34,7 @@ import {
   ALGO_MAX_DAYS,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
-import type { BacktestResult, OptimizeResult } from '@/lib/backtest'
+import type { BacktestResult, OptimizeResult, SweepResult } from '@/lib/backtest'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 
@@ -99,7 +103,7 @@ const BT_GRAN_TITLES: Record<BtGran, string> = {
 }
 const btWlConfig = { wins: { label: 'Wins' }, losses: { label: 'Losses' } } satisfies ChartConfig
 
-export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>) => void }) {
+export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void }) {
   const { toast } = useToast()
   const [days, setDays] = useState('30')
   const [capital, setCapital] = useState('10000')
@@ -115,9 +119,12 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
   // Task 85 — live spread probe: the symbol's current bid/ask spread in bps,
   // surfaced next to the input so the cost model is calibrated, not guessed
   const [liveSpreadBps, setLiveSpreadBps] = useState<number | null>(null)
+  // Task 87 — one-click all-strategy sweep
+  const [topX, setTopX] = useState('8')
+  const [sweepRes, setSweepRes] = useState<SweepResult | null>(null)
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
-  const [busy, setBusy] = useState<null | 'run' | 'optimize'>(null)
+  const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep'>(null)
   const [error, setError] = useState<string | null>(null)
   const [meta, setMeta] = useState<BacktestMeta | null>(null)
   const [runRes, setRunRes] = useState<BacktestResult | null>(null)
@@ -127,7 +134,9 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
 
   const def = ALGO_STRATEGIES[cfg.strategy]
 
-  // strategy switch → drop stale results + ranges
+  // strategy switch → drop stale results + ranges (the SWEEP survives: it is
+  // a cross-strategy artifact — applying a sweep row switches the strategy
+  // and the ranked list must stay on screen)
   useEffect(() => {
     setRanges({})
     setRunRes(null)
@@ -135,6 +144,11 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     setMeta(null)
     setError(null)
   }, [cfg.strategy])
+
+  // symbol / timeframe switch → the sweep was measured on other data
+  useEffect(() => {
+    setSweepRes(null)
+  }, [cfg.symbol, cfg.timeframe])
 
   // keep the re-entry inputs in sync with the run setup they seed from
   useEffect(() => {
@@ -216,7 +230,7 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     return out
   }, [def, ranges])
 
-  const post = async (mode: 'run' | 'optimize') => {
+  const post = async (mode: 'run' | 'optimize' | 'sweep') => {
     setBusy(mode)
     setError(null)
     try {
@@ -228,22 +242,31 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           mode,
           ...(mode === 'optimize'
             ? { ranges: activeRanges, minTrades: Math.max(1, Math.round(Number(minTrades) || 8)) }
-            : {}),
+            : mode === 'sweep'
+              ? {
+                  minTrades: Math.max(1, Math.round(Number(minTrades) || 8)),
+                  topX: Math.min(20, Math.max(1, Math.round(Number(topX) || 8))),
+                }
+              : {}),
         }),
       })
       const json = await res.json().catch(() => null)
       if (!res.ok) {
         setError(json?.error || `HTTP ${res.status}`)
-        toast({ title: mode === 'run' ? 'Backtest failed' : 'Optimizer failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+        toast({ title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : 'Strategy sweep failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
         return
       }
       setMeta(json.meta ?? null)
       if (mode === 'run') {
         setRunRes(json.result ?? null)
         setOptRes(null)
-      } else {
+      } else if (mode === 'optimize') {
         setOptRes(json.optimize ?? null)
         setRunRes(null)
+      } else {
+        setSweepRes(json.sweep ?? null)
+        setRunRes(null)
+        setOptRes(null)
       }
     } catch {
       setError('Network error')
@@ -253,9 +276,14 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
     }
   }
 
-  const applyRow = (params: Record<string, number>) => {
-    onApplyParams(params)
-    toast({ title: 'Parameters applied', description: 'Optimizer values copied into the run setup — start the run when ready.' })
+  const applyRow = (params: Record<string, number>, strategy?: AlgoStrategyId) => {
+    onApplyParams(params, strategy)
+    toast({
+      title: strategy && strategy !== cfg.strategy ? 'Strategy + parameters applied' : 'Parameters applied',
+      description: strategy && strategy !== cfg.strategy
+        ? `${ALGO_STRATEGIES[strategy].name} is now the run setup — review it and start the run when ready.`
+        : 'Optimizer values copied into the run setup — start the run when ready.',
+    })
   }
 
   // downsample the equity curve for the chart
@@ -439,6 +467,29 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
             <SlidersHorizontal className="h-3.5 w-3.5" />
             Auto-tune parameters {optOpen ? '▲' : '▼'}
           </Button>
+          <div className="flex items-center gap-1.5">
+            <Button
+              className="h-8 gap-2 bg-violet-600 px-3 text-xs text-white hover:bg-violet-500"
+              disabled={busy !== null || !cfg.symbol || !sizingOk}
+              title={!sizingOk
+                ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
+                : 'Backtest every strategy at its defaults + an auto-tuned parameter grid, then rank the top X winners'}
+              onClick={() => void post('sweep')}
+            >
+              {busy === 'sweep' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+              Test all strategies
+            </Button>
+            <Label htmlFor="bt-topx" className="text-[10px] text-zinc-500" title="How many winning configurations to list (1–20)">Top</Label>
+            <Input
+              id="bt-topx"
+              value={topX}
+              onChange={(e) => setTopX(e.target.value)}
+              onBlur={() => setTopX(String(Math.min(20, Math.max(1, Math.round(Number(topX) || 8)))))}
+              inputMode="numeric"
+              aria-label="Number of sweep winners to list"
+              className="h-8 w-14 border-zinc-800 bg-zinc-950 text-xs"
+            />
+          </div>
         </div>
 
         {/* ---- optimizer ranges ---- */}
@@ -517,7 +568,11 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
       {busy && (
         <div className="flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-6 text-xs text-zinc-400" role="status">
           <RefreshCw className="h-4 w-4 animate-spin text-zinc-500" aria-hidden />
-          {busy === 'run' ? 'Replaying history…' : 'Searching parameter grid… this can take a few seconds'}
+          {busy === 'run'
+            ? 'Replaying history…'
+            : busy === 'optimize'
+              ? 'Searching parameter grid… this can take a few seconds'
+              : 'Sweeping every strategy — defaults + auto-tuned grids for each… this can take 10–30s'}
         </div>
       )}
 
@@ -722,6 +777,101 @@ export default function BacktestPanel({ cfg, onApplyParams }: { cfg: AlgoSetupCf
           <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
             Click any row to apply those parameters to the run setup (unticked parameters keep their setup values). Past performance ≠ future results — re-run the
             backtest on the tuned parameters and check the drawdown before going live.
+          </p>
+        </div>
+      )}
+
+      {/* strategy sweep result (Task 87) — top X across ALL strategies */}
+      {sweepRes && (
+        <div className="rounded-md border border-violet-500/25 bg-zinc-900/70">
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2">
+            <Zap className="h-3.5 w-3.5 text-violet-400" aria-hidden />
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Strategy sweep — top {sweepRes.rows.length || sweepRes.topX}</span>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">{sweepRes.evaluated.toLocaleString('en-US')} backtests</Badge>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">min {sweepRes.minTrades} trades</Badge>
+            <span className="text-[10px] text-zinc-600">{(sweepRes.elapsedMs / 1000).toFixed(1)}s</span>
+          </div>
+          {sweepRes.perStrategy.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pb-2">
+              {sweepRes.perStrategy.map((ps) => (
+                <Badge
+                  key={ps.strategy}
+                  variant="outline"
+                  className="text-[9px] text-zinc-400"
+                  title={`${ALGO_STRATEGIES[ps.strategy].name}: auto grid ${ps.totalCombos.toLocaleString('en-US')} combos → ${ps.evaluated.toLocaleString('en-US')} sims${ps.truncated ? ' (stride-sampled to the compute budget)' : ''}, ${ps.skipped} skipped, best score ${ps.bestScore != null ? ps.bestScore.toFixed(2) : 'none scorable'}`}
+                >
+                  <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: ALGO_STRATEGIES[ps.strategy].color }} aria-hidden />
+                  {ALGO_STRATEGIES[ps.strategy].name}: {ps.scorable} scorable
+                </Badge>
+              ))}
+            </div>
+          )}
+          {sweepRes.rows.length === 0 ? (
+            <p className="border-t border-zinc-800/60 px-3 py-4 text-center text-xs text-zinc-500">
+              No strategy cleared {sweepRes.minTrades} trades on this window — lower the min-trades gate, widen the history, or relax the session/TP-SL gates.
+            </p>
+          ) : (
+            <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Strategy sweep result table">
+              <table className="w-full min-w-[680px] text-left text-[11px]">
+                <thead className="sticky top-0 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+                  <tr>
+                    <th className="px-2.5 py-1.5 font-medium">#</th>
+                    <th className="px-2 py-1.5 font-medium">Strategy</th>
+                    <th className="px-2 py-1.5 font-medium">Parameters</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Score</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Net %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Win %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Max DD %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Trades</th>
+                    <th className="px-2.5 py-1.5 font-medium" aria-label="Apply" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {sweepRes.rows.map((row, i) => (
+                    <tr
+                      key={`${row.strategy}-${i}`}
+                      className={cn('cursor-pointer border-t border-zinc-800/40 hover:bg-zinc-900/60', i === 0 && 'bg-violet-500/5')}
+                      onClick={() => applyRow(row.params, row.strategy)}
+                      title="Click to apply this strategy + parameters to the run setup"
+                    >
+                      <td className="px-2.5 py-1.5 tabular-nums text-zinc-500">{i + 1}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5">
+                        <span className="flex items-center gap-1.5">
+                          <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: ALGO_STRATEGIES[row.strategy].color }} aria-hidden />
+                          <span className={cn('font-medium', row.strategy === cfg.strategy ? 'text-zinc-100' : 'text-zinc-300')}>{ALGO_STRATEGIES[row.strategy].name}</span>
+                          {row.strategy === cfg.strategy && <span className="text-[9px] uppercase text-zinc-500">setup</span>}
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-zinc-300">
+                        <span className="flex flex-wrap gap-x-2">
+                          {Object.entries(row.params).map(([k, v]) => (
+                            <span key={k} className="whitespace-nowrap">
+                              <span className="text-zinc-500">{paramLabel(row.strategy, k)}</span> <span className="tabular-nums text-zinc-200">{v}</span>
+                            </span>
+                          ))}
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{row.score.toFixed(2)}</td>
+                      <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(row.metrics.netPct))}>{fmtPct(row.metrics.netPct)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.profitFactor >= 999 ? '∞' : row.metrics.profitFactor.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.winRate.toFixed(0)}%</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-rose-400/80">{row.metrics.maxDrawdownPct.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.trades}</td>
+                      <td className="px-2.5 py-1.5 text-right">
+                        {i === 0 && <Badge variant="outline" className="text-[9px] uppercase text-violet-300 border-violet-500/40">best</Badge>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
+            Every strategy ran at its catalog defaults plus an auto-tuned grid (up to 5 values per numeric parameter, defaults always included, compute-budget
+            stride-sampled — hover the badges above for per-strategy counts). Your qty / sizing / TP-SL / session gates and cost model were held fixed; only strategy
+            parameters were optimized. Click a row to apply that strategy + parameters to the run setup, then re-run a single backtest and check the drawdown before
+            going live. Past performance ≠ future results.
           </p>
         </div>
       )}

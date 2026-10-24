@@ -51,7 +51,7 @@
 // reused by every optimizer combo — each combo then costs ~O(bars) with O(1)
 // per-bar indicator updates (grid of ~800 combos × 40k bars ≈ 1–2s).
 import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
-import { ALGO_STRATEGIES, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
+import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
 import type { Bar } from '@/lib/market-types'
 
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — same as the live engine
@@ -643,6 +643,10 @@ export interface OptimizeRange {
   min: number
   max: number
   step: number
+  /** Explicit value grid (Task 87 auto-sweep) — when present it REPLACES the
+   *  min/max/step arithmetic so a curated value set (defaults guaranteed
+   *  included) can be passed without fighting uniform-step reconstruction. */
+  values?: number[]
 }
 
 export interface OptimizeRow {
@@ -665,6 +669,12 @@ const MAX_PER_DIM = 64
 const COMBO_BAR_BUDGET = 12_000_000 // ~1-2s of pure-JS sim work
 
 function dimValues(r: OptimizeRange): number[] {
+  if (Array.isArray(r.values) && r.values.length > 0) {
+    const vals = [...new Set(
+      r.values.filter((v) => Number.isFinite(v)).map((v) => Number(v.toFixed(6))),
+    )].sort((a, b) => a - b)
+    if (vals.length > 0) return vals
+  }
   const step = r.step > 0 ? r.step : 1
   const vals: number[] = []
   const count = Math.floor((r.max - r.min) / step + 1e-9) + 1
@@ -699,16 +709,21 @@ export function optimizeBacktest(
   for (const r of Array.isArray(ranges) ? ranges : []) {
     const d = defsByKey.get(String(r?.key))
     if (!d || d.bool) continue
+    const hasValues = Array.isArray(r?.values) && r.values.length > 0
     const min = Number(r.min)
     const max = Number(r.max)
     const step = Number(r.step)
-    if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step)) continue
-    if (max <= min || step <= 0) continue
+    if (!hasValues && (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step))) continue
+    if (!hasValues && (max <= min || step <= 0)) continue
     clean.push({
       key: d.key,
       min: Math.min(d.max, Math.max(d.min, min)),
       max: Math.min(d.max, Math.max(d.min, max)),
       step,
+      // Task 87 — explicit grids are sanitized to the param's sanctioned span
+      ...(hasValues
+        ? { values: r.values!.filter((v) => Number.isFinite(v)).map((v) => Math.min(d.max, Math.max(d.min, Number(v.toFixed(6))))) }
+        : {}),
     })
   }
   const dims = clean.map((r) => ({ key: r.key, vals: dimValues(r) }))
@@ -753,5 +768,154 @@ export function optimizeBacktest(
     skipped,
     truncated: stride > 1,
     elapsedMs: Date.now() - t0,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// strategy sweep (Task 87) — one click tests EVERY strategy: each runs at its
+// defaults plus an AUTO-BUILT optimizer grid, and the top X rows across all
+// strategies are ranked for the user to apply.
+// ---------------------------------------------------------------------------
+
+export interface SweepRow {
+  strategy: AlgoStrategyId
+  params: Record<string, number> // FULL param set (defaults + overrides)
+  score: number
+  metrics: BacktestMetrics
+}
+
+export interface SweepPerStrategy {
+  strategy: AlgoStrategyId
+  totalCombos: number // auto grid size before sampling
+  evaluated: number // sims actually run (defaults row + sampled combos)
+  skipped: number // invalid combos (e.g. oversold ≥ overbought)
+  truncated: boolean // grid was stride-sampled to the compute budget
+  scorable: number // rows that cleared minTrades
+  bestScore: number | null // best Calmar score for this strategy (null = none scorable)
+}
+
+export interface SweepResult {
+  rows: SweepRow[] // top X across ALL strategies, score desc
+  topX: number
+  minTrades: number
+  evaluated: number
+  skipped: number
+  elapsedMs: number
+  perStrategy: SweepPerStrategy[]
+}
+
+const SWEEP_VALUES_PER_DIM = 5
+
+/**
+ * Auto optimizer grid for one strategy (Task 87): EVERY numeric (non-bool)
+ * param is swept with up to 5 values spanning the param's sanctioned
+ * min..max, and the strategy's DEFAULT value is always one of them — so the
+ * untouched configuration is always inside the grid and tuning can only
+ * wander through ranges the catalog itself sanctions.
+ */
+export function autoOptimizeRanges(strategy: AlgoStrategyId): OptimizeRange[] {
+  const def = ALGO_STRATEGIES[strategy]
+  const out: OptimizeRange[] = []
+  for (const p of def.params) {
+    if (p.bool) continue
+    const count = Math.floor((p.max - p.min) / p.step + 1e-9) + 1
+    if (count <= SWEEP_VALUES_PER_DIM) {
+      // the whole grid fits — sweep it verbatim (default is on-grid)
+      const vals: number[] = []
+      for (let k = 0; k < count; k++) vals.push(Number((p.min + k * p.step).toFixed(6)))
+      out.push({ key: p.key, min: p.min, max: vals[vals.length - 1], step: p.step, values: vals })
+      continue
+    }
+    // sample SWEEP_VALUES_PER_DIM evenly spaced indices, forcing the
+    // default's index in so the setup value can never fall outside the grid
+    const di = Math.min(count - 1, Math.max(0, Math.round((def.defaults[p.key] - p.min) / p.step)))
+    const idxs = new Set<number>()
+    for (let k = 0; k < SWEEP_VALUES_PER_DIM; k++) {
+      idxs.add(Math.min(count - 1, Math.max(0, Math.round((k * (count - 1)) / (SWEEP_VALUES_PER_DIM - 1)))))
+    }
+    idxs.add(di)
+    const vals = [...idxs].sort((a, b) => a - b).map((i) => Number((p.min + i * p.step).toFixed(6)))
+    out.push({ key: p.key, min: vals[0], max: vals[vals.length - 1], step: p.step, values: vals })
+  }
+  return out
+}
+
+function sweepSig(strategy: AlgoStrategyId, params: Record<string, number>): string {
+  return strategy + '|' + Object.entries(params).map(([k, v]) => `${k}=${v}`).sort().join(',')
+}
+
+/**
+ * One-click sweep (Task 87): for EVERY strategy in the catalog —
+ *   1. replay the strategy's DEFAULTS as-is (always a candidate, even when
+ *      the optimizer's stride would skip it);
+ *   2. run the auto grid-search (autoOptimizeRanges) through the same
+ *      budget/stride machinery as the manual optimizer;
+ * then dedupe (strategy+params), rank by the Calmar-style score and return
+ * the top `topX` rows. Rows that failed minTrades are never listed.
+ * The user's cross-cutting config (qty/sizing/TP-SL/session guards/cost
+ * model/capital) is held fixed — only strategy params are optimized.
+ */
+export function sweepStrategies(
+  series: BacktestSeries,
+  base: BacktestConfig,
+  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number },
+): SweepResult {
+  const t0 = Date.now()
+  const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
+  const topX = Math.min(20, Math.max(1, Math.round(opts?.topX ?? 8)))
+  const perStrategy: SweepPerStrategy[] = []
+  const candidates: SweepRow[] = []
+  let evaluated = 0
+  let skipped = 0
+  for (const sid of ALGO_STRATEGY_IDS) {
+    const def = ALGO_STRATEGIES[sid]
+    const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults } }
+    // (1) untouched defaults — always a candidate
+    const baseRun = runBacktest(series, cfg)
+    evaluated++
+    const baseScore = backtestScore(baseRun.metrics, minTrades)
+    if (baseScore > -Infinity) {
+      candidates.push({ strategy: sid, params: { ...def.defaults }, score: baseScore, metrics: baseRun.metrics })
+    }
+    let scorable = baseScore > -Infinity ? 1 : 0
+    let bestScore = baseScore > -Infinity ? baseScore : null
+    // (2) auto grid search over the strategy's numeric params
+    const opt = optimizeBacktest(series, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy })
+    evaluated += opt.evaluated
+    skipped += opt.skipped
+    for (const row of opt.results) {
+      if (!(row.score > -Infinity)) continue
+      scorable++
+      if (bestScore == null || row.score > bestScore) bestScore = row.score
+      candidates.push({ strategy: sid, params: { ...def.defaults, ...row.params }, score: row.score, metrics: row.metrics })
+    }
+    perStrategy.push({
+      strategy: sid,
+      totalCombos: opt.totalCombos,
+      evaluated: opt.evaluated + 1,
+      skipped: opt.skipped,
+      truncated: opt.truncated,
+      scorable,
+      bestScore,
+    })
+  }
+  // dedupe identical (strategy, params) rows — a grid combo that lands exactly
+  // on the defaults would otherwise appear twice with the same score
+  const seen = new Set<string>()
+  const unique = candidates.filter((r) => {
+    const sig = sweepSig(r.strategy, r.params)
+    if (seen.has(sig)) return false
+    seen.add(sig)
+    return true
+  })
+  unique.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
+  return {
+    rows: unique.slice(0, topX),
+    topX,
+    minTrades,
+    evaluated,
+    skipped,
+    elapsedMs: Date.now() - t0,
+    perStrategy,
   }
 }

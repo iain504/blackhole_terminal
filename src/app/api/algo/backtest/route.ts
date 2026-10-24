@@ -1,8 +1,11 @@
 // POST /api/algo/backtest (Task 62) — run one backtest OR a grid-search
 // parameter optimization for an algo strategy over real historical bars.
+// Task 87 adds mode 'sweep' — one click tests EVERY strategy: each runs at
+// its defaults plus an auto-built optimizer grid (defaults guaranteed in-grid)
+// and the top X rows across all strategies are ranked for one-click apply.
 //
 // body: {
-//   mode?: 'run' | 'optimize'            (default 'run')
+//   mode?: 'run' | 'optimize' | 'sweep'   (default 'run'; sweep ignores strategy)
 //   symbol, timeframe ('1m'|'5m'|'15m'), strategy (AlgoStrategyId),
 //   params: Record<string, number>,       base parameters
 //   ranges?: { key, min, max, step }[]    (optimize mode — numeric params only)
@@ -18,7 +21,8 @@
 //   riskMoney?: number                      (Task 78) dollars at risk per trade (required for risk+usd)
 //   riskMoneyPct?: number                   (Task 78e) % of equity per trade (required for risk+pct)
 //   capital?: number                       starting equity for % / DD metrics
-//   minTrades?: number                     (optimize) minimum trades to score
+//   minTrades?: number                     (optimize/sweep) minimum trades to score
+//   topX?: number                          (sweep) how many winners to list (1..20, default 8)
 // }
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
@@ -27,7 +31,7 @@ import { getBars } from '@/lib/alpaca'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, type AlgoTimeframe } from '@/lib/algo-strategies'
 import {
-  prepareSeries, runBacktest, optimizeBacktest,
+  prepareSeries, runBacktest, optimizeBacktest, sweepStrategies,
   type BacktestConfig, type OptimizeRange,
 } from '@/lib/backtest'
 
@@ -85,14 +89,20 @@ interface BacktestBody {
   riskMoneyPct?: number | null
   capital?: number
   minTrades?: number
+  topX?: number
 }
 
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
     const body = await readJson<BacktestBody>(req)
+    const mode = body.mode === 'optimize' || body.mode === 'sweep' ? body.mode : 'run'
 
-    const strategy = body.strategy
+    // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
+    // any) is only a placeholder for the shared config validation below; every
+    // sweep candidate gets its own catalog params inside sweepStrategies().
+    let strategy = body.strategy
+    if (mode === 'sweep') strategy = isAlgoStrategyId(strategy) ? strategy : 'bb-reversion'
     if (!isAlgoStrategyId(strategy)) {
       return NextResponse.json({ error: 'Unknown strategy' }, { status: 400 })
     }
@@ -203,6 +213,13 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'No valid optimize ranges — tick at least one parameter and set min < max' }, { status: 400 })
       }
       return NextResponse.json({ optimize, meta })
+    }
+
+    if (mode === 'sweep') {
+      const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
+      const topX = Math.min(20, Math.max(1, Math.round(Number(body.topX) || 8)))
+      const sweep = sweepStrategies(series, cfg, { minTrades, topX })
+      return NextResponse.json({ sweep, meta })
     }
 
     const result = runBacktest(series, cfg)

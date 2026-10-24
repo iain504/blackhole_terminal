@@ -642,8 +642,15 @@ export default function AlgoTab() {
           {view === 'backtest' && (
             <BacktestPanel
               cfg={setupCfg}
-              onApplyParams={(p) => {
-                setParams((prev) => normalizeAlgoParams(strategy, { ...prev, ...p }))
+              onApplyParams={(p, s) => {
+                // Task 87 — sweep rows carry their own strategy: applying one
+                // switches the setup strategy AND its params in one click
+                if (s && s !== strategy) {
+                  setStrategy(s)
+                  setParams(normalizeAlgoParams(s, p))
+                } else {
+                  setParams((prev) => normalizeAlgoParams(strategy, { ...prev, ...p }))
+                }
                 setShowParams(true)
               }}
             />
