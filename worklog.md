@@ -1759,3 +1759,18 @@ Stage Summary:
 - Spread semantics: spreadBps = full round-trip cost (half per market fill). For crypto majors expect ~0.5–3bps; large-cap stocks ~1–2bps (SIP); IEX-wide prints are gated out, not trusted.
 - Files: src/lib/market-types.ts, src/lib/binance.ts, src/lib/alpaca.ts, src/lib/simulator.ts, src/lib/backtest.ts, src/lib/algo-engine.ts, src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx.
 - Version stamp v1.13.0 (LandingPage). Commit pending user instruction (push not requested yet).
+
+---
+Task ID: 85-push
+Agent: Z.ai Code (main)
+Task: "push to github." (Task 84 + 85; new fine-grained PAT #5)
+
+Work Log:
+- Recreated /tmp/gh-askpass.sh with PAT #5; push rejected non-fast-forward — the sandbox snapshot restore had REWOUND local history to a pre-82b base (merge-base fead176) while origin/main carried Task 82b/82c/83 + a crypto-24/7 session feature (midnight-anchored VWAP/OR, equity-only RTH/EOD guards in backtest.ts + algo-engine.ts) that the restore LOST locally; local line carried Task 84/85 on top of the stale base.
+- Rebased local (Task 84 1e5c085, Task 85 c13524b + churn) onto origin/main 06c8005 with UNION conflict resolution: worklog.md append-append (kept both sections), backtest.ts EOD-flatten hunk (kept remote's !cfg.isCrypto crypto guard AND local's slipPx EOD fill), db/custom.db binary churn (working copy). fead176/2ee3bdb became empty and were dropped by the rebase.
+- Union-tree verification: ALL five feature sets present — T83 day-trade advisor (RVOL/dayplan.ts), T82c fib real-leg, crypto 24/7 session (backtest + engine), T84 warmup+cost model+missed-bar replay, T85 spread (engine spread term line 210, route, panel, bookTicker, anchorPx).
+- Lint clean; tsc errors confined to pre-existing examples/skills; dev server restart needed after the rebase (SQLite readonly — stale handle on the checkout-replaced db file; chmod + restart fixed, 0 readonly errors). Browser smoke: algo tab + Backtest panel render with the Spread (bps) input; / 200; BTC/USD bid/ask OK.
+- Pushed 06c8005..c67f6fb; verified origin/main == local == c67f6fb, 0 unpushed.
+
+Stage Summary:
+- main = origin/main = c67f6fb on iain504/blackhole_terminal: Task 82b/82c + 83 + crypto-24/7 + Task 84 parity + Task 85 spread — all five layers now in ONE linear history. Only db/custom.db + generated version stamp churn remain uncommitted (convention).
