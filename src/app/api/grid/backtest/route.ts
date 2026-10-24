@@ -9,6 +9,7 @@
 //   symbol, lowerPrice, upperPrice, gridCount, spacing, qtyPerGrid,
 //   maxSL?, maxTP?,            — whole-grid guards (number | absent)
 //   slBasis?, tpBasis?,        — 'price' | 'percent' (default 'price')
+//   direction?,                — 'both' | 'buy' | 'sell' (Task 10-g, default 'both')
 //   closeOnStop?,              — default true
 //   days?                      — 1..365 calendar days (default 30)
 // }
@@ -22,7 +23,7 @@ import { rateLimit } from '@/lib/rate-limit'
 import { symbolSchema } from '@/lib/validation'
 import { ALGO_MAX_DAYS } from '@/lib/algo-strategies'
 import { fetchBacktestBars } from '@/lib/backtest-history'
-import { validateGridConfig, isGridSpacing, type GridSpacing } from '@/lib/grid-engine'
+import { validateGridConfig, isGridSpacing, isGridDirection, type GridSpacing } from '@/lib/grid-engine'
 import { simulateGridBacktest, type GridBacktestConfig } from '@/lib/grid-backtest'
 import { parseGuardBasis, round2 } from '../route'
 
@@ -39,6 +40,7 @@ interface GridBacktestBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  direction?: string
   closeOnStop?: boolean
   days?: number
 }
@@ -75,6 +77,8 @@ export async function POST(req: NextRequest) {
     if (slBasis == null) return bad('slBasis must be "price" or "percent"')
     const tpBasis = parseGuardBasis(body?.tpBasis)
     if (tpBasis == null) return bad('tpBasis must be "price" or "percent"')
+    const direction = body?.direction == null || body?.direction === '' ? 'both' : body.direction
+    if (!isGridDirection(direction)) return bad('direction must be "both", "buy" or "sell"')
 
     const lowerPrice = Number(body?.lowerPrice)
     const upperPrice = Number(body?.upperPrice)
@@ -106,6 +110,7 @@ export async function POST(req: NextRequest) {
       slBasis,
       tpBasis,
       isCrypto: symbol.includes('/'),
+      direction,
     })
     if (invalid) return bad(invalid)
 
@@ -134,6 +139,7 @@ export async function POST(req: NextRequest) {
         tpBasis,
         closeOnStop,
         isCrypto: symbol.includes('/'),
+        direction,
       } satisfies GridBacktestConfig,
       bars,
     )

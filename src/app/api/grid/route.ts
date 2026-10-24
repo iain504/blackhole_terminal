@@ -8,7 +8,7 @@ import { hasAlpacaKeys } from '@/lib/alpaca'
 import { symbolSchema } from '@/lib/validation'
 import {
   startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
-  isGridSpacing, parseGridState, type GridSpacing,
+  isGridSpacing, isGridDirection, parseGridState, type GridSpacing,
 } from '@/lib/grid-engine'
 
 export const dynamic = 'force-dynamic'
@@ -63,6 +63,7 @@ export interface GridTradeDto {
   maxTP: number | null
   slBasis: string
   tpBasis: string
+  direction: string
   closeOnStop: boolean
   status: string
   stopReason: string | null
@@ -90,6 +91,7 @@ export function toDto(row: {
   maxTP: number | null
   slBasis: string
   tpBasis: string
+  direction?: string | null
   closeOnStop: boolean
   status: string
   stopReason: string | null
@@ -113,6 +115,7 @@ export function toDto(row: {
     maxTP: row.maxTP,
     slBasis: row.slBasis,
     tpBasis: row.tpBasis,
+    direction: isGridDirection(row.direction) ? row.direction : 'both',
     closeOnStop: row.closeOnStop,
     status: row.status,
     stopReason: row.stopReason,
@@ -170,6 +173,7 @@ interface GridCreateBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  direction?: string
   closeOnStop?: boolean
 }
 
@@ -202,6 +206,10 @@ export async function POST(req: NextRequest) {
     if (slBasis == null) return bad('slBasis must be "price" or "percent"')
     const tpBasis = parseGuardBasis(body?.tpBasis)
     if (tpBasis == null) return bad('tpBasis must be "price" or "percent"')
+    // Task 10-g — grid direction ('both' default; validated again by the
+    // shared validator together with the merged guards)
+    const direction = body?.direction == null || body?.direction === '' ? 'both' : body.direction
+    if (!isGridDirection(direction)) return bad('direction must be "both", "buy" or "sell"')
 
     const lowerPrice = Number(body?.lowerPrice)
     const upperPrice = Number(body?.upperPrice)
@@ -237,6 +245,7 @@ export async function POST(req: NextRequest) {
       slBasis,
       tpBasis,
       isCrypto: symbol.includes('/'),
+      direction,
     })
     if (invalid) return bad(invalid)
 
@@ -261,6 +270,7 @@ export async function POST(req: NextRequest) {
       maxTP,
       slBasis,
       tpBasis,
+      direction,
       closeOnStop: body?.closeOnStop !== false,
     })
     return NextResponse.json(

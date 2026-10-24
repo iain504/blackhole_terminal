@@ -5,7 +5,7 @@
 // resizable after drawing, with right-click context menus (Task 14 #1/#4,
 // Task 16 #4/#5/#6). Earnings [E] (yfinance) + news ⚡ icons on the TIME
 // AXIS (x-axis), TradingView-style.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, IPriceLine, MouseEventParams, CandlestickData, LineData,
@@ -60,6 +60,17 @@ interface GridOverlayRow {
   maxTP: number | null
   slBasis?: string | null
   tpBasis?: string | null
+  /** Task 10-g — 'both' | 'buy' | 'sell' (absent reads as 'both') */
+  direction?: string | null
+}
+
+/** '#10b981' → '16 185 129' — the space-separated triplet the glow CSS var
+ *  consumes (rgb(var(--glow-rgb) / a)); null on a malformed hex. */
+function hexToRgbVar(hex: string): string | null {
+  const m = /^#([0-9a-f]{6})$/i.exec(String(hex ?? '').trim())
+  if (!m) return null
+  const n = parseInt(m[1], 16)
+  return `${(n >> 16) & 255} ${(n >> 8) & 255} ${n & 255}`
 }
 
 /** Suggested price for a not-yet-created TP/SL (ghost chip default). */
@@ -3498,6 +3509,79 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     [gridOverlayData, symbol],
   )
 
+  // ---- Task 10-g — algo-run glow + user-configured glow colors ----
+  // Minimal algo poll (same 5s cadence, same silent-failure contract as the
+  // grid poll): the glow only needs { id, symbol, status } per run.
+  const [algoGlowRows, setAlgoGlowRows] = useState<{ id: string; symbol: string; status: string }[] | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    const fetchAlgos = async () => {
+      try {
+        const res = await fetch('/api/algo')
+        if (!res.ok) { if (!cancelled) setAlgoGlowRows(null); return }
+        const json = (await res.json().catch(() => null)) as { runs?: { id?: unknown; symbol?: unknown; status?: unknown }[] } | null
+        if (!cancelled) {
+          setAlgoGlowRows(
+            Array.isArray(json?.runs)
+              ? json!.runs!.map((r) => ({ id: String(r?.id ?? ''), symbol: String(r?.symbol ?? ''), status: String(r?.status ?? '') }))
+              : null,
+          )
+        }
+      } catch { /* offline — keep the last snapshot */ }
+    }
+    void fetchAlgos()
+    const t = setInterval(() => { void fetchAlgos() }, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+      setAlgoGlowRows(null)
+    }
+  }, [])
+
+  // Glow colors from Settings (grid / algo, hex). Fetched once + on every
+  // settings save. Deliberately does NOT bump settingsVer — a color tweak
+  // must never tear down the chart.
+  const [glowColors, setGlowColors] = useState<{ grid: string; algo: string }>({ grid: '#10b981', algo: '#a855f7' })
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const res = await fetch('/api/settings')
+        if (!res.ok) return // logged out / offline — keep the defaults
+        const json = (await res.json().catch(() => null)) as { glow?: { grid?: unknown; algo?: unknown } } | null
+        const g = json?.glow
+        if (g && typeof g.grid === 'string' && typeof g.algo === 'string' && !cancelled) {
+          setGlowColors({ grid: g.grid, algo: g.algo })
+        }
+      } catch { /* offline — keep the last colors */ }
+    }
+    void load()
+    window.addEventListener('tt:settings-changed', load)
+    return () => {
+      cancelled = true
+      window.removeEventListener('tt:settings-changed', load)
+    }
+  }, [])
+
+  const algoLiveOnSymbol = useMemo(
+    () =>
+      Array.isArray(algoGlowRows) &&
+      algoGlowRows.some((r) => r.status === 'running' && normSym(r.symbol) === normSym(symbol)),
+    [algoGlowRows, symbol],
+  )
+
+  // One pulsing ring per LIVE engine on this symbol (grid + algo stack when
+  // both run); each ring takes its color from the user's settings via the
+  // --glow-rgb CSS variable (globals.css consumes the r g b triplet).
+  const glowLayers = useMemo(() => {
+    const layers: { key: string; rgb: string }[] = []
+    const gridRgb = hexToRgbVar(glowColors.grid) ?? '16 185 129'
+    const algoRgb = hexToRgbVar(glowColors.algo) ?? '168 85 247'
+    if (gridLiveOnSymbol) layers.push({ key: 'grid', rgb: gridRgb })
+    if (algoLiveOnSymbol) layers.push({ key: 'algo', rgb: algoRgb })
+    return layers
+  }, [gridLiveOnSymbol, algoLiveOnSymbol, glowColors])
+
   // Price-line lifecycle: teardown at the TOP of the effect (not as a cleanup)
   // so chart recreation can never call removePriceLine on a disposed series —
   // lines created on a since-replaced chart die with that chart.remove(), and
@@ -3536,11 +3620,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       if (!Number.isFinite(lower) || !Number.isFinite(upper) || !(upper > lower)) continue
       addLine(lower, '#71717a', 2, LineStyle.Dashed, 'G⌄', true)
       addLine(upper, '#71717a', 2, LineStyle.Dashed, 'G⌃', true)
+      // interior levels tinted by direction (Task 10-g): buy-only sky,
+      // sell-only violet, classic emerald
+      const levelColor = g.direction === 'sell' ? '#a855f7' : g.direction === 'buy' ? '#38bdf8' : '#10b981'
       for (const lv of Array.isArray(g.levels) ? g.levels : []) {
         const v = Number(lv)
         if (!Number.isFinite(v)) continue
         if (Math.abs(v - lower) < 1e-9 || Math.abs(v - upper) < 1e-9) continue // bounds already drawn
-        addLine(v, '#10b981', 1, LineStyle.Solid, '', false)
+        addLine(v, levelColor, 1, LineStyle.Solid, '', false)
       }
       // resolved circuit-breaker triggers — same formulas the server uses:
       // SL trigger = lower × (1 − pct/100), TP trigger = upper × (1 + pct/100)
@@ -4520,11 +4607,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         onSelect={onSymbolChange}
       />
     </div>
-    {/* Task 10-d — pulsing boundary glow while this symbol has a live grid.
-        Lives OUTSIDE the overflow-hidden chart container (sibling in the
-        wrapper) so the outer halo is not clipped, and animates opacity only
-        so the chart canvas is never composited per-frame. */}
-    {gridLiveOnSymbol && <div aria-hidden className="grid-live-glow absolute inset-0 z-20" />}
+    {/* Task 10-d / 10-g — pulsing boundary glow while this symbol has a live
+        grid and/or a running algo. Lives OUTSIDE the overflow-hidden chart
+        container (sibling in the wrapper) so the halo is not clipped, animates
+        opacity only, and takes its color(s) from the user's Settings via
+        --glow-rgb (one ring per live engine — grid + algo stack). */}
+    {glowLayers.map((g) => (
+      <div
+        key={g.key}
+        aria-hidden
+        className="grid-live-glow absolute inset-0 z-20"
+        style={{ '--glow-rgb': g.rgb } as CSSProperties}
+      />
+    ))}
     </div>
   )
 }

@@ -1,4 +1,4 @@
-// Grid Trading engine (Task 9-q) — long-only spot grid bot.
+// Grid Trading engine (Task 9-q) — long spot grid bot with one-sided modes.
 //
 // ONE module-level interval (5s) drives every active grid: each tick re-reads
 // ALL status 'active' rows from the DB (the DB is the single source of truth —
@@ -10,12 +10,18 @@
 //   • guards FIRST: whole-grid circuit breakers — triggers resolved EVERY tick
 //     via resolveGuards() (Task 10-a: basis 'price' = absolute maxSL/maxTP,
 //     basis 'percent' = lowerPrice×(1−maxSL/100) / upperPrice×(1+maxTP/100)).
+//     Task 10-g: direction 'sell' MIRRORS the triggers + firing conditions
+//     (short SL = above upper fires on P >= trigger, short TP = below lower
+//     fires on P <= trigger).
 //     P <= slTrigger → close all + stop · P >= tpTrigger → close all + stop
 //   • BUY: level i crossed DOWNWARD this tick (L > level[i] >= P) and no open
 //     lot exists at that level → market buy qtyPerGrid
-//   • SELL (per-lot TP): the lot bought at level i targets level[i+1] (or
-//     upperPrice for the last level) — crossed UPWARD this tick → market sell
-//     the lot, realized pnl = (sellPrice − entryPrice) × qty
+//   • SELL (per-lot TP, 'both' only): the lot bought at level i targets
+//     level[i+1] (or upperPrice for the last level) — crossed UPWARD this tick
+//     → market sell the lot, realized pnl = (sellPrice − entryPrice) × qty
+//   • 'buy' grids skip every sell; 'sell' grids skip every buy and instead
+//     SELL one lot per UPWARD-crossed level (short ladder, tracked inverted —
+//     a close buys the lots back)
 //   • the first evaluation after start only SEEDS lastPrice (no trades)
 //   • state (levels + open lots + lastPrice) is persisted after EVERY
 //     evaluation — crash-safe
@@ -38,6 +44,25 @@ export type GridSpacing = 'arithmetic' | 'geometric'
 export function isGridSpacing(v: unknown): v is GridSpacing {
   return v === 'arithmetic' || v === 'geometric'
 }
+
+/** Task 10-g — grid direction:
+ *  'both' — classic long grid: buy dips to a level, per-lot TP at the next
+ *           level up (the pre-10-g behavior).
+ *  'buy'  — ladder-accumulate: buy each level as price falls, NO auto-sells.
+ *           Lots are marked to market; exits are Max TP / guard / manual stop.
+ *  'sell' — distribution / short ladder: SELL one lot per level as price RISES
+ *           (on stocks Alpaca nets the sale against held shares or opens a
+ *           short). Lots are tracked inverted (mark = entry − price) and a
+ *           close (closeOnStop / guard) BUYS them back. Guards MIRROR:
+ *           SL sits ABOVE the upper bound, TP BELOW the lower bound.
+ */
+export type GridDirection = 'both' | 'buy' | 'sell'
+
+export function isGridDirection(v: unknown): v is GridDirection {
+  return v === 'both' || v === 'buy' || v === 'sell'
+}
+
+export const GRID_DIRECTIONS: readonly GridDirection[] = ['both', 'buy', 'sell']
 
 /** Open lot working memory (persisted inside GridTrade.state). */
 export interface GridLot {
@@ -94,12 +119,19 @@ export function resolveGuards(g: {
   tpBasis: string | null
   lowerPrice: number
   upperPrice: number
+  /** Task 10-g — 'sell' mirrors both triggers to the short side */
+  direction?: string | null
 }): { slTrigger: number | null; tpTrigger: number | null } {
+  const sell = g.direction === 'sell'
   const slTrigger = g.maxSL != null
-    ? (g.slBasis === 'percent' && g.maxSL > 0 ? g.lowerPrice * (1 - g.maxSL / 100) : g.maxSL)
+    ? (g.slBasis === 'percent' && g.maxSL > 0
+        ? (sell ? g.upperPrice * (1 + g.maxSL / 100) : g.lowerPrice * (1 - g.maxSL / 100))
+        : g.maxSL)
     : null
   const tpTrigger = g.maxTP != null
-    ? (g.tpBasis === 'percent' && g.maxTP > 0 ? g.upperPrice * (1 + g.maxTP / 100) : g.maxTP)
+    ? (g.tpBasis === 'percent' && g.maxTP > 0
+        ? (sell ? g.lowerPrice * (1 - g.maxTP / 100) : g.upperPrice * (1 + g.maxTP / 100))
+        : g.maxTP)
     : null
   return { slTrigger, tpTrigger }
 }
@@ -135,9 +167,12 @@ export function validateGridConfig(c: {
   slBasis: string | null
   tpBasis: string | null
   isCrypto: boolean
+  /** Task 10-g — absent/null reads as 'both'; an unknown string 400s */
+  direction?: string | null
 }): string | null {
   if (!Number.isFinite(c.lowerPrice) || c.lowerPrice <= 0) return 'Lower price must be a positive number'
   if (!Number.isFinite(c.upperPrice) || c.upperPrice <= c.lowerPrice) return 'Upper price must be greater than the lower price'
+  if (c.direction != null && !isGridDirection(c.direction)) return 'direction must be "both", "buy" or "sell"'
   if (!Number.isInteger(c.gridCount) || c.gridCount < MIN_GRID_COUNT || c.gridCount > MAX_GRID_COUNT) {
     return `Grid count must be an integer between ${MIN_GRID_COUNT} and ${MAX_GRID_COUNT}`
   }
@@ -148,13 +183,21 @@ export function validateGridConfig(c: {
   if (!c.isCrypto && c.qtyPerGrid < 1) {
     return 'Stocks require a whole-number quantity per grid (min 1) — crypto supports fractional sizes'
   }
+  // guard ordering mirrors for the sell-only (short-ladder) direction:
+  // SL is the hard CEILING above upper, TP the profit FLOOR below lower
+  const sell = c.direction === 'sell'
   if (c.maxSL != null) {
     if (!Number.isFinite(c.maxSL)) return 'Max SL must be a valid number'
     if ((c.slBasis ?? 'price') === 'percent') {
       if (!(c.maxSL > 0) || c.maxSL > 90) return 'Max SL percent must be greater than 0 and at most 90'
     } else {
       if (c.maxSL <= 0) return 'Max SL must be a positive price'
-      if (c.maxSL >= c.lowerPrice) return 'Max SL must be BELOW the lower price (it is the whole-grid hard floor)'
+      if (sell
+        ? c.maxSL <= c.upperPrice
+        : c.maxSL >= c.lowerPrice)
+        return sell
+          ? 'Max SL must be ABOVE the upper price (sell-only grid — it is the whole-grid hard ceiling)'
+          : 'Max SL must be BELOW the lower price (it is the whole-grid hard floor)'
     }
   }
   if (c.maxTP != null) {
@@ -163,7 +206,12 @@ export function validateGridConfig(c: {
       if (!(c.maxTP > 0) || c.maxTP > 1000) return 'Max TP percent must be greater than 0 and at most 1000'
     } else {
       if (c.maxTP <= 0) return 'Max TP must be a positive price'
-      if (c.maxTP <= c.upperPrice) return 'Max TP must be ABOVE the upper price (it is the whole-grid profit ceiling)'
+      if (sell
+        ? c.maxTP >= c.lowerPrice
+        : c.maxTP <= c.upperPrice)
+        return sell
+          ? 'Max TP must be BELOW the lower price (sell-only grid — it is the whole-grid profit floor)'
+          : 'Max TP must be ABOVE the upper price (it is the whole-grid profit ceiling)'
     }
   }
   return null
@@ -215,6 +263,8 @@ export interface GridRowLike {
   state: unknown
   startedAt: Date
   stoppedAt: Date | null
+  /** Task 10-g — absent (pre-10-g rows) reads as 'both' */
+  direction?: string | null
 }
 
 export interface GridStats {
@@ -259,7 +309,11 @@ export function computeGridStats(grid: GridRowLike, fills: GridFillLike[]): Grid
   }
   const openQty = st.lots.reduce((acc, l) => acc + l.qty, 0)
   const px = st.lastPrice
-  const unrealized = px != null ? st.lots.reduce((acc, l) => acc + (px - l.entryPrice) * l.qty, 0) : null
+  // sell-only grids hold SHORT lots — mark (entry − price), inverted vs long
+  const short = grid.direction === 'sell'
+  const unrealized = px != null
+    ? st.lots.reduce((acc, l) => acc + (short ? (l.entryPrice - px) : (px - l.entryPrice)) * l.qty, 0)
+    : null
   const end = grid.stoppedAt ?? new Date()
   return {
     fillsCount: fills.length,
@@ -343,6 +397,8 @@ async function closeAndStop(
     symbol: string
     closeOnStop: boolean
     state: unknown
+    /** Task 10-g — 'sell' grids hold short lots: the close BUYS them back */
+    direction?: string | null
   },
   reason: 'sl' | 'maxtp' | 'manual_close',
   price: number | null,
@@ -363,22 +419,26 @@ async function closeAndStop(
     if (grid.closeOnStop && px != null) {
       const mode = await resolveTradeMode(grid.userId)
       const qty = st.lots.reduce((acc, l) => acc + l.qty, 0)
-      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, 'sell', qty, px)
+      const short = grid.direction === 'sell'
+      const closeSide: 'buy' | 'sell' = short ? 'buy' : 'sell'
+      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, closeSide, qty, px)
       if (r.ok) {
-        const pnl = st.lots.reduce((acc, l) => acc + (r.price - l.entryPrice) * l.qty, 0)
+        const pnl = st.lots.reduce((acc, l) => acc + (short ? l.entryPrice - r.price : r.price - l.entryPrice) * l.qty, 0)
         const levelList = [...new Set(st.lots.map((l) => l.levelIndex))].sort((a, b) => a - b).join(',')
         await db.gridFill.create({
           data: {
             gridTradeId: grid.id,
             userId: grid.userId,
             levelIndex: -1, // combined close spans several levels — see note
-            side: 'sell',
+            side: closeSide,
             reason,
             price: r.price,
             qty,
             pnl,
             orderId: r.orderId,
-            note: `closed all open grid lots (levels ${levelList})`,
+            note: short
+              ? `bought back all open grid lots (levels ${levelList})`
+              : `closed all open grid lots (levels ${levelList})`,
           },
         })
         await db.gridTrade.update({
@@ -462,6 +522,8 @@ async function evaluateGrid(grid: {
   closeOnStop: boolean
   realizedPnl: number
   state: unknown
+  /** Task 10-g — absent reads as 'both' */
+  direction?: string | null
 }, price: number): Promise<void> {
   const st = parseGridState(grid.state)
   const levels = st.levels
@@ -473,11 +535,14 @@ async function evaluateGrid(grid: {
     })
     return
   }
+  const sellGrid = grid.direction === 'sell'
+  const buyOnly = grid.direction === 'buy'
 
   // ---- guards FIRST (whole-grid circuit breakers) ----
   // Triggers are RESOLVED EVERY TICK (price vs percent basis) so a config edit
   // via PUT /api/grid/[id] re-arms the guards on the next 5s cycle — the DB is
-  // the single source of truth, no engine-side cache.
+  // the single source of truth, no engine-side cache. Sell-only mirrors the
+  // firing conditions (short SL fires ABOVE, TP fires BELOW).
   const { slTrigger, tpTrigger } = resolveGuards({
     maxSL: grid.maxSL,
     maxTP: grid.maxTP,
@@ -485,12 +550,13 @@ async function evaluateGrid(grid: {
     tpBasis: grid.tpBasis,
     lowerPrice: grid.lowerPrice,
     upperPrice: grid.upperPrice,
+    direction: grid.direction,
   })
-  if (slTrigger != null && price <= slTrigger) {
+  if (slTrigger != null && (sellGrid ? price >= slTrigger : price <= slTrigger)) {
     await closeAndStop(grid, 'sl', price, guardStopText('sl', grid.slBasis, grid.maxSL ?? 0, price))
     return
   }
-  if (tpTrigger != null && price >= tpTrigger) {
+  if (tpTrigger != null && (sellGrid ? price <= tpTrigger : price >= tpTrigger)) {
     await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price))
     return
   }
@@ -500,8 +566,9 @@ async function evaluateGrid(grid: {
 
   // ---- SELL signals first (free capacity before adding lots) — per-lot TP:
   // the lot bought at level i pays at level[i+1] ?? upperPrice, on an UPWARD
-  // crossing of that target this tick
-  if (L != null) {
+  // crossing of that target this tick. 'both' only — buy-only never sells and
+  // sell-only has no buy-backs.
+  if (!sellGrid && !buyOnly && L != null) {
     for (const lot of [...st.lots]) {
       const target = sellTargetOf(levels, lot.levelIndex, grid.upperPrice)
       if (!(L < target && price >= target)) continue
@@ -535,28 +602,39 @@ async function evaluateGrid(grid: {
         },
       })
     }
+  }
 
-    // ---- BUY signals: level crossed DOWNWARD this tick, no lot there yet
+  // ---- level-entry signals (one lot per level) ----
+  //   both/buy: level crossed DOWNWARD this tick → market buy qtyPerGrid
+  //   sell:     level crossed UPWARD this tick → market sell qtyPerGrid
+  //             (short ladder — the lot is tracked inverted; a close buys back)
+  if (L != null) {
     for (let i = 0; i < levels.length; i++) {
       const level = levels[i]
-      if (!(L > level && price <= level)) continue
+      if (sellGrid) {
+        if (!(L < level && price >= level)) continue
+      } else {
+        if (!(L > level && price <= level)) continue
+      }
       if (st.lots.some((l) => l.levelIndex === i)) continue
       if (!(await stillActive(grid.id))) return // stopped mid-tick — stand down
       const qty = effectiveQty(grid.symbol, grid.qtyPerGrid)
-      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, 'buy', qty, level)
-      if (!r.ok) throw new Error(`Grid buy at ${fmtP(level)} failed: ${r.error}`)
+      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, sellGrid ? 'sell' : 'buy', qty, level)
+      if (!r.ok) throw new Error(`Grid ${sellGrid ? 'sell' : 'buy'} at ${fmtP(level)} failed: ${r.error}`)
       st.lots.push({ levelIndex: i, qty, entryPrice: r.price })
       await db.gridFill.create({
         data: {
           gridTradeId: grid.id,
           userId: grid.userId,
           levelIndex: i,
-          side: 'buy',
+          side: sellGrid ? 'sell' : 'buy',
           reason: 'grid',
           price: r.price,
           qty,
           orderId: r.orderId,
-          note: `grid level ${i + 1}/${levels.length} at ${fmtP(level)}`,
+          note: sellGrid
+            ? `grid level ${i + 1}/${levels.length} at ${fmtP(level)} (sell-only)`
+            : `grid level ${i + 1}/${levels.length} at ${fmtP(level)}`,
         },
       })
       // persist the new lot IMMEDIATELY (crash-safe: a later failed order in
@@ -673,6 +751,8 @@ export interface StartGridInput {
   /** 'price' | 'percent' (Task 10-a) — how maxSL/maxTP are expressed */
   slBasis?: string
   tpBasis?: string
+  /** Task 10-g — 'both' | 'buy' | 'sell' (default 'both') */
+  direction?: string
   closeOnStop: boolean
 }
 
@@ -693,6 +773,7 @@ export async function startGridTrade(input: StartGridInput) {
       maxTP: input.maxTP,
       slBasis: input.slBasis ?? 'price',
       tpBasis: input.tpBasis ?? 'price',
+      direction: isGridDirection(input.direction) ? input.direction : 'both',
       closeOnStop: input.closeOnStop,
       status: 'active',
       state: state as unknown as object,

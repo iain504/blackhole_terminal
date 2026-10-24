@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Download, FileJson, KeyRound, Loader2, Percent, PlugZap, Send, Upload } from 'lucide-react';
+import { Download, FileJson, KeyRound, Loader2, Percent, PlugZap, Send, Sparkles, Upload } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -29,7 +29,11 @@ type SettingsState = {
   telegram: { tokenSet: boolean; chatId: string; notifyFills?: boolean; notifyCloses?: boolean };
   tradeMode?: string;
   tpslPercent?: number;
+  glow?: { grid: string; algo: string };
 };
+
+const DEFAULT_GLOW_GRID = '#10b981';
+const DEFAULT_GLOW_ALGO = '#a855f7';
 
 export default function SettingsDialog({
   open,
@@ -52,6 +56,10 @@ export default function SettingsDialog({
   const [notifyCloses, setNotifyCloses] = useState(true);
   const [tpslPct, setTpslPct] = useState('5');
   const [tpslPctLoaded, setTpslPctLoaded] = useState(false);
+  // Task 10-g — chart glow colors (grid running / algo running)
+  const [glowGrid, setGlowGrid] = useState(DEFAULT_GLOW_GRID);
+  const [glowAlgo, setGlowAlgo] = useState(DEFAULT_GLOW_ALGO);
+  const [glowLoaded, setGlowLoaded] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -181,7 +189,13 @@ export default function SettingsDialog({
   }
 
   // Any typed-but-unsaved credential — closing the dialog would lose it.
-  const dirty = Boolean(keyId.trim() || secret.trim() || token.trim() || chatId.trim() !== (state?.telegram?.chatId ?? ''));
+  const dirty = Boolean(
+    keyId.trim() ||
+    secret.trim() ||
+    token.trim() ||
+    chatId.trim() !== (state?.telegram?.chatId ?? '') ||
+    (glowLoaded && (glowGrid !== (state?.glow?.grid ?? DEFAULT_GLOW_GRID) || glowAlgo !== (state?.glow?.algo ?? DEFAULT_GLOW_ALGO)))
+  );
 
   const confirmDiscard = useCallback(
     (nextOpen: boolean) => {
@@ -210,6 +224,11 @@ export default function SettingsDialog({
         setTpslPct(String(data?.tpslPercent ?? 5));
         setTpslPctLoaded(true);
       }
+      if (!glowLoaded) {
+        setGlowGrid(data?.glow?.grid ?? DEFAULT_GLOW_GRID);
+        setGlowAlgo(data?.glow?.algo ?? DEFAULT_GLOW_ALGO);
+        setGlowLoaded(true);
+      }
     } catch (err) {
       setLoadError(
         err instanceof Error ? err.message : 'Failed to load settings.'
@@ -236,6 +255,11 @@ export default function SettingsDialog({
     payload.notifyCloses = notifyCloses;
     const pct = parseFloat(tpslPct);
     if (tpslPctLoaded && isFinite(pct) && pct > 0) payload.tpslPercent = pct;
+    // glow colors always ride along once loaded (strings can't be "empty")
+    if (glowLoaded) {
+      payload.glowGridColor = glowGrid;
+      payload.glowAlgoColor = glowAlgo;
+    }
     if (Object.keys(payload).length === 0) {
       toast({ title: 'Nothing to save', description: 'Enter a value first.' });
       return;
@@ -510,6 +534,49 @@ export default function SettingsDialog({
                 and stop-loss at this distance from the entry price (5 = ±5%).
                 Still adjustable per order before submitting.
               </p>
+            </div>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- Chart glow (Task 10-g) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">Chart glow</h3>
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              The chart border pulses while a bot is running on the charted
+              symbol. Pick the glow color for each engine (defaults: grid
+              emerald, algo purple).
+            </p>
+            <div className="flex items-center justify-between gap-3">
+              <Label htmlFor="glow-grid" className="text-zinc-300">
+                Grid running
+              </Label>
+              <input
+                id="glow-grid"
+                type="color"
+                value={glowGrid}
+                onChange={(e) => setGlowGrid(e.target.value)}
+                disabled={loading || saving}
+                aria-label="Glow color while a grid trade is running"
+                className="h-9 w-16 cursor-pointer rounded border border-zinc-800 bg-zinc-950 p-0.5"
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <Label htmlFor="glow-algo" className="text-zinc-300">
+                Algo running
+              </Label>
+              <input
+                id="glow-algo"
+                type="color"
+                value={glowAlgo}
+                onChange={(e) => setGlowAlgo(e.target.value)}
+                disabled={loading || saving}
+                aria-label="Glow color while an algo run is live"
+                className="h-9 w-16 cursor-pointer rounded border border-zinc-800 bg-zinc-950 p-0.5"
+              />
             </div>
           </section>
 

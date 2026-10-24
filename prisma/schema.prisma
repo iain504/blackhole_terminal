@@ -299,6 +299,12 @@ model GridTrade {
   // later config edit (PUT /api/grid/[id]) re-arms the guards automatically.
   slBasis     String    @default("price")
   tpBasis     String    @default("price")
+  // Task 10-g — grid direction: 'both' (classic: buy dips + sell rallies) |
+  // 'buy' (ladder-accumulate: buy each level as price falls, no auto-sells) |
+  // 'sell' (sell each level as price rises — on stocks Alpaca nets this against
+  // held shares or shorts; engine tracks the sold lots inverted and a close
+  // buys them back. Guards mirror: SL sits ABOVE upper, TP BELOW lower.)
+  direction   String    @default("both")
   // when the grid stops (manual or guard), market-close open grid positions
   closeOnStop Boolean   @default(true)
   // 'active' | 'stopped' | 'error'

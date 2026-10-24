@@ -17,6 +17,7 @@
 //   "slBasis": "price",
 //   "maxTP": null,
 //   "tpBasis": "price",
+//   "direction": "both",
 //   "closeOnStop": true,
 //   "exportedAt": "2026-10-24T12:00:00.000Z"
 // }
@@ -30,6 +31,8 @@ export const GRID_SETUP_VERSION = 1
 
 /** Portable grid configuration — the shape both the export file and the
  * dialog's import applier work with. */
+export type GridSetupDirection = 'both' | 'buy' | 'sell'
+
 export interface GridSetup {
   symbol: string
   lowerPrice: number
@@ -41,6 +44,8 @@ export interface GridSetup {
   slBasis: 'price' | 'percent'
   maxTP: number | null
   tpBasis: 'price' | 'percent'
+  /** Task 10-g — one-sided grids; absent in pre-10-g files reads as 'both' */
+  direction: GridSetupDirection
   closeOnStop: boolean
 }
 
@@ -54,7 +59,8 @@ export interface GridSetupFile extends GridSetup {
 const round2 = (n: number) => Math.round(n * 100) / 100
 
 /** Minimum shape a grid row (GridTradeDto) must expose to be exported.
- * slBasis/tpBasis are optional strings — pre-10-a rows lack them (→ 'price'). */
+ * slBasis/tpBasis are optional strings — pre-10-a rows lack them (→ 'price').
+ * direction optional — pre-10-g rows lack it (→ 'both'). */
 export type GridSetupRowLike = Pick<
   GridSetup, 'lowerPrice' | 'upperPrice' | 'gridCount' | 'qtyPerGrid' | 'maxSL' | 'maxTP' | 'closeOnStop'
 > & {
@@ -62,6 +68,7 @@ export type GridSetupRowLike = Pick<
   spacing: string
   slBasis?: string | null
   tpBasis?: string | null
+  direction?: string | null
 }
 
 /** Serialize a grid row (API DTO) into the portable setup file. */
@@ -79,6 +86,7 @@ export function gridSetupFromRow(row: GridSetupRowLike): GridSetupFile {
     slBasis: row.slBasis === 'percent' ? 'percent' : 'price',
     maxTP: row.maxTP,
     tpBasis: row.tpBasis === 'percent' ? 'percent' : 'price',
+    direction: row.direction === 'buy' || row.direction === 'sell' ? row.direction : 'both',
     closeOnStop: !!row.closeOnStop,
     exportedAt: new Date().toISOString(),
   }
@@ -117,6 +125,15 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
   }
   const qty = num(o.qtyPerGrid)
   if (!(qty > 0)) return { ok: false, error: 'qtyPerGrid must be a positive number' }
+  // Task 10-g — one-sided grids; absent reads as 'both' (pre-10-g files)
+  let direction: GridSetupDirection = 'both'
+  if (o.direction != null) {
+    if (o.direction === 'buy' || o.direction === 'sell' || o.direction === 'both') {
+      direction = o.direction
+    } else {
+      return { ok: false, error: 'direction must be "both", "buy" or "sell"' }
+    }
+  }
   const basis = (v: unknown) => (v === 'percent' ? 'percent' : 'price') as 'price' | 'percent'
   const slBasis = basis(o.slBasis)
   const tpBasis = basis(o.tpBasis)
@@ -130,11 +147,22 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
   if (tpBasis === 'percent' && rawTP != null && rawTP > 1000) {
     return { ok: false, error: 'maxTP percent must be within 0–1000' }
   }
-  if (slBasis === 'price' && rawSL != null && rawSL >= lowerR) {
-    return { ok: false, error: 'maxSL (price) must be below the lower price' }
-  }
-  if (tpBasis === 'price' && rawTP != null && rawTP <= upperR) {
-    return { ok: false, error: 'maxTP (price) must be above the upper price' }
+  if (direction !== 'sell') {
+    // long ordering (both / buy): SL strictly below lower, TP strictly above upper
+    if (slBasis === 'price' && rawSL != null && rawSL >= lowerR) {
+      return { ok: false, error: 'maxSL (price) must be below the lower price' }
+    }
+    if (tpBasis === 'price' && rawTP != null && rawTP <= upperR) {
+      return { ok: false, error: 'maxTP (price) must be above the upper price' }
+    }
+  } else {
+    // sell-only mirrors the ordering (SL above upper, TP below lower)
+    if (slBasis === 'price' && rawSL != null && rawSL <= upperR) {
+      return { ok: false, error: 'maxSL (price) must be above the upper price for sell-only grids' }
+    }
+    if (tpBasis === 'price' && rawTP != null && rawTP >= lowerR) {
+      return { ok: false, error: 'maxTP (price) must be below the lower price for sell-only grids' }
+    }
   }
   return {
     ok: true,
@@ -149,6 +177,7 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
       slBasis,
       maxTP: rawTP != null ? round2(rawTP) : null,
       tpBasis,
+      direction,
       closeOnStop: o.closeOnStop !== false,
     },
   }

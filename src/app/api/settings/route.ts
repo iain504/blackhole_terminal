@@ -22,9 +22,22 @@ interface UserSettings {
   notifyCloses?: boolean
   tradeMode?: string
   tpslPercent?: number
+  // Task 10-g — chart boundary glow colors (hex #rrggbb). Grid glow defaults
+  // emerald, algo glow purple; the user picks both in Settings → Chart glow.
+  glowGridColor?: string
+  glowAlgoColor?: string
 }
 
 export const DEFAULT_TPSL_PERCENT = 5
+
+/** #rrggbb (exactly) — the only glow-color shape we persist. */
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
+export const DEFAULT_GLOW_GRID = '#10b981'
+export const DEFAULT_GLOW_ALGO = '#a855f7'
+
+function safeGlow(v: unknown, fallback: string): string {
+  return typeof v === 'string' && HEX_COLOR_RE.test(v) ? v.toLowerCase() : fallback
+}
 
 // GET /api/settings — masked values + availability flags
 export async function GET() {
@@ -50,6 +63,10 @@ export async function GET() {
         typeof s?.tpslPercent === 'number' && isFinite(s.tpslPercent) && s.tpslPercent > 0
           ? s.tpslPercent
           : DEFAULT_TPSL_PERCENT,
+      glow: {
+        grid: safeGlow(s?.glowGridColor, DEFAULT_GLOW_GRID),
+        algo: safeGlow(s?.glowAlgoColor, DEFAULT_GLOW_ALGO),
+      },
     })
   } catch (e) {
     return handleError(e)
@@ -65,6 +82,8 @@ interface PutBody {
   notifyCloses?: boolean
   tradeMode?: string
   tpslPercent?: number
+  glowGridColor?: string
+  glowAlgoColor?: string
 }
 
 // PUT /api/settings — update private credentials (stored encrypted, never returned).
@@ -110,6 +129,18 @@ export async function PUT(req: Request) {
     }
     if (typeof body.tpslPercent === 'number' && isFinite(body.tpslPercent) && body.tpslPercent > 0 && body.tpslPercent <= 90) {
       s.tpslPercent = Math.round(body.tpslPercent * 100) / 100
+    }
+    if (body.glowGridColor != null) {
+      if (typeof body.glowGridColor !== 'string' || !HEX_COLOR_RE.test(body.glowGridColor)) {
+        return NextResponse.json({ error: 'glowGridColor must be a hex color like #10b981' }, { status: 400 })
+      }
+      s.glowGridColor = body.glowGridColor.toLowerCase()
+    }
+    if (body.glowAlgoColor != null) {
+      if (typeof body.glowAlgoColor !== 'string' || !HEX_COLOR_RE.test(body.glowAlgoColor)) {
+        return NextResponse.json({ error: 'glowAlgoColor must be a hex color like #a855f7' }, { status: 400 })
+      }
+      s.glowAlgoColor = body.glowAlgoColor.toLowerCase()
     }
     await db.user.update({
       where: { id: user.id },

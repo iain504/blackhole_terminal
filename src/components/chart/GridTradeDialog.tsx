@@ -18,7 +18,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   LayoutGrid, TriangleAlert, GripHorizontal, FlaskConical, Loader2, ChevronDown, CircleAlert,
-  FileUp,
+  FileUp, Sparkles,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -38,11 +38,14 @@ import { useToast } from '@/hooks/use-toast'
 // pushed the header above the viewport on short screens.
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
-import { parseGridSetup, type GridSetup } from '@/lib/grid-setup'
+import { parseGridSetup, type GridSetup, type GridSetupDirection } from '@/lib/grid-setup'
+
+export type DialogDirection = GridSetupDirection
 
 /** Full config of a grid being edited (edit-when-flat, Task 10-b).
  * slBasis/tpBasis are optional API strings ('price' | 'percent') — rows created
- * before Task 10-a landed simply lack them (treated as 'price'). */
+ * before Task 10-a landed simply lack them (treated as 'price'). direction —
+ * pre-10-g rows lack it (treated as 'both'). */
 export interface GridEditTarget {
   id: string
   symbol: string
@@ -55,6 +58,7 @@ export interface GridEditTarget {
   maxTP: number | null
   slBasis?: string | null
   tpBasis?: string | null
+  direction?: string | null
   closeOnStop: boolean
 }
 
@@ -122,6 +126,7 @@ type FormSetters = {
   setGridCount: (v: string) => void
   setSpacing: (v: 'arithmetic' | 'geometric') => void
   setQty: (v: string) => void
+  setDirection: (v: DialogDirection) => void
   setSlOn: (v: boolean) => void
   setSlBasis: (v: Basis) => void
   setSlPrice: (v: string) => void
@@ -142,6 +147,7 @@ function applySetupToForm(s: GridSetup, st: FormSetters) {
   st.setGridCount(String(s.gridCount))
   st.setSpacing(s.spacing)
   st.setQty(String(s.qtyPerGrid))
+  st.setDirection(s.direction)
   st.setSlOn(s.maxSL != null)
   st.setSlBasis(slIsPct ? 'percent' : 'price')
   st.setSlPrice(s.maxSL != null && !slIsPct ? String(s.maxSL) : '')
@@ -163,6 +169,51 @@ const to2dpStr = (v: string) => {
 const trimNum = (n: number) => String(Number(n.toFixed(2)))
 
 const BT_DAYS = ['7', '30', '90', '365']
+
+const DIRECTION_LABEL: Record<DialogDirection, string> = {
+  both: 'Both sides',
+  buy: 'Buy only',
+  sell: 'Sell only',
+}
+const DIRECTION_HINT: Record<DialogDirection, string> = {
+  both: 'buys each dip to a level, sells the lot at the next level up (classic grid)',
+  buy: 'ladder-buys every level as price falls — no auto-sells (exits: Max TP, guard, or stop)',
+  sell: 'sells every level as price rises — short ladder marked inverted; a close buys the lots back (stocks: nets against held shares or shorts)',
+}
+
+/** One-sided grid selector (Task 10-g) — module-level so it never remounts. */
+function DirectionToggle({ value, onChange, disabled }: {
+  value: DialogDirection
+  onChange: (d: DialogDirection) => void
+  disabled: boolean
+}) {
+  return (
+    <div role="group" aria-label="Grid direction" className="flex shrink-0 overflow-hidden rounded border border-zinc-800">
+      {(['both', 'buy', 'sell'] as const).map((d) => (
+        <button
+          key={d}
+          type="button"
+          aria-pressed={value === d}
+          disabled={disabled}
+          onClick={() => onChange(d)}
+          title={DIRECTION_HINT[d]}
+          className={cn(
+            'h-7 px-2.5 text-[11px] leading-none transition-colors disabled:opacity-40',
+            value === d
+              ? d === 'sell'
+                ? 'bg-violet-500/20 text-violet-300'
+                : d === 'buy'
+                  ? 'bg-sky-500/20 text-sky-300'
+                  : 'bg-emerald-500/20 text-emerald-400'
+              : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300',
+          )}
+        >
+          {DIRECTION_LABEL[d]}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 /** Dependency-free inline sparkline of the backtest's total-P/L curve.
  * Green above zero, red below; dashed zinc zero-baseline when the curve
@@ -252,6 +303,7 @@ export default function GridTradeDialog({
   const [gridCount, setGridCount] = useState('8')
   const [spacing, setSpacing] = useState<'arithmetic' | 'geometric'>('arithmetic')
   const [qty, setQty] = useState('1')
+  const [direction, setDirection] = useState<DialogDirection>('both')
   const [slOn, setSlOn] = useState(false)
   const [slBasis, setSlBasis] = useState<Basis>('price')
   const [slPrice, setSlPrice] = useState('')
@@ -344,6 +396,11 @@ export default function GridTradeDialog({
   const [btRanConfig, setBtRanConfig] = useState<string | null>(null)
   const [btFillsOpen, setBtFillsOpen] = useState(false)
 
+  // ---- auto-optimize state (Task 10-g) ----
+  const [optRunning, setOptRunning] = useState(false)
+  const [optError, setOptError] = useState<string | null>(null)
+  const [optNote, setOptNote] = useState<string | null>(null)
+
   // (re)initialize every time the dialog opens — from the edit target when
   // editing, otherwise from the picked range. editGrid is read through a ref so
   // a parent re-creating the object per render can never reset the user's edits.
@@ -366,12 +423,15 @@ export default function GridTradeDialog({
     setImportError(null)
     setImportedFrom(null)
     setImportOpen(!eg && !!openImportRef.current)
+    setOptError(null)
+    setOptNote(null)
     if (eg) {
       setLower(to2dpStr(String(eg.lowerPrice)))
       setUpper(to2dpStr(String(eg.upperPrice)))
       setGridCount(String(eg.gridCount))
       setSpacing(eg.spacing === 'geometric' ? 'geometric' : 'arithmetic')
       setQty(String(eg.qtyPerGrid))
+      setDirection(eg.direction === 'buy' || eg.direction === 'sell' ? eg.direction : 'both')
       const slIsPct = eg.slBasis === 'percent'
       setSlOn(eg.maxSL != null)
       setSlBasis(slIsPct ? 'percent' : 'price')
@@ -389,6 +449,7 @@ export default function GridTradeDialog({
       setGridCount('8')
       setSpacing('arithmetic')
       setQty('1')
+      setDirection('both')
       setSlOn(false)
       setSlBasis('price')
       setSlPrice('')
@@ -407,6 +468,7 @@ export default function GridTradeDialog({
       setGridCount('8')
       setSpacing('arithmetic')
       setQty('1')
+      setDirection('both')
       setSlOn(false)
       setSlBasis('price')
       setSlPrice('')
@@ -436,19 +498,26 @@ export default function GridTradeDialog({
   // the server bounds (SL% 0<p≤90 below the lower bound, TP% 0<p≤1000 above
   // the upper bound) and resolves the ABSOLUTE trigger with the same formulas
   // the engine uses: lower × (1 − pct/100) / upper × (1 + pct/100).
+  // Task 10-g: sell-only grids MIRROR — SL% sits ABOVE the upper bound,
+  // TP% BELOW the lower bound (short-side circuit breakers).
+  const sellGrid = direction === 'sell'
   const slN = Number(slPrice)
   const slPctN = Number(slPct)
   const tpN = Number(tpPrice)
   const tpPctN = Number(tpPct)
   const slPctValid = Number.isFinite(slPctN) && slPctN > 0 && slPctN <= 90
   const tpPctValid = Number.isFinite(tpPctN) && tpPctN > 0 && tpPctN <= 1000
-  const slResolved = slBasis === 'percent' && rangeOk && slPctValid ? round2(lowerN * (1 - slPctN / 100)) : slN
-  const tpResolved = tpBasis === 'percent' && rangeOk && tpPctValid ? round2(upperN * (1 + tpPctN / 100)) : tpN
+  const slResolved = slBasis === 'percent' && rangeOk && slPctValid
+    ? round2(sellGrid ? upperN * (1 + slPctN / 100) : lowerN * (1 - slPctN / 100))
+    : slN
+  const tpResolved = tpBasis === 'percent' && rangeOk && tpPctValid
+    ? round2(sellGrid ? lowerN * (1 - tpPctN / 100) : upperN * (1 + tpPctN / 100))
+    : tpN
   const slInvalid = slOn && (slBasis === 'price'
-    ? (!Number.isFinite(slN) || slN <= 0 || (rangeOk && slN >= lowerN))
+    ? (!Number.isFinite(slN) || slN <= 0 || (rangeOk && (sellGrid ? slN <= upperN : slN >= lowerN)))
     : !slPctValid)
   const tpInvalid = tpOn && (tpBasis === 'price'
-    ? (!Number.isFinite(tpN) || tpN <= 0 || (rangeOk && tpN <= upperN))
+    ? (!Number.isFinite(tpN) || tpN <= 0 || (rangeOk && (sellGrid ? tpN >= lowerN : tpN <= upperN)))
     : !tpPctValid)
 
   const preview = useMemo(() => {
@@ -474,6 +543,7 @@ export default function GridTradeDialog({
     gridCount: countN,
     spacing,
     qtyPerGrid: qtyN,
+    direction,
     maxSL: slOn ? (slBasis === 'percent' ? round2(slPctN) : slN) : null,
     slBasis: slOn ? slBasis : 'price',
     maxTP: tpOn ? (tpBasis === 'percent' ? round2(tpPctN) : tpN) : null,
@@ -484,7 +554,7 @@ export default function GridTradeDialog({
   // snapshot of everything that affects the outcome — a backtest result is
   // only "fresh" while this string is unchanged
   const configSnapshot = () =>
-    JSON.stringify([lowerN, upperN, countN, spacing, qtyN, slOn, slBasis, slPrice, slPct, tpOn, tpBasis, tpPrice, tpPct, closeOnStop])
+    JSON.stringify([lowerN, upperN, countN, spacing, qtyN, direction, slOn, slBasis, slPrice, slPct, tpOn, tpBasis, tpPrice, tpPct, closeOnStop])
   const btStale = bt != null && btRanConfig != null && btRanConfig !== configSnapshot()
 
   const runBacktest = async () => {
@@ -524,6 +594,66 @@ export default function GridTradeDialog({
         ? 'valid quantity required'
         : null
 
+  // ---- auto-optimize (Task 10-g): sweep width × count around the live
+  // price server-side, fill the winning range + count into the form. Sizing
+  // and the SL/TP guards are NOT touched — they stay the user's decision.
+  const runOptimize = async () => {
+    setOptRunning(true)
+    setOptError(null)
+    setOptNote(null)
+    try {
+      const res = await fetch('/api/grid/optimize', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          symbol,
+          qtyPerGrid: qtyN,
+          direction,
+          spacing,
+          days: Number(btDays),
+        }),
+      })
+      const json = (await res.json().catch(() => null)) as
+        | {
+            error?: string
+            days?: number
+            tried?: number
+            best?: {
+              lowerPrice: number
+              upperPrice: number
+              gridCount: number
+              totalPnl: number
+              maxDrawdown: number
+              fillsCount: number
+              winRate: number
+            }
+          }
+        | null
+      if (!res.ok || !json?.best) {
+        const msg = json?.error || (res.status === 429 ? 'Rate limited — try again shortly' : `HTTP ${res.status}`)
+        setOptError(msg)
+        toast({ title: 'Auto optimize failed', description: msg, variant: 'destructive' })
+        return
+      }
+      const b = json.best
+      setLower(to2dpStr(String(b.lowerPrice)))
+      setUpper(to2dpStr(String(b.upperPrice)))
+      setGridCount(String(b.gridCount))
+      setBt(null)
+      setBtRanConfig(null)
+      setBtFillsOpen(false)
+      setOptNote(
+        `Optimized on ${json.days ?? btDays}d · ${json.tried ?? 0} configs · range ${fmtPrice(round2(b.lowerPrice))}–${fmtPrice(round2(b.upperPrice))} · ${b.gridCount} levels · P/L ${signed(b.totalPnl)} · max DD ${Number(b.maxDrawdown ?? 0).toFixed(2)} · ${b.fillsCount} fills`,
+      )
+      toast({ title: 'Range optimized', description: `${symbol} · ${b.gridCount} levels · ${fmtPrice(round2(b.lowerPrice))}–${fmtPrice(round2(b.upperPrice))}` })
+    } catch {
+      setOptError('Network error')
+      toast({ title: 'Auto optimize failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setOptRunning(false)
+    }
+  }
+
   // ---- setup import (Task 10-f) ----
   // Parse the pasted/uploaded JSON and fill the whole form. The server ALWAYS
   // re-validates on submit — parseGridSetup just fails early and honestly.
@@ -534,7 +664,7 @@ export default function GridTradeDialog({
       return
     }
     applySetupToForm(r.setup, {
-      setLower, setUpper, setGridCount, setSpacing, setQty,
+      setLower, setUpper, setGridCount, setSpacing, setQty, setDirection,
       setSlOn, setSlBasis, setSlPrice, setSlPct,
       setTpOn, setTpBasis, setTpPrice, setTpPct, setCloseOnStop,
     })
@@ -641,7 +771,7 @@ export default function GridTradeDialog({
           <DialogDescription className="text-xs text-zinc-400">
             {editGrid
               ? 'Editing a flat active grid — saved changes reconfigure the running engine (levels, size, circuit breakers).'
-              : 'Long-only spot grid — buys each dip to a level, sells the lot at the next level up. Paper orders every 5s engine tick.'}
+              : 'Spot grid — buy dips, sell rallies, or run one-sided ladders. Paper orders every 5s engine tick.'}
           </DialogDescription>
         </DialogHeader>
 
@@ -722,6 +852,16 @@ export default function GridTradeDialog({
         )}
 
         <div className="grid grid-cols-2 gap-3">
+          {/* Direction (Task 10-g) — both sides / buy-only ladder / sell-only ladder */}
+          <div className="col-span-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <Label htmlFor="grid-direction" className="text-[11px] text-zinc-300">Direction</Label>
+              <span id="grid-direction">
+                <DirectionToggle value={direction} onChange={setDirection} disabled={false} />
+              </span>
+            </div>
+            <p className="mt-1 text-[10px] leading-snug text-zinc-500">{DIRECTION_HINT[direction]}</p>
+          </div>
           <div>
             <Label htmlFor="grid-lower" className="text-[10px] text-zinc-500">
               Lower price <span className="text-zinc-600">2 d.p.</span>
@@ -806,15 +946,20 @@ export default function GridTradeDialog({
                   disabled={!slOn}
                   placeholder={slBasis === 'percent' ? '5' : 'price'}
                   aria-label={slBasis === 'percent'
-                    ? 'Max stop loss percent (0–90) below the lower price'
-                    : 'Max stop loss price — whole-grid hard floor below the lower price'}
+                    ? (sellGrid
+                        ? 'Max stop loss percent (0–90) above the upper price'
+                        : 'Max stop loss percent (0–90) below the lower price')
+                    : (sellGrid
+                        ? 'Max stop loss price — whole-grid hard ceiling above the upper price'
+                        : 'Max stop loss price — whole-grid hard floor below the lower price')}
                   className="h-7 w-20 border-zinc-800 bg-zinc-950 text-right text-xs tabular-nums"
                 />
               </div>
             </div>
             {slOn && slBasis === 'percent' && rangeOk && slPctValid && (
               <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-500">
-                ≈ trigger {fmtPrice(slResolved)} <span className="text-zinc-600">below lower {fmtPrice(lowerN)}</span>
+                ≈ trigger {fmtPrice(slResolved)}{' '}
+                <span className="text-zinc-600">{sellGrid ? <>above upper {fmtPrice(upperN)}</> : <>below lower {fmtPrice(lowerN)}</>}</span>
               </p>
             )}
           </div>
@@ -835,15 +980,20 @@ export default function GridTradeDialog({
                   disabled={!tpOn}
                   placeholder={tpBasis === 'percent' ? '5' : 'price'}
                   aria-label={tpBasis === 'percent'
-                    ? 'Max take profit percent (0–1000) above the upper price'
-                    : 'Max take profit price — whole-grid profit ceiling above the upper price'}
+                    ? (sellGrid
+                        ? 'Max take profit percent (0–1000) below the lower price'
+                        : 'Max take profit percent (0–1000) above the upper price')
+                    : (sellGrid
+                        ? 'Max take profit price — whole-grid profit floor below the lower price'
+                        : 'Max take profit price — whole-grid profit ceiling above the upper price')}
                   className="h-7 w-20 border-zinc-800 bg-zinc-950 text-right text-xs tabular-nums"
                 />
               </div>
             </div>
             {tpOn && tpBasis === 'percent' && rangeOk && tpPctValid && (
               <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-500">
-                ≈ trigger {fmtPrice(tpResolved)} <span className="text-zinc-600">above upper {fmtPrice(upperN)}</span>
+                ≈ trigger {fmtPrice(tpResolved)}{' '}
+                <span className="text-zinc-600">{sellGrid ? <>below lower {fmtPrice(lowerN)}</> : <>above upper {fmtPrice(upperN)}</>}</span>
               </p>
             )}
           </div>
@@ -851,7 +1001,11 @@ export default function GridTradeDialog({
           <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
             <div>
               <p className="text-[11px] text-zinc-300">Close when grid stops</p>
-              <p className="text-[10px] leading-snug text-zinc-500">market-sell all open lots when the grid stops (guard hit or manual stop)</p>
+              <p className="text-[10px] leading-snug text-zinc-500">
+                {sellGrid
+                  ? 'market-BUY back all open lots when the grid stops (guard hit or manual stop)'
+                  : 'market-sell all open lots when the grid stops (guard hit or manual stop)'}
+              </p>
             </div>
             <Switch checked={closeOnStop} onCheckedChange={setCloseOnStop} className="scale-90" aria-label="Close open positions when the grid stops" />
           </div>
@@ -898,9 +1052,45 @@ export default function GridTradeDialog({
             <p className="mt-1 flex items-start gap-1 text-amber-400">
               <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
               {slInvalid
-                ? (slBasis === 'percent' ? 'Max SL % must be within 0–90 (it sits below the lower price).' : 'Max SL must be a positive price BELOW the lower price.')
-                : (tpBasis === 'percent' ? 'Max TP % must be within 0–1000 (it sits above the upper price).' : 'Max TP must be a positive price ABOVE the upper price.')}
+                ? (slBasis === 'percent'
+                    ? (sellGrid ? 'Max SL % must be within 0–90 (it sits above the upper price).' : 'Max SL % must be within 0–90 (it sits below the lower price).')
+                    : (sellGrid ? 'Max SL must be a positive price ABOVE the upper price (short-grid hard ceiling).' : 'Max SL must be a positive price BELOW the lower price.'))
+                : (tpBasis === 'percent'
+                    ? (sellGrid ? 'Max TP % must be within 0–1000 (it sits below the lower price).' : 'Max TP % must be within 0–1000 (it sits above the upper price).')
+                    : (sellGrid ? 'Max TP must be a positive price BELOW the lower price (short-grid profit floor).' : 'Max TP must be a positive price ABOVE the upper price.'))}
             </p>
+          )}
+        </div>
+
+        {/* auto-optimize (Task 10-g) — sweeps range width × level count around
+            the live price over the backtest window and fills the winner into
+            the form. Quantity + SL/TP guards are left untouched. */}
+        <div className="rounded border border-zinc-800/70 bg-zinc-950/60">
+          <div className="flex flex-wrap items-center gap-2 px-2.5 py-2">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-amber-300" aria-hidden />
+            <span className="text-[11px] font-medium text-zinc-300">Auto optimize</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1.5 px-2 text-[11px] text-amber-300 hover:bg-amber-500/10 hover:text-amber-200"
+              disabled={optRunning || !qtyOk}
+              onClick={() => void runOptimize()}
+            >
+              {optRunning ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <Sparkles className="h-3 w-3" aria-hidden />}
+              Optimize range
+            </Button>
+            {!qtyOk && <span className="text-[10px] text-zinc-600">valid quantity required</span>}
+            {qtyOk && <span className="text-[10px] text-zinc-600">on {btDays}d · keeps qty + SL/TP</span>}
+          </div>
+          {optError && (
+            <p className="flex items-start gap-1 px-2.5 pb-2 text-[11px] text-rose-400">
+              <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+              {optError}
+            </p>
+          )}
+          {optNote && (
+            <p className="border-t border-zinc-800/60 px-2.5 py-2 text-[10px] leading-relaxed text-amber-300/90">{optNote}</p>
           )}
         </div>
 
@@ -1042,7 +1232,9 @@ export default function GridTradeDialog({
         </div>
 
         <DialogFooter className="flex-row items-center gap-2 sm:justify-between">
-          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">paper mode · long-only</Badge>
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">
+            paper mode · {direction === 'both' ? 'both sides' : direction === 'buy' ? 'buy-only ladder' : 'sell-only ladder'}
+          </Badge>
           <span className="flex items-center gap-2">
             <Button variant="ghost" size="sm" className="h-8 text-xs text-zinc-300 hover:bg-zinc-800" onClick={() => onOpenChange(false)} disabled={submitting}>
               Cancel

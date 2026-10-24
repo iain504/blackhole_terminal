@@ -273,6 +273,16 @@ export default function GridTab() {
                   <Badge variant="outline" className="text-[10px] text-zinc-500">
                     {g.gridCount} levels · {g.spacing}
                   </Badge>
+                  {g.direction === 'buy' && (
+                    <Badge variant="outline" className="text-[10px] text-sky-400/90" title="Buy-only ladder — buys every level as price falls, no auto-sells">
+                      BUY ONLY
+                    </Badge>
+                  )}
+                  {g.direction === 'sell' && (
+                    <Badge variant="outline" className="text-[10px] text-violet-400/90" title="Sell-only ladder — sells every level as price rises; a close buys the lots back">
+                      SELL ONLY
+                    </Badge>
+                  )}
                   <span className="tabular-nums text-zinc-500">qty {g.qtyPerGrid}/grid</span>
                   {g.maxSL != null && (
                     <Badge
@@ -452,7 +462,7 @@ export default function GridTab() {
             </DialogTitle>
             <DialogDescription className="text-xs text-zinc-400">
               {detail
-                ? `${detail.grid.gridCount} levels · ${detail.grid.spacing} · ${fmtPrice(detail.grid.lowerPrice)}–${fmtPrice(detail.grid.upperPrice)} · qty ${detail.grid.qtyPerGrid}/grid`
+                ? `${detail.grid.direction === 'buy' ? 'BUY ONLY · ' : detail.grid.direction === 'sell' ? 'SELL ONLY · ' : ''}${detail.grid.gridCount} levels · ${detail.grid.spacing} · ${fmtPrice(detail.grid.lowerPrice)}–${fmtPrice(detail.grid.upperPrice)} · qty ${detail.grid.qtyPerGrid}/grid`
                 : 'Loading…'}
             </DialogDescription>
           </DialogHeader>

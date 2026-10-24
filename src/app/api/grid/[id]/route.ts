@@ -4,6 +4,7 @@ import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import {
   computeGridStats, computeLevels, parseGridState, validateGridConfig,
+  isGridDirection,
 } from '@/lib/grid-engine'
 import { toDto, round2, type GridFillDto } from '../route'
 
@@ -74,6 +75,7 @@ interface GridEditBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  direction?: string
   closeOnStop?: boolean
 }
 
@@ -110,6 +112,9 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     if (body?.tpBasis !== undefined && body.tpBasis !== null && body.tpBasis !== 'price' && body.tpBasis !== 'percent') {
       return bad('tpBasis must be "price" or "percent"')
     }
+    if (body?.direction !== undefined && body.direction !== null && !isGridDirection(body.direction)) {
+      return bad('direction must be "both", "buy" or "sell"')
+    }
     if (body?.closeOnStop !== undefined && body.closeOnStop !== null && typeof body.closeOnStop !== 'boolean') {
       return bad('closeOnStop must be a boolean')
     }
@@ -122,6 +127,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
     const slBasis = (body?.slBasis ?? row.slBasis ?? 'price') as 'price' | 'percent'
     const tpBasis = (body?.tpBasis ?? row.tpBasis ?? 'price') as 'price' | 'percent'
+    const direction = body?.direction ?? row.direction ?? 'both'
     const lower = round2(Number(body?.lowerPrice ?? row.lowerPrice))
     const upper = round2(Number(body?.upperPrice ?? row.upperPrice))
     const gridCount = body?.gridCount !== undefined ? Number(body.gridCount) : row.gridCount
@@ -144,6 +150,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       slBasis,
       tpBasis,
       isCrypto: row.symbol.includes('/'),
+      direction,
     })
     if (invalid) return bad(invalid)
     const levels = computeLevels(lower, upper, gridCount, spacing as 'arithmetic' | 'geometric')
@@ -168,6 +175,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
           maxTP,
           slBasis,
           tpBasis,
+          direction,
           closeOnStop,
           // keep lastPrice + lots (empty — checked above); only the levels
           // snapshot is rebuilt, failCount/lastError reset to fresh

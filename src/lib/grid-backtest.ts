@@ -4,17 +4,20 @@
 // Semantics mirrored from evaluateGrid() (read them side by side):
 //   • bars[0] only SEEDS lastPrice (the engine's first evaluation seeds and
 //     never trades); every following bar is evaluated with high/low/close.
-//   • guards FIRST, SL before TP: bar.low ≤ slTrigger → grid stopped
-//     (closeOnStop → all lots closed AT the trigger, one fill per lot);
-//     else bar.high ≥ tpTrigger → same on the profit side. Triggers come from
-//     resolveGuards() — the SAME price/percent resolution the live engine
+//   • guards FIRST, SL before TP: long grids stop on bar.low ≤ slTrigger /
+//     bar.high ≥ tpTrigger (closeOnStop → all lots closed AT the trigger, one
+//     fill per lot); sell-only MIRRORS (short SL = bar.high ≥ slTrigger with
+//     the close BUYING back, short TP = bar.low ≤ tpTrigger). Triggers come
+//     from resolveGuards() — the SAME price/percent resolution the live engine
 //     re-runs every tick.
-//   • TP sells before buys (the engine frees capacity before adding lots):
-//     a lot bought at level i pays at level[i+1] ?? upperPrice when
-//     lastPrice < target ≤ bar.high — sold AT the target.
-//   • buys: level i crossed downward (lastPrice > level[i] ≥ bar.low), one lot
-//     per level, bought AT the level. Lots freed by a TP sell in the SAME bar
-//     can be re-bought (the engine behaves identically within a tick).
+//   • TP sells before entries (the engine frees capacity before adding lots,
+//     'both' only): a lot bought at level i pays at level[i+1] ?? upperPrice
+//     when lastPrice < target ≤ bar.high — sold AT the target.
+//   • entries: level i crossed downward (lastPrice > level[i] ≥ bar.low), one
+//     lot per level, bought AT the level. Lots freed by a TP sell in the SAME
+//     bar can be re-bought (the engine behaves identically within a tick).
+//     sell-only mirrors: level i crossed UPWARD (lastPrice < level[i] ≤
+//     bar.high) → one SHORT lot sold AT the level, marked inverted.
 //   • lastPrice = bar.close at the end of every bar; one curve point per bar
 //     (realized + open marked at that close).
 // Intrabar ambiguity is accepted by design: with only OHLC we cannot know
@@ -27,7 +30,7 @@
 import type { Bar } from '@/lib/market-types'
 import {
   computeLevels, resolveGuards, guardStopText,
-  type GridSpacing,
+  type GridSpacing, type GridDirection,
 } from '@/lib/grid-engine'
 
 export interface GridBacktestConfig {
@@ -44,6 +47,8 @@ export interface GridBacktestConfig {
   closeOnStop: boolean
   /** crypto trades fractional size; stocks are floored to whole shares */
   isCrypto: boolean
+  /** Task 10-g — absent reads as 'both'; 'sell' mirrors guards + entries */
+  direction?: GridDirection | string | null
 }
 
 export interface GridBacktestFill {
@@ -107,6 +112,8 @@ function downsampleCurve(pts: { t: number; totalPnl: number }[]): { t: number; t
 export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): GridBacktestResult {
   if (bars.length === 0) throw new Error('No bars to simulate')
   const levels = computeLevels(cfg.lowerPrice, cfg.upperPrice, cfg.gridCount, cfg.spacing)
+  const sellGrid = cfg.direction === 'sell'
+  const buyOnly = cfg.direction === 'buy'
   const { slTrigger, tpTrigger } = resolveGuards({
     maxSL: cfg.maxSL,
     maxTP: cfg.maxTP,
@@ -114,6 +121,7 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
     tpBasis: cfg.tpBasis,
     lowerPrice: cfg.lowerPrice,
     upperPrice: cfg.upperPrice,
+    direction: cfg.direction ?? 'both',
   })
 
   interface SimLot { levelIndex: number; qty: number; entryPrice: number }
@@ -126,35 +134,44 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
   let stopReason: string | null = null
 
   const qtyFor = () => (cfg.isCrypto ? cfg.qtyPerGrid : Math.floor(cfg.qtyPerGrid))
-  const markPnl = (px: number) => lots.reduce((acc, l) => acc + (px - l.entryPrice) * l.qty, 0)
+  // short lots (sell-only) mark INVERTED: (entry − price)
+  const markPnl = (px: number) =>
+    lots.reduce((acc, l) => acc + (sellGrid ? (l.entryPrice - px) : (px - l.entryPrice)) * l.qty, 0)
 
   for (let bi = 1; bi < bars.length; bi++) {
     const bar = bars[bi]
 
     if (!stopped) {
-      // ---- guards FIRST (SL before TP — same order as evaluateGrid) ----
-      if (slTrigger != null && bar.low <= slTrigger) {
+      // ---- guards FIRST (SL before TP — same order as evaluateGrid);
+      // sell-only fires mirrored (short SL above, short TP below) ----
+      const slHit = slTrigger != null && (sellGrid ? bar.high >= slTrigger : bar.low <= slTrigger)
+      const tpHit = tpTrigger != null && (sellGrid ? bar.low <= tpTrigger : bar.high >= tpTrigger)
+      if (slHit) {
         stopped = true
         stopReason = guardStopText('sl', cfg.slBasis, cfg.maxSL ?? 0, slTrigger)
         if (cfg.closeOnStop) {
           // the close-all IS the stop close — one fill per lot at the trigger
           for (const lot of lots) {
-            const pnl = (slTrigger - lot.entryPrice) * lot.qty
+            const pnl = sellGrid
+              ? (lot.entryPrice - slTrigger) * lot.qty
+              : (slTrigger - lot.entryPrice) * lot.qty
             realized += pnl
-            fills.push({ t: iso(bar.time), side: 'sell', reason: 'sl', price: slTrigger, qty: lot.qty, pnl })
+            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'sl', price: slTrigger, qty: lot.qty, pnl })
           }
           lots = []
         } else {
           stopReason += ' — open grid positions left running (close-on-stop disabled)'
         }
-      } else if (tpTrigger != null && bar.high >= tpTrigger) {
+      } else if (tpHit) {
         stopped = true
         stopReason = guardStopText('maxtp', cfg.tpBasis, cfg.maxTP ?? 0, tpTrigger)
         if (cfg.closeOnStop) {
           for (const lot of lots) {
-            const pnl = (tpTrigger - lot.entryPrice) * lot.qty
+            const pnl = sellGrid
+              ? (lot.entryPrice - tpTrigger) * lot.qty
+              : (tpTrigger - lot.entryPrice) * lot.qty
             realized += pnl
-            fills.push({ t: iso(bar.time), side: 'sell', reason: 'maxtp', price: tpTrigger, qty: lot.qty, pnl })
+            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'maxtp', price: tpTrigger, qty: lot.qty, pnl })
           }
           lots = []
         } else {
@@ -164,9 +181,10 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
     }
 
     if (!stopped) {
-      // ---- TP sells BEFORE buys (engine order): upward crossing of the
-      // lot's target this bar — lastPrice < target ≤ bar.high, sold AT target
-      if (lots.length > 0) {
+      // ---- TP sells BEFORE entries (engine order) — 'both' ONLY: a lot
+      // bought at level i pays at level[i+1] ?? upperPrice when
+      // lastPrice < target ≤ bar.high, sold AT target
+      if (!sellGrid && !buyOnly && lots.length > 0) {
         for (const lot of [...lots]) {
           const target = levels[lot.levelIndex + 1] ?? cfg.upperPrice
           if (!(lastPrice < target && bar.high >= target)) continue
@@ -176,16 +194,23 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
           lots = lots.filter((l) => l !== lot)
         }
       }
-      // ---- buys: downward crossing this bar — lastPrice > level ≥ bar.low,
-      // one lot per level (a level freed by a TP above CAN re-buy this bar)
+      // ---- level entries: one lot per level
+      //   both/buy: downward crossing (lastPrice > level ≥ bar.low) → BUY at
+      //   the level · sell: UPWARD crossing (lastPrice < level ≤ bar.high) →
+      //   SELL at the level (short lot). A level freed by a TP above CAN
+      //   re-enter this bar (engine parity).
       for (let i = 0; i < levels.length; i++) {
         const level = levels[i]
-        if (!(lastPrice > level && bar.low <= level)) continue
+        if (sellGrid) {
+          if (!(lastPrice < level && bar.high >= level)) continue
+        } else {
+          if (!(lastPrice > level && bar.low <= level)) continue
+        }
         if (lots.some((l) => l.levelIndex === i)) continue
         const q = qtyFor()
         if (!(q > 0)) continue // whole-share floor rounded a tiny stock qty to 0
         lots.push({ levelIndex: i, qty: q, entryPrice: level })
-        fills.push({ t: iso(bar.time), side: 'buy', reason: 'grid', price: level, qty: q, pnl: null })
+        fills.push({ t: iso(bar.time), side: sellGrid ? 'sell' : 'buy', reason: 'grid', price: level, qty: q, pnl: null })
       }
     }
 
