@@ -7,8 +7,9 @@ import { handleError } from '@/lib/api-helpers'
 // GET /api/trading/history?mode=paper&limit=100 — realized round-trip trades
 // (FIFO-matched from the broker's filled closed orders) with realized P&L.
 // Powers the Positions tab "Trade history" group + the Performance Report.
-// Each trade carries `source: 'manual' | 'algo'` (decoded from the entry
-// order's client_order_id) and, for algo trades, the resolved strategy name.
+// Each trade carries `source: 'manual' | 'algo' | 'grid'` (decoded from the
+// entry order's client_order_id, Task 10-k) and, for algo trades, the
+// resolved strategy name.
 export async function GET(req: Request) {
   try {
     const user = await getSessionUser()

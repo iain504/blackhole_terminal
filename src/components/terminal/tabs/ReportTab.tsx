@@ -44,6 +44,7 @@ const SHORT_C = '#f59e0b'
 const WEEK_C = '#a1a1aa'
 const MANUAL_C = '#a1a1aa'
 const ALGO_C = '#a78bfa'
+const GRID_C = '#34d399'
 
 const DAY = 86_400_000
 const WEEK = 7 * DAY
@@ -410,14 +411,15 @@ export default function ReportTab() {
   // Each closed trade carries `source` (decoded from the entry order's
   // client_order_id: `ttr-` = algo run) and, for algo trades, the strategy name.
   const src = useMemo(() => {
-    const acc: { manual: SourceAcc; algo: SourceAcc } = {
+    const acc: { manual: SourceAcc; algo: SourceAcc; grid: SourceAcc } = {
       manual: { trades: 0, wins: 0, losses: 0, profit: 0, loss: 0, net: 0 },
       algo: { trades: 0, wins: 0, losses: 0, profit: 0, loss: 0, net: 0 },
+      grid: { trades: 0, wins: 0, losses: 0, profit: 0, loss: 0, net: 0 },
     }
     const strat = new Map<string, StratAcc>()
     for (const t of agg.asc) {
       const pnl = Number.isFinite(t.pnl) ? t.pnl : 0
-      const a = t.source === 'algo' ? acc.algo : acc.manual
+      const a = t.source === 'algo' ? acc.algo : t.source === 'grid' ? acc.grid : acc.manual
       a.trades++
       a.net += pnl
       if (pnl > 0) {
@@ -440,9 +442,10 @@ export default function ReportTab() {
     const chart = [
       // NOTE: no per-entry `fill` — recharts turns data-row fills into implicit
       // Cells that override the Bar's green/rose; source identity lives on the
-      // X axis + the breakdown panel (MANUAL_C/ALGO_C dots there).
+      // X axis + the breakdown panel (MANUAL_C/ALGO_C/GRID_C dots there).
       { name: 'Manual', profit: Math.round(acc.manual.profit * 100) / 100, loss: Math.round(acc.manual.loss * 100) / 100, net: acc.manual.net, trades: acc.manual.trades },
       { name: 'Algo', profit: Math.round(acc.algo.profit * 100) / 100, loss: Math.round(acc.algo.loss * 100) / 100, net: acc.algo.net, trades: acc.algo.trades },
+      { name: 'Grid', profit: Math.round(acc.grid.profit * 100) / 100, loss: Math.round(acc.grid.loss * 100) / 100, net: acc.grid.net, trades: acc.grid.trades },
     ]
     return {
       acc,
@@ -681,7 +684,7 @@ export default function ReportTab() {
               </BarChart>
             </ChartContainer>
             <p className="mt-1 text-[11px] text-zinc-500">
-              Gross profit vs gross loss by placement source · Manual {src.acc.manual.trades} trade{src.acc.manual.trades === 1 ? '' : 's'} ({signedMoney(src.acc.manual.net)}) · Algo {src.acc.algo.trades} trade{src.acc.algo.trades === 1 ? '' : 's'} ({signedMoney(src.acc.algo.net)})
+              Gross profit vs gross loss by placement source · Manual {src.acc.manual.trades} trade{src.acc.manual.trades === 1 ? '' : 's'} ({signedMoney(src.acc.manual.net)}) · Algo {src.acc.algo.trades} trade{src.acc.algo.trades === 1 ? '' : 's'} ({signedMoney(src.acc.algo.net)}) · Grid {src.acc.grid.trades} trade{src.acc.grid.trades === 1 ? '' : 's'} ({signedMoney(src.acc.grid.net)})
             </p>
           </section>
 
@@ -706,6 +709,16 @@ export default function ReportTab() {
                 </span>
                 <span className={cn('w-20 text-right font-semibold tabular-nums', pnlClass(src.acc.algo.net))}>
                   {signedMoney(src.acc.algo.net)}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 rounded-md border border-emerald-500/25 bg-emerald-500/5 px-2.5 py-2">
+                <span aria-hidden="true" className="h-2 w-2 shrink-0 rounded-[2px]" style={{ backgroundColor: GRID_C }} />
+                <span className="font-semibold text-zinc-100">Grid</span>
+                <span className="ml-auto tabular-nums text-zinc-400">
+                  {src.acc.grid.trades} trade{src.acc.grid.trades === 1 ? '' : 's'} · {src.acc.grid.wins}W/{src.acc.grid.losses}L
+                </span>
+                <span className={cn('w-20 text-right font-semibold tabular-nums', pnlClass(src.acc.grid.net))}>
+                  {signedMoney(src.acc.grid.net)}
                 </span>
               </div>
               {src.strategies.length > 0 && (

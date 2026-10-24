@@ -295,6 +295,10 @@ export interface PlaceOrderBody {
   client_order_id?: string
   /** short algo source tag (first 8 of the AlgoRun id) — embeds `ttr-` attribution in the client_order_id */
   sourceRef?: string
+  /** Task 10-k — which pipeline placed the order: 'algo' (default) embeds
+   * `ttr-`, 'grid' embeds `ttg-` in the client_order_id so positions/history
+   * can attribute the trade to a grid. */
+  sourceKind?: 'algo' | 'grid'
 }
 
 /**
@@ -350,7 +354,13 @@ export async function placeOrderWithExits(
       // encode the plan for the chart's pending display: Alpaca materializes
       // bracket LEGS only when the entry activates, so a queued (weekend /
       // pre-market) bracket would otherwise render without its TP/SL lines
-      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef)
+      entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef, body.sourceKind)
+    } else if (body.sourceRef) {
+      // Task 10-k — source-tagged orders WITHOUT exits (grid market orders)
+      // used to lose their attribution entirely (the tag was only written
+      // alongside a TP/SL plan) → grid fills rendered as "Manual". Tag them
+      // anyway: same grammar, tp/sl segments decode to null.
+      entry.client_order_id = encodePlanClientId(mode, null, null, body.sourceRef, body.sourceKind)
     }
     const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
       method: 'POST',
@@ -367,7 +377,10 @@ export async function placeOrderWithExits(
   if (hasTp || hasSl) {
     // encode the planned exits so the chart can render them while the entry
     // is pending AND the supervisor can attach the legs without extra state
-    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef)
+    entry.client_order_id = encodePlanClientId(mode, hasTp ? body.take_profit! : null, hasSl ? body.stop_loss! : null, body.sourceRef, body.sourceKind)
+  } else if (body.sourceRef) {
+    // Task 10-k — keep source attribution on exit-less orders (grid fills)
+    entry.client_order_id = encodePlanClientId(mode, null, null, body.sourceRef, body.sourceKind)
   }
   const r = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
     method: 'POST',
@@ -427,15 +440,18 @@ function exitLegClientId(entryOrderId: string, kind: 'tp' | 'sl'): string {
  * client_order_id. Grammar (Alpaca caps client_order_id at 48 chars):
  *   manual/plan entry:  ttb-<m>-tp<enc>-sl<enc>-<rand6>
  *   ALGO RUN entry:     ttr-<m>-<runRef>-tp<enc>-sl<enc>-<rand4>
+ *   GRID entry (10-k):  ttg-<m>-<gridRef>-tp<enc>-sl<enc>-<rand4>
  * `ttb-` powers the chart's pending TP/SL display and the crypto OCO
  * supervisor; `ttr-` additionally carries the first 8 chars of the AlgoRun id
- * so every trade can be attributed Manual vs Algo (which strategy).
+ * so every trade can be attributed Manual vs Algo (which strategy); `ttg-`
+ * carries the first 8 chars of the GridTrade id (sourceKind 'grid').
  */
-export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null, runRef?: string | null): string {
+export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null, runRef?: string | null, sourceKind?: 'algo' | 'grid'): string {
   const tpE = tp != null && tp > 0 ? encP(tp) : '0'
   const slE = sl != null && sl > 0 ? encP(sl) : '0'
   if (runRef) {
-    const coid = `ttr-${mode[0]}-${runRef}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 6)}`
+    const prefix = sourceKind === 'grid' ? 'ttg' : 'ttr'
+    const coid = `${prefix}-${mode[0]}-${runRef}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 6)}`
     if (coid.length <= 48) return coid
     // absurd prices (≥$100k with both legs) can overflow the 48-char cap —
     // fall back to the manual grammar (attribution lost, order stays valid)
@@ -444,21 +460,23 @@ export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: numbe
 }
 
 /**
- * Decode the plan (and the algo source tag) from a `ttb-…`/`ttr-…`
- * client_order_id. Returns null when the order was not placed by this
+ * Decode the plan (and the algo/grid source tag) from a `ttb-…`/`ttr-…`/
+ * `ttg-…` client_order_id. Returns null when the order was not placed by this
  * terminal (external orders — Alpaca dashboard, mobile app — carry uuid coids).
  */
-export function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null; runRef: string | null } | null {
+export function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null; runRef: string | null; gridRef: string | null } | null {
   const coid = clientOrderId || ''
   const pos = (s: string | undefined) => {
     const v = s ? parseInt(s, 10) / 1e6 : 0
     return v > 0 ? v : null
   }
   const algo = /^ttr-[a-z]-([a-z0-9]{6,12})-tp(\d+)-sl(\d+)-/.exec(coid)
-  if (algo) return { tp: pos(algo[2]), sl: pos(algo[3]), runRef: algo[1] }
+  if (algo) return { tp: pos(algo[2]), sl: pos(algo[3]), runRef: algo[1], gridRef: null }
+  const grid = /^ttg-[a-z]-([a-z0-9]{6,12})(?:-tp(\d+)-sl(\d+))?-/.exec(coid)
+  if (grid) return { tp: pos(grid[2]), sl: pos(grid[3]), runRef: null, gridRef: grid[1] }
   const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(coid)
   if (!m) return null
-  return { tp: pos(m[1]), sl: pos(m[2]), runRef: null }
+  return { tp: pos(m[1]), sl: pos(m[2]), runRef: null, gridRef: null }
 }
 
 /**

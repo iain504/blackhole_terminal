@@ -364,8 +364,11 @@ async function placeGridMarketOrder(
       side,
       qty,
       type: 'market',
-      // tag with the grid id prefix so the trade history can attribute these
+      // tag with the grid id prefix so positions/history attribute these as
+      // 'grid' (Task 10-k: ttg- client_order_id — works even without TP/SL,
+      // which grid market orders never carry)
       sourceRef: gridId.slice(0, 8),
+      sourceKind: 'grid',
     })
     if (r.results.length === 0) return { ok: false, error: r.errors[0] || 'order rejected' }
     const o = r.results[0]

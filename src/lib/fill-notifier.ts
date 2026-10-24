@@ -60,6 +60,7 @@ const fmtPx = (n: number): string =>
 function orderRole(o: TradingOrder): string {
   const coid = o.client_order_id || ''
   if (coid.startsWith('ttb-')) return 'Entry (planned TP/SL)'
+  if (coid.startsWith('ttg-')) return 'Grid order'
   if (coid.endsWith('-tp')) return coid.startsWith('ttp-heal-') ? 'Take profit (auto-restored)' : 'Take profit'
   if (coid.endsWith('-sl')) return coid.startsWith('ttp-heal-') ? 'Stop loss (auto-restored)' : 'Stop loss'
   if (o.order_class === 'bracket' || o.group_role === 'take_profit') return 'Take profit'

@@ -2622,3 +2622,37 @@ Work Log:
 
 Stage Summary:
 - Deploy failure explained and fixed at the STATE level: the platform was building a stale Oct-22 snapshot that predates every fix; the current pushed code (5e9667a) is already sanitized-env-safe (Task 9-j). Repo restored to remote main; DB re-seeded (trader + TOTP); demo grid glow live. NOTHING to commit code-wise — this entry documents the recovery. User data since Oct 22 is NOT recoverable (no backups): grids/watchlists/layouts/settings lost, account + 2FA restored.
+
+---
+Task ID: 10-j
+Agent: main (Z.ai Code)
+Task: "Registration is disabled" — user report after the Task 10-i deploy-failure recovery.
+
+Work Log:
+- Root cause: the Task 10-i recovery rebuilt .env from the stale-snapshot shape — ALLOW_REGISTRATION came back as **false** (it had been true since Task 9-j) — while the re-seeded user table is non-empty ('trader'), so registrationOpen() (ALLOW_REGISTRATION=true OR empty-table bootstrap) evaluated false → POST /api/auth/register and GET /api/auth/2fa/setup both 403 {"error":"Registration is disabled"} at the FIRST register UI step.
+- Fix (state-only, zero code changes): .env line 4 ALLOW_REGISTRATION=false → true (non-secret line; ships inside the deploy package per the Task 9-j publish-sanitization design, so the deployed app opens signups too). All other env values verified intact (DATABASE_URL, AUTH_SECRET, APP_ENCRYPTION_SECRET, ALLOW_SHARED_BROKER=true, dev Alpaca keys).
+- Dev server was DOWN post-restore (curl /api/health → 000); restarted per protocol, healthy in ~6s: GET / 200, /api/health {status:ok, db:true, v1.80.0+134}.
+- Live API verification: GET /api/auth/2fa/setup?username=… → 200 (secret + otpauth + QR minted; was 403); POST /api/auth/register (bad TOTP) → 400 "Invalid 2FA code…" = past the gate; PUT /api/auth/register (trader/SuperSecret99) → 200 login ticket — existing-account login unaffected (PUT never gated).
+- E2E browser (agent-browser): browser still held trader session from 10-i → Sign out → auth screen → Create account tab → gateprobe2/gateprobe123 + confirm → Continue → **2FA QR step rendered** (image "2FA QR code" + secret + Copy secret + code input) — the exact step that previously said "Registration is disabled". No account created (Back + Sign in, browser closed). Screenshot: screens-tmp/t10j-register-qr-open.png. dev.log clean (only expected 405 from a wrong-method POST probe).
+- Deploy-failure cross-check (from the earlier "problem deploying" report): Task 10-i already root-caused + fixed it (platform restored a stale Oct-22 snapshot; tree reset to origin/main; bun run build + .zscripts/build.sh full pipeline EXIT 0). tsc --noEmit shows errors only in probe dirs (scripts-tmp/, skills/, tests/) — irrelevant to deploys because next.config.ts sets typescript.ignoreBuildErrors=true. Nothing blocks the next platform deploy.
+
+Stage Summary:
+- Registration is OPEN again (local .env; will be open in the next deploy package too). Login flow untouched and re-verified end-to-end. Repo pushed: b930f5a → f0c69ff (version drift only, v1.80.0+134), remote==local==f0c69ff, tree clean. No code changes in this task — the gate was purely environmental fallout of the 10-i snapshot restore.
+
+---
+Task ID: 10-k
+Agent: main (Z.ai Code)
+Task: "Enhence: 1. Positions Tag: Source need to support Grid."
+
+Work Log:
+- Root cause of grid fills showing "Manual": placeGridMarketOrder already passed sourceRef=gridId.slice(0,8), but placeOrderWithExits only wrote the client_order_id when a TP/SL plan existed — grid MARKET orders never carry exits → the tag was silently dropped → source degraded to manual.
+- Codec (trading.ts): new `ttg-<m>-<gridRef8>-tp<enc>-sl<enc>-<rand>` grammar (sourceKind:'grid' in PlaceOrderBody → encodePlanClientId); exit-less sourceRef orders now tagged too (else-if branch in BOTH stock + crypto paths); parseCryptoPlan returns gridRef (ttg- regex, tp/sl segments optional).
+- grid-engine.ts: placeGridMarketOrder passes sourceKind:'grid'.
+- trade-history.ts sourceOf: gridRef → source 'grid' (closed trades attribute too); market-types ClosedTrade.source + history route comment extended.
+- positions route: PositionRow/PendingOrderRow source unions + retro-attribution — newest 2000 GridFill orderIds (indexed userId query) → open lots whose orderId matches resolve to 'grid' even when placed BEFORE tagging. Refinement after live probe: the demo BTC/USD position's OLDEST FIFO lot is an old external/manual dust buy (uuid coid) that masked the grid lot → rule changed to "a grid lot ANYWHERE in the FIFO claims the row" (grid manages that symbol's inventory: Grid tab, chart glow); openedAt/runRef still derive from the oldest lot.
+- UI: PositionsTab SourceBadge gains emerald Grid branch (matches grid glow color family); PositionRowExt union; chart trading-types PendingOrderInfo union; ReportTab 3-bucket attribution (GRID_C #34d399, acc.grid, chart row, caption, breakdown row); fill-notifier orderRole 'ttg-' → 'Grid order' (Telegram labels).
+- Verified: lint clean, tsc 0 src errors; API login → /api/trading/positions BTC/USD source=grid (retro via GridFill orderId 7d28fb9c…); E2E browser (trader TOTP): Positions tab Source column shows emerald Grid badge (screens-tmp/t10k-positions-grid-badge.png); Performance Report "Trade source breakdown" renders Manual/Algo/Grid rows (screens-tmp/t10k-report-grid-bucket.png); dev.log clean.
+- Housekeeping: platform UUID auto-commit 77b712d (Task 10-j worklog only) soft-reset and recommitted with a proper message before pushing.
+
+Stage Summary:
+- Positions Source tag now supports Grid: new grid fills carry `ttg-` client_order_id (forward attribution), pre-tagging grid fills attribute retroactively via GridFill.orderId, mixed positions claim 'grid' when any grid lot is open. Report breakdown + Telegram labels updated. E2E + API verified on the live demo grid position.

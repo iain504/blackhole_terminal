@@ -61,7 +61,7 @@ interface PosConsoleRow {
  * kept as a local extension so the shared trading-types file stays stable). */
 type PositionRowExt = PositionRow & {
   openedAt?: string | null
-  source?: 'manual' | 'algo'
+  source?: 'manual' | 'algo' | 'grid'
   strategy?: string
 }
 
@@ -109,12 +109,13 @@ function fmtCompactDT(iso: string | null | undefined): string {
   })
 }
 
-/** Manual vs Algo source badge (Task 65): algo rows show which strategy placed it.
- *  Task 79 — an UNKNOWN source (no open entry lot in the recent closed-orders
- *  window, e.g. an old position or a pre-dating fill) used to render as
- *  "Manual" — a wrong attribution. It now shows a dim "—" like other
- *  unknown columns; only a decoded `ttb-`/external coid renders "Manual". */
-function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | undefined; strategy?: string }) {
+/** Manual / Algo / Grid source badge (Task 65, grid in Task 10-k): algo rows
+ *  show which strategy placed it, grid rows an emerald Grid tag. Task 79 — an
+ *  UNKNOWN source (no open entry lot in the recent closed-orders window,
+ *  e.g. an old position or a pre-dating fill) used to render as "Manual" — a
+ *  wrong attribution. It now shows a dim "—" like other unknown columns;
+ *  only a decoded `ttb-`/external coid renders "Manual". */
+function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | 'grid' | undefined; strategy?: string }) {
   if (source === 'algo') {
     return (
       <Badge
@@ -123,6 +124,17 @@ function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | undefin
         title={strategy ? `Placed by the ${strategy} algo run` : 'Placed by an algo run'}
       >
         {strategy ? `Algo · ${strategy}` : 'Algo'}
+      </Badge>
+    )
+  }
+  if (source === 'grid') {
+    return (
+      <Badge
+        variant="outline"
+        className="border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-300"
+        title="Placed by a grid trade"
+      >
+        Grid
       </Badge>
     )
   }

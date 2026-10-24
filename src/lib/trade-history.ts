@@ -33,30 +33,32 @@ interface Lot {
   time: string // ISO fill time
   orderId: string
   groupId: string | null
-  clientOrderId: string | null // carries the ttb-/ttr- source tag
+  clientOrderId: string | null // carries the ttb-/ttr-/ttg- source tag
 }
 
 const EPS = 1e-9
 
 /** Decode the placement source from the ENTRY order's client_order_id —
- * `ttr-` (algo run, runRef = first 8 of the AlgoRun id) vs `ttb-`/external
- * (manual). The strategy NAME is resolved server-side where the DB lives. */
+ * `ttr-` (algo run, runRef = first 8 of the AlgoRun id), `ttg-` (grid, Task
+ * 10-k, gridRef = first 8 of the GridTrade id) vs `ttb-`/external (manual).
+ * The strategy NAME is resolved server-side where the DB lives. */
 function sourceOf(entryClientOrderId: string | null): Pick<ClosedTrade, 'source' | 'runRef'> {
   const plan = parseCryptoPlan(entryClientOrderId)
+  if (plan?.gridRef) return { source: 'grid', runRef: null }
   if (plan?.runRef) return { source: 'algo', runRef: plan.runRef }
   return { source: 'manual', runRef: null }
 }
 
 /** An entry fill that survives the FIFO walk — one lot of a LIVE position.
  * Exposed so /api/trading/positions can attach `openedAt` (oldest lot) and
- * the Manual/Algo source decoded from the lot's client_order_id. */
+ * the Manual/Algo/Grid source decoded from the lot's client_order_id. */
 export interface OpenLot {
   side: string // entry side: 'buy' | 'sell'
   qty: number
   price: number
   entryTime: string // ISO fill time of the entry
   orderId: string
-  clientOrderId: string | null // carries the ttb-/ttr- source tag
+  clientOrderId: string | null // carries the ttb-/ttr-/ttg- source tag
 }
 
 export interface FifoMatch {

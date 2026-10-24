@@ -7,6 +7,7 @@ import {
 import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
 import { handleError } from '@/lib/api-helpers'
+import { db } from '@/lib/db'
 
 /** Chart symbol (AAPL, BTC/USD) -> trading symbol (AAPL, BTCUSD). */
 function normSymbol(s: string): string {
@@ -41,8 +42,10 @@ export interface PositionRow {
    * e.g. the entry fill predates the closed-orders window) */
   openedAt: string | null
   /** placement source decoded from that lot's client_order_id — absent when
-   * no open lot was found (rendered as '—' like other unknown columns) */
-  source?: 'manual' | 'algo'
+   * no open lot was found (rendered as '—' like other unknown columns).
+   * 'grid' (Task 10-k): a `ttg-` tagged entry OR any open lot whose orderId
+   * appears in GridFill (retro-attribution of pre-tagging grid fills). */
+  source?: 'manual' | 'algo' | 'grid'
   /** when source === 'algo': first 8 chars of the originating AlgoRun id */
   runRef?: string | null
   /** when source === 'algo': strategy display name (resolved from AlgoRun) */
@@ -65,8 +68,9 @@ export interface PendingOrderRow {
   slPrice: number | null
   /** true when TP/SL ride along (managed complex order) */
   managed: boolean
-  /** placement source: algo entries carry a `ttr-` client_order_id */
-  source: 'manual' | 'algo'
+  /** placement source: algo entries carry a `ttr-`, grid entries a `ttg-`
+   * client_order_id (Task 10-k) */
+  source: 'manual' | 'algo' | 'grid'
   /** strategy display name when source === 'algo' (resolved from AlgoRun) */
   strategy?: string
   createdAt: string | null
@@ -133,14 +137,40 @@ export async function GET(req: Request) {
     const openLotsByNorm = new Map<string, OpenLot[]>()
     for (const [sym, lots] of openLots) openLotsByNorm.set(normSymbol(sym), lots)
 
+    // Task 10-k — retro-attribution: GridFill rows record the broker orderId
+    // of EVERY grid-placed order, so open lots placed BEFORE the `ttg-`
+    // client_order_id tagging still resolve to source 'grid'. Capped to the
+    // newest 2000 fills (indexed on userId) — far wider than the FIFO window
+    // this route actually walks.
+    let gridOrderIds: Set<string> | null = null
+    try {
+      const gfills = await db.gridFill.findMany({
+        where: { userId: user.id, orderId: { not: null } },
+        orderBy: { ts: 'desc' },
+        take: 2000,
+        select: { orderId: true },
+      })
+      gridOrderIds = new Set(gfills.map((f) => f.orderId as string))
+    } catch {
+      gridOrderIds = null // degrade to coid-only attribution
+    }
+
     const rows: PositionRow[] = positions
       .filter((p) => !symbolParam || normSymbol(p.symbol) === normSymbol(symbolParam))
       .map((p) => {
-        // OLDEST still-open FIFO entry lot for this symbol → when the position
-        // was opened + who placed it (ttb-… manual · ttr-… algo run). Lookup is
-        // normalized (Task 79) so crypto 'BTCUSD' positions find 'BTC/USD' lots.
-        const lot = openLotsByNorm.get(normSymbol(p.symbol))?.[0]
-        const lotPlan = lot ? parseCryptoPlan(lot.clientOrderId) : null
+        // FIFO entry lots for this symbol → when the position was opened + who
+        // placed it (ttb-… manual · ttr-… algo run · ttg-… grid, or a GridFill
+        // orderId match for pre-tagging grid fills). Lookup is normalized
+        // (Task 79) so crypto 'BTCUSD' positions find 'BTC/USD' lots.
+        // Task 10-k — a grid lot ANYWHERE in the FIFO claims the source: the
+        // grid engine actively manages inventory on that symbol (Grid tab,
+        // chart glow), so an old manual dust lot being oldest must not mask it.
+        const lots = openLotsByNorm.get(normSymbol(p.symbol)) ?? []
+        const oldest = lots[0]
+        const oldestPlan = oldest ? parseCryptoPlan(oldest.clientOrderId) : null
+        const lotIsGrid =
+          lots.some((l) => parseCryptoPlan(l.clientOrderId)?.gridRef != null) ||
+          lots.some((l) => gridOrderIds?.has(l.orderId) === true)
         return {
           symbol: p.symbol.includes('/') ? p.symbol : p.asset_class === 'crypto' ? p.symbol.replace(/USD$/, '/USD') : p.symbol,
           tradeSymbol: p.symbol,
@@ -152,9 +182,9 @@ export async function GET(req: Request) {
           upl: parseFloat(p.unrealized_pl) || 0,
           uplPct: (parseFloat(p.unrealized_plpc) || 0) * 100,
           assetClass: p.asset_class,
-          openedAt: lot?.entryTime ?? null,
-          ...(lot ? { source: lotPlan?.runRef ? ('algo' as const) : ('manual' as const) } : {}),
-          runRef: lotPlan?.runRef ?? null,
+          openedAt: oldest?.entryTime ?? null,
+          ...(lots.length ? { source: lotIsGrid ? ('grid' as const) : oldestPlan?.runRef ? ('algo' as const) : ('manual' as const) } : {}),
+          runRef: oldestPlan?.runRef ?? null,
         }
       })
 
@@ -281,7 +311,7 @@ export async function GET(req: Request) {
         tpPrice,
         slPrice,
         managed: Boolean(plan) || (o.legs?.length ?? 0) > 0,
-        source: plan?.runRef ? 'algo' : 'manual',
+        source: plan?.gridRef ? 'grid' : plan?.runRef ? 'algo' : 'manual',
         strategy: plan?.runRef ? stratNames.get(plan.runRef) : undefined,
         createdAt: o.created_at,
       })
