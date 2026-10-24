@@ -23,6 +23,19 @@
 // clobber an already-triggered row.
 import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
+
+// 5s micro-cache for alert-evaluation quotes: the supervisor (15s) and any
+// client polls landing in the same window reuse one Alpaca snapshot round-trip
+// per symbol set. Alert checks run on a 15–30s cadence, so ≤5s staleness is
+// fine. Order placement NEVER goes through here (it calls getQuotes directly).
+let quoteCache: { at: number; key: string; data: Awaited<ReturnType<typeof getQuotes>> } | null = null
+async function getQuotesCached(symbols: string[], userId?: string) {
+  const key = [...symbols].sort().join(',') + '|' + (userId ?? '')
+  if (quoteCache && quoteCache.key === key && Date.now() - quoteCache.at < 5_000) return quoteCache.data
+  const data = await getQuotes(symbols, userId)
+  quoteCache = { at: Date.now(), key, data }
+  return data
+}
 import { sendTelegram } from '@/lib/api-helpers'
 import { decrypt } from '@/lib/crypt'
 import { Bar, Timeframe, TIMEFRAMES } from '@/lib/market-types'
@@ -148,7 +161,7 @@ async function evaluateInner(userId: string): Promise<AlertsResult> {
   const priceAlerts = alerts.filter((a) => a.kind !== 'rsi' && a.kind !== 'macd' && a.kind !== 'trend')
   if (priceAlerts.length > 0) {
     const symbols = [...new Set(priceAlerts.map((a) => a.symbol))]
-    const { quotes } = await getQuotes(symbols, userId)
+    const { quotes } = await getQuotesCached(symbols, userId)
     const bySymbol = new Map(quotes.map((q) => [q.symbol, q]))
     for (const a of priceAlerts) {
       const q = bySymbol.get(a.symbol)
