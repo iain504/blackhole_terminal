@@ -2460,3 +2460,20 @@ Work Log:
 Stage Summary:
 - Delivered: self-healing stack (watchdog ~40s auto-revive + rescue page /?XTransformPort=3030 + in-app banner one-click restart), 1m OOM fixed (30d cap + no retention + universal gate + mid-matrix aborts), Grid Trading (chart two-click → dialog → engine → Grid tab with stats), Backup/Restore (survive Publish resets).
 - Bonus fix: sidecar session verification now actually works (was guest-only since APP_ENCRYPTION_SECRET existed) — restores stock streaming for logged-in users.
+
+---
+Task ID: 9-s
+Agent: main (Z.ai Code)
+Task: "push it" verification + provision user's new development Alpaca keys as shared dev broker.
+
+Work Log:
+- Verified sync: remote==local==27fb62f (Tasks 9-p/q/r self-healing + Grid Trading + Backup/Restore already pushed, landing v1.25.0). Only src/generated/version.ts drift pending (build 121→122, sha 27fb62f).
+- Key validation: initial curl to paper-api returned 'unauthorized' — root cause was MY test header name (APCA-API-SECRET); correct Alpaca header is APCA-API-SECRET-KEY. Retested: paper account ACTIVE (PA3RI1K5E, $10,000 cash, crypto_status ACTIVE, created 2026-10-24). Egress sanity: public data.alpaca.markets crypto endpoint returned real BTC bars (network clean).
+- Wired shared dev broker into .env (gitignored, never committed): ALLOW_SHARED_BROKER=true, APCA_API_KEY_ID=PKYAB…4SG, APCA_API_SECRET_KEY=8SvR…bwwj. Comment notes the publish pipeline strips secret env lines on redeploy.
+- Restarted dev server (pkill protocol, NODE_OPTIONS heap cap, back to 200). Browser E2E with live session: GET /api/settings → serverKeysPresent:true; GET /api/trading/positions → {"mode":"paper","positions":[],"exits":{},"pending":[]} — real resolver→Alpaca paper round-trip, no demo fallback, no no-keys error. README already documents the correct env var names.
+- Committed version.ts drift + this worklog; pushed.
+
+Stage Summary:
+- The dev sandbox now runs on the user's new development paper keys via the shared-broker path; any user who saves their own keys in Settings still takes precedence (per-user first, env fallback, gate = ALLOW_SHARED_BROKER).
+- Grid/algo/trading features that previously refused with 'No Alpaca keys' will now pass the gate in this sandbox.
+- Persistence caveat (by design): secret env lines do NOT survive publish/redeploy on the hosting platform — the persistent path remains per-user Settings keys or the Task 9-r Backup/Restore flow. Old leaked key (PKGJ…) should be revoked on Alpaca's side if not already done; the new key only ever existed in .env (gitignored).
