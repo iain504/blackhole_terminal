@@ -2367,3 +2367,19 @@ Stage Summary:
 - Export/import is now sandbox-proof: the JSON is always visible and copyable in-app; download is a bonus, not a single point of failure.
 - Copy ↔ paste closes the loop: export dialog → import paste works with no downloads at all.
 - No backend changes; rules-import route untouched and re-validated by parse flow.
+
+---
+Task ID: 9-o
+Agent: main (Z.ai Code)
+Task: "Create a README file and update to github such that other can check it out and deploy themselves easily."
+
+Work Log:
+- Gathered deployment facts from the codebase: package.json scripts (dev/build/start/db:push), .env.example (DATABASE_URL, AUTH_SECRET required at boot, APP_ENCRYPTION_SECRET AES-256-GCM at-rest key, ALLOW_REGISTRATION first-run bootstrap, ALLOW_SHARED_BROKER), alpaca.ts (per-user encrypted keys via Settings + env-shared APCA_API_KEY_ID/APCA_API_SECRET_KEY), stream-service/index.ts (socket.io :3030, one Binance WS + one Alpaca iex WS per account, handshake auth, REST fallback), stream-client.ts (browser connects io('/?XTransformPort=3030') same-origin → reverse proxy requirement), Caddyfile (the XTransformPort=3030 mapping pattern), next.config.ts (output standalone), TabBar (Chart/Calendar/Heat Map/Positions/Strategy Orders/Report/Algo Trading), Telegram fill notifications.
+- Wrote README.md: hero image, feature overview, requirements (Bun ≥ 1.1), 5-minute quick start (clone → bun install → .env with absolute DATABASE_URL + two 32-byte hex secrets via bun -e → db:push → dev), first-run flow (first-account bootstrap, TOTP 2FA enrollment, Alpaca keys in Settings), market-data coverage table (crypto keyless via Binance; equities via Alpaca IEX), full env var table, optional stream-service section with copy-paste Caddy snippet for real domains, production build/start + systemd unit pair, scripts table, troubleshooting (boot refusal, demo equity data, Polling chip, absolute DATABASE_URL trap, heap-guarded sweeps, port 3000), security notes (paper first, encryption at rest, guest mode, rotate leaked keys), project structure, disclaimer.
+- Called out the Prisma relative-path trap explicitly (file: URLs resolve against prisma/, hence absolute path recommendation).
+- Landing version v1.23.0 → v1.24.0.
+- Commit hygiene: version.ts drift committed separately first (da75f3c), then README + bump (dcdac06).
+
+Stage Summary:
+- README.md shipped: a newcomer can clone → configure two secrets → db:push → bun run dev and have a working terminal with keyless crypto data; equities/streaming/production each have a dedicated section.
+- Pushed to origin/main (iain504/blackhole_terminal), remote == local.
