@@ -157,5 +157,5 @@ export const watchlistPatchSchema = z.object({
 export const layoutPutSchema = z.object({
   data: z.unknown(),
   // ISO timestamp of the client's base revision (optimistic concurrency)
-  baseUpdatedAt: z.string().optional(),
+  baseUpdatedAt: z.string().nullish().transform((v) => v ?? undefined),
 })

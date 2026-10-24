@@ -10,7 +10,7 @@
 import { db } from '@/lib/db'
 import { evaluateAlerts } from '@/lib/alerts-eval'
 
-const SUPERVISOR_MS = 20000
+const SUPERVISOR_MS = 15000 // < barsFor TTL (20s) — supervisor keeps the cache warm for client polls
 
 type GlobalWithAlerts = typeof globalThis & {
   __ttAlertsSupervisor?: { timer: ReturnType<typeof setInterval>; busy: boolean }

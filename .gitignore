@@ -62,3 +62,7 @@ server.log
 /skills/
 # sandbox session artifacts (tool-call logs, may contain transient secrets)
 tool-results/
+
+db/*.db-shm
+db/*.db-wal
+db/*.db-journal
