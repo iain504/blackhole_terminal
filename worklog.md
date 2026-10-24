@@ -1859,3 +1859,86 @@ Work Log:
 
 Stage Summary:
 - Recommended setups are now self-refreshing from the frontend: one click re-runs the entire 21-combo research sweep on fresh bars server-side (mutex-guarded background job with live N/21 progress), persists the result to the DB, and swaps the ranked list in place — no CLI needed. The baked-in static list remains as the offline fallback and first-paint source.
+
+---
+Task ID: 1-a
+Agent: Explore (perf)
+Task: performance & speed audit
+
+Work Log:
+- Traced the full market-data path: getBars (alpaca.ts:293-426 — Binance-first crypto, Alpaca paginated ≤60 pages stocks, 45s-budget deep crypto path >9k bars), caches (binance.ts:76-79 quote 5s/bars 15s TTL, bars-cache.ts:8 engine TTL 20s, backtest route:49-63 TTL 120s ×12 entries, markers/route.ts:22-23 10min), confirmed NO bars DB table (schema has none — bars are never persisted; db/custom.db = 176KB) and no /api/market/bars server cache for stocks.
+- Read the backtest/algo stack end-to-end (backtest.ts 921 lines: prepareSeries prefix-sums + COMBO_BAR_BUDGET 12M stride sampling ≤800 combos; algo-reco.ts 21-combo matrix as in-process background job; backtest route 120k-bar cap, forming-bar slice loop), and matched scripts-tmp/reco-sweep-results.json: 21 combos = 240s total, 33.2s compute (14%) vs 206.8s bar fetch (86%), worst BTC/USD 15m 33.5s, crypto 1m/5m hit the 120k cap.
+- Audited chart + realtime: ChartPanel.tsx (4867 lines) tick coalescing 250ms/pane with refs+rAF updates (3514-3529), full chart rebuild on symbol/tf/chartType/settingsVer/ETH (3368), scroll-back prepend = full setData + sort of merged history (3146-3152); stream-service single Binance WS + single Alpaca WS/key, 200ms batched emit, refcount + backoff (index.ts:81-86); stream-client shared socket per tab.
+- Counted polling cadences (client: 5/10/12/15/20/30/60s ×tab; server supervisors 15s algo cycle, 20s strategy) and measured dev.log: POST /api/alerts/check renders 1150-1250ms on EVERY poll (barsFor TTL 20s < 30s poll = always cold), /api/trading/fills 624-640ms/12s (Alpaca broker round-trip), POST /api/market/quote 249-630ms cold.
+- Environment evidence for the OOM: box = 4GB RAM, NO swap; live next-server (dev v16.1.3) RSS 1.86GB (44.8% MEM); backtest bars cache alone up to 12×~50MB ≈ 600MB worst (route:47 comment) on top of 120k-bar arrays during matrix runs + dev recompiles → matches the worklog OOM report. Frontend: zero dynamic imports app-wide, recharts static in 2 tabs, framer-motion on landing, ~20 unused heavy deps (mdxeditor, syntax-highlighter, tanstack, next-auth…), node_modules 1.2GB.
+
+Stage Summary:
+- Fast/well-designed: typed-array backtest core (prepareSeries once, ≤800 sampled combos, ~1-3s per 120k-bar combo), 20s engine bars cache collapsing engine polls, 200ms batched WS fan-out + 250ms client coalescing, Binance circuit-breaker/failover, markers 10min cache, AlgoLog pruned.
+- Top risks: (1) 4GB no-swap box with 1.86GB dev-server baseline + 600MB backtest cache + in-process 240s matrix = OOM; (2) alerts/check always-cold 1.2s/poll (TTL 20s < poll 30s); (3) 86% of sweep wall-time is repeated bar fetching because bars are never persisted; (4) per-tab poll multiplication vs Alpaca rate limits; (5) full-series setData/sort on every scroll-back prepend; (6) no server cache on /api/market/bars stock path; (7) chart full rebuild on indicator-settings change; (8) zero code-splitting (recharts/framer-motion) + unused deps.
+- Quickest wins: raise barsFor TTL ≥ poll cadence (or move polls to SSE), persist bars in SQLite with tail refresh, run sweeps/backtests in a worker thread with bars-cache entries ≤4, add gzip `encode` in Caddy, next/dynamic for recharts tabs, prod build instead of next dev.
+
+---
+Task ID: 1-d
+Agent: Explore (reliability/UX)
+Task: functions, reliability, robustness, HA, UX audit
+
+Work Log:
+- Inventoried all features from src/components/terminal/**, chart/**, landing, auth + the 47-route /api tree (terminal: multi-chart workspace 1-8 panes w/ drawing+indicators+S/R, watchlists, quote/news, heatmap, calendar w/ FF actuals scrape, positions console w/ bracket+OCO+trailing+drag-edit, strategy bot, algo runner 4 strategies, backtest+optimizer+sweep+recommended-setups, report tab, alerts price/RSI/MACD/trend, Telegram notify; platform: landing, 2FA auth, settings+config export/import, mobile shell, stream-service socket.io mini-service).
+- Reliability deep-read: api-helpers, alpaca/binance/trading libs, stream-service, algo-engine, algo-reco, strategy supervisor, fill-notifier, alerts/check, TerminalRoot polling, store hydrate. Strengths: consistent route try/catch+handleError, 6-9s outbound timeouts everywhere, demo fallback with reasons, bar pagination caps + truncation logs, Binance 418/429 circuit breaker + dual host, WS backoff+watchdogs+slot cooldowns, algo state persisted per cycle + engine resume, race-safe strategy fire claims, fill-notifier persisted cursor.
+- Gaps verified against source: NO error.tsx/global-error.tsx anywhere in src/app; alerts only evaluate while a browser polls /api/alerts/check (no server scheduler, unlike strategies); algo engine resume needs an API touch after boot; AUTH_SECRET/APP_ENCRYPTION_SECRET unset in .env → hardcoded dev fallback signs sessions AND derives the AES key for stored broker keys; readJson is an unvalidated cast (zod unused server-side); Prisma query logging floods dev.log; layout autosave is last-writer-wins across tabs.
+- HA reality check: production runs `next dev` (v16.1.3, ~1.9GB RSS observed); no process manager/health endpoint; all schedulers in-process (engines, supervisors, reco job, caches, socket.io service) → 2nd instance would double-trade algo runs (algo-engine has no cross-instance claim, unlike strategy.ts); SQLite single-writer; OOM during sweeps documented in Task 90; dev.log scan: 177×200s, one malformed-JSON 500, Binance HTTP 418 IP-ban events.
+- UX audit: skeletons/spinners/toasts/empty states/aria-labels/mobile shell all present and good; top gaps = no crash boundary, no stream-disconnect indicator (silent 10s REST fallback), 1060px-wide tables on small screens, IEX-only stock data not labeled as delayed, no onboarding/shortcut help.
+
+Stage Summary:
+- Feature surface is very broad and the per-request reliability engineering is genuinely strong (timeouts, pagination, fallbacks, reason surfacing); the biggest structural risks are operational, not per-request: dev-mode-in-production, in-process-only schedulers that stop with the browser closed or process restart, and no React error boundary.
+- Top fixes ranked: (1) add app/error.tsx + global-error.tsx; (2) server-side alert/notify scheduler + boot-time ensureAlgoEngines; (3) set AUTH_SECRET/APP_ENCRYPTION_SECRET and add login rate limiting; (4) swap `next dev` for the standalone build under a process manager with /api/health; (5) cap concurrent backtest/sweep jobs (memory) and silence prisma:query log spam.
+---
+Task ID: 1-c
+Agent: Explore (security)
+Task: security audit
+
+Work Log:
+- Audited auth (custom HMAC-cookie scheme, NOT NextAuth — next-auth dep is dead), TOTP flow, all ~40 API routes, gateway, mini-services, secrets hygiene, injection surface, rate limiting; read-only, no code changed.
+- Confirmed all DB-backed routes enforce per-user scoping (findFirst {id, userId}), no raw SQL/fs/exec-with-input/SSRF in src; orders route relies on per-user keys via getAlpacaKeys (alpaca.ts:93-107) which FALLS BACK to env keys for trading (trading.ts:69) with client-chosen mode (trading.ts:42-43).
+- Found hardcoded Alpaca credentials (KEY PKGJ****ZGOR + secret 6fwV****TSe) in scripts-tmp/alpos-flatten.mjs:24 and key ID in 14 more scripts-tmp files — tracked in git and pushed to github.com/iain504/blackhole_terminal (≥5 history commits).
+- Found db/custom.db, .env, upload/v24.tar + v23-algo.zip tracked in git (DB holds 3 users' plaintext TOTP secrets; tarball embeds .env + .git).
+- Verified in running deployment: AUTH_SECRET/APP_ENCRYPTION_SECRET unset → session HMAC + credential encryption use the public hardcoded default (auth.ts:8, crypt.ts:8) → forgeable session cookies; cookie also lacks `secure`; no middleware.ts, no rate limiting/lockout anywhere.
+- Caddyfile XTransformPort (Caddyfile:2-13) = unauthenticated reverse proxy to ANY localhost port (SSRF/port-scan); stream-service socket.io is open with CORS '*' (index.ts:40); market/* routes accept anonymous calls (user?.id fallback); expensive endpoints (backtest sweep, reco refresh 4-min matrix) have no quotas.
+
+Stage Summary:
+- CRITICAL: leaked Alpaca paper creds in git (rotate + history purge), forgeable sessions via default AUTH_SECRET (fail-closed + rotate), git-tracked DB/tarball/.env with plaintext TOTP secrets.
+- HIGH: env-key fallback lets any registered user trade the shared broker account (close registration, no fallback, server-side mode); XTransformPort loopback SSRF; open CORS-* WS.
+- MEDIUM: no rate limiting on login/TOTP + non-constant-time TOTP compare; no quotas on CPU-heavy endpoints; public market-data proxy; missing `secure`/HSTS/CSP headers.
+- Verdict: app-layer authz solid, ops/secret layer not production-safe — top fixes ~2h: rotate keys, set env secrets, untrack DB/tar/.env, close registration, pin XTransformPort=3030.
+
+---
+Task ID: 1-b
+Agent: Explore (trading accuracy)
+Task: trading logic & algo accuracy audit
+
+Work Log:
+- Read backtest.ts end-to-end + all imports (sessions, algo-strategies, indicators) and cross-diffed every decide() branch against the live evalStrategy() (algo-engine.ts): signal/fill timing, TP/SL intrabar order, cost model, warmup, gates all verified line-by-line; no lookahead found (entries fill next bar open, exits same-bar close, forming bar dropped in route).
+- Audited live parity path: algo-engine 15s cycle (closed-bar cursor, missed-bar replay, gates), trading.ts order plumbing (stock bracket/OTO, crypto split OCO emulation, FIFO P&L in trade-history.ts), position sync via getPositions each cycle.
+- Audited data layer: Binance klines (dedup+sort), Alpaca stock feed=iex/adjustment=split, Alpaca v1beta3 deep crypto history; identified backtest-uses-Alpaca vs live-uses-Binance crypto split and IEX-only equities as skew sources; Binance WS is display-tick only (no bars).
+- Audited optimizer/sweep/reco: auto-grid construction, stride sampling (<=800 sims/strategy), Calmar score (net%/(maxDD% floored 0.5)), minTrades gate, rank-1+pool reco selection; confirmed zero walk-forward/holdout anywhere (grep) and realized-only maxDD (no intratrade mark-to-market).
+- Quantified headline-reco risk: BTC/USD 5m vwap-fade +1152% comes from fixed qty 10 BTC (~$650k notional/trade on $10k capital, ~65x, no buying-power model) with allowShort=1 despite Alpaca crypto being long-only; live crypto exits are half-size TP + half-size stop-limit legs held simultaneously, not the full-position TP-or-SL the backtest models.
+
+Stage Summary:
+- Engine mechanics are unusually sound: no lookahead bias, conservative stop-first intrabar rule, honest cost model (slip+half-spread+fees), DST-correct ET session handling, demo-data blocked, live/backtest decision rules in verified byte-parity.
+- Top risks ranked: (1) no margin/buying-power constraint -> fixed-qty crypto net% is a leverage illusion; (2) maxDD is realized-only -> Calmar score denominator understated; (3) crypto live exit emulation (half-position dual legs, stop-limit, long-only) diverges from backtest full-size TP-or-SL; (4) pure in-sample optimizer + rank-1 selection with minTrades 10 -> 11-23-trade "winners" are multiple-testing artifacts (BTC winner sits on the devPct=5 grid boundary).
+- Trust: equity backtests with TP/SL brackets and modest qty, the parity layer, and live P&L accounting (broker fills, FIFO) are trustworthy; trust the absolute crypto net%/score numbers and the reco leaderboard ranking NOT AT ALL without re-sizing to notional limits and an out-of-sample re-run.
+
+---
+Task ID: 2
+Agent: Z.ai Code (main)
+Task: 10-dimension system review (performance / trading logic / algo / security / functions / reliability / robustness / UX / speed / HA) — synthesis of 4 parallel audits + self-verification
+
+Work Log:
+- Ran 4 parallel Explore audits (Task 1-a perf/speed, 1-b trading & algo accuracy, 1-c security, 1-d reliability/UX/HA/functions), each appended its own worklog section.
+- Self-verified the CRITICAL security claims: git ls-files confirms db/custom.db, .env, upload/v24.tar, scripts-tmp/alpos-flatten.mjs are tracked; hardcoded AUTH_SECRET/APP_ENCRYPTION fallback confirmed at src/lib/auth.ts:8 + src/lib/crypt.ts:8; printenv confirms neither env var is set in the running deployment.
+- Delivered scorecard (10 dimensions) + P0 remediation list to the user. No code changes made; nothing to push.
+
+Stage Summary:
+- Strong: functions breadth (9/10), backtest mechanics correctness (no lookahead, stop-first, DST-safe, live parity), client tick path.
+- Critical: secrets in git (Alpaca key+secret pushed to GitHub), forgeable sessions via public default AUTH_SECRET (unset in env), plaintext TOTP secrets in tracked DB, dev-mode single process = weakest HA (2.5/10).
+- Algo numbers conditionally trustworthy: crypto net% is a fixed-qty leverage artifact, maxDD realized-only, in-sample-only selection.
