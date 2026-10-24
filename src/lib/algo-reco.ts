@@ -13,18 +13,35 @@ import { TIMEFRAMES } from '@/lib/market-types'
 import { prepareSeries, sweepStrategies, type BacktestConfig, type SweepResult } from '@/lib/backtest'
 import { ALGO_MAX_DAYS, ALGO_TIMEFRAMES, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
+import { memoryGuard } from '@/lib/mem-guard'
+import { symbolSchema } from '@/lib/validation'
 
 export type { AlgoRecommendation }
 export { ALGO_RECOMMENDATIONS as BAKED_RECOMMENDATIONS, ALGO_RECO_META as BAKED_RECO_META }
 
+/** Task 9-m — the refresh sweeps the USER'S WATCHLIST, not a baked universe.
+ *  RECO_SYMBOLS is only the fallback for accounts with an empty watchlist
+ *  (and the offline script that generates the baked-in list). */
 export const RECO_SYMBOLS = ['TSLA', 'AAPL', 'NVDA', 'SPY', 'BTC/USD', 'ETH/USD', 'SOL/USD']
+/** Hard cap on watchlist symbols per refresh — each symbol × 3 timeframes is
+ *  a multi-second deep-bar fetch + full-catalog sweep, and the matrix must
+ *  stay bounded (10 symbols = ≤30 combos, a few minutes worst case). */
+export const RECO_MAX_SYMBOLS = 10
 export const RECO_MIN_TRADES = 10
 export const RECO_TOPX = 10
 export const RECO_POOL_TAKE = 3 // rows kept per combo for the global pool
 export const RECO_CAP = 18 // final list size
 export const RECO_OOS_FRACTION = 0.3 // Task 3-d — 70/30 IS/OOS walk-forward
 const MAX_BARS = 120_000 // same hard cap the API route enforces
-const CACHE_ID = 'algo-reco'
+/** Task 9-m — recommendations are PER-USER (each account sweeps its own
+ *  watchlist), so the cache row is keyed by user. */
+const cacheIdFor = (userId: string) => `algo-reco:${userId}`
+/** Mid-matrix heap abort threshold: strictly between the POST start-gate
+ *  (0.70) and the fatal heap ceiling (1.0). If the running matrix itself
+ *  pushes heapUsed past this, abort GRACEFULLY (throw → job.error → the
+ *  previously persisted feed stays intact) instead of walking into the
+ *  uncatchable OOM kill that "made the server die". */
+const MATRIX_HEAP_ABORT = 0.78
 
 // Task 88 suggestions + realistic spreads (majors ~3 bps live, alts wider)
 export const costsFor = (symbol: string): { slip: number; fee: number; spread: number } => {
@@ -62,6 +79,44 @@ export interface RecoComboRow {
   trades: number
   oos: RecoOos | null
   boundary: boolean
+}
+
+/**
+ * Task 9-m — resolve the sweep universe for a user: every symbol across ALL
+ * their watchlists ("#Group" separators excluded), deduped in order, valid
+ * per the shared symbol schema, capped at RECO_MAX_SYMBOLS. Empty/invalid
+ * watchlists fall back to the baked RECO_SYMBOLS so refresh always has a
+ * matrix to run.
+ */
+export async function getUserRecoSymbols(userId: string): Promise<string[]> {
+  const raw: string[] = []
+  try {
+    const lists = await db.watchlist.findMany({
+      where: { userId },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+    })
+    for (const l of lists) {
+      if (!Array.isArray(l.items)) continue
+      for (const it of l.items) {
+        if (typeof it !== 'string') continue
+        const s = it.trim().toUpperCase()
+        if (!s || s.startsWith('#')) continue // group separator, not a symbol
+        raw.push(s)
+      }
+    }
+  } catch {
+    /* watchlist read failed — fall back below */
+  }
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const s of raw) {
+    if (seen.has(s)) continue
+    if (!symbolSchema.safeParse(s).success) continue
+    seen.add(s)
+    out.push(s)
+    if (out.length >= RECO_MAX_SYMBOLS) break
+  }
+  return out.length > 0 ? out : [...RECO_SYMBOLS]
 }
 
 /**
@@ -195,24 +250,28 @@ export function getRecoJobState(): RecoJobState {
   return job
 }
 
-/** Start a refresh (mutex-guarded). Returns false when one is already running. */
-export function startRecoRefresh(userId: string): boolean {
+/** Start a refresh over the given (already resolved) watchlist symbols —
+ *  mutex-guarded. Returns false when one is already running. The route
+ *  resolves symbols BEFORE calling this so `job.total` (and the POST
+ *  response) reflect the real matrix size synchronously. */
+export function startRecoRefresh(userId: string, symbols: string[]): boolean {
   if (job.running) return false
   job.running = true
   job.done = 0
-  job.total = RECO_TOTAL_COMBOS
+  job.total = Math.max(1, symbols.length) * ALGO_TIMEFRAMES.length
   job.startedAt = Date.now()
   job.finishedAt = null
   job.error = null
   void (async () => {
     try {
-      const feed = await runRecoSweepMatrix(userId, () => {
+      const feed = await runRecoSweepMatrix(userId, symbols, () => {
         job.done++
       })
+      const payload = JSON.stringify({ generatedAt: feed.generatedAt, method: feed.method, rows: feed.rows })
       await db.algoRecoCache.upsert({
-        where: { id: CACHE_ID },
-        create: { id: CACHE_ID, generatedAt: new Date(feed.generatedAt), payload: JSON.stringify({ generatedAt: feed.generatedAt, method: feed.method, rows: feed.rows }) },
-        update: { generatedAt: new Date(feed.generatedAt), payload: JSON.stringify({ generatedAt: feed.generatedAt, method: feed.method, rows: feed.rows }) },
+        where: { id: cacheIdFor(userId) },
+        create: { id: cacheIdFor(userId), generatedAt: new Date(feed.generatedAt), payload },
+        update: { generatedAt: new Date(feed.generatedAt), payload },
       })
     } catch (e) {
       job.error = e instanceof Error ? (e.stack ?? e.message) : String(e)
@@ -232,10 +291,11 @@ export interface RecoFeed {
   source: 'db' | 'baked'
 }
 
-/** Newest persisted feed — DB cache when present, else the baked-in list. */
-export async function getRecoFeed(): Promise<RecoFeed> {
+/** Newest persisted feed for THIS user — their per-user DB cache when
+ *  present, else the baked-in global list (never shared across accounts). */
+export async function getRecoFeed(userId: string): Promise<RecoFeed> {
   try {
-    const row = await db.algoRecoCache.findUnique({ where: { id: CACHE_ID } })
+    const row = await db.algoRecoCache.findUnique({ where: { id: cacheIdFor(userId) } })
     if (row) {
       const payload = JSON.parse(row.payload) as { generatedAt: string; method: string; rows: AlgoRecommendation[] }
       if (Array.isArray(payload.rows) && payload.rows.length > 0) {
@@ -254,6 +314,7 @@ export async function getRecoFeed(): Promise<RecoFeed> {
 
 export async function runRecoSweepMatrix(
   userId: string,
+  symbols: string[],
   onComboDone?: (done: number) => void,
 ): Promise<RecoFeed> {
   const t0 = Date.now()
@@ -272,7 +333,18 @@ export async function runRecoSweepMatrix(
   const combos: Combo[] = []
   let completed = 0
   for (const tf of ALGO_TIMEFRAMES as readonly AlgoTimeframe[]) {
-    for (const symbol of RECO_SYMBOLS) {
+    for (const symbol of symbols) {
+      // Task 9-m — MID-MATRIX heap abort: the background job runs for
+      // minutes and cannot rely on the POST-time gate alone. If the heap
+      // climbs past MATRIX_HEAP_ABORT, throw here: startRecoRefresh catches
+      // it, records job.error, and the previously persisted feed stays —
+      // a graceful abort instead of a fatal OOM server death.
+      const mem = memoryGuard(MATRIX_HEAP_ABORT)
+      if (!mem.ok) {
+        throw new Error(
+          `Sweep aborted at combo ${completed + 1} (heap ${mem.heapUsedMb}MB / ${mem.limitMb}MB cap) — your saved recommendations are unchanged; retry when the server is quieter.`,
+        )
+      }
       const costs = costsFor(symbol)
       try {
         const days = ALGO_MAX_DAYS[tf]
@@ -338,6 +410,14 @@ export async function runRecoSweepMatrix(
     to: p.to,
     source: p.source,
   }))
+  if (combos.length === 0) {
+    // Task 9-m — distinguish "feed had NO data" from "no profitable setup":
+    // an all-equity watchlist on a feed without equity history (or symbols
+    // with no deep data) must say so instead of the generic no-profit error.
+    throw new Error(
+      `No historical bar data for any watchlist symbol (tried ${symbols.join(', ')} × ${ALGO_TIMEFRAMES.length} timeframes) — the feed may be unreachable or these symbols lack deep history here. Your saved recommendations are unchanged.`,
+    )
+  }
   if (rows.length === 0) {
     throw new Error('No profitable configuration found across the whole matrix — nothing to recommend')
   }

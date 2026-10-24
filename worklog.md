@@ -2329,3 +2329,24 @@ Work Log:
 Stage Summary:
 - Sweep memory: per-run churn eliminated (RSI scratch + no equity arrays), retention bounded losslessly, heavy endpoints refuse to start on a hot heap (503 + retry-after), watchdog back online as the last-resort reviver.
 - Landing version -> v1.21.0. Lint clean, tsc clean in src/.
+
+---
+Task ID: 9-m
+Agent: main (Z.ai Code)
+Task: Recommended setups refresh must (a) sweep the USER'S WATCHLIST instead of a baked symbol universe, (b) never kill the server again ("This sweep make server die again").
+
+Work Log:
+- Diagnosis: the "die again" report crossed with the 9-l push — dev.log since the 16:05 restart had ZERO POSTs to /api/algo/recommendations, zero errors, no restarts; the crash the user saw was the PRE-9-l server. Watchdog alive (pid file) but its log empty (never needed).
+- src/lib/algo-reco.ts: NEW getUserRecoSymbols(userId) — collects symbols across ALL the user's watchlists ("#Group" separators excluded, symbolSchema-validated, deduped, capped RECO_MAX_SYMBOLS=10; empty/invalid watchlists fall back to baked RECO_SYMBOLS). RECO_SYMBOLS is now only the fallback.
+- PER-USER feed: cache row id `algo-reco:<userId>` (was global 'algo-reco'); getRecoFeed(userId) reads the user's row, else baked. getRecoFeed scripts-tmp consumers unaffected (they import only constants/shapers).
+- startRecoRefresh(userId, symbols) — route resolves symbols BEFORE arming the mutex so job.total is synchronous and exact (symbols × 3 TFs).
+- Matrix hardening: runRecoSweepMatrix(userId, symbols, cb) — per-combo MID-MATRIX heap probe (MATRIX_HEAP_ABORT=0.78, between the 0.70 POST gate and the 1.0 fatal ceiling) → graceful throw → job.error → previously persisted feed intact. New distinct error when ZERO combos got bar data ("No historical bar data for any watchlist symbol (tried …) — feed may be unreachable…") vs the old generic no-profit message.
+- Route GET: per-user feed + `symbols` array in response; POST: resolves watchlist, returns exact total + symbols.
+- BacktestPanel: "N watchlist symbols" badge (tooltip lists symbols × 3 TFs), POST toast names the watchlist preview, poll-end toast distinguishes "Sweep stopped early + lastError" (destructive) from success, description line documents watchlist basis + fallback list.
+- E2E (agent-browser, logged-in trader): badge "4 watchlist symbols" (AAPL/MSFT/NVDA/TSLA); Refresh → "Sweeping 0/12" (dynamic total) → graceful abort toast + job.error in dev.log, feed untouched, server 200 RSS 1455→1460MB. Added BTC/USD via DB (sandbox has crypto data only), badge "5 watchlist symbols", Refresh → "Sweeping 14/15" in 6s → DONE; results table shows fresh BTC/USD 15m BB+RSI row (BB 53/1.8, RSI 26); DB row algo-reco:cmvmjlqwg… (trader cuid) with score 0.497 / honest OOS −2.94; server 200 RSS 1492MB throughout. Watchlist restored to original 4 afterwards.
+- Landing version → v1.22.0. Lint clean, tsc clean.
+
+Stage Summary:
+- Refresh now sweeps the USER'S WATCHLIST (per-user feed, per-user cache) — fallback baked list only for empty watchlists.
+- Death-proofed: POST-time heap gate (0.70) + mid-matrix graceful abort (0.78) + bounded matrix (≤10 symbols × 3 TFs) + watchdog last-resort. A hot heap now costs a toast, not the process.
+- Sandbox reality: equities have NO bar data here, so an all-equity watchlist refresh ends with an honest explanatory toast; crypto symbols sweep fine.

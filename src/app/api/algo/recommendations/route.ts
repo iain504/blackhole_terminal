@@ -3,10 +3,12 @@
 // else the baked-in static list; plus live refresh-job progress.
 //
 // POST /api/algo/recommendations — START a refresh: re-runs the full-catalog
-// sweep matrix (7 symbols × 3 timeframes at max history, realistic costs) as
-// an in-process background job (a full pass takes a few minutes — bar fetching
-// dominates) and rewrites the cache when it finishes. Mutex-guarded: a second
-// POST while one runs is a 409 with the current progress.
+// sweep matrix over the USER'S WATCHLIST symbols (Task 9-m; falls back to the
+// baked RECO_SYMBOLS list for empty watchlists) × 3 timeframes at max
+// history, realistic costs, as an in-process background job (a full pass
+// takes a few minutes — bar fetching dominates) and rewrites the per-user
+// cache when it finishes. Mutex-guarded: a second POST while one runs is a
+// 409 with the current progress.
 //
 // GET response: {
 //   running, done, total, startedAt?, lastError?,
@@ -15,7 +17,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
-import { getRecoFeed, getRecoJobState, startRecoRefresh } from '@/lib/algo-reco'
+import { getRecoFeed, getRecoJobState, getUserRecoSymbols, startRecoRefresh } from '@/lib/algo-reco'
 import { rateLimit } from '@/lib/rate-limit'
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 
@@ -23,9 +25,12 @@ export const dynamic = 'force-dynamic'
 
 export async function GET() {
   try {
-    await requireUser()
+    const user = await requireUser()
     const job = getRecoJobState()
-    const feed = await getRecoFeed()
+    // Task 9-m — the feed is PER-USER (each account sweeps its own watchlist);
+    // `symbols` is the live sweep universe this account's next refresh uses.
+    const feed = await getRecoFeed(user.id)
+    const symbols = await getUserRecoSymbols(user.id)
     return NextResponse.json({
       running: job.running,
       done: job.done,
@@ -35,6 +40,7 @@ export async function GET() {
       generatedAt: feed.generatedAt,
       method: feed.method,
       source: feed.source,
+      symbols,
       rows: feed.rows,
     })
   } catch (e) {
@@ -62,7 +68,11 @@ export async function POST(_req: NextRequest) {
     if (!mem.ok) {
       return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
     }
-    const started = startRecoRefresh(user.id)
+    // Task 9-m — resolve THIS user's watchlist universe before arming the job:
+    // startRecoRefresh is synchronous (mutex), so symbols must be known first
+    // for job.total + the response to reflect the real matrix size.
+    const symbols = await getUserRecoSymbols(user.id)
+    const started = startRecoRefresh(user.id, symbols)
     const job = getRecoJobState()
     if (!started) {
       return NextResponse.json(
@@ -70,7 +80,7 @@ export async function POST(_req: NextRequest) {
         { status: 409 },
       )
     }
-    return NextResponse.json({ started: true, running: true, done: 0, total: job.total })
+    return NextResponse.json({ started: true, running: true, done: 0, total: job.total, symbols })
   } catch (e) {
     return handleError(e)
   }

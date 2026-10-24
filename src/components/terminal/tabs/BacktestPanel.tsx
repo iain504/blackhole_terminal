@@ -191,6 +191,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     method: ALGO_RECO_META.method,
   })
   const [recoJob, setRecoJob] = useState<{ running: boolean; done: number; total: number } | null>(null)
+  // Task 9-m — the sweep universe for THIS account (their watchlist symbols,
+  // capped server-side); shown in the section header so the refresh target is explicit
+  const [recoSymbols, setRecoSymbols] = useState<string[]>([])
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
   const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep'>(null)
@@ -233,6 +236,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
           setRecos(j.rows)
           if (j.generatedAt) setRecoMeta({ generatedAt: j.generatedAt, method: j.method ?? ALGO_RECO_META.method })
         }
+        if (Array.isArray(j.symbols)) setRecoSymbols(j.symbols)
         setRecoJob(j.running ? { running: true, done: j.done ?? 0, total: j.total ?? 21 } : null)
       } catch {
         /* recommendations stay baked-in */
@@ -256,9 +260,16 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         if (dead) return
         if (Array.isArray(j.rows) && j.rows.length > 0) setRecos(j.rows)
         if (j.generatedAt) setRecoMeta((prev) => ({ generatedAt: j.generatedAt, method: j.method ?? prev.method }))
+        if (Array.isArray(j.symbols)) setRecoSymbols(j.symbols)
         setRecoJob(j.running ? { running: true, done: j.done ?? 0, total: j.total ?? 21 } : null)
         if (!j.running) {
-          toast({ title: 'Recommendations refreshed', description: `${Array.isArray(j.rows) ? j.rows.length : 0} setups re-swept on fresh bars — the list is updated.` })
+          if (j.lastError) {
+            // Task 9-m — honesty: a mid-matrix abort (heap guard, feed outage)
+            // must say so — the old list is still on screen, unchanged.
+            toast({ title: 'Sweep stopped early', description: String(j.lastError).slice(0, 200), variant: 'destructive' })
+          } else {
+            toast({ title: 'Recommendations refreshed', description: `${Array.isArray(j.rows) ? j.rows.length : 0} setups re-swept on fresh bars — the list is updated.` })
+          }
         }
       } catch {
         /* keep polling */
@@ -284,9 +295,12 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         return
       }
       setRecoJob({ running: true, done: j.done ?? 0, total: j.total ?? 21 })
+      if (Array.isArray(j.symbols)) setRecoSymbols(j.symbols)
+      const symList = Array.isArray(j.symbols) ? (j.symbols as string[]) : []
+      const symPreview = symList.length > 0 ? ` — ${symList.slice(0, 5).join(', ')}${symList.length > 5 ? ` +${symList.length - 5} more` : ''}` : ''
       toast({
         title: 'Sweep started',
-        description: `Re-running ${j.total ?? 21} symbol × timeframe sweeps on fresh bars — the list updates when it finishes (a few minutes).`,
+        description: `Re-running ${j.total ?? 21} symbol × timeframe sweeps over your watchlist${symPreview} on fresh bars — the list updates when it finishes (a few minutes).`,
       })
     } catch {
       toast({ title: 'Request failed', description: 'Network error', variant: 'destructive' })
@@ -1058,6 +1072,15 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <Badge variant="outline" className="text-[10px] text-zinc-400">
               swept {new Date(recoMeta.generatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
             </Badge>
+            {recoSymbols.length > 0 && (
+              <Badge
+                variant="outline"
+                className="max-w-[320px] truncate text-[10px] text-zinc-400"
+                title={`Refresh sweeps YOUR watchlist symbols × 3 timeframes (1m/5m/15m): ${recoSymbols.join(', ')}`}
+              >
+                {recoSymbols.length} watchlist symbols
+              </Badge>
+            )}
             <div className="ml-auto flex items-center gap-2">
               <span className="hidden text-[10px] text-zinc-600 sm:inline">click a row to load the whole setup — symbol · TF · strategy · params · costs</span>
               <Button
@@ -1066,7 +1089,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                 className="h-6 gap-1 border-emerald-500/30 bg-zinc-950 px-2 text-[10px] text-emerald-300 hover:bg-zinc-900"
                 onClick={refreshRecos}
                 disabled={recoJob?.running === true}
-                title="Re-run the full sweep matrix on fresh bars (a few minutes) — the list updates in place when it lands"
+                title="Re-run the sweep matrix over your watchlist symbols × 3 timeframes on fresh bars (a few minutes) — the list updates in place when it lands"
               >
                 <RefreshCw className={cn('h-3 w-3', recoJob?.running && 'animate-spin')} aria-hidden />
                 {recoJob?.running ? `Sweeping ${recoJob.done}/${recoJob.total}` : 'Refresh'}
@@ -1074,7 +1097,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
           </div>
           <p className="px-3 pb-1.5 text-[11px] text-zinc-500">
-            Max 1× capital per position (no leverage) · mark-to-market DD · crypto long-only · 70/30 IS/OOS walk-forward · IEX equity data
+            Sweeps YOUR watchlist (fallback: BTC/USD ETH/USD SOL/USD TSLA AAPL NVDA SPY) · max 1× capital per position (no leverage) · mark-to-market DD · crypto long-only · 70/30 IS/OOS walk-forward
           </p>
           <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Recommended setups table">
             <table className="w-full min-w-[860px] text-left text-[11px]">
