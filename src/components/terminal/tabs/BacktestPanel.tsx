@@ -161,6 +161,15 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   // Task 87 — one-click all-strategy sweep
   const [topX, setTopX] = useState('8')
   const [sweepRes, setSweepRes] = useState<SweepResult | null>(null)
+  // Task 90 — live recommendations: painted instantly from the baked-in list,
+  // then swapped for the persisted (DB) feed; a refresh POST re-sweeps the
+  // whole matrix server-side and the table updates in place via polling
+  const [recos, setRecos] = useState<AlgoRecommendation[]>(ALGO_RECOMMENDATIONS)
+  const [recoMeta, setRecoMeta] = useState<{ generatedAt: string; method: string }>({
+    generatedAt: ALGO_RECO_META.generatedAt,
+    method: ALGO_RECO_META.method,
+  })
+  const [recoJob, setRecoJob] = useState<{ running: boolean; done: number; total: number } | null>(null)
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
   const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep'>(null)
@@ -188,6 +197,80 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   useEffect(() => {
     setSweepRes(null)
   }, [cfg.symbol, cfg.timeframe])
+
+  // Task 90 — pick up the persisted recommendations feed (and any refresh job
+  // another tab may have started) once on mount
+  useEffect(() => {
+    let dead = false
+    void (async () => {
+      try {
+        const res = await fetch('/api/algo/recommendations', { cache: 'no-store' })
+        if (!res.ok) return
+        const j = await res.json()
+        if (dead) return
+        if (Array.isArray(j.rows) && j.rows.length > 0) {
+          setRecos(j.rows)
+          if (j.generatedAt) setRecoMeta({ generatedAt: j.generatedAt, method: j.method ?? ALGO_RECO_META.method })
+        }
+        setRecoJob(j.running ? { running: true, done: j.done ?? 0, total: j.total ?? 21 } : null)
+      } catch {
+        /* recommendations stay baked-in */
+      }
+    })()
+    return () => {
+      dead = true
+    }
+  }, [])
+
+  // Task 90 — while a refresh job runs, poll its progress and swap the list in
+  // when the fresh sweep lands
+  useEffect(() => {
+    if (!recoJob?.running) return
+    let dead = false
+    const iv = setInterval(async () => {
+      try {
+        const res = await fetch('/api/algo/recommendations', { cache: 'no-store' })
+        if (!res.ok) return
+        const j = await res.json()
+        if (dead) return
+        if (Array.isArray(j.rows) && j.rows.length > 0) setRecos(j.rows)
+        if (j.generatedAt) setRecoMeta((prev) => ({ generatedAt: j.generatedAt, method: j.method ?? prev.method }))
+        setRecoJob(j.running ? { running: true, done: j.done ?? 0, total: j.total ?? 21 } : null)
+        if (!j.running) {
+          toast({ title: 'Recommendations refreshed', description: `${Array.isArray(j.rows) ? j.rows.length : 0} setups re-swept on fresh bars — the list is updated.` })
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 3000)
+    return () => {
+      dead = true
+      clearInterval(iv)
+    }
+  }, [recoJob?.running, toast])
+
+  const refreshRecos = async () => {
+    try {
+      const res = await fetch('/api/algo/recommendations', { method: 'POST' })
+      const j = await res.json().catch(() => null)
+      if (!res.ok) {
+        if (res.status === 409 && j?.running) {
+          // someone (another tab) already started one — just follow it
+          setRecoJob({ running: true, done: j.done ?? 0, total: j.total ?? 21 })
+          return
+        }
+        toast({ title: 'Refresh failed', description: j?.error ?? `HTTP ${res.status}`, variant: 'destructive' })
+        return
+      }
+      setRecoJob({ running: true, done: j.done ?? 0, total: j.total ?? 21 })
+      toast({
+        title: 'Sweep started',
+        description: `Re-running ${j.total ?? 21} symbol × timeframe sweeps on fresh bars — the list updates when it finishes (a few minutes).`,
+      })
+    } catch {
+      toast({ title: 'Request failed', description: 'Network error', variant: 'destructive' })
+    }
+  }
 
   // keep the re-entry inputs in sync with the run setup they seed from
   useEffect(() => {
@@ -952,17 +1035,30 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         </div>
       )}
 
-      {/* recommended setups (Task 89) — baked-in full-catalog sweep winners */}
-      {ALGO_RECOMMENDATIONS.length > 0 && (
+      {/* recommended setups (Task 89/90) — full-catalog sweep winners, refreshable */}
+      {recos.length > 0 && (
         <div className="rounded-md border border-emerald-500/25 bg-zinc-900/70">
           <div className="flex flex-wrap items-center gap-2 px-3 py-2">
             <Sparkles className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
             <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Recommended setups</span>
-            <Badge variant="outline" className="text-[10px] text-zinc-400">{ALGO_RECOMMENDATIONS.length} configs</Badge>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">{recos.length} configs</Badge>
             <Badge variant="outline" className="text-[10px] text-zinc-400">
-              swept {new Date(ALGO_RECO_META.generatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+              swept {new Date(recoMeta.generatedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
             </Badge>
-            <span className="ml-auto text-[10px] text-zinc-600">click a row to load the whole setup — symbol · TF · strategy · params · costs</span>
+            <div className="ml-auto flex items-center gap-2">
+              <span className="hidden text-[10px] text-zinc-600 sm:inline">click a row to load the whole setup — symbol · TF · strategy · params · costs</span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 gap-1 border-emerald-500/30 bg-zinc-950 px-2 text-[10px] text-emerald-300 hover:bg-zinc-900"
+                onClick={refreshRecos}
+                disabled={recoJob?.running === true}
+                title="Re-run the full sweep matrix on fresh bars (a few minutes) — the list updates in place when it lands"
+              >
+                <RefreshCw className={cn('h-3 w-3', recoJob?.running && 'animate-spin')} aria-hidden />
+                {recoJob?.running ? `Sweeping ${recoJob.done}/${recoJob.total}` : 'Refresh'}
+              </Button>
+            </div>
           </div>
           <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Recommended setups table">
             <table className="w-full min-w-[760px] text-left text-[11px]">
@@ -983,7 +1079,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                 </tr>
               </thead>
               <tbody>
-                {ALGO_RECOMMENDATIONS.map((rec, i) => {
+                {recos.map((rec, i) => {
                   const isHere = rec.symbol === cfg.symbol && rec.timeframe === cfg.timeframe
                   return (
                     <tr
@@ -1031,7 +1127,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </table>
           </div>
           <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
-            Baked-in community sweep — {ALGO_RECO_META.method}
+            Community sweep — {recoMeta.method}
           </p>
         </div>
       )}

@@ -241,3 +241,14 @@ model AlgoLog {
   @@index([runId, createdAt])
   @@index([userId, createdAt])
 }
+
+// Task 90 — cached output of the "Recommended setups" sweep matrix. One row
+// (fixed id) holds the newest full-catalog sweep results as JSON; the Backtest
+// page reads it via GET /api/algo/recommendations and a refresh POST rewrites
+// it. Falls back to the baked-in static list when absent.
+model AlgoRecoCache {
+  id          String   @id @default("algo-reco")
+  generatedAt DateTime
+  payload     String
+  updatedAt   DateTime @updatedAt
+}

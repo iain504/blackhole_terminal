@@ -1842,3 +1842,20 @@ Work Log:
 
 Stage Summary:
 - The Backtest page now ships a baked-in "Recommended setups" community list: 18 full-catalog sweep winners across TSLA/AAPL/NVDA/SPY/BTC/ETH/SOL × 1m/5m/15m at max history, each carrying the EXACT cost model and history window it was measured with, one click loads the entire setup (symbol·TF·strategy·params·costs·days) and a re-run reproduces the published metrics. Unprofitable combos are honestly omitted and the in-sample caveat is printed on the card.
+
+---
+Task ID: 90
+Agent: Z.ai Code (main)
+Task: "the refresh should be built in frontend. then push this" — make the Recommended setups list refreshable from the Backtest UI.
+
+Work Log:
+- SCHEMA (prisma): new AlgoRecoCache model (singleton row, generatedAt + JSON payload) pushed with db:push.
+- ENGINE (src/lib/algo-reco.ts, server-only): full-catalog sweep matrix runner (same procedure as scripts-tmp/reco-sweep.ts — 7 symbols × 3 TFs at ALGO_MAX_DAYS, exact route semantics, per-market costs, minTrades 10, winners+pool selection capped at 18) + module-level background job state (mutex-guarded startRecoRefresh with live done/total progress) + getRecoFeed (DB cache when present, else the baked-in list). Client components import ONLY the pure baked module — the first panel wiring pulled algo-reco (prisma/alpaca) into the client bundle and crashed the page; fixed by reverting the panel import to @/lib/algo-recommendations.
+- ROUTE (/api/algo/recommendations): GET returns feed (rows + generatedAt + source db|baked) plus job progress; POST starts the in-process refresh job (409 + progress when one is already running). A full matrix pass takes ~4 min (bar fetching dominates).
+- UI (BacktestPanel): Refresh button on the Recommended setups header (spinning RefreshCw, disabled while running, live "Sweeping N/21" label), mount-time GET to pick up the persisted feed or a job another tab started, 3s polling while running, list + "swept" badge swap in place when the fresh sweep lands, completion toast, 409-join behavior (second click follows the running job instead of erroring).
+- BUG FOUND + FIXED via stack-trace instrumentation: the selection map read p.combo.row.strategy instead of p.row.strategy (entries are { combo, row }) — first two runs swept all 21 combos then died before the cache write; third run completed clean.
+- E2E (agent-browser, real trader+TOTP): GET baked 18 rows → POST started job → button "Sweeping 0/21" → progress 11/21 at ~60s → second POST correctly 409 → run completed 21/21 → source flipped to 'db', 18 fresh rows, top row BTC/USD 5m vwap-fade, button back to "Refresh", badge updated, no console errors. Dev server OOM-crashed once during back-to-back matrix runs + recompiles (restarted, unrelated to the feature logic).
+- Version stamp v1.17.0. Files: prisma/schema.prisma, src/lib/algo-reco.ts, src/app/api/algo/recommendations/route.ts, src/components/terminal/tabs/BacktestPanel.tsx, src/components/landing/LandingPage.tsx. Screenshot: screens-tmp/t90-reco-refresh.png.
+
+Stage Summary:
+- Recommended setups are now self-refreshing from the frontend: one click re-runs the entire 21-combo research sweep on fresh bars server-side (mutex-guarded background job with live N/21 progress), persists the result to the DB, and swaps the ranked list in place — no CLI needed. The baked-in static list remains as the offline fallback and first-paint source.
