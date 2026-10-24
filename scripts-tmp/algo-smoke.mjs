@@ -40,9 +40,9 @@ function totp(secret) {
 }
 
 // ---- login ----
-const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: 'S****99' })
+const step1 = await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS ?? '', // creds via env (scrubbed from repo) })
 console.log('step1', step1.status, step1.json?.ticket ? 'ticket ok' : step1.text)
-const code = totp('P7FT****REDACTED')
+const code = totp(process.env.TOTP_SECRET ?? '')
 const step2 = await api('POST', '/api/auth/login/verify', { ticket: step1.json?.ticket, code })
 console.log('step2', step2.status, JSON.stringify(step2.json))
 

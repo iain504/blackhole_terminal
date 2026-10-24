@@ -1,7 +1,7 @@
 // Generates the current TOTP code for the test account (2FA login in E2E).
 import crypto from 'node:crypto'
 
-const secret = process.env.TOTP_SECRET || 'P7FT****REDACTED'
+const secret = process.env.TOTP_SECRET || (console.error('set TOTP_SECRET'), process.exit(1))
 const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
 let bits = ''
 for (const c of secret.replace(/=+$/, '')) {

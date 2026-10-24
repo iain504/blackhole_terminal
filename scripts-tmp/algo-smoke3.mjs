@@ -16,8 +16,8 @@ function totp(secret) {
   const hmac = crypto.createHmac('sha1', key).update(cbuf).digest(); const off = hmac[hmac.length - 1] & 0xf
   return String((((hmac[off] & 0x7f) << 24) | (hmac[off + 1] << 16) | (hmac[off + 2] << 8) | hmac[off + 3]) % 1e6).padStart(6, '0')
 }
-await api('PUT', '/api/auth/register', { username: 'trader', password: 'S****99' })
-await api('POST', '/api/auth/login/verify', { ticket: (await api('PUT', '/api/auth/register', { username: 'trader', password: 'S****99' })).json?.ticket, code: totp('P7FT****REDACTED') })
+await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS ?? '', // creds via env (scrubbed from repo) })
+await api('POST', '/api/auth/login/verify', { ticket: (await api('PUT', '/api/auth/register', { username: 'trader', password: process.env.TEST_PASS ?? '', // creds via env (scrubbed from repo) })).json?.ticket, code: totp(process.env.TOTP_SECRET ?? '') })
 const start = await api('POST', '/api/algo', {
   symbol: 'BTC/USD', timeframe: '1m', strategy: 'bb-reversion',
   params: { bbPeriod: 20, bbStd: 1, rsiPeriod: 2, rsiOversold: 85, rsiOverbought: 15, allowShort: 0 },
