@@ -6,9 +6,11 @@
 // restart auto-resumes every active grid and one failing grid can never kill
 // the loop.
 //
-// Mechanics (v1, per evaluation with current price P and persisted lastPrice L):
-//   • guards FIRST: maxSL (P <= maxSL → close all + stop) / maxTP (P >= maxTP
-//     → close all + stop) — whole-grid absolute-price circuit breakers
+// Mechanics (per evaluation with current price P and persisted lastPrice L):
+//   • guards FIRST: whole-grid circuit breakers — triggers resolved EVERY tick
+//     via resolveGuards() (Task 10-a: basis 'price' = absolute maxSL/maxTP,
+//     basis 'percent' = lowerPrice×(1−maxSL/100) / upperPrice×(1+maxTP/100)).
+//     P <= slTrigger → close all + stop · P >= tpTrigger → close all + stop
 //   • BUY: level i crossed DOWNWARD this tick (L > level[i] >= P) and no open
 //     lot exists at that level → market buy qtyPerGrid
 //   • SELL (per-lot TP): the lot bought at level i targets level[i+1] (or
@@ -70,6 +72,101 @@ export function parseGridState(raw: unknown): GridState {
     failCount: typeof s.failCount === 'number' ? s.failCount : 0,
     lastError: typeof s.lastError === 'string' ? s.lastError : undefined,
   }
+}
+
+// ---------- guard resolution (Task 10-a) ----------
+
+/**
+ * Resolve the whole-grid guard triggers from the configured values + basis.
+ *   basis 'percent': slTrigger = lowerPrice × (1 − maxSL/100) — a percent drop
+ *                    BELOW the range floor · tpTrigger = upperPrice ×
+ *                    (1 + maxTP/100) — a percent rise ABOVE the range ceiling.
+ *   basis 'price' (or null/unknown basis): the configured values ARE the
+ *   absolute-price triggers (legacy behavior).
+ * The ENGINE calls this EVERY tick and the backtest per run, so a later config
+ * edit (PUT /api/grid/[id]) re-resolves the triggers automatically — no engine
+ * restart, no stale absolute price.
+ */
+export function resolveGuards(g: {
+  maxSL: number | null
+  maxTP: number | null
+  slBasis: string | null
+  tpBasis: string | null
+  lowerPrice: number
+  upperPrice: number
+}): { slTrigger: number | null; tpTrigger: number | null } {
+  const slTrigger = g.maxSL != null
+    ? (g.slBasis === 'percent' && g.maxSL > 0 ? g.lowerPrice * (1 - g.maxSL / 100) : g.maxSL)
+    : null
+  const tpTrigger = g.maxTP != null
+    ? (g.tpBasis === 'percent' && g.maxTP > 0 ? g.upperPrice * (1 + g.maxTP / 100) : g.maxTP)
+    : null
+  return { slTrigger, tpTrigger }
+}
+
+const fmtP = (n: number) => (Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4))
+const fmtPct = (n: number) => String(Math.round(n * 100) / 100)
+
+/** Guard stop message — includes the percent for percent-basis guards and the
+ *  price at which the guard fired (the live price for the engine, the resolved
+ *  trigger for the backtest close). Same stems the engine has always used. */
+export function guardStopText(kind: 'sl' | 'maxtp', basis: string | null, value: number, price: number): string {
+  const pct = basis === 'percent' && value > 0 ? ` ${fmtPct(value)}%` : ''
+  return kind === 'sl' ? `Max SL${pct} hit at ${fmtP(price)}` : `Max TP${pct} reached at ${fmtP(price)}`
+}
+
+// ---------- shared config validation (Task 10-a) ----------
+
+/**
+ * Validate a FULL grid config — ONE source of truth shared by POST /api/grid,
+ * PUT /api/grid/[id] and POST /api/grid/backtest so the three can never drift.
+ * Basis-aware guards: 'price' keeps the legacy strict ordering 400s (maxSL
+ * below the range, maxTP above it); 'percent' requires 0 < maxSL ≤ 90 and
+ * 0 < maxTP ≤ 1000. Returns null when valid, else a user-facing 400 message.
+ */
+export function validateGridConfig(c: {
+  lowerPrice: number
+  upperPrice: number
+  gridCount: number
+  spacing: string
+  qtyPerGrid: number
+  maxSL: number | null
+  maxTP: number | null
+  slBasis: string | null
+  tpBasis: string | null
+  isCrypto: boolean
+}): string | null {
+  if (!Number.isFinite(c.lowerPrice) || c.lowerPrice <= 0) return 'Lower price must be a positive number'
+  if (!Number.isFinite(c.upperPrice) || c.upperPrice <= c.lowerPrice) return 'Upper price must be greater than the lower price'
+  if (!Number.isInteger(c.gridCount) || c.gridCount < MIN_GRID_COUNT || c.gridCount > MAX_GRID_COUNT) {
+    return `Grid count must be an integer between ${MIN_GRID_COUNT} and ${MAX_GRID_COUNT}`
+  }
+  if (!isGridSpacing(c.spacing)) return 'Invalid spacing'
+  if (!Number.isFinite(c.qtyPerGrid) || c.qtyPerGrid <= 0) return 'Quantity per grid must be a positive number'
+  // stocks are floored to whole shares by the broker pipeline (trading.ts) —
+  // a fractional stock grid could never fill
+  if (!c.isCrypto && c.qtyPerGrid < 1) {
+    return 'Stocks require a whole-number quantity per grid (min 1) — crypto supports fractional sizes'
+  }
+  if (c.maxSL != null) {
+    if (!Number.isFinite(c.maxSL)) return 'Max SL must be a valid number'
+    if ((c.slBasis ?? 'price') === 'percent') {
+      if (!(c.maxSL > 0) || c.maxSL > 90) return 'Max SL percent must be greater than 0 and at most 90'
+    } else {
+      if (c.maxSL <= 0) return 'Max SL must be a positive price'
+      if (c.maxSL >= c.lowerPrice) return 'Max SL must be BELOW the lower price (it is the whole-grid hard floor)'
+    }
+  }
+  if (c.maxTP != null) {
+    if (!Number.isFinite(c.maxTP)) return 'Max TP must be a valid number'
+    if ((c.tpBasis ?? 'price') === 'percent') {
+      if (!(c.maxTP > 0) || c.maxTP > 1000) return 'Max TP percent must be greater than 0 and at most 1000'
+    } else {
+      if (c.maxTP <= 0) return 'Max TP must be a positive price'
+      if (c.maxTP <= c.upperPrice) return 'Max TP must be ABOVE the upper price (it is the whole-grid profit ceiling)'
+    }
+  }
+  return null
 }
 
 /**
@@ -321,8 +418,6 @@ async function closeAndStop(
   })
 }
 
-const fmtP = (n: number) => (Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4))
-
 /** Manual stop (Grid tab button). Returns false when the grid is not owned. */
 export async function stopGridTrade(userId: string, gridId: string, opts?: { reason?: 'manual_close' }): Promise<boolean> {
   const grid = await db.gridTrade.findFirst({ where: { id: gridId, userId } })
@@ -362,6 +457,8 @@ async function evaluateGrid(grid: {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
+  slBasis: string | null
+  tpBasis: string | null
   closeOnStop: boolean
   realizedPnl: number
   state: unknown
@@ -378,12 +475,23 @@ async function evaluateGrid(grid: {
   }
 
   // ---- guards FIRST (whole-grid circuit breakers) ----
-  if (grid.maxSL != null && price <= grid.maxSL) {
-    await closeAndStop(grid, 'sl', price, `Max SL hit at ${fmtP(price)}`)
+  // Triggers are RESOLVED EVERY TICK (price vs percent basis) so a config edit
+  // via PUT /api/grid/[id] re-arms the guards on the next 5s cycle — the DB is
+  // the single source of truth, no engine-side cache.
+  const { slTrigger, tpTrigger } = resolveGuards({
+    maxSL: grid.maxSL,
+    maxTP: grid.maxTP,
+    slBasis: grid.slBasis,
+    tpBasis: grid.tpBasis,
+    lowerPrice: grid.lowerPrice,
+    upperPrice: grid.upperPrice,
+  })
+  if (slTrigger != null && price <= slTrigger) {
+    await closeAndStop(grid, 'sl', price, guardStopText('sl', grid.slBasis, grid.maxSL ?? 0, price))
     return
   }
-  if (grid.maxTP != null && price >= grid.maxTP) {
-    await closeAndStop(grid, 'maxtp', price, `Max TP reached at ${fmtP(price)}`)
+  if (tpTrigger != null && price >= tpTrigger) {
+    await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price))
     return
   }
 
@@ -562,6 +670,9 @@ export interface StartGridInput {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
+  /** 'price' | 'percent' (Task 10-a) — how maxSL/maxTP are expressed */
+  slBasis?: string
+  tpBasis?: string
   closeOnStop: boolean
 }
 
@@ -580,6 +691,8 @@ export async function startGridTrade(input: StartGridInput) {
       qtyPerGrid: input.qtyPerGrid,
       maxSL: input.maxSL,
       maxTP: input.maxTP,
+      slBasis: input.slBasis ?? 'price',
+      tpBasis: input.tpBasis ?? 'price',
       closeOnStop: input.closeOnStop,
       status: 'active',
       state: state as unknown as object,

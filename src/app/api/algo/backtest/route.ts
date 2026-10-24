@@ -31,8 +31,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
-import { getBars } from '@/lib/alpaca'
-import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
+import { type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { rateLimit } from '@/lib/rate-limit'
 import {
@@ -70,29 +69,12 @@ function downsampleEquity(equity: { t: number; equity: number }[]): { t: number;
  * staleness is invisible to the replay. Task 9-l: bounded to 6 entries
  * (~60-80MB worst) — this cache duplicates the global bars-cache, and on the
  * 1.8GB-heap dev box every retained MB is sweep headroom.
+ *
+ * Task 10-a — the cache + the demo/short-history/forming-bar gates were
+ * EXTRACTED VERBATIM into src/lib/backtest-history.ts so the grid backtest
+ * reuses the exact same machinery; the algo route's behavior is unchanged.
  */
-const BARS_TTL_MS = 120_000
-const BARS_CACHE_MAX = 6
-const barsCache = new Map<string, { at: number; res: Awaited<ReturnType<typeof getBars>> }>()
-
-async function getBarsCached(symbol: string, tf: Timeframe, userId: string, days: number) {
-  // Task 9-p — NEVER retain a 1m window (30d ≈ 43k bars): the tune→re-run
-  // loop's refetch for 1m costs a couple of seconds, the retained window
-  // costs tens of MB of heap for minutes. This cache duplicated the global
-  // bars-cache — the double retention is exactly what killed the box on
-  // repeated 1m backtests.
-  if (tf === '1m') return getBars(symbol, tf, userId, { lookbackDays: days })
-  const key = `${userId}|${symbol}|${tf}|${days}`
-  const hit = barsCache.get(key)
-  if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.res
-  const res = await getBars(symbol, tf, userId, { lookbackDays: days })
-  barsCache.set(key, { at: Date.now(), res })
-  if (barsCache.size > BARS_CACHE_MAX) {
-    const oldest = [...barsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
-    if (oldest) barsCache.delete(oldest[0])
-  }
-  return res
-}
+import { fetchBacktestBars } from '@/lib/backtest-history'
 
 interface BacktestBody {
   mode?: string
@@ -207,30 +189,20 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
 
-    // ---- fetch the history (same source the live engine polls; TTL-cached) ----
-    const res = await getBarsCached(symbol, tf as Timeframe, userId, days)
-    let bars = Array.isArray(res.bars) ? res.bars : []
-    if (res.demo || bars.length < 80) {
-      return NextResponse.json(
-        { error: res.demo ? 'No live historical data for this symbol (demo feed) — cannot backtest' : `Not enough history (${bars.length} bars) — widen the period or pick a smaller timeframe` },
-        { status: 400 },
-      )
+    // ---- fetch the history (same source the live engine polls; TTL-cached —
+    // Task 10-a: shared fetchBacktestBars helper, identical gates/messages) ----
+    const hist = await fetchBacktestBars(symbol, tf as Timeframe, userId, days, MAX_BARS)
+    if (!hist.ok) {
+      return NextResponse.json({ error: hist.error }, { status: 400 })
     }
-    // drop the FORMING bar (never a decision bar in the live engine either)
-    const tfSec = TIMEFRAMES[tf as Timeframe].seconds
-    const nowSec = Math.floor(Date.now() / 1000)
-    while (bars.length > 0 && bars[bars.length - 1].time + tfSec > nowSec) bars = bars.slice(0, -1)
-    if (bars.length < 80) {
-      return NextResponse.json({ error: 'Not enough closed bars in range' }, { status: 400 })
-    }
-    // hard compute cap — keep the most recent bars
-    if (bars.length > MAX_BARS) bars = bars.slice(bars.length - MAX_BARS)
+    const bars = hist.bars
 
     // ACTUAL coverage — the feed may return less history than requested (per-
     // feed bar caps, brand-new listings). Report the real window so the UI can
     // say "data Jul 9 → Oct 21" instead of pretending the requested period.
     const fromT = bars[0].time
     const toT = bars[bars.length - 1].time
+    const nowSec = Math.floor(Date.now() / 1000)
     const coveredDays = Math.max(1, Math.round((nowSec - fromT) / 86400))
 
     const cfg: BacktestConfig = {
@@ -272,7 +244,7 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
       from: fromT,
       to: toT,
       coveredDays,
-      source: res.source ?? 'alpaca',
+      source: hist.source ?? 'alpaca',
       dataCapped: coveredDays < days - 3,
     }
 

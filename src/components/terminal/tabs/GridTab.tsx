@@ -1,12 +1,13 @@
 'use client'
 
-// Grid Trading tab (Task 9-q) — tracks every grid trade: live status, total
-// realized/unrealized P&L, grid start time and per-fill history. Grids are
-// created from the chart's two-click "Grid" range tool; this tab is the
-// mission control (stop / inspect / delete). Polls every 5s like the Algo tab.
+// Grid Trading tab (Task 9-q, extended by Task 10-b) — tracks every grid
+// trade: live status, total realized/unrealized P&L, grid start time and
+// per-fill history. Grids are created from the chart's two-click "Grid" range
+// tool; this tab is the mission control (stop / edit-when-flat / inspect /
+// delete). Polls every 5s like the Algo tab.
 import { useCallback, useEffect, useState } from 'react'
 import {
-  LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert,
+  LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -21,7 +22,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
+import GridTradeDialog from '@/components/chart/GridTradeDialog'
 import type { GridTradeDto, GridFillDto } from '@/app/api/grid/route'
+
+/** API rows gain slBasis/tpBasis ('price'|'percent') via Task 10-a — treat as
+ * optional strings so pre-10-a rows (and the base DTO type) keep working. */
+type GridRow = GridTradeDto & { slBasis?: string | null; tpBasis?: string | null }
+
+/** Percent → display without trailing zeros (5 → "5", 5.25 → "5.25"). */
+const trimNum = (n: number) => String(Number(n.toFixed(2)))
+
+/** Resolve a percent-basis SL/TP exactly like the server/engine does:
+ * SL trigger = lower × (1 − pct/100), TP trigger = upper × (1 + pct/100). */
+const resolveTrigger = (bound: number, pct: number, kind: 'sl' | 'tp') =>
+  Math.round((kind === 'sl' ? bound * (1 - pct / 100) : bound * (1 + pct / 100)) * 100) / 100
 
 const STATUS_CLS: Record<string, string> = {
   active: 'border-emerald-500/40 text-emerald-400',
@@ -69,7 +83,7 @@ const REASON_LABEL: Record<string, string> = {
 }
 
 interface GridData {
-  grids: GridTradeDto[]
+  grids: GridRow[]
 }
 
 export default function GridTab() {
@@ -77,7 +91,9 @@ export default function GridTab() {
   const [data, setData] = useState<GridData | null>(null)
   const [loading, setLoading] = useState(true)
   const [busyId, setBusyId] = useState<string | null>(null)
-  const [stopTarget, setStopTarget] = useState<GridTradeDto | null>(null)
+  const [stopTarget, setStopTarget] = useState<GridRow | null>(null)
+  // edit-when-flat (Task 10-b): the grid being reconfigured in-place
+  const [editTarget, setEditTarget] = useState<GridRow | null>(null)
   // details dialog: the grid id + its fetched fills
   const [detailId, setDetailId] = useState<string | null>(null)
   const [detail, setDetail] = useState<{ grid: GridTradeDto; fills: GridFillDto[] } | null>(null)
@@ -108,7 +124,7 @@ export default function GridTab() {
     finally { setDetailLoading(false) }
   }
 
-  const stop = async (grid: GridTradeDto) => {
+  const stop = async (grid: GridRow) => {
     setBusyId(grid.id)
     try {
       const res = await fetch(`/api/grid/${grid.id}/stop`, { method: 'POST' })
@@ -127,7 +143,7 @@ export default function GridTab() {
     }
   }
 
-  const remove = async (grid: GridTradeDto) => {
+  const remove = async (grid: GridRow) => {
     setBusyId(grid.id)
     try {
       const res = await fetch(`/api/grid/${grid.id}`, { method: 'DELETE' })
@@ -213,8 +229,28 @@ export default function GridTab() {
                     {g.gridCount} levels · {g.spacing}
                   </Badge>
                   <span className="tabular-nums text-zinc-500">qty {g.qtyPerGrid}/grid</span>
-                  {g.maxSL != null && <Badge variant="outline" className="text-[10px] text-rose-400/90">SL {fmtPrice(g.maxSL)}</Badge>}
-                  {g.maxTP != null && <Badge variant="outline" className="text-[10px] text-emerald-400/90">TP {fmtPrice(g.maxTP)}</Badge>}
+                  {g.maxSL != null && (
+                    <Badge
+                      variant="outline"
+                      className="text-[10px] text-rose-400/90"
+                      title={g.slBasis === 'percent' ? 'percent of the lower bound' : 'absolute price'}
+                    >
+                      {g.slBasis === 'percent'
+                        ? `SL ${trimNum(g.maxSL)}% (≈${fmtPrice(resolveTrigger(g.lowerPrice, g.maxSL, 'sl'))})`
+                        : `SL ${fmtPrice(g.maxSL)}`}
+                    </Badge>
+                  )}
+                  {g.maxTP != null && (
+                    <Badge
+                      variant="outline"
+                      className="text-[10px] text-emerald-400/90"
+                      title={g.tpBasis === 'percent' ? 'percent of the upper bound' : 'absolute price'}
+                    >
+                      {g.tpBasis === 'percent'
+                        ? `TP ${trimNum(g.maxTP)}% (≈${fmtPrice(resolveTrigger(g.upperPrice, g.maxTP, 'tp'))})`
+                        : `TP ${fmtPrice(g.maxTP)}`}
+                    </Badge>
+                  )}
                   {isActive && g.stats.currentPrice != null && (
                     <span className="tabular-nums text-zinc-400" title="current price">now {fmtPrice(g.stats.currentPrice)}</span>
                   )}
@@ -242,6 +278,16 @@ export default function GridTab() {
                     </span>
                   )}
                   <span className="ml-auto flex items-center gap-0.5">
+                    {isActive && openLotsG === 0 && (
+                      <Button
+                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-emerald-300"
+                        disabled={busyId === g.id}
+                        onClick={() => setEditTarget(g)}
+                        title="Edit this grid's config — only while it holds no open lots"
+                      >
+                        <Pencil className="h-3 w-3" /> Edit
+                      </Button>
+                    )}
                     {isActive && (
                       <Button
                         variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
@@ -275,6 +321,20 @@ export default function GridTab() {
             )
           })}
         </div>
+      )}
+
+      {/* edit-when-flat (Task 10-b) — reuses the create dialog in edit mode;
+          the engine reconfigures the still-running grid on a successful PUT */}
+      {editTarget && (
+        <GridTradeDialog
+          open
+          onOpenChange={(v) => { if (!v) setEditTarget(null) }}
+          symbol={editTarget.symbol}
+          lowerPrice={editTarget.lowerPrice}
+          upperPrice={editTarget.upperPrice}
+          editGrid={editTarget}
+          onSaved={() => void load()}
+        />
       )}
 
       {/* stop confirmation — spell out what closeOnStop will do */}

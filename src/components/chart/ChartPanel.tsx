@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
-  IChartApi, ISeriesApi, MouseEventParams, CandlestickData, LineData,
+  IChartApi, ISeriesApi, IPriceLine, MouseEventParams, CandlestickData, LineData,
 } from 'lightweight-charts'
 import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS, Alert } from '@/store/terminal'
 import { detectSrLevels, SrBar } from '@/lib/sr'
@@ -33,7 +33,7 @@ import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
   Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
-  LayoutGrid,
+  LayoutGrid, Grid3x3,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -45,6 +45,22 @@ import { ttLog } from '@/lib/console-log'
 import { subscribeStream, StreamTick } from '@/lib/stream-client'
 
 const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
+
+/** Slim grid-row shape for the chart overlay (Task 10-b). Only the fields the
+ * price-line renderer needs; slBasis/tpBasis are optional API strings
+ * ('price' | 'percent') added by the backend in Task 10-a. */
+interface GridOverlayRow {
+  id: string
+  symbol: string
+  status: string
+  lowerPrice: number
+  upperPrice: number
+  levels?: number[]
+  maxSL: number | null
+  maxTP: number | null
+  slBasis?: string | null
+  tpBasis?: string | null
+}
 
 /** Suggested price for a not-yet-created TP/SL (ghost chip default). */
 function ghostDefaultPrice(kind: 'tp' | 'sl', entry: number, long: boolean): number {
@@ -330,6 +346,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [gridArm, setGridArm] = useState<'off' | 'lower' | 'upper'>('off')
   const [gridRange, setGridRange] = useState<{ lowerPrice: number; upperPrice: number } | null>(null)
   const gridCaptureRef = useRef<{ stage: 0 | 1 | 2; first: number | null }>({ stage: 0, first: null })
+  // ---- Grid trades overlay (Task 10-b): toggle → poll GET /api/grid every 5s
+  // and draw active grids for THIS symbol as lightweight-charts price lines on
+  // the main series. Purely visual — the two-click capture flow is untouched.
+  const [gridOverlayOn, setGridOverlayOn] = useState(false)
+  const [gridOverlayData, setGridOverlayData] = useState<GridOverlayRow[] | null>(null)
 
   // Esc cancels an armed grid capture (own listener so the big pointer effect
   // below stays untouched by grid state)
@@ -3442,6 +3463,91 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // chart or refetches bars/markers.
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours])
 
+  // ---------- grid trades overlay (Task 10-b) ----------
+  // Poll lifecycle: while the toggle is ON, fetch GET /api/grid immediately and
+  // every 5s; any non-OK response (401 logged-out, offline 4xx, 5xx) simply
+  // clears the snapshot → nothing renders, never a toast or a crash. Toggling
+  // OFF (or unmount) clears the interval and the snapshot. Two effects so the
+  // poll keeps running regardless of chart recreation.
+  useEffect(() => {
+    if (!gridOverlayOn) return
+    let cancelled = false
+    const fetchGrids = async () => {
+      try {
+        const res = await fetch('/api/grid')
+        if (!res.ok) { if (!cancelled) setGridOverlayData(null); return }
+        const json = (await res.json().catch(() => null)) as { grids?: GridOverlayRow[] } | null
+        if (!cancelled) setGridOverlayData(Array.isArray(json?.grids) ? json.grids : null)
+      } catch { /* offline — keep the last snapshot */ }
+    }
+    void fetchGrids()
+    const t = setInterval(() => { void fetchGrids() }, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(t)
+      setGridOverlayData(null)
+    }
+  }, [gridOverlayOn])
+
+  // Price-line lifecycle: teardown at the TOP of the effect (not as a cleanup)
+  // so chart recreation can never call removePriceLine on a disposed series —
+  // lines created on a since-replaced chart die with that chart.remove(), and
+  // the guard `prev.series === series` skips them. Lines are removed + rebuilt
+  // when the polled data changes, the chart is recreated (symbol/tf/type/ETH/
+  // session/credentials) or the toggle turns off. Declared AFTER the chart
+  // lifecycle effect so seriesRef.current is the fresh series on rebuilds.
+  const gridLinesRef = useRef<{ series: ISeriesApi<'Candlestick'> | ISeriesApi<'Line'> | null; lines: IPriceLine[] }>({ series: null, lines: [] })
+  useEffect(() => {
+    const series = seriesRef.current
+    const prev = gridLinesRef.current
+    if (prev.lines.length > 0 && prev.series === series && series) {
+      for (const l of prev.lines) {
+        try { series.removePriceLine(l) } catch { /* disposed mid-teardown */ }
+      }
+    }
+    gridLinesRef.current = { series: series ?? null, lines: [] }
+    if (!gridOverlayOn || !gridOverlayData || !series) return
+
+    const symN = normSym(symbol)
+    const rows = gridOverlayData
+      .filter((g) => g.status === 'active' && normSym(String(g.symbol || '')) === symN)
+      .slice(0, 2) // cap 2 grids per pane
+    const lines: IPriceLine[] = []
+    let budget = 60 // hard cap across all drawn lines
+    const addLine = (price: number, color: string, width: 1 | 2, style: LineStyle, title: string, axis: boolean) => {
+      if (budget <= 0 || !Number.isFinite(price)) return
+      try {
+        lines.push(series.createPriceLine({ price, color, lineWidth: width, lineStyle: style, axisLabelVisible: axis, title }))
+        budget--
+      } catch { /* disposed chart */ }
+    }
+    for (const g of rows) {
+      const lower = Number(g.lowerPrice)
+      const upper = Number(g.upperPrice)
+      if (!Number.isFinite(lower) || !Number.isFinite(upper) || !(upper > lower)) continue
+      addLine(lower, '#71717a', 2, LineStyle.Dashed, 'G⌄', true)
+      addLine(upper, '#71717a', 2, LineStyle.Dashed, 'G⌃', true)
+      for (const lv of Array.isArray(g.levels) ? g.levels : []) {
+        const v = Number(lv)
+        if (!Number.isFinite(v)) continue
+        if (Math.abs(v - lower) < 1e-9 || Math.abs(v - upper) < 1e-9) continue // bounds already drawn
+        addLine(v, '#10b981', 1, LineStyle.Solid, '', false)
+      }
+      // resolved circuit-breaker triggers — same formulas the server uses:
+      // SL trigger = lower × (1 − pct/100), TP trigger = upper × (1 + pct/100)
+      if (g.maxSL != null && Number.isFinite(Number(g.maxSL))) {
+        const sl = g.slBasis === 'percent' ? lower * (1 - Number(g.maxSL) / 100) : Number(g.maxSL)
+        addLine(sl, '#f43f5e', 1, LineStyle.Dashed, 'SL', true)
+      }
+      if (g.maxTP != null && Number.isFinite(Number(g.maxTP))) {
+        const tp = g.tpBasis === 'percent' ? upper * (1 + Number(g.maxTP) / 100) : Number(g.maxTP)
+        addLine(tp, '#22c55e', 1, LineStyle.Dashed, 'TP', true)
+      }
+      if (budget <= 0) break
+    }
+    gridLinesRef.current = { series, lines }
+  }, [gridOverlayOn, gridOverlayData, symbol, tf, chartType, showExtendedHours, sessionGate, settingsVer])
+
   // ---------- technical indicators: series lifecycle ----------
   // lightweight-charts v4 has no real multi-pane support: SMA/EMA/BB are line
   // overlays on the price scale, RSI/MACD are dedicated price scales squeezed
@@ -4140,6 +4246,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           )}
         >
           <LayoutGrid className="h-3.5 w-3.5" />
+        </button>
+        {/* grid trades overlay toggle (Task 10-b) — draws ACTIVE grids for this
+            symbol as price lines; does NOT touch the two-click arm tool above */}
+        <button
+          title="Show grid trades on chart"
+          aria-label="Show grid trades on chart"
+          aria-pressed={gridOverlayOn}
+          onClick={() => setGridOverlayOn((v) => !v)}
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            gridOverlayOn ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',
+          )}
+        >
+          <Grid3x3 className="h-3.5 w-3.5" />
         </button>
         <div className="mx-1 my-0.5 h-px bg-zinc-800" />
         {(

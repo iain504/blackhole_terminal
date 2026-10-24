@@ -7,7 +7,7 @@ import { resolveTradeMode } from '@/lib/trading'
 import { hasAlpacaKeys } from '@/lib/alpaca'
 import { symbolSchema } from '@/lib/validation'
 import {
-  startGridTrade, ensureGridEngine, computeGridStats,
+  startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
   isGridSpacing, parseGridState, type GridSpacing,
 } from '@/lib/grid-engine'
 
@@ -61,6 +61,8 @@ export interface GridTradeDto {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
+  slBasis: string
+  tpBasis: string
   closeOnStop: boolean
   status: string
   stopReason: string | null
@@ -86,6 +88,8 @@ export function toDto(row: {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
+  slBasis: string
+  tpBasis: string
   closeOnStop: boolean
   status: string
   stopReason: string | null
@@ -107,6 +111,8 @@ export function toDto(row: {
     qtyPerGrid: row.qtyPerGrid,
     maxSL: row.maxSL,
     maxTP: row.maxTP,
+    slBasis: row.slBasis,
+    tpBasis: row.tpBasis,
     closeOnStop: row.closeOnStop,
     status: row.status,
     stopReason: row.stopReason,
@@ -162,10 +168,20 @@ interface GridCreateBody {
   qtyPerGrid?: number
   maxSL?: number | null
   maxTP?: number | null
+  slBasis?: string
+  tpBasis?: string
   closeOnStop?: boolean
 }
 
 const bad = (error: string) => NextResponse.json({ error }, { status: 400 })
+
+/** 'price' | 'percent' guard basis — absent defaults to 'price' (legacy). */
+export function parseGuardBasis(v: unknown): 'price' | 'percent' | null {
+  if (v === undefined || v === null || v === '') return 'price'
+  return v === 'price' || v === 'percent' ? v : null
+}
+
+export const round2 = (x: number) => Math.round(x * 100) / 100
 
 // POST /api/grid — create + start a grid trade
 export async function POST(req: NextRequest) {
@@ -182,38 +198,47 @@ export async function POST(req: NextRequest) {
     if (!symbolSchema.safeParse(symRaw).success) return bad('Invalid symbol')
     const symbol = symRaw
 
+    const slBasis = parseGuardBasis(body?.slBasis)
+    if (slBasis == null) return bad('slBasis must be "price" or "percent"')
+    const tpBasis = parseGuardBasis(body?.tpBasis)
+    if (tpBasis == null) return bad('tpBasis must be "price" or "percent"')
+
     const lowerPrice = Number(body?.lowerPrice)
     const upperPrice = Number(body?.upperPrice)
     if (!Number.isFinite(lowerPrice) || lowerPrice <= 0) return bad('Lower price must be a positive number')
     if (!Number.isFinite(upperPrice) || upperPrice <= lowerPrice) return bad('Upper price must be greater than the lower price')
+    // server-side rounding to 2 decimals — the stored range, the guard checks
+    // and the computed levels all use the SAME rounded values
+    const lower = round2(lowerPrice)
+    const upper = round2(upperPrice)
 
     const gridCount = Number(body?.gridCount)
-    if (!Number.isInteger(gridCount) || gridCount < 2 || gridCount > 100) {
-      return bad('Grid count must be an integer between 2 and 100')
-    }
     const spacing: GridSpacing = isGridSpacing(body?.spacing) ? body.spacing : 'arithmetic'
-
     const qtyPerGrid = Number(body?.qtyPerGrid)
-    if (!Number.isFinite(qtyPerGrid) || qtyPerGrid <= 0) return bad('Quantity per grid must be a positive number')
-    // stocks are floored to whole shares by the broker pipeline (trading.ts) —
-    // a fractional stock grid could never fill
-    if (!symbol.includes('/') && qtyPerGrid < 1) {
-      return bad('Stocks require a whole-number quantity per grid (min 1) — crypto supports fractional sizes')
-    }
 
-    // whole-grid guards: optional absolute prices with strict ordering
+    // whole-grid guards: optional, basis-aware ('price' = absolute prices that
+    // must order strictly outside the range · 'percent' = 0 < maxSL ≤ 90 /
+    // 0 < maxTP ≤ 1000 — resolved against the range edges by resolveGuards)
     let maxSL: number | null = null
-    if (body?.maxSL != null && Number.isFinite(Number(body.maxSL))) {
-      maxSL = Number(body.maxSL)
-      if (maxSL <= 0) return bad('Max SL must be a positive price')
-      if (maxSL >= lowerPrice) return bad('Max SL must be BELOW the lower price (it is the whole-grid hard floor)')
-    }
+    if (body?.maxSL != null && Number.isFinite(Number(body.maxSL))) maxSL = Number(body.maxSL)
     let maxTP: number | null = null
-    if (body?.maxTP != null && Number.isFinite(Number(body.maxTP))) {
-      maxTP = Number(body.maxTP)
-      if (maxTP <= 0) return bad('Max TP must be a positive price')
-      if (maxTP <= upperPrice) return bad('Max TP must be ABOVE the upper price (it is the whole-grid profit ceiling)')
-    }
+    if (body?.maxTP != null && Number.isFinite(Number(body.maxTP))) maxTP = Number(body.maxTP)
+
+    // ONE shared validator for POST / PUT / backtest (grid-engine.ts) — keeps
+    // the legacy 'price' 400s and adds the percent-basis rules
+    const invalid = validateGridConfig({
+      lowerPrice: lower,
+      upperPrice: upper,
+      gridCount,
+      spacing,
+      qtyPerGrid,
+      maxSL,
+      maxTP,
+      slBasis,
+      tpBasis,
+      isCrypto: symbol.includes('/'),
+    })
+    if (invalid) return bad(invalid)
 
     // orders go through the same paper-broker pipeline as manual/algo orders
     if (!(await hasAlpacaKeys(user.id))) {
@@ -227,13 +252,15 @@ export async function POST(req: NextRequest) {
     const grid = await startGridTrade({
       userId: user.id,
       symbol,
-      lowerPrice,
-      upperPrice,
+      lowerPrice: lower,
+      upperPrice: upper,
       gridCount,
       spacing,
       qtyPerGrid,
       maxSL,
       maxTP,
+      slBasis,
+      tpBasis,
       closeOnStop: body?.closeOnStop !== false,
     })
     return NextResponse.json(

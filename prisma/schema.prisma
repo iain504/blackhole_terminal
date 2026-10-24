@@ -289,9 +289,16 @@ model GridTrade {
   spacing     String    @default("arithmetic")
   // ---- sizing ----
   qtyPerGrid  Float
-  // ---- whole-grid guards (absolute prices, optional) ----
+  // ---- whole-grid guards (optional) ----
   maxSL       Float? // price falls here → close everything + stop (hard floor)
   maxTP       Float? // price rises here → close everything + stop (profit ceiling)
+  // Task 10-a — how the guard values are expressed: 'price' = maxSL/maxTP are
+  // absolute prices (must order strictly outside the range) · 'percent' =
+  // maxSL/maxTP are percentages: slTrigger = lowerPrice × (1 − maxSL/100),
+  // tpTrigger = upperPrice × (1 + maxTP/100) — resolved EVERY engine tick so a
+  // later config edit (PUT /api/grid/[id]) re-arms the guards automatically.
+  slBasis     String    @default("price")
+  tpBasis     String    @default("price")
   // when the grid stops (manual or guard), market-close open grid positions
   closeOnStop Boolean   @default(true)
   // 'active' | 'stopped' | 'error'
