@@ -1774,3 +1774,20 @@ Work Log:
 
 Stage Summary:
 - main = origin/main = c67f6fb on iain504/blackhole_terminal: Task 82b/82c + 83 + crypto-24/7 + Task 84 parity + Task 85 spread — all five layers now in ONE linear history. Only db/custom.db + generated version stamp churn remain uncommitted (convention).
+
+---
+Task ID: 86
+Agent: Z.ai Code (main)
+Task: User question — "backtest timeframe is 1m/5m/15m, is this solid for backtest?" — audit per-TF soundness, fix what's unsound.
+
+Work Log:
+- Audited the per-TF replay model end-to-end: live EOD gate is WALL-CLOCK (algo-engine.ts:404 `nowMinEt >= 15:45` on the 15s tick) while the backtest filled the flatten at the gate bar's CLOSE — exit at 15:46 (1m) / 15:50 (5m) / 16:00 (15m), up to 15 minutes past the live exit and through the close auction. THE unsound bit for coarse TFs.
+- FIXED backtest.ts: EOD flatten now fires BEFORE the intrabar bracket check, fills at the gate bar's OPEN (15:45:00 price = the live market order), and preempts that bar's TP/SL (on aligned 1m/5m/15m bars the gate bar STARTS at 15:45 — the whole bar is post-gate, so no bracket fills there; matches live precedence where the wall-clock flatten outranks resting exits). Same-bar entries (signal on the 15:40 bar) now wash at open (entry open → EOD open) with both fills' costs — matches the live enter-then-immediately-flatten net effect. Header + panel fill-model note updated.
+- Probe (/tmp/eod-check.ts): synthetic 15m equity bars with late-day ramp → ALL EOD exits at ET-minute 945 exactly, exitPx == gate-bar open (was 16:00 close). Spread + cost-model probes re-run clean (EOD change orthogonal). Lint clean.
+- E2E: TSLA 15m 30d via UI → 19 trades, PF 1.47, avg hold 2.7h, 0 errors. dev.log clean.
+- Documented (not fixed — both engines share it, parity holds): ORB opening-range pollution on 15m when orMinutes is NOT a multiple of 15 (e.g. 5/10/20: the last OR bar spans up to 14 min past the window) — defaults (15) and 30/45/60 are exact; 5m is exact for all step-5 values; 1m always exact.
+- Audit verdict per TF: 1m — most live-faithful fills (next-open ≈ seconds-after-close) but thin stock history depth + costs dominate tight targets; 5m — solid middle ground, all windows clean; 15m — now sound after the EOD fix; ORB range = exactly the 9:30 bar (orMinutes 15), fewer trades = wider stats. TF set itself (1m/5m/15m) is the right intraday envelope: vwap-fade/orb15 are session-anchored strategies that don't exist on 1D; rsi2/bb could theoretically run 1h swing but would need OR window clipping + EOD rework — out of scope.
+- Version stamp v1.13.1.
+
+Stage Summary:
+- 1m/5m/15m backtest is now SOLID per-TF: the last genuine per-TF divergence (EOD fill timing) is fixed with wall-clock parity; brackets preempted on the gate bar; ORB coarse-TF caveat documented. Files: src/lib/backtest.ts, src/components/terminal/tabs/BacktestPanel.tsx, src/components/landing/LandingPage.tsx.

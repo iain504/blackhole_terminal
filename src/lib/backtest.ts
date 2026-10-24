@@ -33,7 +33,10 @@
 //     low INCLUDING the entry bar; when both could hit in one bar the STOP is
 //     assumed first (worst case);
 //   • flattenEod closes the position at the first bar opening at/after 15:45
-//     ET (fill at that bar's close) and suppresses entries from 15:45 ET —
+//     ET (fill at that bar's OPEN — wall-clock parity: the live gate is a
+//     15:45:00 tick event, not a bar-close event, so on aligned 1m/5m/15m
+//     bars the gate bar starts exactly at 15:45 and its brackets are
+//     preempted) and suppresses entries from 15:45 ET —
 //     EQUITY symbols only (crypto runs 24/7, guards ignored like the engine);
 //   • rthOnly gates entries to regular-session bars (exits/brackets run 24h,
 //     like the live engine) — EQUITY symbols only, ignored for crypto;
@@ -484,8 +487,23 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       pending = null
     }
 
-    // ---- 2) resting TP/SL intrabar (stop assumed first — worst case) ----
-    if (pos) {
+    // ---- 2) EOD flatten — WALL-CLOCK parity (equity symbols only — crypto
+    //         never force-flattens): the live gate fires at 15:45:00 ET on the
+    //         engine's tick, NOT on the bar close, so the backtest flattens at
+    //         the OPEN of the first bar opening at/after 15:45 (on aligned
+    //         1m/5m/15m bars that bar STARTS at the gate) and preempts the
+    //         bar's brackets — no post-gate TP/SL fills can happen. Filling at
+    //         the CLOSE (the old model) exited 15:46 / 15:50 / 16:00 on 1m/5m/
+    //         15m — up to 15 minutes past the live exit through the close.
+    const eodGate = cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN
+    if (pos && eodGate) {
+      closeTrade(pos, slipPx(bar.open, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
+      pos = null
+    }
+
+    // ---- 3) resting TP/SL intrabar (stop assumed first — worst case) —
+    //         skipped on the EOD gate bar, the position is already flat
+    if (pos && !eodGate) {
       let exitPx: number | null = null
       let reason = ''
       if (pos.side === 1) {
@@ -509,12 +527,6 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         closeTrade(pos, exitPx, bar.time, reason)
         pos = null
       }
-    }
-
-    // ---- 3) EOD flatten (equity symbols only — crypto never force-flattens) ----
-    if (pos && cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) {
-      closeTrade(pos, slipPx(bar.close, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
-      pos = null
     }
 
     // ---- 4) evaluate the strategy on this closed bar (exits → entries) ----
