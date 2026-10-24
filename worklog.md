@@ -2551,3 +2551,19 @@ Work Log:
 Stage Summary:
 - Chart boundary now pulses emerald whenever its symbol has an active grid (independent of the line-overlay toggle). Files: src/components/chart/ChartPanel.tsx (always-on poll + wrapper + glow ring), src/app/globals.css (.grid-live-glow + keyframes).
 - remote==local==<pushed sha> after this commit.
+
+---
+Task ID: 10-e
+Agent: main (Z.ai Code)
+Task: "push." — clean repo state and push Task 10-d glow work to GitHub.
+
+Work Log:
+- Push check: remote already had db83c5d (Task 10-d glow, pushed in the prior session — the worklog's "<pushed sha>" placeholder meant db83c5d). HEAD had a NEW stray platform UUID auto-commit (df9cb1f) re-adding agent-ctx/ + scripts-tmp scratch on top, plus uncommitted version.ts drift (build 126→127 pointing at the UUID sha).
+- Dropped df9cb1f via git reset --mixed HEAD~1 (scratch became untracked — same decision as 10-d).
+- Root-cause fix for the recurring UUID commits: .gitignore now ignores agent-ctx/ and scripts-tmp/ so platform auto-commits have nothing to pick up.
+- Regenerated src/generated/version.ts via bun scripts/stamp-version.mjs → v1.80.0+126 · sha db83c5d (no stale reference to the dropped commit).
+- Two commits: f10904a (.gitignore scratch dirs) + 7b58d5f (version.ts drift, convention message). Pushed via askpass protocol: db83c5d..7b58d5f main -> main.
+- Verified: git fetch → remote == local == 7b58d5f; git status --porcelain = 0 changes (scratch dirs now ignored). Dev server healthy throughout (GET / 200 in dev.log). No runtime code changed — 10-d glow remains live (demo grid left running from 10-d shows the pulsing boundary).
+
+Stage Summary:
+- remote==local==7b58d5f on main; tree fully clean. Task 10-d grid-boundary glow (db83c5d) confirmed on GitHub. UUID auto-commit problem solved permanently via .gitignore (agent-ctx/, scripts-tmp/).
