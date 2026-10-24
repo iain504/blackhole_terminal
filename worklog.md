@@ -2232,3 +2232,21 @@ Work Log:
 Stage Summary:
 - OOM structural risk now bounded three ways: LRU bars cache (growth eliminated), 1.8GB V8 ceiling (request-scoped failure), ops-watchdog (self-healing restart ~2min after death or memory runaway). Reliability/HA: server recovers without agent intervention.
 - Dep graph slimmed 15 packages. Remaining USER actions: Alpaca key rotation (broker dashboard); git history purge executed next (9-g, force-push rewrite).
+
+---
+Task ID: 9-g/9-h
+Agent: Z.ai Code (main)
+Task: git history purge + force-push + final scorecard (10/10 program close-out)
+
+Work Log:
+- Enumerated sensitive history paths (git log --all --diff-filter=A): .env, db/custom.db, db/custom.db-shm, db/custom.db-wal, upload/v23-algo.zip, upload/v24.tar.
+- Extracted exact historical secrets from pre-scrub blobs: Alpaca PKGJ...ZGOR key + 6fwV...TSe secret (alpos-flatten.mjs@c61f5a4^); confirmed historical .env blobs only ever held DATABASE_URL (auth/enc secrets NEVER committed — 0 -S hits).
+- 7 probe scripts at HEAD still carried plaintext test creds -> env-scrubbed (TEST_PASS/TOTP_SECRET ?? '' pattern), commit 0f2a3cf.
+- git-filter-repo 119 commits rewritten: --invert-paths over the 6 paths + --replace-text (6 rules incl. defense-in-depth disk-secret values). 6.08s.
+- VERIFY (all zero): sensitive paths 0; -S hits for Alpaca KEY/SEC, TOTP, SuperSecret99 = 0 across all history. size-pack 42.08MiB.
+- Force-push: 3c63615...422ba01 (forced update); remote main == local main == 422ba01.
+- Note: GitHub may retain unreachable old objects server-side until their GC; for guaranteed purge, contact support or delete+recreate the repo. Alpaca key rotation remains a USER action (broker dashboard).
+
+Stage Summary:
+- Final scorecard (baseline -> now): performance 6.5->8.5, trading logic 7.5->9.5, algo accuracy 5->8.5, security 3->9, functions 9->9, reliability 6->9, robustness 6.5->9, UX 7.5->9, speed 7->8.5, HA 2.5->7.5.
+- Honest ceiling: HA/perf 10/10 unreachable in a single 4GB dev-mode sandbox (no swap, no replicas, no external DB); every actionable item was actioned. Remaining user actions: Alpaca key rotation; optional GitHub GC for old unreachable objects.
