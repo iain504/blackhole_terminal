@@ -188,7 +188,7 @@ Work Log:
 - Fixed all issues found during E2E (listed above)
 
 Stage Summary:
-- APP COMPLETE AND BROWSER-VERIFIED. Test account: username "trader" / password "S****99", TOTP secret P7FT****REDACTED (add to authenticator to log in). Users can register their own 2FA account. Alpaca keys can be added per-user in Settings (encrypted) or via APCA_API_KEY_ID/APCA_API_SECRET_KEY env; without keys the app runs on deterministic demo data ("demo" badges shown).
+- APP COMPLETE AND BROWSER-VERIFIED. Test account: username "trader" / password "S****99(redacted)", TOTP secret P7FT****KI2J(redacted) (add to authenticator to log in). Users can register their own 2FA account. Alpaca keys can be added per-user in Settings (encrypted) or via APCA_API_KEY_ID/APCA_API_SECRET_KEY env; without keys the app runs on deterministic demo data ("demo" badges shown).
 
 ---
 Task ID: 17
@@ -2194,3 +2194,41 @@ Work Log:
 
 Stage Summary:
 - v1.18.0 pushed (b16f9aa + ops commits). Remaining documented debts: OOM structural (worker isolation/prod build/swap), poll multiplication, dep pruning, live gateway config platform-managed, Alpaca key rotation + git history purge = user actions.
+
+---
+Task ID: 9-d
+Agent: dep-prune
+Task: Remove zero-reference dependencies from package.json (10/10 program, dep-pruning debt)
+
+Work Log:
+- Method: for EACH of the 79 entries in package.json (69 deps + 10 devDeps) ran quoted-reference search `["']<pkg>(["'/]|$)` via rg over src/ scripts/ scripts-tmp/ tests/ examples/ mini-services/ prisma/ public/ download/ + next.config.ts tsconfig.json postcss.config.mjs tailwind.config.ts eslint.config.mjs components.json Caddyfile .env.example, excluding node_modules/.next/bun.lock/tool-results/screens-tmp/upload/binary+log files; then a case-insensitive word-boundary sweep of every zero-hit candidate across the WHOLE repo (including skills/) to catch unquoted refs; also verified no kept package peer/depends on candidates via bun.lock.
+- Config evidence: tailwind.config.ts imports tailwindcss + tailwindcss-animate; postcss.config.mjs imports @tailwindcss/postcss; eslint.config.mjs imports eslint-config-next; components.json iconLibrary=lucide. tsconfig.json include = `**/*.ts(x)` → examples/ and mini-services/ ARE typechecked, so examples refs count as real usage (socket.io-client kept via examples + src/lib/stream-client.ts; mini-services' own socket.io dep is independent).
+- REMOVED 15 (zero refs anywhere, only package.json+bun.lock mention them): @dnd-kit/core, @dnd-kit/sortable, @dnd-kit/utilities, @hookform/resolvers, @mdxeditor/editor, @reactuses/core, @tanstack/react-query, @tanstack/react-table, date-fns, next-auth, next-intl, react-markdown, react-syntax-highlighter, uuid (only "uuid" hit repo-wide = a COMMENT in trading.ts:449), bun-types (devDep; zero refs, no "types" field in tsconfig, no /// reference anywhere, zero `Bun.` usage in any typechecked .ts → tsc-neutral).
+- KEPT with evidence: sharp — LandingPage.tsx:6 uses next/image and eslint config disables no-img-element elsewhere → sharp still required for prod image optimization under output:"standalone"; z-ai-web-dev-sdk — used only in scripts-tmp probes (daytrade-research*.mjs, algo-research.mjs) = dev tooling per constraints; qrcode+@types/qrcode — src/app/api/auth/2fa/setup/route.ts:5; framer-motion — LandingPage.tsx:7 (audit had flagged it, but it IS referenced); @types/react/@types/react-dom — implicit types for kept react/react-dom; prisma (CLI for db:* scripts) + @prisma/client (9 hits); all 29 @radix-ui/* (1+ hits each in src/components/ui/*); date-fns remains in tree as react-day-picker@9.13.0's own declared dependency (bun.lock:1066) — only our direct edge was removed; socket.io-client — src/lib/stream-client.ts + examples; recharts (ui/chart.tsx, ReportTab, BacktestCharts), zustand (store/terminal.ts, ChartPanel), lightweight-charts (ChartPanel), cmdk/input-otp/embla/vaul/react-day-picker/react-resizable-panels/sonner/next-themes/clsx/tailwind-merge/class-variance-authority all referenced in src/components/ui/* and app code.
+- Applied `bun remove` (one command, 15 pkgs) — Saved lockfile, "Removed: 15", no failures. Follow-up `bun install` → "Checked 570 installs across 622 packages (no changes)".
+- VERIFY: `bunx tsc --noEmit` output BYTE-IDENTICAL to pre-removal baseline (8 pre-existing errors, all in examples/websocket/server.ts, scripts-tmp/*.ts, skills/*, tests/totp.test.ts — zero new errors in src/). `bun run lint` → exit 0, zero warnings/errors. `curl /api/health` → 200 {"status":"ok","uptimeSec":3059,"memoryMB":1488,"db":true,"stream":"up","version":"v1.80.0+109"} (dev server not restarted; picks up pruned tree on next restart, as expected). No source files touched: git status shows ONLY package.json + bun.lock modified; bars-cache.ts / TerminalRoot.tsx untouched; dev server not restarted/killed; no build run.
+- NOTE: bun v1.3.14 does not GC physically-present-but-unlocked orphan dirs — node_modules/@dnd-kit/accessibility, @tanstack/query-core, @tanstack/table-core, @mdxeditor/gurx + empty @hookform/@reactuses dirs remain on disk (0 lockfile entries, nothing imports them, fresh `rm -rf node_modules && bun install` will not recreate them). Harmless; optionally clean by hand.
+
+Stage Summary:
+- Removed 15 deps (14 deps + 1 devDep): @dnd-kit/core @dnd-kit/sortable @dnd-kit/utilities @hookform/resolvers @mdxeditor/editor @reactuses/core @tanstack/react-query @tanstack/react-table date-fns next-auth next-intl react-markdown react-syntax-highlighter uuid bun-types → package.json 79→64 entries (69→55 deps, 10→9 devDeps); bun.lock pruned of all 15 (date-fns retained only as react-day-picker transitive). Kept 2 audit-flagged deps that ARE referenced: framer-motion (LandingPage motion), sharp (next/image on landing + prod optimizer). du node_modules still reads 1.2G at GB granularity (small dirs; real win shows on fresh install + faster install/build graph). tsc identical to baseline (no new errors anywhere, incl. mini-services which lost bun-types), lint clean 0/0, health 200 ok/stream:up. Remaining R10 follow-ups for a later pass: second-order pruning of unused src/components/ui/* shadcn files (would unlock ~12 more radix/embla/cmdk/input-otp/vaul/react-day-picker edges), and orphan-dir GC via clean install.
+
+---
+Task ID: 9
+Agent: Z.ai Code (main)
+Task: 10/10 program residual debts — OOM structural mitigation, poll-multiplication verdict, dep pruning, secret redaction, E2E, history purge
+
+Work Log:
+- Swap: NOT feasible (uid 1001, no CAP_SYS_ADMIN — swapon EPERM). Documented as platform constraint; mitigated in code instead.
+- src/lib/bars-cache.ts: hard LRU cap MAX_ENTRIES=8 (~400MB worst case) + recency refresh on hit. Previously entries lived FOREVER (TTL only governed freshness) — the audit's ~600MB unbounded growth path.
+- Dev restarts now export NODE_OPTIONS=--max-old-space-size=1800: a runaway sweep degrades into ONE catchable RangeError (route 500) instead of a kernel OOM that kills the server.
+- NEW scripts-tmp/ops-watchdog.sh: single-instance watchdog (pidfile /tmp/bh-watchdog.pid), 60s cadence — restarts dev when / is down x2 probes OR next-server RSS > 2.3GB sustained x2 (pre-OOM), warm-compiles after restart, logs to scripts-tmp/watchdog.log. Launched via the Task 8 surviving double-fork pattern (pid 28802 confirmed).
+- Dep pruning (subagent Task 9-d): 15 zero-reference packages removed — next-auth, @tanstack/react-query, @tanstack/react-table, @dnd-kit/core+sortable+utilities, @mdxeditor/editor, react-syntax-highlighter, react-markdown, @reactuses/core, @hookform/resolvers, date-fns, next-intl, uuid, bun-types. tsc --noEmit byte-identical to baseline (8 pre-existing errors confined to examples/, scripts-tmp/, tests/), lint exit 0, package.json 79->64 entries.
+- Poll multiplication VERDICT — no code change: TerminalRoot intervals are dirty-gated layout autosave + 20-60s checks; server-side coalescing already shipped (5s quote micro-cache, alerts supervisor 15s cadence < barsFor TTL 20s, warm alerts/check cache). A client-side poll-bus refactor is negative ROI at current cadences.
+- worklog.md: test-account TOTP + password redacted from HEAD (P7FT****KI2J / S****99).
+- Controlled dev restart picked up everything (UP in 3s, build +111, health ok, stream up).
+- E2E (agent-browser): landing clean 0 errors; session survives restart (DB-backed JWT); terminal 0 page errors; BTC/USD 8 chart canvases + stream chip "live"; Positions tab equity curve renders; Algo Trading -> Backtest shows RECOMMENDED SETUPS with honesty methodology line, Lev default 1x, SCORE + OOS columns including a losing OOS row (-0.43%, honesty over flattery); mobile 390px no horizontal scroll; /api/health {"status":"ok","memoryMB":1786,"stream":"up"}.
+- Version stamp v1.18.0 -> v1.19.0 (LandingPage footer).
+
+Stage Summary:
+- OOM structural risk now bounded three ways: LRU bars cache (growth eliminated), 1.8GB V8 ceiling (request-scoped failure), ops-watchdog (self-healing restart ~2min after death or memory runaway). Reliability/HA: server recovers without agent intervention.
+- Dep graph slimmed 15 packages. Remaining USER actions: Alpaca key rotation (broker dashboard); git history purge executed next (9-g, force-push rewrite).
