@@ -2850,3 +2850,21 @@ Stage Summary:
 - Optimizer/Sweep/Walk-forward now survive ANY proxy/host: work runs detached, progress streams live (fetch → grid → OOS → hold-out), results persist in-process for 10min, and failures surface as honest messages instead of empty 502s.
 - Cached deep history now covers ALL timeframes incl. 1m — the tune→optimize loop re-runs in sub-second on warm bars.
 - Note for Render: jobs are in-process — a pod restart mid-job surfaces as "Job not found — the server may have restarted" (honest, retryable). Next deploy picks this up automatically from main.
+
+---
+Task ID: 14
+Agent: Z.ai Code (main session)
+Task: Fix "Cannot read properties of null (reading 'toFixed')" runtime crash in Backtest > Auto Optimizer; push.
+
+Work Log:
+- Root-caused the crash: `backtestScore()` scores rows below `minTrades` as `-Infinity` (src/lib/backtest.ts), but `JSON.stringify` (used by BOTH the inline POST and the Task-15 background-job poll via NextResponse.json) coerces ±Infinity to `null`. The client guarded `row.score === -Infinity ? '—' : row.score.toFixed(2)` — never matches `null` → `null.toFixed(2)` → full-panel runtime crash whenever the optimizer table contained a non-scorable row (guaranteed when few/no combos clear minTrades).
+- Server fix (src/app/api/algo/backtest/route.ts): added `jsonSafe()` deep wire sanitizer (non-finite numbers → null, arrays/objects walked, depth-capped) applied at the single serialization boundary — both the inline response and `completeJob()` now pass through it, making the implicit JSON coercion explicit and uniform for run/optimize/sweep/walkforward payloads.
+- Client fix (src/components/terminal/tabs/BacktestPanel.tsx): new `fmtScore()` helper (null/undefined/non-finite → '—'); applied to every score cell: optimizer table, sweep table, walk-forward fold IS score, recommended-setups score, plateau/sensitivity tooltips. Hardened the sensitivity gate from `best.score > -Infinity` (true for null — wrong over the wire) to `Number.isFinite(best.score)`.
+- Docs: backtestScore()/OptimizeRow.score comments now state the wire behavior (±Infinity never reaches the wire).
+- Version bumped 1.80.0 → 1.80.1 (version.ts auto-restamps).
+- Verified: bun run lint clean; API-level test (QA user + forged session) with minTrades=200 returned `"score": null` rows + `best: null` — the exact pre-fix crash input; browser end-to-end (agent-browser, QA session): ran the optimizer via the real UI, table rendered all score cells as '—' with NET %/PF/WIN %/DD %/TRADES intact, zero page errors, zero console errors. QA user + script deleted afterwards. NOTE: dev server died silently once during testing (unrelated fluke — restarted and survived the full optimizer run).
+
+Stage Summary:
+- Bug: optimizer null-score crash FIXED at both the wire boundary (jsonSafe) and the render layer (fmtScore). Same hardening covers sweep / walk-forward / recommendations score cells.
+- Files: src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx, src/lib/backtest.ts, package.json, src/generated/version.ts.
+- Verified end-to-end in browser (v1.80.1+165): optimizer table renders '—' for non-scorable rows, no runtime error.

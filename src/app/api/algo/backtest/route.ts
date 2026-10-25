@@ -74,6 +74,34 @@ const MAX_BARS = 120_000
 /** Task 15 — heavy modes run detached as background jobs. */
 const JOB_MODES = new Set(['optimize', 'sweep', 'walkforward'])
 
+/**
+ * v1.80.1 — wire sanitizer for backtest payloads. The engines score rows that
+ * clear `minTrades` with a Calmar-style number and rows that DON'T with
+ * `-Infinity` (listed, never "best") — but JSON.stringify coerces ±Infinity/NaN
+ * to `null`, so the client received `score: null` while still guarding
+ * `score === -Infinity` → "Cannot read properties of null (reading 'toFixed')"
+ * the moment an optimizer table contained a non-scorable row. Applying this
+ * deep walk at the single serialization boundary makes the implicit JSON
+ * coercion EXPLICIT and uniform for the inline POST and the job poll (both
+ * share computeBacktest bodies). The UI renders null scores as '—'.
+ */
+function jsonSafe<T>(v: T, depth = 0): T {
+  if (v == null || typeof v !== 'object') {
+    return typeof v === 'number' && !Number.isFinite(v) ? (null as T) : v
+  }
+  if (depth > 24) return v // backtest payloads are plain shallow trees; belt for pathological input
+  if (Array.isArray(v)) {
+    const out = new Array(v.length)
+    for (let i = 0; i < v.length; i++) out[i] = jsonSafe(v[i], depth + 1)
+    return out as T
+  }
+  const out: Record<string, unknown> = {}
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    out[k] = jsonSafe(val, depth + 1)
+  }
+  return out as T
+}
+
 /** Task 15 — wire format for the equity curve: ≤500 points (stride + first/last). */
 function downsampleEquity(equity: { t: number; equity: number }[]): { t: number; equity: number }[] {
   if (equity.length <= 500) return equity
@@ -169,7 +197,7 @@ export async function POST(req: NextRequest) {
       void (async () => {
         try {
           const r = await computeBacktest(user.id, body, jobProgress(job))
-          if (r.status === 200) completeJob(job, r.body)
+          if (r.status === 200) completeJob(job, jsonSafe(r.body))
           else failJob(job, typeof r.body.error === 'string' ? r.body.error : `HTTP ${r.status}`)
         } catch (e) {
           failJob(job, e instanceof Error ? e.message : 'Backtest failed')
@@ -185,7 +213,7 @@ export async function POST(req: NextRequest) {
     }
     try {
       const r = await computeBacktest(user.id, body)
-      return NextResponse.json(r.body, { status: r.status })
+      return NextResponse.json(jsonSafe(r.body), { status: r.status })
     } finally {
       releaseBacktestSlot(user.id)
     }

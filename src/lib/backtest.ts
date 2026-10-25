@@ -777,7 +777,10 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
 // ---------------------------------------------------------------------------
 
 /** Calmar-style composite: net return % over max drawdown %. Runs with fewer
- *  than minTrades are scored -Infinity (listed, never "best"). */
+ *  than minTrades are scored -Infinity (listed, never "best").
+ *  v1.80.1 — ±Infinity NEVER reaches the wire: JSON.stringify coerces it to
+ *  null, so the route sanitizes payloads (jsonSafe) and the UI renders null
+ *  scores as '—' — never `.toFixed` on a raw score over the wire. */
 export function backtestScore(m: BacktestMetrics, minTrades: number): number {
   if (m.trades < minTrades) return -Infinity
   const dd = Math.max(m.maxDrawdownPct, 0.5)
@@ -797,7 +800,7 @@ export interface OptimizeRange {
 
 export interface OptimizeRow {
   params: Record<string, number>
-  score: number
+  score: number // in-memory: -Infinity when below minTrades → null on the wire (jsonSafe)
   metrics: BacktestMetrics
 }
 

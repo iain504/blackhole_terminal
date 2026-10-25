@@ -102,6 +102,12 @@ const fmtPx = (v: number) => (Math.abs(v) >= 100 ? v.toFixed(2) : v.toFixed(4))
 const fmtDayY = (t: number) => new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' })
 const fmtClockT = (t: number) =>
   new Date(t * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+// v1.80.1 — scores travel as JSON: the engine scores below-minTrades rows as
+// -Infinity, which JSON.stringify coerces to `null` on the wire — so a raw
+// `.toFixed(2)` crashed the whole panel ("Cannot read properties of null")
+// whenever an optimizer table contained a non-scorable row. Render null /
+// non-finite as '—' (not scorable) at every score cell instead.
+const fmtScore = (v: number | null | undefined) => (v == null || !Number.isFinite(v) ? '—' : v.toFixed(2))
 
 // Task 88 — market-typical execution costs (bps) so the cost model starts
 // honest instead of frictionless:
@@ -1157,7 +1163,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                           ))}
                         </span>
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{row.score === -Infinity ? '—' : row.score.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{fmtScore(row.score)}</td>
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(row.metrics.netPct))}>{fmtPct(row.metrics.netPct)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.profitFactor >= 999 ? '∞' : row.metrics.profitFactor.toFixed(2)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.winRate.toFixed(0)}%</td>
@@ -1173,7 +1179,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
           )}
           {/* Task 12 — plateau analysis on the winner (improvement plan P1) */}
-          {optRes.sensitivity && optRes.sensitivity.length > 0 && optRes.best && optRes.best.score > -Infinity && (
+          {optRes.sensitivity && optRes.sensitivity.length > 0 && optRes.best && Number.isFinite(optRes.best.score) && (
             <div className="border-t border-zinc-800/60 px-3 py-2">
               <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">Best-row sensitivity (±1 grid step)</p>
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
@@ -1182,7 +1188,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                     key={s.key}
                     variant="outline"
                     className="text-[10px] tabular-nums text-zinc-400"
-                    title={`Re-running the winner with ${paramLabel(cfg.strategy, s.key)} one grid step lower/higher scores ${s.down ?? '—'} / ${s.up ?? '—'} (best ${optRes.best!.score.toFixed(2)}). Null = the step falls outside the grid.`}
+                    title={`Re-running the winner with ${paramLabel(cfg.strategy, s.key)} one grid step lower/higher scores ${s.down ?? '—'} / ${s.up ?? '—'} (best ${fmtScore(optRes.best?.score)}). Null = the step falls outside the grid.`}
                   >
                     {paramLabel(cfg.strategy, s.key)}: {s.down == null ? '—' : s.down.toFixed(2)} / {s.up == null ? '—' : s.up.toFixed(2)}
                   </Badge>
@@ -1191,7 +1197,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                   <Badge
                     variant="outline"
                     className={optRes.plateau.ok ? 'border-emerald-500/40 text-[10px] text-emerald-400' : 'border-amber-500/40 text-[10px] text-amber-400'}
-                    title={`Mean neighbor score ${optRes.plateau.meanNeighborScore.toFixed(2)} = ${(optRes.plateau.ratio * 100).toFixed(0)}% of the winner. ≥70% = broad plateau (robust), below = fragile peak (likely overfit).`}
+                    title={`Mean neighbor score ${fmtScore(optRes.plateau.meanNeighborScore)} = ${(optRes.plateau.ratio * 100).toFixed(0)}% of the winner. ≥70% = broad plateau (robust), below = fragile peak (likely overfit).`}
                   >
                     {optRes.plateau.ok ? 'plateau ✓ stable' : '⚠ fragile peak'}
                   </Badge>
@@ -1291,7 +1297,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                           {row.boundary && <BoundaryChip />}
                         </span>
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{row.score.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{fmtScore(row.score)}</td>
                       <OosCell oos={row.oos} />
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(row.metrics.netPct))}>{fmtPct(row.metrics.netPct)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{row.metrics.profitFactor >= 999 ? '∞' : row.metrics.profitFactor.toFixed(2)}</td>
@@ -1399,7 +1405,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                       <td className="px-2.5 py-1.5 tabular-nums text-zinc-500">{f.fold}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400">{fmtDayY(f.isFrom)} → {fmtDayY(f.isTo)}</td>
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(f.isNetPct))}>{f.isTrades > 0 ? fmtPct(f.isNetPct) : '—'}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.isScore == null ? '—' : f.isScore.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{fmtScore(f.isScore)}</td>
                       <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400">{fmtDayY(f.oosFrom)} → {fmtDayY(f.oosTo)}</td>
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', f.oosTrades > 0 ? pnlColor(f.oosNetPct) : 'text-zinc-600')}>{f.oosTrades > 0 ? fmtPct(f.oosNetPct) : '—'}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.oosTrades > 0 ? `${f.oosWinRate.toFixed(0)}%` : '—'}</td>
@@ -1531,7 +1537,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                       <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-zinc-400" title="slippage / fee / spread (bps) this setup was measured with">
                         {rec.slipBps}/{rec.feeBps}/{rec.spreadBps}
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{rec.score.toFixed(2)}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-200">{fmtScore(rec.score)}</td>
                       <OosCell oos={rec.oos} />
                       <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(rec.netPct))}>{fmtPct(rec.netPct)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{rec.pf >= 999 ? '∞' : rec.pf.toFixed(2)}</td>
