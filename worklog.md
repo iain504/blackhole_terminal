@@ -2770,3 +2770,17 @@ Stage Summary:
 - Render deploys now self-heal any bad DATABASE_URL: boot log shows "[entrypoint] ⚠ … falling back to file:/app/db/custom.db" then "database ready: … (N bytes)" before the server starts.
 - User-side recommended action: delete DATABASE_URL from the Render dashboard env (or set file:/app/db/custom.db) and redeploy; fresh ephemeral DB each deploy → register a new account on the Render instance (ALLOW_REGISTRATION=true), paste Alpaca paper keys in the Environment tab.
 - Free-tier constraints unchanged and documented: ephemeral disk, 15-min spin-down, no stream sidecar (REST polling).
+---
+Task ID: 13-render-fix-2
+Agent: Z.ai Code (main)
+Task: Fix Render boot #2 — "Cannot find package 'effect' from /app/node_modules/@prisma/config/dist/index.js" (db push failed → zero tables → every query errored "table does not exist").
+
+Work Log:
+- Root cause: runner stage cherry-picked node_modules/{prisma,@prisma,.bin} from the deps install, but prisma CLI 6.19 needs transitive runtime deps via @prisma/config (effect 3.18, c12, deepmerge-ts, empathic — and c12's own closure). Latent since Task 11; surfaced by 13-render-fix's loud logging.
+- Reproduced BOTH sides in sandbox: cherry-pick tree → `Cannot find module 'effect'`; dedicated production-only install (package.json+bun.lock+prisma, `bun install --frozen-lockfile --production`, 240 pkgs) → `bunx prisma db push` succeeds, schema created (225KB db).
+- Dockerfile: new `prisma-cli` stage (production-only install = automatic version-proof closure); runner now COPYs its full node_modules FIRST, then standalone bundle OVER it (next's traced subset wins on identical-version overlap, CLI closure fills the gaps); added build-time smoke test `RUN bunx prisma -v` so any future closure regression fails the image BUILD instead of silently failing at every boot.
+- Stamp v1.80.0+150.
+
+Stage Summary:
+- Render redeploy expectation: build passes smoke test; boot log shows "[entrypoint] applying prisma schema…" → "database ready: /app/db/custom.db (N bytes)" with NO "table does not exist" spam after; register a fresh account (ephemeral free-tier DB resets each deploy).
+- docker-compose stack inherits the same fix (single Dockerfile).

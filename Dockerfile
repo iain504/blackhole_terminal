@@ -1,7 +1,7 @@
-# BLACKHOLE Terminal — production image (Task 11-d).
+# BLACKHOLE Terminal — production image (Task 11-d, runner fixed in Task 13).
 # Multi-stage, Bun-native, Prisma/SQLite inside. The app builds to a Next.js
-# standalone bundle; the runner copies only what the server (and `prisma db
-# push` at boot) needs.
+# standalone bundle; the runner merges it with a production-only node_modules
+# so the boot-time `prisma db push` has its complete dependency closure.
 #
 #   docker build -t blackhole-terminal .
 #   docker run -p 3000:3000 -v "$PWD/db:/app/db" \
@@ -17,6 +17,17 @@ COPY package.json bun.lock ./
 COPY prisma ./prisma
 RUN bun install --frozen-lockfile
 RUN bunx prisma generate
+
+# ---- prisma-cli: production-only tree for the boot-time `prisma db push` -----
+# The CLI's transitive runtime deps (@prisma/config → effect, c12, deepmerge-ts,
+# empathic, …) change between prisma releases — cherry-picking node_modules/prisma
+# + node_modules/@prisma broke the Render boot with "Cannot find package 'effect'".
+# A production-only install IS the automatic, version-proof closure (no devDeps).
+FROM oven/bun:1 AS prisma-cli
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY prisma ./prisma
+RUN bun install --frozen-lockfile --production
 
 # ---- build: next build (standalone) + static asset copy ----------------------
 FROM oven/bun:1 AS build
@@ -34,15 +45,19 @@ ENV NODE_ENV=production \
     PORT=3000 \
     DATABASE_URL=file:/app/db/custom.db
 
+# Full production node_modules first (Prisma CLI closure base), then the
+# standalone bundle OVER it — next's traced subset wins on overlap (identical
+# versions per bun.lock), the CLI closure fills everything else.
+COPY --from=prisma-cli /app/node_modules ./node_modules
 # Standalone bundle (server.js + traced deps) and the static/public assets.
 COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
-# Prisma CLI + engines + schema for the entrypoint's `prisma db push`.
-COPY --from=deps /app/node_modules/prisma ./node_modules/prisma
-COPY --from=deps /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=deps /app/node_modules/.bin ./node_modules/.bin
+# Schema for the entrypoint's `prisma db push`.
 COPY prisma ./prisma
+# Build-time smoke test: if the CLI dependency closure is ever incomplete
+# again, the image build fails HERE — never again silently at boot.
+RUN bunx prisma -v > /dev/null 2>&1
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
