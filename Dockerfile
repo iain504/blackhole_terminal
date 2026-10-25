@@ -39,6 +39,19 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+# v1.80.2 — source-completeness guard: a stale/partial copy of the repo (an
+# old ZIP downloaded weeks ago, a partial extract, a moved subfolder) reaches
+# Docker with src/ gutted and dies deep inside next build with a cryptic
+# "Module not found: Can't resolve '@/lib/auth'". Fail HERE instead, loudly,
+# with the fix. (GitHub's zipball of main is complete — verified 49 files
+# under src/lib at 8a5c7ef — so a missing dir always means a bad local copy.)
+RUN test -f src/lib/auth.ts && test -f prisma/schema.prisma \
+  || (echo "" \
+   && echo "ERROR: the Docker build context is INCOMPLETE — src/lib (or prisma/) is missing." \
+   && echo "Your local copy of the repository is stale or was partially extracted." \
+   && echo "Fix: re-download the full repository (or git clone it) and build from its root:" \
+   && echo "  docker compose up -d --build" \
+   && exit 1)
 # `bun run build` = prebuild version stamp → next build → static copy.
 RUN bun run build
 

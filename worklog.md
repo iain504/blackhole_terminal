@@ -2880,3 +2880,18 @@ Work Log:
 
 Stage Summary:
 - origin/main = 8a5c7ef, working tree clean, 0 commits ahead. The old PAT in the helper had been revoked — new one works.
+
+---
+Task ID: 15
+Agent: Z.ai Code (main session)
+Task: User's local Docker Desktop build fails — "public archive is missing src/lib" → unresolved imports like @/lib/auth. Diagnose + harden.
+
+Work Log:
+- Verified the repo is COMPLETE: 48 files tracked under src/lib; GitHub API confirms src/lib exists on origin/main; downloaded the official zipball of main (8a5c7ef) — 49 src/lib entries present. .dockerignore does NOT exclude src/lib; Dockerfile builds from `COPY . .` at the repo root.
+- Conclusion: the user's build context is stale/partial (old ZIP, partial extract, or copied-out subset) — GitHub's archive of main is provably complete.
+- Hardened the Dockerfile (v1.80.2): source-completeness guard in the build stage — fails fast with a loud, actionable message when src/lib/auth.ts or prisma/schema.prisma are missing from the context, instead of a cryptic "Module not found: Can't resolve '@/lib/auth'" deep inside next build. Guard logic shell-tested (pass on complete tree, exit 1 on empty dir).
+- README Option A: added the matching troubleshooting note (symptom → cause → re-download/clone → build from repo root).
+- Bumped package.json 1.80.1 → 1.80.2. Docker unavailable in the sandbox, so no end-to-end image build test — the guard is unit-tested at shell level.
+
+Stage Summary:
+- Repo verified complete; failure is local to the user's copy. Dockerfile + README now self-diagnose this failure mode. Committed and pushed for the user to re-pull.
