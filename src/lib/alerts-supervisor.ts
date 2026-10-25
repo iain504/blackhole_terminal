@@ -9,11 +9,13 @@
 // a concurrently polling browser tab).
 import { db } from '@/lib/db'
 import { evaluateAlerts } from '@/lib/alerts-eval'
+import { memWatchdogTick } from '@/lib/mem-watchdog'
 
 const SUPERVISOR_MS = 15000 // < barsFor TTL (20s) — supervisor keeps the cache warm for client polls
+const MEM_TICK_CYCLES = 2 // watchdog every 30s
 
 type GlobalWithAlerts = typeof globalThis & {
-  __ttAlertsSupervisor?: { timer: ReturnType<typeof setInterval>; busy: boolean }
+  __ttAlertsSupervisor?: { timer: ReturnType<typeof setInterval>; busy: boolean; tick: number }
 }
 
 async function cycle(): Promise<void> {
@@ -22,6 +24,10 @@ async function cycle(): Promise<void> {
   if (!state || state.busy) return // previous cycle still running — skip
   state.busy = true
   try {
+    // memory watchdog (Task 13): telemetry + clean exit at the RSS ceiling
+    state.tick = (state.tick || 0) + 1
+    if (state.tick % MEM_TICK_CYCLES === 0) memWatchdogTick()
+
     // cheap gate: the vast majority of cycles have nothing to watch
     const active = await db.alert.count({ where: { status: 'active' } })
     if (active === 0) return
@@ -59,8 +65,10 @@ export function startAlertsSupervisor(): void {
   if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
     ;(timer as { unref: () => void }).unref()
   }
-  g.__ttAlertsSupervisor = { timer, busy: false }
+  g.__ttAlertsSupervisor = { timer, busy: false, tick: 0 }
   console.log(`[alerts] supervisor started (every ${SUPERVISOR_MS / 1000}s)`)
+  // baseline memory line (Task 13) — the RSS curve starts here
+  memWatchdogTick()
   // first pass right away — catch anything that fired while the process was
   // down (busy flag + claims make this safe even if the poll races it)
   void cycle()

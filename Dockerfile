@@ -9,9 +9,13 @@
 #
 # Version stamping: stamp-version.mjs degrades gracefully without .git
 # (v1.80.0-dev style). Pass --build-arg only if you need exact counters.
+#
+# Bun is PINNED to the 1.3 line: the floating oven/bun:1 tag shipped 1.4.4 on
+# Render while this app is validated on 1.3.x (dev + all tests). Bump only
+# after re-validating the full stack on the new minor.
 
 # ---- deps: install + prisma client (cached until lockfile/schema change) ----
-FROM oven/bun:1 AS deps
+FROM oven/bun:1.3 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 COPY prisma ./prisma
@@ -23,14 +27,14 @@ RUN bunx prisma generate
 # empathic, …) change between prisma releases — cherry-picking node_modules/prisma
 # + node_modules/@prisma broke the Render boot with "Cannot find package 'effect'".
 # A production-only install IS the automatic, version-proof closure (no devDeps).
-FROM oven/bun:1 AS prisma-cli
+FROM oven/bun:1.3 AS prisma-cli
 WORKDIR /app
 COPY package.json bun.lock ./
 COPY prisma ./prisma
 RUN bun install --frozen-lockfile --production
 
 # ---- build: next build (standalone) + static asset copy ----------------------
-FROM oven/bun:1 AS build
+FROM oven/bun:1.3 AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
@@ -39,7 +43,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN bun run build
 
 # ---- runner: standalone server + prisma CLI for the boot-time db push --------
-FROM oven/bun:1 AS runner
+FROM oven/bun:1.3 AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000 \

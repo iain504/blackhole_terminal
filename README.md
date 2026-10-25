@@ -226,6 +226,8 @@ Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite 
 
 **Troubleshooting — Prisma `Error code 14: Unable to open the database file`**: your Render service has a `DATABASE_URL` pointing outside the container (e.g. a dev path like `file:/home/z/my-project/db/custom.db`). The entrypoint self-heals since Task 13 (falls back to `file:/app/db/custom.db` with a loud boot log), but the clean fix is to delete the `DATABASE_URL` env var in the Render dashboard — the image default is identical — or set it to `file:/app/db/custom.db`, then redeploy. On Render, `DATABASE_URL` must always live under `/app`.
 
+**Created the service manually (not via Blueprint)?** Later `render.yaml` changes do NOT apply to it — env vars must be maintained in the dashboard's Environment tab. The free-tier memory hardening expects: `MEM_RSS_CEILING_MB=460`, `BUN_JSC_forceRamSize=268435456`, `NODE_OPTIONS=--max-old-space-size=256` (or delete the service and re-apply the Blueprint). The boot log prints one `[mem] rss … · heap …` line every 30s — a climbing RSS curve that ends in `[mem] RSS … reached the … ceiling — exiting` is the memory diagnosis; a bare 502 with a flat RSS curve points at the Render dashboard's Events/Metrics instead.
+
 ### Option C — systemd
 
 ```bash

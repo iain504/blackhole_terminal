@@ -2800,3 +2800,18 @@ Work Log:
 Stage Summary:
 - The 502 most plausibly = OOM crash-loop (silent SIGKILL) possibly triggered by dashboard-opening request bursts; new deploy hardens RSS ceiling + kicks the service out of restart backoff. If 502 persists post-deploy: check Render dashboard Events (crash markers) + Metrics→Memory sawtooth at 512MB, and whether other free services consume the shared 750 instance-hours.
 - Free-tier spin-down also wipes the ephemeral disk (the 19:37 boot printed the fresh-database hint) — account created on Render is session-scoped by design.
+---
+Task ID: 13-render-fix-4
+Agent: Z.ai Code (main)
+Task: Render still 502 after healthy boot #3 (19:58 "live 🎉") — instant bare 502 from Render's edge, pod unreachable within minutes.
+
+Work Log:
+- Probed with full headers: HTTP/2 502, content-length 0, x-render-origin-server: Render — Render's own edge has NO upstream instance 3 min after a health-checked "live"; not cold-start, not Cloudflare.
+- Key realization: the service was created MANUALLY (proved by the original wrong DATABASE_URL) → render.yaml env changes NEVER applied to it → last commit's MEM_RSS_CEILING_MB/BUN_JSC_forceRamSize hardening was inert on the user's instance.
+- Dockerfile floated oven/bun:1 → Render built Bun 1.4.4, an unvalidated minor (sandbox/dev run 1.3.14 where the full stack works).
+- Shipped: (1) src/lib/mem-watchdog.ts — [mem] rss/heap telemetry line every 30s (prod or MEM_LOG=1), hard GC (Bun.gc(true)) at 90% of MEM_RSS_CEILING_MB, clean logged process.exit(1) at 100% (a cgroup OOM-kill is silent; a clean exit explains itself in the log); wired into the alerts supervisor heartbeat + boot baseline; validated all three modes (telemetry / ceiling-exit=1 / silent-dev). (2) Dockerfile: Bun pinned to oven/bun:1.3 across all four stages. (3) README: manual-service env-var warning (render.yaml changes don't apply; add MEM_RSS_CEILING_MB=460, BUN_JSC_forceRamSize=268435456, NODE_OPTIONS=--max-old-space-size=256 in the Environment tab).
+- lint clean; tsc clean for changed files (pre-existing errors only in untracked examples/scripts-tmp/skills + tests bun:test types); dev restarted clean on HEAD; stamp v1.80.0+152.
+
+Stage Summary:
+- Next deploy is self-diagnosing: [mem] lines every 30s reveal whether RSS climbs (OOM path) or stays flat (points to Render Events/Metrics: crash markers, instance-hours, or router). If the ceiling exit fires, the log names it explicitly instead of vanishing.
+- Still need from the user's dashboard: Events tab entries after 19:58 + Metrics→Memory graph + whether other free services share the 750 instance-hours.
