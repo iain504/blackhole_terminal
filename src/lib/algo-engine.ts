@@ -25,6 +25,17 @@ import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
+import {
+  adxSeries,
+  halfLifeSeries,
+  regimeCfgFromParams,
+  regimeVeto,
+  anyRegimeActive,
+  REGIME_TREND_SMA,
+  ADX_PERIOD,
+  HL_LOOKBACK,
+  HL_SMA_PERIOD,
+} from '@/lib/algo-regime'
 
 const CYCLE_MS = 15000
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
@@ -74,6 +85,8 @@ interface AlgoState {
   orDone?: boolean // opening range captured
   firedLong?: boolean // ORB: entry-per-side memory
   firedShort?: boolean
+  orVolSum?: number // Task 12 — OR volume accumulator (breakout participation filter)
+  orVolN?: number
   // re-entry control (Task 70-c) — persisted so restarts keep the gates
   hadPosition?: boolean // broker position present on the PREVIOUS cycle
   cooldownUntil?: number // epoch ms — no entries before this after a close
@@ -146,9 +159,10 @@ async function flattenPosition(userId: string, mode: TradeMode, symbol: string):
 
 // ---- strategy evaluation ----------------------------------------------------
 
-// Exported for parity probes (scripts-tmp) — must stay PURE (no I/O) so the
-// backtest engine can diff its own decide() against this live evaluator.
-export function evalStrategy(
+// Raw strategy logic — entries/exits ONLY from the strategy's own rules.
+// evalStrategy() wraps this with the Task 12 regime gates so the vetoes can
+// never drift between the backtest (backtest.ts decide()) and live.
+function evalRaw(
   strategy: AlgoStrategyId,
   params: Record<string, number>,
   bars: BarRow[],
@@ -257,6 +271,56 @@ export function evalStrategy(
   }
 }
 
+/**
+ * Live evaluator — raw strategy rules + the Task 12 quality gates. Must stay
+ * PURE (no I/O) so the backtest engine can diff its own decide() against it
+ * (parity probes). Gates (improvement plan upload/algo_improvement.txt):
+ *   • P2 ORB participation filter — breakout bar volume ≥ × the opening-range
+ *     average (0 = off; no OR volume yet → fail-open);
+ *   • P0 regime trend gate — LONG only above the 200-SMA, SHORT only below;
+ *   • P0 ADX chop gate — mean-reversion entries only while ADX < adxMax;
+ *   • P1 half-life gate — entries only while the deviation reverts fast
+ *     enough (rolling OU fit). NaN inputs fail OPEN — a thin bar window must
+ *     never freeze a live strategy.
+ * Exits are NEVER gated — the regime veto only suppresses fresh entries.
+ */
+export function evalStrategy(
+  strategy: AlgoStrategyId,
+  params: Record<string, number>,
+  bars: BarRow[],
+  st: AlgoState,
+): EvalResult {
+  const out = evalRaw(strategy, params, bars, st)
+  if (out.entry == null) return out
+  // ---- ORB volume participation filter (P2) ----
+  if (strategy === 'orb15') {
+    const volMult = params.orbVolMult ?? 0
+    const volSum = st.orVolSum ?? 0
+    const volN = st.orVolN ?? 0
+    if (volMult > 0 && volN > 0 && volSum > 0) {
+      const avg = volSum / volN
+      if (avg > 0 && bars[bars.length - 1].volume < volMult * avg) {
+        return { entry: null, exit: out.exit }
+      }
+    }
+  }
+  // ---- regime gates (P0 trend / P0 ADX / P1 half-life) ----
+  const regCfg = regimeCfgFromParams(params)
+  if (!anyRegimeActive(regCfg)) return out
+  const n = bars.length
+  const closes = bars.map((b) => b.close)
+  const trendSma = regCfg.regimeTrend
+    ? (n >= REGIME_TREND_SMA
+        ? closes.slice(n - REGIME_TREND_SMA).reduce((a, b) => a + b, 0) / REGIME_TREND_SMA
+        : null) // insufficient history → fail-open (same rule as the backtest)
+    : null
+  const adxLast = regCfg.regimeAdx ? adxSeries(bars, ADX_PERIOD)[n - 1] : Number.NaN
+  const hlLast = regCfg.hlGate ? halfLifeSeries(closes, HL_LOOKBACK, HL_SMA_PERIOD)[n - 1] : Number.NaN
+  const veto = regimeVeto(regCfg, out.entry.side, closes[n - 1], trendSma, adxLast, hlLast)
+  if (veto != null) return { entry: null, exit: out.exit }
+  return out
+}
+
 /** Feed ONE closed bar into the day accumulators (session VWAP + opening
  *  range). Equity symbols: only TODAY's REGULAR-session bars count —
  *  restart-safe. Crypto symbols: ALL bars of the ET day count (crypto trades
@@ -280,6 +344,10 @@ function feedAccumulators(strategy: AlgoStrategyId, orMinutes: number, bar: BarR
     if (minutes >= orAnchor && minutes < orAnchor + orMinutes) {
       st.orHigh = st.orHigh == null ? bar.high : Math.max(st.orHigh, bar.high)
       st.orLow = st.orLow == null ? bar.low : Math.min(st.orLow, bar.low)
+      // Task 12 — OR volume average for the breakout participation filter
+      // (mirrors the backtest's orVolSum/orVolN accumulators)
+      st.orVolSum = (st.orVolSum ?? 0) + bar.volume
+      st.orVolN = (st.orVolN ?? 0) + 1
     } else if (minutes >= orAnchor + orMinutes && st.orHigh != null && st.orLow != null) {
       st.orDone = true
     }
@@ -374,6 +442,8 @@ async function cycle(runId: string) {
       st.orDone = false
       st.firedLong = false
       st.firedShort = false
+      st.orVolSum = 0
+      st.orVolN = 0
       await log(runId, run.userId, 'info', `New session ${dayKey} — counters reset`)
     }
 

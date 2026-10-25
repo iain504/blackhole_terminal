@@ -54,6 +54,19 @@ import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessi
 import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
 import type { Bar } from '@/lib/market-types'
 import { memoryGuard } from '@/lib/mem-guard'
+import {
+  adxSeries,
+  atrPctSeries,
+  halfLifeSeries,
+  regimeCfgFromParams,
+  regimeVeto,
+  anyRegimeActive,
+  REGIME_TREND_SMA,
+  ADX_PERIOD,
+  HL_LOOKBACK,
+  HL_SMA_PERIOD,
+  type RegimeCfg,
+} from '@/lib/algo-regime'
 
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — same as the live engine
 
@@ -91,6 +104,12 @@ export interface BacktestConfig {
   // (buy fills at ask, sell at bid — a round trip pays the full spread);
   // resting TP limits still fill at their price. Stacks with slippageBps.
   spreadBps?: number
+  // Task 12 — vol-scaled slippage (improvement plan P1): the slippageBps
+  // IMPACT component scales with THIS bar's ATR% vs the dataset average
+  // (clamped 0.5×..3×). The spread component stays static — a quote is not
+  // impact. No effect when slippageBps = 0. Default false = the exact
+  // historical constant-fill model.
+  dynSlip?: boolean
   // Task 3-d — buying-power cap. Max position notional = capital × maxNotionalX
   // (default 1 = no leverage beyond capital). Every entry (fixed AND risk-
   // derived sizing) is clamped to maxQty = (capital × maxNotionalX) / entryPx;
@@ -175,6 +194,12 @@ export interface BacktestSeries {
   // box. Safe: runs are sequential/single-threaded and each run re-fills the
   // whole array before the sim loop reads it.
   rsiScratch?: Float64Array
+  // Task 12 — param-independent regime/cost series, computed ONCE per dataset
+  // and reused by every optimizer combo (same pattern as the prefix sums):
+  adx: Float64Array // Wilder ADX(14) per bar — NaN before the seed index
+  hl: Float64Array // half-life (bars) of the close−SMA(50) deviation — NaN = fail-open, Infinity = trending
+  atrPct: Float64Array // Wilder ATR(14) / close per bar (vol-scaled slippage)
+  atrBase: number // mean ATR% across the dataset
 }
 
 export function prepareSeries(bars: Bar[]): BacktestSeries {
@@ -199,7 +224,15 @@ export function prepareSeries(bars: Bar[]): BacktestSeries {
     ps[i + 1] = ps[i] + b.close
     ps2[i + 1] = ps2[i] + b.close * b.close
   }
-  return { bars, n, dayIdx, minutes, rth, ps, ps2 }
+  // Task 12 — regime gates + vol-scaled cost series (once per dataset).
+  // These are param-independent, so they belong with the prefix sums: every
+  // optimizer combo reuses them for free.
+  const adx = adxSeries(bars, ADX_PERIOD)
+  const { atrPct, base: atrBase } = atrPctSeries(bars)
+  const closesArr: number[] = new Array(n)
+  for (let i = 0; i < n; i++) closesArr[i] = bars[i].close
+  const hl = halfLifeSeries(closesArr, HL_LOOKBACK, HL_SMA_PERIOD)
+  return { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +246,7 @@ interface Dec {
 const NONE: Dec = { entry: null, exit: null }
 
 export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): BacktestResult {
-  const { bars, n, dayIdx, minutes, rth, ps, ps2 } = series
+  const { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase } = series
   const params = normalizeAlgoParams(cfg.strategy, cfg.params)
   const strategy = cfg.strategy
 
@@ -226,16 +259,25 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 1
   if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 1
 
-  // ---- Task 84 cost model · Task 85 spread ----
-  // slip = total adverse drift fraction on every MARKET/STOP fill. The spread
-  // contributes HALF of spreadBps per fill (buy at ask = +half, sell at bid =
-  // −half) — a full round trip therefore pays the entire spread. slippageBps
-  // stacks on top as impact/latency drift beyond the quote.
-  const slip = Math.max(0, (cfg.slippageBps ?? 0) + (cfg.spreadBps ?? 0) / 2) / 1e4
+  // ---- Task 84 cost model · Task 85 spread · Task 12 vol-scaled impact ----
+  // Every MARKET/STOP fill pays half the spread (buy at ask = +half, sell at
+  // bid = −half) plus the slippage impact. With dynSlip the IMPACT scales
+  // with THIS bar's ATR% vs the dataset average (clamped 0.5×..3×) — costs
+  // breathe with volatility instead of assuming one regime forever.
+  const spreadFrac = Math.max(0, (cfg.spreadBps ?? 0) / 2) / 1e4
+  const impactBase = Math.max(0, cfg.slippageBps ?? 0) / 1e4
+  const dynSlipOn = cfg.dynSlip === true && impactBase > 0 && atrBase > 0
+  const slipAt = (i: number): number => {
+    if (!dynSlipOn) return spreadFrac + impactBase
+    const r = atrPct[i] / atrBase
+    const f = Number.isFinite(r) && r > 0 ? Math.min(3, Math.max(0.5, r)) : 1
+    return spreadFrac + impactBase * f
+  }
   const fee = Math.max(0, cfg.feeBps ?? 0) / 1e4 // per-fill fee fraction
-  const slipPx = (px: number, exitDir: 1 | -1): number => {
+  const slipPx = (i: number, px: number, exitDir: 1 | -1): number => {
     // exitDir: +1 = buying back (short exit) → pay up · -1 = selling (long exit) → receive less
-    const p = exitDir === 1 ? px * (1 + slip) : px * (1 - slip)
+    const s = slipAt(i)
+    const p = exitDir === 1 ? px * (1 + s) : px * (1 - s)
     return p > 0 ? p : px
   }
 
@@ -282,6 +324,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let orDone = false
   let firedLong = false
   let firedShort = false
+  let orVolSum = 0 // Task 12 — opening-range volume accumulator (breakout vol filter)
+  let orVolN = 0
   const orMinutes = Math.max(5, Math.round(params.orMinutes ?? 15))
 
   const smaAt = (i: number, period: number): number => {
@@ -294,7 +338,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     return v > 0 ? Math.sqrt(v) : 0
   }
 
-  const decide = (i: number): Dec => {
+  const rawDecide = (i: number): Dec => {
     const c = bars[i].close
     if (strategy === 'bb-reversion') {
       const period = Math.max(5, Math.round(params.bbPeriod ?? 20))
@@ -339,6 +383,14 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     if (strategy === 'orb15') {
       if (!orDone || orHigh == null || orLow == null) return NONE
       const onePerSide = (params.onePerSide ?? 1) >= 1
+      // Task 12 — P2 entry timing: the breakout bar must carry participation
+      // ≥ × the opening-range average volume (0 = off; no OR volume yet →
+      // fail-open, matching the live engine's accumulator).
+      const volMult = params.orbVolMult ?? 0
+      if (volMult > 0 && orVolN > 0 && orVolSum > 0) {
+        const avg = orVolSum / orVolN
+        if (avg > 0 && bars[i].volume < volMult * avg) return NONE
+      }
       if (c > orHigh && !(onePerSide && firedLong)) return { entry: { side: 'buy', reason: 'close broke OR high' }, exit: null }
       if (c < orLow && !(onePerSide && firedShort)) return { entry: { side: 'sell', reason: 'close broke OR low' }, exit: null }
       return NONE
@@ -356,6 +408,24 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       if (Math.abs(dev) < 0.08) return { entry: null, exit: 'reverted to session VWAP' }
       return NONE
     }
+  }
+
+  // Task 12 — regime gates (improvement plan P0/P1), applied AFTER the raw
+  // strategy signal so EXITS are never touched: a trending regime vetoes
+  // entries that would fight the 200-SMA, an ADX spike vetoes mean-reversion
+  // in a breakout, and a slow half-life vetoes "reversion" trades that are
+  // actually the start of a trend. Mirrors evalStrategy() in algo-engine.ts.
+  const regCfg: RegimeCfg = regimeCfgFromParams(params)
+  const useRegime = anyRegimeActive(regCfg)
+  const decide = (i: number): Dec => {
+    const dec = rawDecide(i)
+    if (dec.entry == null || !useRegime) return dec
+    const trendSma = regCfg.regimeTrend
+      ? (i + 1 >= REGIME_TREND_SMA ? (ps[i + 1] - ps[i + 1 - REGIME_TREND_SMA]) / REGIME_TREND_SMA : null)
+      : null
+    const veto = regimeVeto(regCfg, dec.entry.side, bars[i].close, trendSma, adx[i], hl[i])
+    if (veto != null) return { entry: null, exit: dec.exit }
+    return dec
   }
 
   // ---- executor state ----
@@ -453,6 +523,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       orDone = false
       firedLong = false
       firedShort = false
+      orVolSum = 0
+      orVolN = 0
     }
     // ---- feed day accumulators (equities: regular-session bars only ·
     // crypto: ALL bars of the ET day — 24/7 VWAP / midnight-anchored OR) ----
@@ -469,6 +541,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         if (m >= orAnchor && m < orAnchor + orMinutes) {
           orHigh = orHigh == null ? bar.high : Math.max(orHigh, bar.high)
           orLow = orLow == null ? bar.low : Math.min(orLow, bar.low)
+          orVolSum += bar.volume // Task 12 — OR volume average for the breakout filter
+          orVolN++
         } else if (m >= orAnchor + orMinutes && orHigh != null && orLow != null) {
           orDone = true
         }
@@ -481,7 +555,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     if (pending && Number.isFinite(bar.open) && bar.open > 0) {
       const dir = pending.side
       // market order fill — adverse slippage against the position direction
-      const fill = slip > 0 ? (dir === 1 ? bar.open * (1 + slip) : bar.open * (1 - slip)) : bar.open
+      const s = slipAt(i)
+      const fill = s > 0 ? (dir === 1 ? bar.open * (1 + s) : bar.open * (1 - s)) : bar.open
       const pctPx = (v: number | null, tp: boolean): number | null => {
         if (v == null || !(v > 0)) return null
         const p = Math.min(100, Math.max(0.01, Math.abs(v)))
@@ -553,7 +628,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     //         15m — up to 15 minutes past the live exit through the close.
     const eodGate = cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN
     if (pos && eodGate) {
-      closeTrade(pos, slipPx(bar.open, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
+      closeTrade(pos, slipPx(i, bar.open, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
       pos = null
     }
 
@@ -564,7 +639,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       let reason = ''
       if (pos.side === 1) {
         if (pos.slPx != null && bar.low <= pos.slPx) {
-          exitPx = slipPx(pos.slPx, -1) // stop-market sell — adverse drift
+          exitPx = slipPx(i, pos.slPx, -1) // stop-market sell — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.high >= pos.tpPx) {
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
@@ -572,7 +647,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         }
       } else {
         if (pos.slPx != null && bar.high >= pos.slPx) {
-          exitPx = slipPx(pos.slPx, 1) // stop-market buy-back — adverse drift
+          exitPx = slipPx(i, pos.slPx, 1) // stop-market buy-back — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.low <= pos.tpPx) {
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
@@ -588,7 +663,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // ---- 4) evaluate the strategy on this closed bar (exits → entries) ----
     const dec = decide(i)
     if (dec.exit && pos) {
-      closeTrade(pos, slipPx(bar.close, pos.side === 1 ? -1 : 1), bar.time, dec.exit)
+      closeTrade(pos, slipPx(i, bar.close, pos.side === 1 ? -1 : 1), bar.time, dec.exit)
       pos = null
     }
     if (dec.entry && !pos && !pending) {
@@ -635,7 +710,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let openAtEnd = false
   if (pos) {
     const lastBar = bars[n - 1]
-    closeTrade(pos, slipPx(lastBar.close, pos.side === 1 ? -1 : 1), lastBar.time, 'open at end of data (marked)')
+    closeTrade(pos, slipPx(n - 1, lastBar.close, pos.side === 1 ? -1 : 1), lastBar.time, 'open at end of data (marked)')
     openAtEnd = true
   }
 
@@ -734,12 +809,20 @@ export interface OptimizeResult {
   skipped: number // invalid combos (e.g. oversold ≥ overbought)
   truncated: boolean // grid was stride-sampled to fit the compute budget
   elapsedMs: number
+  // Task 12 — plateau analysis (improvement plan P1): re-run the ±1-step
+  // grid neighbors of the BEST row per dimension. A winner only deserves
+  // trust when its neighborhood holds up (a broad plateau), not when it sits
+  // on a fragile peak. down/up = neighbor scores (null = outside the grid or
+  // invalid combo — itself boundary evidence). plateau.ok = the mean neighbor
+  // score keeps ≥ 70% of the best score (only computed when best score > 0).
+  sensitivity?: { key: string; down: number | null; up: number | null }[]
+  plateau?: { meanNeighborScore: number; ratio: number; ok: boolean } | null
 }
 
 const MAX_PER_DIM = 64
 const COMBO_BAR_BUDGET = 12_000_000 // ~1-2s of pure-JS sim work
 
-function dimValues(r: OptimizeRange): number[] {
+export function dimValues(r: OptimizeRange): number[] {
   if (Array.isArray(r.values) && r.values.length > 0) {
     const vals = [...new Set(
       r.values.filter((v) => Number.isFinite(v)).map((v) => Number(v.toFixed(6))),
@@ -859,14 +942,54 @@ export function optimizeBacktest(
     }
   }
   results.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
+  const best = results.length > 0 && results[0].score > -Infinity ? results[0] : null
+  // ---- Task 12 — neighbor sensitivity of the winner (cheap plateau probe) --
+  // ≤ 2×dims extra sims (dims ≤ 8 → ≤ 16 runs): for every tuned parameter,
+  // re-run the grid neighbor on BOTH sides of the best value. The optimizer's
+  // stride may never visit these exact points, so they are computed here,
+  // outside the `evaluated` combo counter.
+  let sensitivity: OptimizeResult['sensitivity']
+  let plateau: OptimizeResult['plateau'] = null
+  if (best && dims.length >= 1 && dims.length <= 8) {
+    const neighborScores: number[] = []
+    sensitivity = []
+    for (const d of dims) {
+      const idxBest = d.vals.findIndex((v) => Math.abs(v - (best.params[d.key] ?? Number.NaN)) < 1e-9)
+      const scores: (number | null)[] = []
+      for (const step of [-1, 1] as const) {
+        const j = idxBest + step
+        if (idxBest < 0 || j < 0 || j >= d.vals.length) {
+          scores.push(null)
+          continue
+        }
+        const params = { ...base.params, ...best.params, [d.key]: d.vals[j] }
+        if (comboInvalid(base.strategy, params)) {
+          scores.push(null)
+          continue
+        }
+        const res = runBacktest(series, { ...base, params, collectEquity: false })
+        const sc = backtestScore(res.metrics, minTrades)
+        scores.push(sc === -Infinity ? null : sc)
+        if (sc > -Infinity) neighborScores.push(sc)
+      }
+      sensitivity.push({ key: d.key, down: scores[0], up: scores[1] })
+    }
+    if (neighborScores.length > 0 && best.score > 0) {
+      const mean = neighborScores.reduce((a, b) => a + b, 0) / neighborScores.length
+      const ratio = mean / best.score
+      plateau = { meanNeighborScore: mean, ratio, ok: ratio >= 0.7 }
+    }
+  }
   return {
     results: results.slice(0, 100),
-    best: results.length > 0 && results[0].score > -Infinity ? results[0] : null,
+    best,
     totalCombos,
     evaluated,
     skipped,
     truncated: stride > 1,
     elapsedMs: Date.now() - t0,
+    sensitivity,
+    plateau,
   }
 }
 
@@ -1103,5 +1226,303 @@ export function sweepStrategies(
     perStrategy,
     oosFraction: oosSeries ? oosFraction : 0,
     skippedShorts,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Walk-Forward Optimization (Task 12 — improvement plan P0) — the gold
+// standard overfitting control. The old sweep OOS split (tune on the first
+// 70%, verify once on the last 30%) is a SINGLE split; WFO repeats the
+// tune→verify cycle across CHRONOLOGICAL folds, then stresses the surviving
+// parameter set on a pure hold-out tail that NO tuning ever saw:
+//
+//   fold1 [IS][OOS] · fold2 [IS][OOS] · fold3 [IS][OOS] ··· [pure hold-out]
+//
+//   • rolling  — the data (after the hold-out carve) is partitioned into
+//     `folds` consecutive spans; each span tunes on its first isFraction of
+//     bars and verifies untouched on the rest (how you will actually
+//     re-optimize through time);
+//   • anchored — each fold tunes on EVERYTHING from the start up to its OOS
+//     segment (expanding window; earlier folds get more re-use of data).
+// The aggregate reports the DISTRIBUTION of OOS outcomes (robustness =
+// share of folds whose OOS stayed profitable, median OOS return) and how
+// stable the chosen parameters were across folds — not one lucky number.
+// ---------------------------------------------------------------------------
+
+export interface WalkForwardOpts {
+  ranges: OptimizeRange[]
+  folds?: number // 2..6 (default 3)
+  isFraction?: number // 0.5..0.9 per-fold IS share (default 0.7 — rolling mode only)
+  anchored?: boolean // expanding IS windows instead of rolling (default false)
+  holdoutFraction?: number // 0..0.4 — tail carved off BEFORE any tuning (default 0.2)
+  minTrades?: number
+  maxCombosPerFold?: number
+}
+
+export interface WFFold {
+  fold: number
+  isFrom: number // IS window start (unix s)
+  isTo: number // IS window end (= OOS start)
+  oosFrom: number
+  oosTo: number
+  isTrades: number
+  isNetPct: number
+  isScore: number | null
+  oosTrades: number
+  oosNetPct: number
+  oosWinRate: number
+  oosPF: number
+  oosMaxDDPct: number
+  oosScore: number | null
+  oosValid: boolean // ≥ 3 OOS trades — enough to mean anything
+  params: Record<string, number> // the fold's IS winner (override keys only)
+  boundary: boolean // any tuned param sits on its grid min/max
+}
+
+export interface WalkForwardAggregate {
+  foldsTotal: number
+  foldsValid: number // folds whose OOS produced ≥ 3 trades
+  positiveFolds: number
+  robustness: number | null // positiveFolds / foldsValid (null = none valid)
+  oosNetMedian: number | null
+  oosNetMean: number | null
+  paramStability: number | null // share of folds choosing the modal params
+  modalParams: Record<string, number> | null
+}
+
+export interface WalkForwardResult {
+  mode: 'rolling' | 'anchored'
+  isFraction: number
+  holdoutFraction: number
+  folds: WFFold[]
+  aggregate: WalkForwardAggregate
+  // hold-out stress test: the most trustworthy parameter set (modal when ≥2
+  // folds agree, else the best valid OOS fold's winner) re-run on the tail
+  holdout: { from: number; to: number; netPct: number; winRate: number; profitFactor: number; maxDrawdownPct: number; trades: number } | null
+  holdoutDisabled?: string // reason when no hold-out could be carved
+  evaluated: number
+  elapsedMs: number
+}
+
+const wfSig = (p: Record<string, number>): string =>
+  Object.entries(p)
+    .map(([k, v]) => `${k}=${v}`)
+    .sort()
+    .join(',')
+
+export function walkForward(
+  series: BacktestSeries,
+  base: BacktestConfig,
+  opts: WalkForwardOpts,
+): WalkForwardResult {
+  const t0 = Date.now()
+  let folds = Math.min(6, Math.max(2, Math.round(opts.folds ?? 3)))
+  const isFraction = Math.min(0.9, Math.max(0.5, Number(opts.isFraction) || 0.7))
+  const anchored = opts.anchored === true
+  const holdoutFraction = Math.min(0.4, Math.max(0, Number(opts.holdoutFraction) || 0))
+  const minTrades = Math.max(1, Math.round(opts.minTrades ?? 8))
+
+  // ---- 1) pure hold-out — carved off FIRST, never touched by any fold ----
+  let wfN = series.n
+  let holdoutBars: Bar[] | null = null
+  let holdoutDisabled: string | undefined
+  if (holdoutFraction > 0) {
+    const start = Math.floor(series.n * (1 - holdoutFraction))
+    if (start >= 500 && series.n - start >= 200) {
+      holdoutBars = series.bars.slice(start)
+      wfN = start
+    } else {
+      holdoutDisabled = `dataset too small for a ${Math.round(holdoutFraction * 100)}% hold-out (need ≥ ~700 bars) — the walk-forward ran without it`
+    }
+  }
+
+  // ---- 2) fold windows: the post-hold-out data is partitioned into `folds`
+  // consecutive spans; each span = IS head (isFraction) + OOS tail ----------
+  while (folds > 2 && Math.floor(wfN / folds) < 60) folds-- // degrade gracefully on short data
+  const seg = Math.floor(wfN / folds)
+  const outFolds: WFFold[] = []
+  let evaluated = 0
+  if (seg < 60) {
+    return {
+      mode: anchored ? 'anchored' : 'rolling',
+      isFraction,
+      holdoutFraction,
+      folds: [],
+      aggregate: {
+        foldsTotal: 0, foldsValid: 0, positiveFolds: 0, robustness: null,
+        oosNetMedian: null, oosNetMean: null, paramStability: null, modalParams: null,
+      },
+      holdout: null,
+      holdoutDisabled: holdoutDisabled ?? `dataset too small for ${folds} folds (need ≥ ~${folds * 60} bars)`,
+      evaluated: 0,
+      elapsedMs: Date.now() - t0,
+    }
+  }
+
+  // boundary flags mirror the optimizer's grid sanitization
+  const def = ALGO_STRATEGIES[base.strategy]
+  const byKey = new Map(def.params.map((p) => [p.key, p]))
+  const bounds = (Array.isArray(opts.ranges) ? opts.ranges : []).flatMap((r) => {
+    const d = byKey.get(String(r?.key))
+    if (!d || d.bool) return []
+    const hasValues = Array.isArray(r.values) && r.values.length > 0
+    const min = Number(r.min)
+    const max = Number(r.max)
+    if (!hasValues && (!Number.isFinite(min) || !Number.isFinite(max) || !(Number(r.step) > 0))) return []
+    const vals = dimValues({
+      key: d.key,
+      min: Math.min(d.max, Math.max(d.min, min)),
+      max: Math.min(d.max, Math.max(d.min, max)),
+      step: Number(r.step),
+      ...(hasValues ? { values: r.values!.map((v) => Math.min(d.max, Math.max(d.min, Number(v)))) } : {}),
+    })
+    return [{ key: d.key, min: vals[0], max: vals[vals.length - 1] }]
+  })
+  const onBoundary = (params: Record<string, number>): boolean =>
+    bounds.some((b) => {
+      const v = params[b.key]
+      return v != null && (Math.abs(v - b.min) < 1e-9 || Math.abs(v - b.max) < 1e-9)
+    })
+
+  for (let k = 0; k < folds; k++) {
+    // Task 9-p — per-fold heap probe (the harness runs several optimizers)
+    heapAbortCheck('Walk-forward')
+    const segStart = k * seg
+    const isEnd = segStart + Math.floor(seg * isFraction)
+    const oosStart = isEnd
+    const oosEnd = k === folds - 1 ? wfN : segStart + seg
+    const isLen = anchored ? oosStart : isEnd - segStart
+    const isStart = anchored ? 0 : segStart
+    const oosLen = oosEnd - oosStart
+    if (isLen < 300 || oosLen < 60) continue // too little history to tune / verify honestly
+    const isBars = series.bars.slice(isStart, isEnd)
+    const oosBars = series.bars.slice(oosStart, oosEnd)
+    const isSeries = prepareSeries(isBars)
+    const oosSeries = prepareSeries(oosBars)
+    // per-fold compute budget — the whole harness must stay inside the same
+    // COMBO_BAR_BUDGET envelope a single optimize run gets
+    const budget = Math.max(30, Math.min(400, Math.floor(COMBO_BAR_BUDGET / Math.max(1, isSeries.n) / folds)))
+    const opt = optimizeBacktest(isSeries, { ...base, collectEquity: false }, opts.ranges, { minTrades, maxCombos: budget })
+    evaluated += opt.evaluated
+    const best = opt.best
+    if (!best) {
+      outFolds.push({
+        fold: k + 1,
+        isFrom: isBars[0].time,
+        isTo: isBars[isBars.length - 1].time,
+        oosFrom: oosBars[0].time,
+        oosTo: oosBars[oosBars.length - 1].time,
+        isTrades: 0, isNetPct: 0, isScore: null,
+        oosTrades: 0, oosNetPct: 0, oosWinRate: 0, oosPF: 0, oosMaxDDPct: 0, oosScore: null,
+        oosValid: false, params: {}, boundary: false,
+      })
+      continue
+    }
+    const oosRun = runBacktest(oosSeries, { ...base, params: { ...base.params, ...best.params }, collectEquity: false })
+    evaluated++
+    const om = oosRun.metrics
+    const oosValid = om.trades >= 3
+    outFolds.push({
+      fold: k + 1,
+      isFrom: isBars[0].time,
+      isTo: isBars[isBars.length - 1].time,
+      oosFrom: oosBars[0].time,
+      oosTo: oosBars[oosBars.length - 1].time,
+      isTrades: best.metrics.trades,
+      isNetPct: best.metrics.netPct,
+      isScore: best.score,
+      oosTrades: om.trades,
+      oosNetPct: om.netPct,
+      oosWinRate: om.winRate,
+      oosPF: om.profitFactor,
+      oosMaxDDPct: om.maxDrawdownPct,
+      oosScore: oosValid ? backtestScore(om, minTrades) : null,
+      oosValid,
+      params: best.params,
+      boundary: onBoundary({ ...base.params, ...best.params }),
+    })
+  }
+
+  // ---- 3) aggregate the OOS DISTRIBUTION (not one lucky number) ----
+  const counts = new Map<string, number>()
+  for (const f of outFolds) {
+    if (Object.keys(f.params).length === 0) continue
+    const s = wfSig(f.params)
+    counts.set(s, (counts.get(s) ?? 0) + 1)
+  }
+  let modalSig: string | null = null
+  let modalCount = 0
+  for (const [s, c] of counts) {
+    if (c > modalCount) {
+      modalCount = c
+      modalSig = s
+    }
+  }
+  const modalParams: Record<string, number> | null = modalSig
+    ? Object.fromEntries(modalSig.split(',').map((kv) => {
+        const [k, v] = kv.split('=')
+        return [k, Number(v)]
+      }))
+    : null
+  const valid = outFolds.filter((f) => f.oosValid)
+  const positive = valid.filter((f) => f.oosNetPct > 0)
+  const oosNets = valid.map((f) => f.oosNetPct)
+  const oosSorted = [...oosNets].sort((a, b) => a - b)
+  const aggregate: WalkForwardAggregate = {
+    foldsTotal: outFolds.length,
+    foldsValid: valid.length,
+    positiveFolds: positive.length,
+    robustness: valid.length > 0 ? positive.length / valid.length : null,
+    oosNetMedian: oosNets.length > 0 ? oosSorted[Math.floor((oosNets.length - 1) / 2)] : null,
+    oosNetMean: oosNets.length > 0 ? oosNets.reduce((a, b) => a + b, 0) / oosNets.length : null,
+    paramStability: outFolds.length > 0 && modalCount > 0 ? modalCount / outFolds.length : null,
+    modalParams,
+  }
+
+  // ---- 4) hold-out stress test on the most trustworthy parameter set ----
+  let holdout: WalkForwardResult['holdout'] = null
+  if (holdoutBars != null) {
+    let chosen: Record<string, number> | null = null
+    if (modalCount >= 2 && modalParams) chosen = modalParams
+    else {
+      let bestScore = -Infinity
+      for (const f of valid) {
+        if (f.oosScore != null && f.oosScore > bestScore) {
+          bestScore = f.oosScore
+          chosen = f.params
+        }
+      }
+      if (chosen == null) {
+        const anyF = outFolds.find((f) => Object.keys(f.params).length > 0)
+        chosen = anyF ? anyF.params : null
+      }
+    }
+    if (chosen) {
+      const hSeries = prepareSeries(holdoutBars)
+      const hRun = runBacktest(hSeries, { ...base, params: { ...base.params, ...chosen }, collectEquity: false })
+      evaluated++
+      const hm = hRun.metrics
+      holdout = {
+        from: hm.from,
+        to: hm.to,
+        netPct: hm.netPct,
+        winRate: hm.winRate,
+        profitFactor: hm.profitFactor,
+        maxDrawdownPct: hm.maxDrawdownPct,
+        trades: hm.trades,
+      }
+    }
+  }
+
+  return {
+    mode: anchored ? 'anchored' : 'rolling',
+    isFraction,
+    holdoutFraction,
+    folds: outFolds,
+    aggregate,
+    holdout,
+    holdoutDisabled,
+    evaluated,
+    elapsedMs: Date.now() - t0,
   }
 }

@@ -56,7 +56,7 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'Stage 3 distribution chops between support and resistance — fading band extremes with an RSI filter is the consensus range-market tactic.',
     color: '#f472b6',
     intradayOnly: true,
-    defaults: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1 },
+    defaults: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1, regimeTrend: 1, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 48 },
     params: [
       { key: 'bbPeriod', label: 'BB period', min: 5, max: 100, step: 1 },
       { key: 'bbStd', label: 'BB std-dev', min: 1, max: 4, step: 0.1 },
@@ -64,6 +64,14 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
       { key: 'rsiOversold', label: 'RSI oversold <', min: 5, max: 45, step: 1 },
       { key: 'rsiOverbought', label: 'RSI overbought >', min: 55, max: 95, step: 1 },
       { key: 'allowShort', label: 'Allow shorts', min: 0, max: 1, step: 1, bool: true },
+      // Task 12 — regime gates (improvement plan P0/P1): stop fading strong
+      // trends. Trend gate ON by default — mean reversion above/below the
+      // 200-SMA only. ADX + half-life gates are opt-in (0 = off).
+      { key: 'regimeTrend', label: 'Trend gate (200-SMA)', min: 0, max: 1, step: 1, bool: true },
+      { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
+      { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
     ],
   },
   'rsi2-connors': {
@@ -74,12 +82,19 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'Larry Connors\u2019 most-studied mean-reversion system — designed for regular-hours equity trading; buys fear-driven dips inside a rising market.',
     color: '#22c55e',
     intradayOnly: true,
-    defaults: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5 },
+    defaults: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5, regimeTrend: 0, regimeAdx: 0, adxMax: 25, hlGate: 0, hlMax: 48 },
     params: [
       { key: 'rsiPeriod', label: 'RSI period', min: 2, max: 5, step: 1 },
       { key: 'rsiBuy', label: 'RSI buy below', min: 5, max: 30, step: 1 },
       { key: 'trendSma', label: 'Trend SMA', min: 50, max: 300, step: 10 },
       { key: 'exitSma', label: 'Exit SMA', min: 3, max: 20, step: 1 },
+      // Task 12 — optional extra regime gates (the strategy's own trend SMA
+      // already IS the P0 trend filter, so the generic gate defaults off here)
+      { key: 'regimeTrend', label: 'Extra 200-SMA gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
+      { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
     ],
   },
   'orb15': {
@@ -90,10 +105,14 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'The classic regular-hours momentum play — the opening range sets intraday support/resistance and its break carries the day\u2019s directional bias.',
     color: '#f59e0b',
     intradayOnly: true,
-    defaults: { orMinutes: 15, onePerSide: 1 },
+    defaults: { orMinutes: 15, onePerSide: 1, orbVolMult: 0 },
     params: [
       { key: 'orMinutes', label: 'Range minutes', min: 5, max: 60, step: 5 },
       { key: 'onePerSide', label: 'One trade per side', min: 0, max: 1, step: 1, bool: true },
+      // Task 12 — P2 entry timing: require the breakout bar's volume to be ≥
+      // × the opening-range average (0 = off). Confirms the break with
+      // participation instead of fading drift.
+      { key: 'orbVolMult', label: 'Breakout vol ≥ × OR avg (0=off)', min: 0, max: 5, step: 0.5 },
     ],
   },
   'vwap-fade': {
@@ -104,10 +123,16 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'VWAP is the institutional execution benchmark — in distribution phases price keeps snapping back to it, making deviation fades high-probability.',
     color: '#38bdf8',
     intradayOnly: true,
-    defaults: { devPct: 0.6, allowShort: 1 },
+    defaults: { devPct: 0.6, allowShort: 1, regimeTrend: 1, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 48 },
     params: [
       { key: 'devPct', label: 'Deviation %', min: 0.2, max: 5, step: 0.1 },
       { key: 'allowShort', label: 'Allow shorts', min: 0, max: 1, step: 1, bool: true },
+      // Task 12 — regime gates (same toolkit as bb-reversion, P0/P1)
+      { key: 'regimeTrend', label: 'Trend gate (200-SMA)', min: 0, max: 1, step: 1, bool: true },
+      { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
+      { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
     ],
   },
 }

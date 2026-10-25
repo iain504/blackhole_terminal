@@ -26,7 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -42,7 +42,8 @@ import {
   ALGO_MAX_DAYS,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
-import type { BacktestResult, OptimizeResult, SweepResult } from '@/lib/backtest'
+import type { BacktestResult, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
+import type { MonteCarloResult } from '@/lib/algo-regime'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 
@@ -160,6 +161,18 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [btFee, setBtFee] = useState('0')
   // Task 85 — bid/ask spread (bps): half is charged per market fill
   const [btSpread, setBtSpread] = useState('0')
+  // Task 12 — vol-scaled slippage (improvement plan P1): scale the impact
+  // component by THIS bar's ATR% vs the dataset average (clamped 0.5–3×).
+  // No effect while slippage = 0; off = the constant-fill model.
+  const [btDynSlip, setBtDynSlip] = useState(true)
+  // Task 12 — walk-forward optimization (P0): folds, IS share, anchored mode,
+  // pure hold-out fraction + the result card
+  const [wfFolds, setWfFolds] = useState('3')
+  const [wfIsPct, setWfIsPct] = useState('70')
+  const [wfHoldout, setWfHoldout] = useState('20')
+  const [wfAnchored, setWfAnchored] = useState(false)
+  const [wfRes, setWfRes] = useState<WalkForwardResult | null>(null)
+  const [mcRes, setMcRes] = useState<MonteCarloResult | null>(null)
   // Task 4-a — leverage-honest sizing: max position notional = capital × Lev
   // (route clamps 0.1..10; default 1 = cash-only, matching the baked reco runs)
   const [btLev, setBtLev] = useState('1')
@@ -196,7 +209,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [recoSymbols, setRecoSymbols] = useState<string[]>([])
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
-  const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep'>(null)
+  const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep' | 'walkforward'>(null)
   const [error, setError] = useState<string | null>(null)
   const [meta, setMeta] = useState<BacktestMeta | null>(null)
   const [runRes, setRunRes] = useState<BacktestResult | null>(null)
@@ -215,11 +228,13 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setOptRes(null)
     setMeta(null)
     setError(null)
+    setMcRes(null)
   }, [cfg.strategy])
 
   // symbol / timeframe switch → the sweep was measured on other data
   useEffect(() => {
     setSweepRes(null)
+    setWfRes(null)
   }, [cfg.symbol, cfg.timeframe])
 
   // Task 90 — pick up the persisted recommendations feed (and any refresh job
@@ -335,11 +350,13 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     slippageBps: Math.min(500, Math.max(0, Math.round(Number(btSlip) || 0))),
     feeBps: Math.min(500, Math.max(0, Math.round(Number(btFee) || 0))),
     spreadBps: Math.min(500, Math.max(0, Math.round(Number(btSpread) || 0))),
+    // Task 12 — vol-scaled slippage (ATR% × impact, clamped 0.5–3×)
+    dynSlip: btDynSlip,
     // Task 4-a — leverage-honest sizing cap (0.1..10; 1 = notional ≤ capital)
     maxNotionalX: Number(btLev) > 0 ? Math.min(10, Math.max(0.1, Number(btLev))) : 1,
     days: Math.max(1, Math.round(Number(days) || 30)),
     capital: Number(capital) || 10000,
-  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee, btSpread, btLev])
+  }), [cfg, days, capital, btCooldown, btFresh, btSlip, btFee, btSpread, btLev, btDynSlip])
 
   // live spread probe (Task 85) — polls the quote endpoint for cfg.symbol's
   // top of book every 60s and shows "≈X.X bps live" beside the Spread input;
@@ -389,7 +406,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     return out
   }, [def, ranges])
 
-  const post = async (mode: 'run' | 'optimize' | 'sweep') => {
+  const post = async (mode: 'run' | 'optimize' | 'sweep' | 'walkforward') => {
     setBusy(mode)
     setError(null)
     try {
@@ -410,26 +427,46 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                   // the winners untouched on the last 30% → rows carry oos/boundary
                   oosFraction: 0.3,
                 }
-              : {}),
+              : mode === 'walkforward'
+                ? {
+                    // Task 12 — full walk-forward optimization: re-optimize on
+                    // every fold's in-sample window, verify on its OOS segment,
+                    // stress the survivor on a pure hold-out tail
+                    ranges: activeRanges,
+                    minTrades: Math.max(1, Math.round(Number(minTrades) || 8)),
+                    folds: Math.min(6, Math.max(2, Math.round(Number(wfFolds) || 3))),
+                    isFraction: Math.min(0.9, Math.max(0.5, (Number(wfIsPct) || 70) / 100)),
+                    holdoutFraction: Math.min(0.4, Math.max(0, (Number(wfHoldout) || 0) / 100)),
+                    anchored: wfAnchored,
+                  }
+                : {}),
         }),
       })
       const json = await res.json().catch(() => null)
       if (!res.ok) {
         setError(json?.error || `HTTP ${res.status}`)
-        toast({ title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : 'Strategy sweep failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+        toast({ title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : mode === 'walkforward' ? 'Walk-forward failed' : 'Strategy sweep failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
         return
       }
       setMeta(json.meta ?? null)
       if (mode === 'run') {
         setRunRes(json.result ?? null)
+        setMcRes(json.mc ?? null)
         setOptRes(null)
       } else if (mode === 'optimize') {
         setOptRes(json.optimize ?? null)
         setRunRes(null)
+        setMcRes(null)
+      } else if (mode === 'walkforward') {
+        setWfRes(json.walkforward ?? null)
+        setRunRes(null)
+        setOptRes(null)
+        setMcRes(null)
       } else {
         setSweepRes(json.sweep ?? null)
         setRunRes(null)
         setOptRes(null)
+        setMcRes(null)
       }
     } catch {
       setError('Network error')
@@ -658,9 +695,25 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
             <p className="text-[9px] leading-tight text-zinc-600">edge-triggered re-entry — wait for a new cross</p>
           </div>
+          <div className="flex flex-col justify-between">
+            <div className="flex items-center justify-between gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Label htmlFor="bt-dynslip" className="w-fit cursor-help text-[10px] leading-tight text-zinc-500 underline decoration-dotted decoration-zinc-600 underline-offset-2">
+                    Vol-scaled slip (ATR)
+                  </Label>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-64 border-zinc-700 bg-zinc-800 text-zinc-100">
+                  Slippage impact = bps × (bar ATR% ÷ dataset average), clamped 0.5–3×. Spread and fee stay flat. No effect while slippage = 0. Off = constant fills.
+                </TooltipContent>
+              </Tooltip>
+              <Switch id="bt-dynslip" checked={btDynSlip} onCheckedChange={setBtDynSlip} className="scale-90" />
+            </div>
+            <p className="text-[9px] leading-tight text-zinc-600">impact breathes with volatility — high-ATR bars pay more</p>
+          </div>
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
-              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Vol-scaled slip multiplies the impact by the bar's ATR% vs the dataset average (clamped 0.5–3×). Regime gates (200-SMA trend / ADX chop / half-life) veto entries that fight the regime — they live in the strategy parameters and are mirrored 1:1 by the live engine. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
               {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
                 <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
               )}
@@ -712,6 +765,55 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               aria-label="Number of sweep winners to list"
               className="h-8 w-14 border-zinc-800 bg-zinc-950 text-xs"
             />
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              className="h-8 gap-2 bg-emerald-600 px-3 text-xs text-white hover:bg-emerald-500"
+              disabled={busy !== null || !cfg.symbol || !sizingOk || activeRanges.length === 0}
+              title={!sizingOk
+                ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
+                : activeRanges.length === 0
+                  ? 'Tick parameters in Auto-tune first — walk-forward re-optimizes them on every fold'
+                  : 'Re-optimize on every fold\'s in-sample window, verify out-of-sample per fold, then stress the survivor on a pure hold-out tail'}
+              onClick={() => void post('walkforward')}
+            >
+              {busy === 'walkforward' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Repeat className="h-3.5 w-3.5" />}
+              Walk-forward
+            </Button>
+            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-folds">Folds</Label>
+            <Input
+              id="bt-wf-folds"
+              value={wfFolds}
+              onChange={(e) => setWfFolds(e.target.value)}
+              onBlur={() => setWfFolds(String(Math.min(6, Math.max(2, Math.round(Number(wfFolds) || 3)))))}
+              inputMode="numeric"
+              aria-label="Walk-forward folds (2–6)"
+              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-is">IS %</Label>
+            <Input
+              id="bt-wf-is"
+              value={wfIsPct}
+              onChange={(e) => setWfIsPct(e.target.value)}
+              onBlur={() => setWfIsPct(String(Math.min(90, Math.max(50, Math.round(Number(wfIsPct) || 70)))))}
+              inputMode="numeric"
+              aria-label="Walk-forward in-sample share percent"
+              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-ho">Hold-out %</Label>
+            <Input
+              id="bt-wf-ho"
+              value={wfHoldout}
+              onChange={(e) => setWfHoldout(e.target.value)}
+              onBlur={() => setWfHoldout(String(Math.min(40, Math.max(0, Math.round(Number(wfHoldout) || 0)))))}
+              inputMode="numeric"
+              aria-label="Pure hold-out tail percent (0–40)"
+              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
+            />
+            <div className="flex items-center gap-1">
+              <Switch id="bt-wf-anch" checked={wfAnchored} onCheckedChange={setWfAnchored} className="scale-90" aria-label="Anchored walk-forward windows" />
+              <Label htmlFor="bt-wf-anch" className="text-[10px] text-zinc-500" title="Anchored = each fold tunes on everything from the start (expanding IS). Off = rolling fixed-length IS window immediately before each out-of-sample segment.">Anchored</Label>
+            </div>
           </div>
         </div>
 
@@ -800,7 +902,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             ? 'Replaying history…'
             : busy === 'optimize'
               ? 'Searching parameter grid… this can take a few seconds'
-              : 'Sweeping every strategy — defaults + auto-tuned grids for each… this can take 10–30s'}
+              : busy === 'walkforward'
+                ? 'Walk-forward: re-optimizing on every fold, verifying out-of-sample, stress-testing the hold-out… this can take 10–60s'
+                : 'Sweeping every strategy — defaults + auto-tuned grids for each… this can take 10–30s'}
         </div>
       )}
 
@@ -817,6 +921,33 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <Metric label="Avg hold" value={`${m.avgHoldMin < 90 ? `${Math.round(m.avgHoldMin)}m` : `${(m.avgHoldMin / 60).toFixed(1)}h`}`} sub={`${m.tradesPerWeek.toFixed(1)} trades/wk`} cls="text-zinc-100" />
             <Metric label="Final equity" value={fmtUsd(m.finalEquity)} sub={m.suppressed > 0 ? `${m.suppressed} signals gated` : 'gates: none hit'} cls="text-zinc-100" />
           </div>
+
+          {/* Task 12 — Monte Carlo bootstrap (improvement plan P2): resample the
+              realized trade sequence to estimate how much of the edge is luck */}
+          {mcRes && (
+            <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <Dices className="h-3.5 w-3.5 text-sky-400" aria-hidden />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Monte Carlo</span>
+                <Badge variant="outline" className="text-[10px] text-zinc-400" title="Bootstrap resampling of the realized trade sequence (with replacement, seeded — deterministic)">
+                  {mcRes.iters.toLocaleString('en-US')} bootstraps · {mcRes.trades} trades
+                </Badge>
+                <span className={cn('text-[11px] tabular-nums', mcRes.probLoss > 0.2 ? 'text-amber-400' : 'text-zinc-400')}>
+                  P(loss) {(mcRes.probLoss * 100).toFixed(1)}%
+                </span>
+              </div>
+              <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] tabular-nums text-zinc-400">
+                <span>net% <span className="text-rose-400">p5 {fmtPct(mcRes.netPctP5)}</span></span>
+                <span>p50 <span className="text-zinc-200">{fmtPct(mcRes.netPctP50)}</span></span>
+                <span>p95 <span className="text-emerald-400">{fmtPct(mcRes.netPctP95)}</span></span>
+                <span>max DD% p50 {mcRes.maxDDPctP50.toFixed(1)} · p95 {mcRes.maxDDPctP95.toFixed(1)}</span>
+              </div>
+              <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+                Sequence-risk stress: the same trades replayed in {mcRes.iters.toLocaleString('en-US')} random orders. A green backtest whose p5 lands deep negative has a
+                thin edge — the order of wins/losses (and the drawdown it can produce) is luck. Use p5 / max-DD p95 as the honest sizing budget.
+              </p>
+            </div>
+          )}
 
           <EquityChart data={eqData} />
 
@@ -948,6 +1079,36 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </table>
             </div>
           )}
+          {/* Task 12 — plateau analysis on the winner (improvement plan P1) */}
+          {optRes.sensitivity && optRes.sensitivity.length > 0 && optRes.best && optRes.best.score > -Infinity && (
+            <div className="border-t border-zinc-800/60 px-3 py-2">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">Best-row sensitivity (±1 grid step)</p>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                {optRes.sensitivity.map((s) => (
+                  <Badge
+                    key={s.key}
+                    variant="outline"
+                    className="text-[10px] tabular-nums text-zinc-400"
+                    title={`Re-running the winner with ${paramLabel(cfg.strategy, s.key)} one grid step lower/higher scores ${s.down ?? '—'} / ${s.up ?? '—'} (best ${optRes.best!.score.toFixed(2)}). Null = the step falls outside the grid.`}
+                  >
+                    {paramLabel(cfg.strategy, s.key)}: {s.down == null ? '—' : s.down.toFixed(2)} / {s.up == null ? '—' : s.up.toFixed(2)}
+                  </Badge>
+                ))}
+                {optRes.plateau && (
+                  <Badge
+                    variant="outline"
+                    className={optRes.plateau.ok ? 'border-emerald-500/40 text-[10px] text-emerald-400' : 'border-amber-500/40 text-[10px] text-amber-400'}
+                    title={`Mean neighbor score ${optRes.plateau.meanNeighborScore.toFixed(2)} = ${(optRes.plateau.ratio * 100).toFixed(0)}% of the winner. ≥70% = broad plateau (robust), below = fragile peak (likely overfit).`}
+                  >
+                    {optRes.plateau.ok ? 'plateau ✓ stable' : '⚠ fragile peak'}
+                  </Badge>
+                )}
+              </div>
+              <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+                Only accept winners whose neighborhood holds up — a broad plateau survives re-optimization and regime drift; a sharp parameter peak is overfitting.
+              </p>
+            </div>
+          )}
           <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
             Click any row to apply those parameters to the run setup (unticked parameters keep their setup values). Past performance ≠ future results — re-run the
             backtest on the tuned parameters and check the drawdown before going live.
@@ -1058,6 +1219,131 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             stride-sampled — hover the badges above for per-strategy counts). Your qty / sizing / TP-SL / session gates and cost model were held fixed; only strategy
             parameters were optimized. Click a row to apply that strategy + parameters to the run setup, then re-run a single backtest and check the drawdown before
             going live. Past performance ≠ future results.
+          </p>
+        </div>
+      )}
+
+      {/* walk-forward optimization result (Task 12 — improvement plan P0) */}
+      {wfRes && (
+        <div className="rounded-md border border-emerald-500/25 bg-zinc-900/70">
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2">
+            <Repeat className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Walk-forward optimization</span>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">{wfRes.mode}</Badge>
+            <Badge variant="outline" className="text-[10px] text-zinc-400">{wfRes.folds.length} fold{wfRes.folds.length === 1 ? '' : 's'} re-optimized</Badge>
+            {wfRes.holdoutFraction > 0 && (
+              <Badge variant="outline" className="text-[10px] text-emerald-400/90" title="The last X% of bars was carved off BEFORE any tuning — no fold ever saw it. The survivor parameter set was then re-run on it untouched.">
+                {Math.round(wfRes.holdoutFraction * 100)}% pure hold-out
+              </Badge>
+            )}
+            <span className="text-[10px] text-zinc-600">{wfRes.evaluated.toLocaleString('en-US')} sims · {(wfRes.elapsedMs / 1000).toFixed(1)}s</span>
+          </div>
+          {wfRes.holdoutDisabled && (
+            <p className="mx-3 mb-2 rounded border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5 text-[11px] text-amber-300" role="note">{wfRes.holdoutDisabled}</p>
+          )}
+          <div className="flex flex-wrap gap-x-5 gap-y-1 px-3 pb-2 text-[11px]">
+            <span className="text-zinc-500">
+              Robustness{' '}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0} className="cursor-help underline decoration-dotted decoration-zinc-600 underline-offset-2">
+                    <span className={cn('font-semibold tabular-nums', wfRes.aggregate.robustness == null ? 'text-zinc-500' : wfRes.aggregate.robustness >= 0.6 ? 'text-emerald-400' : wfRes.aggregate.robustness > 0 ? 'text-amber-400' : 'text-rose-400')}>
+                      {wfRes.aggregate.robustness == null ? '—' : `${wfRes.aggregate.positiveFolds}/${wfRes.aggregate.foldsValid} (${Math.round(wfRes.aggregate.robustness * 100)}%)`}
+                    </span>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-64 border-zinc-700 bg-zinc-800 text-zinc-100">
+                  Share of folds whose out-of-sample window (re-optimized in-sample each fold, then verified untouched) stayed profitable. This is the realistic expectation for live trading.
+                </TooltipContent>
+              </Tooltip>
+            </span>
+            <span className="text-zinc-500">median OOS <span className={cn('font-semibold tabular-nums', pnlColor(wfRes.aggregate.oosNetMedian ?? 0))}>{wfRes.aggregate.oosNetMedian == null ? '—' : fmtPct(wfRes.aggregate.oosNetMedian)}</span></span>
+            <span className="text-zinc-500">mean OOS <span className={cn('font-semibold tabular-nums', pnlColor(wfRes.aggregate.oosNetMean ?? 0))}>{wfRes.aggregate.oosNetMean == null ? '—' : fmtPct(wfRes.aggregate.oosNetMean)}</span></span>
+            <span className="text-zinc-500">
+              <span title="Share of folds whose optimizer picked the SAME parameters — high stability means a broad, trustworthy optimum; every fold picking different params is noise.">
+                param stability
+              </span>{' '}
+              <span className="font-semibold tabular-nums text-zinc-200">{wfRes.aggregate.paramStability == null ? '—' : `${Math.round(wfRes.aggregate.paramStability * 100)}%`}</span>
+            </span>
+            {wfRes.holdout && (
+              <span className="text-zinc-500">
+                hold-out <span className={cn('font-semibold tabular-nums', pnlColor(wfRes.holdout.netPct))}>{fmtPct(wfRes.holdout.netPct)}</span>
+                <span className="text-zinc-600"> · {wfRes.holdout.trades} trades · win {wfRes.holdout.winRate.toFixed(0)}% · DD {wfRes.holdout.maxDrawdownPct.toFixed(1)}%</span>
+              </span>
+            )}
+          </div>
+          {wfRes.folds.length === 0 ? (
+            <p className="border-t border-zinc-800/60 px-3 py-4 text-center text-xs text-zinc-500">
+              No fold produced a tunable winner — widen the history, tick more parameters in Auto-tune, or lower the min-trades gate.
+            </p>
+          ) : (
+            <div className="max-h-96 overflow-auto border-t border-zinc-800/60 terminal-scroll" aria-label="Walk-forward fold table">
+              <table className="w-full min-w-[860px] text-left text-[11px]">
+                <thead className="sticky top-0 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
+                  <tr>
+                    <th className="px-2.5 py-1.5 font-medium">Fold</th>
+                    <th className="px-2 py-1.5 font-medium">In-sample window</th>
+                    <th className="px-2 py-1.5 font-medium text-right">IS net %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">IS score</th>
+                    <th className="px-2 py-1.5 font-medium">OOS window</th>
+                    <ThTip label="OOS net %" tip="the fold's winner re-run untouched on bars it was never tuned on" right />
+                    <th className="px-2 py-1.5 font-medium text-right">Win %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">PF</th>
+                    <th className="px-2 py-1.5 font-medium text-right">DD %</th>
+                    <th className="px-2 py-1.5 font-medium text-right">Trades</th>
+                    <th className="px-2 py-1.5 font-medium">Fold winner (click to apply)</th>
+                    <th className="px-2.5 py-1.5 font-medium" aria-label="Flags" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {wfRes.folds.map((f) => (
+                    <tr
+                      key={f.fold}
+                      className={cn('border-t border-zinc-800/40 hover:bg-zinc-900/60', Object.keys(f.params).length > 0 && 'cursor-pointer')}
+                      onClick={() => Object.keys(f.params).length > 0 && applyRow(f.params)}
+                      title={Object.keys(f.params).length > 0 ? 'Click to apply this fold\'s winning parameters to the run setup' : 'This fold produced no tunable winner'}
+                    >
+                      <td className="px-2.5 py-1.5 tabular-nums text-zinc-500">{f.fold}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400">{fmtDayY(f.isFrom)} → {fmtDayY(f.isTo)}</td>
+                      <td className={cn('px-2 py-1.5 text-right tabular-nums', pnlColor(f.isNetPct))}>{f.isTrades > 0 ? fmtPct(f.isNetPct) : '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.isScore == null ? '—' : f.isScore.toFixed(2)}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400">{fmtDayY(f.oosFrom)} → {fmtDayY(f.oosTo)}</td>
+                      <td className={cn('px-2 py-1.5 text-right tabular-nums', f.oosTrades > 0 ? pnlColor(f.oosNetPct) : 'text-zinc-600')}>{f.oosTrades > 0 ? fmtPct(f.oosNetPct) : '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.oosTrades > 0 ? `${f.oosWinRate.toFixed(0)}%` : '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.oosTrades > 0 ? (f.oosPF >= 999 ? '∞' : f.oosPF.toFixed(2)) : '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-rose-400/80">{f.oosTrades > 0 ? f.oosMaxDDPct.toFixed(2) : '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-zinc-300">{f.oosTrades > 0 ? f.oosTrades : '—'}</td>
+                      <td className="px-2 py-1.5 text-zinc-300">
+                        <span className="flex flex-wrap gap-x-2">
+                          {Object.entries(f.params).map(([k, v]) => (
+                            <span key={k} className="whitespace-nowrap">
+                              <span className="text-zinc-500">{paramLabel(cfg.strategy, k)}</span> <span className="tabular-nums text-zinc-200">{v}</span>
+                            </span>
+                          ))}
+                          {Object.keys(f.params).length === 0 && <span className="text-zinc-600">no scorable winner</span>}
+                        </span>
+                      </td>
+                      <td className="px-2.5 py-1.5">
+                        {f.boundary && <BoundaryChip />}
+                        {!f.oosValid && f.oosTrades > 0 && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span tabIndex={0} className="ml-1 inline-flex cursor-help items-center rounded border border-zinc-600/40 px-1 py-px text-[9px] uppercase text-zinc-500">thin</span>
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-56 border-zinc-700 bg-zinc-800 text-zinc-100">OOS window produced fewer than 3 trades — not evidence either way</TooltipContent>
+                          </Tooltip>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
+            Each fold re-runs the full grid search on its in-sample window (rolling: a fixed window right before the OOS segment · anchored: everything from the
+            start), then replays the winner untouched on its out-of-sample segment. Report the DISTRIBUTION — {wfRes.aggregate.positiveFolds}/{wfRes.aggregate.foldsValid || 0} valid folds stayed
+            profitable OOS — not the best in-sample row. The pure hold-out tail was never available to any fold. Past performance ≠ future results.
           </p>
         </div>
       )}

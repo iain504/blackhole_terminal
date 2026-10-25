@@ -3,12 +3,15 @@
 // Task 87 adds mode 'sweep' — one click tests EVERY strategy: each runs at
 // its defaults plus an auto-built optimizer grid (defaults guaranteed in-grid)
 // and the top X rows across all strategies are ranked for one-click apply.
+// Task 12 (improvement plan) adds mode 'walkforward' — rolling/anchored
+// walk-forward optimization with a pure hold-out tail — plus the Monte Carlo
+// bootstrap on plain runs and the vol-scaled slippage cost model.
 //
 // body: {
-//   mode?: 'run' | 'optimize' | 'sweep'   (default 'run'; sweep ignores strategy)
+//   mode?: 'run' | 'optimize' | 'sweep' | 'walkforward'   (default 'run'; sweep ignores strategy)
 //   symbol, timeframe ('1m'|'5m'|'15m'), strategy (AlgoStrategyId),
 //   params: Record<string, number>,       base parameters
-//   ranges?: { key, min, max, step }[]    (optimize mode — numeric params only)
+//   ranges?: { key, min, max, step }[]    (optimize/walkforward — numeric params only)
 //   days?: number                          calendar days of history
 //   qty, tpMode, tpValue, slMode, slValue, maxTradesDay, rthOnly, flattenEod,
 //   cooldownMin?: number                    (Task 70-c) no-entry minutes after a close (0..240, default 0)
@@ -16,6 +19,7 @@
 //   slippageBps?: number                    (Task 84) adverse bps on market/stop fills (default 0)
 //   feeBps?: number                         (Task 84) per-fill notional fee bps (default 0)
 //   spreadBps?: number                      (Task 85) bid/ask spread bps — half charged per market fill (default 0)
+//   dynSlip?: boolean                       (Task 12) vol-scale the slippage impact by ATR% (default false)
 //   sizingMode?: 'fixed'|'risk'             (Task 78) 'risk' = Risk-Money sizing (default 'fixed')
 //   riskBasis?: 'usd'|'pct'                 (Task 78e) budget basis: dollars (default) or % of equity
 //   riskMoney?: number                      (Task 78) dollars at risk per trade (required for risk+usd)
@@ -24,8 +28,12 @@
 //                                           capital × maxNotionalX (0.1..10, default 1 = no leverage)
 //   oosFraction?: number                    (Task 3-d, sweep) walk-forward: tune on the first (1-f)
 //                                           of bars, re-run winners untouched on the tail (0..0.5, default 0)
+//   folds?: number                          (Task 12, walkforward) 2..6 folds (default 3)
+//   isFraction?: number                     (Task 12, walkforward) per-fold IS share 0.5..0.9 (default 0.7)
+//   anchored?: boolean                      (Task 12, walkforward) expanding IS windows (default false)
+//   holdoutFraction?: number                (Task 12, walkforward) pure hold-out tail 0..0.4 (default 0.2)
 //   capital?: number                       starting equity for % / DD metrics
-//   minTrades?: number                     (optimize/sweep) minimum trades to score
+//   minTrades?: number                     (optimize/sweep/walkforward) minimum trades to score
 //   topX?: number                          (sweep) how many winners to list (1..20, default 8)
 // }
 import { NextRequest, NextResponse } from 'next/server'
@@ -35,9 +43,10 @@ import { type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { rateLimit } from '@/lib/rate-limit'
 import {
-  prepareSeries, runBacktest, optimizeBacktest, sweepStrategies,
+  prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward,
   type BacktestConfig, type OptimizeRange,
 } from '@/lib/backtest'
+import { monteCarloBootstrap } from '@/lib/algo-regime'
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 
 export const dynamic = 'force-dynamic'
@@ -97,12 +106,17 @@ interface BacktestBody {
   slippageBps?: number
   feeBps?: number
   spreadBps?: number
+  dynSlip?: boolean
   sizingMode?: string
   riskBasis?: string
   riskMoney?: number | null
   riskMoneyPct?: number | null
   maxNotionalX?: number
   oosFraction?: number
+  folds?: number
+  isFraction?: number
+  anchored?: boolean
+  holdoutFraction?: number
   capital?: number
   minTrades?: number
   topX?: number
@@ -145,7 +159,7 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
       return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
     }
     const body = await readJson<BacktestBody>(req)
-    const mode = body.mode === 'optimize' || body.mode === 'sweep' ? body.mode : 'run'
+    const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
 
     // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
     // any) is only a placeholder for the shared config validation below; every
@@ -228,6 +242,8 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
       feeBps: Math.min(500, Math.max(0, Math.round(Number(body.feeBps) || 0))),
       // Task 85 — bid/ask spread (bps, half charged per market fill)
       spreadBps: Math.min(500, Math.max(0, Math.round(Number(body.spreadBps) || 0))),
+      // Task 12 — vol-scaled slippage (ATR% × impact, clamped 0.5..3)
+      dynSlip: body.dynSlip === true,
       // Task 3-d — buying-power cap (0.1..10, default 1 = max 1× capital per position)
       maxNotionalX: Number.isFinite(Number(body.maxNotionalX)) && Number(body.maxNotionalX) > 0
         ? Math.min(10, Math.max(0.1, Number(body.maxNotionalX)))
@@ -287,13 +303,41 @@ async function handleBacktest(req: NextRequest, userId: string): Promise<NextRes
       })
     }
 
+    if (mode === 'walkforward') {
+      // Task 12 — the heaviest mode: folds × (optimizer + verify) + hold-out.
+      // Same heap gate as the sweep, same concurrency guard as every mode.
+      const mem = memoryGuard(0.7)
+      if (!mem.ok) {
+        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
+      }
+      const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
+      const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
+      const wf = walkForward(series, cfg, {
+        ranges,
+        folds: Math.min(6, Math.max(2, Math.round(Number(body.folds) || 3))),
+        isFraction: Number.isFinite(Number(body.isFraction)) ? Number(body.isFraction) : 0.7,
+        anchored: body.anchored === true,
+        holdoutFraction: Number.isFinite(Number(body.holdoutFraction)) ? Number(body.holdoutFraction) : 0.2,
+        minTrades,
+      })
+      return NextResponse.json({ walkforward: wf, meta })
+    }
+
     const result = runBacktest(series, cfg)
     // Task 3-d — equity curve for the wire: downsampled to ≤500 points
     // (stride + first/last kept; the point-per-trade array is never shipped)
     const wire = { ...result, equity: downsampleEquity(result.equity) }
+    // Task 12 — Monte Carlo bootstrap of the realized trade sequence:
+    // resample-with-replacement confidence bands for the edge (null when
+    // there are too few trades to mean anything)
+    const mc = monteCarloBootstrap(
+      result.trades.map((t) => t.pnl),
+      capital,
+    )
     return NextResponse.json({
       result: wire,
-      meta: { ...meta, mtmDD: true, skippedShorts: result.metrics.skippedShorts ?? 0 },
+      mc,
+      meta: { ...meta, mtmDD: true, skippedShorts: result.metrics.skippedShorts ?? 0, dynSlip: cfg.dynSlip === true && (cfg.slippageBps ?? 0) > 0 },
     })
   } catch (e) {
     return handleError(e)

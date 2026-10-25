@@ -2709,3 +2709,27 @@ Stage Summary:
 - All 12 review areas addressed: 9 implemented in code, engine-worker isolation + mobile depth documented as roadmap (deliberate), 78-test suite replaces "Weak" testing rating
 - DB was wiped again by a platform snapshot (user table empty): re-registered trader with the SAME password + SAME TOTP base32 so user credentials are unchanged; Alpaca keys re-stored encrypted (live-verified); no other data existed to restore
 - HEAD before push: Task 11 commit + version drift + this worklog; suite stays green (78/78), lint clean
+
+---
+Task ID: 12
+Agent: Z.ai Code (main)
+Task: Sync with GitHub, then implement the uploaded algo improvement plan (upload/algo_improvement.txt) — regime filters, walk-forward optimization, dynamic costs, half-life gate, hold-out + Monte Carlo, sensitivity analysis.
+
+Work Log:
+- Synced GitHub: fetch + rev-list compare → local == origin/main (0/0), tree clean, nothing to pull/push.
+- Explored the algo subsystem (strategies catalog, backtest engine, live engine, API route, BacktestPanel) and mapped the parity contract between backtest decide() and live evalStrategy().
+- NEW src/lib/algo-regime.ts — shared quality toolkit: Wilder ADX(14) series, OU half-life series (exact per-bar windowed OLS — sliding sums catastrophically cancel on reverting data and were rejected), regimeVeto() gate (fail-open on NaN), atrPctSeries + baseline, seeded Monte Carlo bootstrap.
+- algo-strategies.ts — added params: regimeTrend/regimeAdx/adxMax/hlGate/hlMax to bb-reversion (trend+HL default ON), rsi2-connors (all OFF — its own trendSma already gates), vwap-fade (trend+HL ON); orbVolMult to orb15 (OFF). All flow automatically through normalizeAlgoParams, optimizer grids, config import/export, both UIs.
+- backtest.ts — prepareSeries now computes adx/hl/atrPct/atrBase once per dataset; decide() wrapped with the regime veto (exits never gated); ORB volume accumulators + participation check; dynSlip (ATR%-scaled impact, clamped 0.5–3×, no-op at 0 slippage); optimizeBacktest ±1-step neighbor sensitivity + plateau verdict; NEW walkForward() — rolling/anchored folds (IS head + OOS tail per fold), OOS-distribution aggregate (robustness, median/mean OOS, param stability via modal params), pure hold-out tail carved before tuning, hold-out stress run of modal/best fold winner; dimValues exported.
+- algo-engine.ts — evalStrategy() = evalRaw() + the same gates (ORB volume via st.orVolSum/orVolN accumulators fed in feedAccumulators + day reset; regime veto identical to the backtest). Missed-bar replay inherits the gates for free.
+- api/algo/backtest/route.ts — mode 'walkforward' (heap-gated, clamped folds 2–6 / IS 0.5–0.9 / holdout 0–0.4), dynSlip in cfg, Monte Carlo attached to plain run responses, meta.dynSlip honesty flag.
+- BacktestPanel.tsx — Vol-scaled slip (ATR) switch (default ON), Walk-forward button + Folds/IS%/Hold-out%/Anchored controls (disabled until params ticked), WFO results card (mode/folds/hold-out badges, robustness+median+mean+stability chips, hold-out line, fold table with click-to-apply winners + EDGE/THIN flags), Monte Carlo card on run results (bootstraps, P(loss), p5/p50/p95 net%, DD p50/p95), optimizer Best-row sensitivity badges + plateau ✓/⚠ fragile peak chip, footnote + honesty copy updated.
+- tests/algo-quality.test.ts — 33 tests: ADX trend/chop/range, OU half-life exact vectors (φ=0.5/0.9/1.15) + fail-open, regimeVeto semantics incl. Infinity veto, backtest end-to-end vetoes (trend gate 0 trades on flat-head ramp; fail-open < 200 bars; hl positive control on spikes), dynSlip no-op/divergence, optimizer sensitivity, walk-forward rolling/anchored/tiny-dataset, Monte Carlo determinism, param back-compat. Two fixture bugs found and fixed along the way (DM-freezing envelope; FP-absorbed AR tail).
+- Caught and fixed 3 real bugs pre-ship: regimeVeto passed Infinity (Number.isFinite guard) — trending deviations were NOT vetoed; absolute 1e-9 OLS denominator guard NaN'd small-scale deviations (now relative); sliding-sum OLS catastrophic cancellation (rewrote as exact per-bar window OLS).
+- README: added "Strategy quality toolkit (Task 12)" section.
+- Verified: bun test 111/111 (78 existing + 33 new), ESLint clean, tsc no new errors (pre-existing archive/bun:test noise only). Dev restarted; agent-browser E2E: login → Algo tab → new params render in setup + auto-tune grid → backtest with gates ("9 signals gated") → Monte Carlo card (1,000 bootstraps, P(loss), percentile bands) → walk-forward 3 folds + 20% hold-out (aggregate chips, fold table with EDGE/THIN, click-to-apply) → optimizer sensitivity + "⚠ fragile peak" → no console/page errors → desktop + mobile layouts OK.
+
+Stage Summary:
+- All 5 items of the uploaded 2–4 week roadmap shipped: (1) trend filter on all four strategies, (2) rolling walk-forward harness around backtest.ts, (3) ATR-scaled slippage, (4) half-life gate for BB/VWAP deviations, (5) pure hold-out never used for tuning. Plus P1 plateau analysis, P2 Monte Carlo + ORB volume confirmation.
+- Parity contract preserved: one shared module (algo-regime.ts) feeds both engines; gates fail open, never block exits.
+- No DB schema changes; version stamped v1.80.0+144; tests 111/111; E2E browser-verified.

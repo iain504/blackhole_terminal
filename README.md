@@ -78,6 +78,21 @@ One supervisor loop, evaluated every **15 seconds** (`CYCLE_MS`), strictly on **
 
 The **grid engine** (`src/lib/grid-engine.ts`, 5s tick) is the same discipline: arithmetic/geometric levels, per-lot fills with realized-PnL attribution, whole-grid maxSL/maxTP guards (absolute price or percent basis), one-sided `buy`/`sell` directions, and `closeOnStop` market-closing every open lot when a guard trips. A pure replay of the same math backs the grid backtester (`simulateGridBacktest`) — covered by tests.
 
+### Strategy quality toolkit (Task 12)
+
+Shared by the backtest (`decide()`) and the live engine (`evalStrategy()`) from one module, [`src/lib/algo-regime.ts`](src/lib/algo-regime.ts), so a veto can never drift between backtest and live. Gates **fail open** on insufficient history (a thin bar window never freezes a strategy) and never touch exits:
+
+- **Regime trend gate** (P0) — LONG only above the 200-SMA, SHORT only below; ships ON for the mean-reversion strategies.
+- **ADX chop gate** (P0) — mean-reversion entries only while Wilder ADX(14) < `adxMax` (default 25); opt-in per strategy.
+- **Half-life gate** (P1) — rolling Ornstein-Uhlenbeck fit of the close−SMA(50) deviation; entries only while the half-life is finite and ≤ `hlMax` bars (a trending deviation is vetoed).
+- **ORB volume filter** (P2) — the breakout bar must carry ≥ `orbVolMult` × the opening-range average volume (0 = off).
+- **Vol-scaled slippage** (P1, backtest) — the slippage impact scales with each bar's ATR% vs the dataset average, clamped 0.5–3×.
+- **Walk-forward optimization** (P0, backtest) — rolling or anchored re-optimization across chronological folds, an OOS-distribution aggregate (robustness / median OOS / parameter stability), and a pure hold-out tail carved off before any tuning.
+- **Monte Carlo bootstrap** (P2, backtest) — 1,000 seeded resamples of the realized trade sequence → p5/p50/p95 net%, P(loss), max-DD percentiles.
+- **Optimizer plateau analysis** (P1) — ±1-grid-step neighbor re-runs of the winner; a verdict of "fragile peak" flags overfit optima.
+
+All gates are plain strategy parameters (they flow through `normalizeAlgoParams`, the optimizer grids, config import/export and both UIs automatically); the new ones default conservatively and are covered by `tests/algo-quality.test.ts`.
+
 ## Keyboard shortcuts
 
 Honest list — only shortcuts that actually exist (press **?** in the terminal to see this dialog):
