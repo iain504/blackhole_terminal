@@ -1,10 +1,11 @@
 'use client'
 
-// Grid Trading tab (Task 9-q, extended by Task 10-b/10-f) — tracks every grid
-// trade: live status, total realized/unrealized P&L, grid start time and
+// Grid Trading tab (Task 9-q, extended by Task 10-b/10-f/10-l) — tracks every
+// grid trade: live status, total realized/unrealized P&L, grid start time and
 // per-fill history. Grids are created from the chart's two-click "Grid" range
 // tool; this tab is the mission control (stop / edit-when-flat / inspect /
-// delete / export-import setups). Polls every 5s like the Algo tab.
+// delete / export-import setups / export-import ALL setups as a bundle).
+// Polls every 5s like the Algo tab.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
@@ -29,7 +30,8 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
 import GridTradeDialog from '@/components/chart/GridTradeDialog'
-import { gridSetupFromRow, downloadGridSetup } from '@/lib/grid-setup'
+import { gridSetupFromRow, downloadGridSetup, buildGridSetupBundle, downloadGridSetupBundle } from '@/lib/grid-setup'
+import GridBundleImportDialog from './GridBundleImportDialog'
 import { tabPanes, type Tab } from '@/store/terminal'
 import type { GridTradeDto, GridFillDto } from '@/app/api/grid/route'
 
@@ -121,6 +123,8 @@ export default function GridTab() {
   // (importSymbol) instead of the focused chart's symbol.
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [importSymbol, setImportSymbol] = useState<string | null>(null)
+  // Task 10-l — ALL-setups bundle import (file/paste → preview → bulk start)
+  const [bundleImportOpen, setBundleImportOpen] = useState(false)
   const activeTab = useTerminal(useShallow((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? null))
   const chartSymbol = useMemo(() => focusedSymbol(activeTab), [activeTab])
 
@@ -197,6 +201,17 @@ export default function GridTab() {
     }
   }
 
+  /** Task 10-l — copy EVERY grid's config to the clipboard as one bundle. */
+  const copyAllSetups = async () => {
+    const json = JSON.stringify(buildGridSetupBundle(grids), null, 2)
+    try {
+      await navigator.clipboard.writeText(json)
+      toast({ title: 'Bundle copied', description: `${grids.length} grid setup${grids.length === 1 ? '' : 's'} on the clipboard` })
+    } catch {
+      toast({ title: 'Could not copy', description: 'Clipboard unavailable — use Download instead', variant: 'destructive' })
+    }
+  }
+
   const grids = data?.grids ?? []
   const active = grids.filter((g) => g.status === 'active')
   const totalRealized = grids.reduce((acc, g) => acc + g.realizedPnl, 0)
@@ -218,6 +233,37 @@ export default function GridTab() {
           {openLots} open lot{openLots === 1 ? '' : 's'}
         </Badge>
         <span className="ml-auto text-[11px] text-zinc-500">engine tick every 5s · paper orders</span>
+        {/* Task 10-l — one-click export of ALL grid setups as one bundle */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost" size="sm"
+              className="h-7 gap-1.5 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
+              disabled={grids.length === 0}
+              title="Export EVERY grid's config as one bundle (JSON) — re-importable anywhere via Import all"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden />
+              Export all
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="border-zinc-800 bg-zinc-900 text-xs text-zinc-200">
+            <DropdownMenuItem className="gap-1.5" onClick={() => downloadGridSetupBundle(buildGridSetupBundle(grids))}>
+              <Download className="h-3 w-3" aria-hidden /> Download bundle .json
+            </DropdownMenuItem>
+            <DropdownMenuItem className="gap-1.5" onClick={() => void copyAllSetups()}>
+              <Copy className="h-3 w-3" aria-hidden /> Copy bundle JSON
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <Button
+          variant="ghost" size="sm"
+          className="h-7 gap-1.5 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
+          onClick={() => setBundleImportOpen(true)}
+          title="Import a bundle of grid setups (JSON) — starts every valid setup as its own grid"
+        >
+          <Upload className="h-3.5 w-3.5" aria-hidden />
+          Import all
+        </Button>
         <Button
           variant="ghost" size="sm"
           className="h-7 gap-1.5 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
@@ -397,6 +443,14 @@ export default function GridTab() {
           })}
         </div>
       )}
+
+      {/* Task 10-l — bundle import: file/paste → per-item preview →
+          POST /api/grid/bulk starts every valid setup in one call */}
+      <GridBundleImportDialog
+        open={bundleImportOpen}
+        onOpenChange={setBundleImportOpen}
+        onImported={() => void load()}
+      />
 
       {/* setup import (Task 10-f) — opens the create dialog with the import
           panel expanded; the applied setup retargets the new grid to its own

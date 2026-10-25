@@ -203,3 +203,114 @@ export function downloadGridSetup(setup: GridSetupFile): void {
   a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
+
+// ---------------------------------------------------------------------------
+// Task 10-l — ALL-grids bundle: one-click export / import of every setup.
+//
+// Wire format (v1):
+// {
+//   "kind": "blackhole-grid-setups-bundle",
+//   "version": 1,
+//   "exportedAt": "…",
+//   "count": 3,
+//   "setups": [ <GridSetupFile>, … ]
+// }
+//
+// parseGridSetupBundle accepts THREE shapes so nothing is ever stranded:
+//   · a bundle (kind blackhole-grid-setups-bundle)
+//   · a single setup file (Task 10-f format)        → wraps into a 1-item list
+//   · a raw JSON array of setups                    → treated as a bundle
+// ---------------------------------------------------------------------------
+
+export const GRID_BUNDLE_KIND = 'blackhole-grid-setups-bundle'
+export const GRID_BUNDLE_VERSION = 1
+
+/** Hard cap on how many setups one bundle may carry (matches the bulk API). */
+export const GRID_BUNDLE_MAX = 50
+
+/** What lands in the exported all-grids .json file. */
+export interface GridSetupBundleFile {
+  kind: string
+  version: number
+  exportedAt: string
+  count: number
+  setups: GridSetupFile[]
+}
+
+/** Serialize EVERY grid row into one portable bundle (order preserved). */
+export function buildGridSetupBundle(rows: GridSetupRowLike[]): GridSetupBundleFile {
+  const setups = rows.map((r) => gridSetupFromRow(r))
+  return {
+    kind: GRID_BUNDLE_KIND,
+    version: GRID_BUNDLE_VERSION,
+    exportedAt: new Date().toISOString(),
+    count: setups.length,
+    setups,
+  }
+}
+
+/** Per-item parse outcome for the import preview UI. */
+export type ParsedBundleItem =
+  | { ok: true; setup: GridSetup }
+  | { ok: false; error: string }
+
+export type ParseGridSetupBundleResult =
+  | { ok: true; items: ParsedBundleItem[] }
+  | { ok: false; error: string }
+
+/** Parse + validate a bundle / single setup / raw array. Items are validated
+ * independently — one bad setup never poisons the rest (the preview UI shows
+ * per-item errors; the bulk API re-validates everything server-side). */
+export function parseGridSetupBundle(text: string): ParseGridSetupBundleResult {
+  let obj: unknown
+  try {
+    obj = JSON.parse(text)
+  } catch {
+    return { ok: false, error: 'Not valid JSON' }
+  }
+  let raw: unknown[]
+  if (Array.isArray(obj)) {
+    raw = obj
+  } else if (obj != null && typeof obj === 'object') {
+    const o = obj as Record<string, unknown>
+    if (o.kind != null && o.kind !== GRID_BUNDLE_KIND && o.kind !== GRID_SETUP_KIND) {
+      return { ok: false, error: `Not a BLACKHOLE grid setup/bundle (kind "${String(o.kind).slice(0, 40)}")` }
+    }
+    if (Array.isArray(o.setups)) {
+      raw = o.setups
+    } else if (o.kind === GRID_SETUP_KIND || o.lowerPrice != null) {
+      raw = [obj] // single-setup file (Task 10-f format)
+    } else {
+      return { ok: false, error: 'No setups found in this JSON' }
+    }
+  } else {
+    return { ok: false, error: 'Not a grid setup bundle' }
+  }
+  if (raw.length === 0) return { ok: false, error: 'The bundle contains no setups' }
+  if (raw.length > GRID_BUNDLE_MAX) {
+    return { ok: false, error: `Too many setups (${raw.length}) — the limit is ${GRID_BUNDLE_MAX}` }
+  }
+  const items: ParsedBundleItem[] = raw.map((entry, i) => {
+    const one = parseGridSetup(JSON.stringify(entry ?? null))
+    return one.ok ? { ok: true, setup: one.setup } : { ok: false, error: `#${i + 1}: ${one.error}` }
+  })
+  return { ok: true, items }
+}
+
+export function gridBundleFilename(): string {
+  const d = new Date().toISOString().slice(0, 10)
+  return `grid-setups-bundle-${d}.json`
+}
+
+/** Trigger a browser download of the all-grids bundle JSON. */
+export function downloadGridSetupBundle(bundle: GridSetupBundleFile): void {
+  const blob = new Blob([`${JSON.stringify(bundle, null, 2)}\n`], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = gridBundleFilename()
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}

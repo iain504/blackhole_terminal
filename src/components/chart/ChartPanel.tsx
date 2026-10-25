@@ -29,11 +29,12 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useToast } from '@/hooks/use-toast'
+import { Slider } from '@/components/ui/slider'
 import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
   Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
-  LayoutGrid, Grid3x3,
+  LayoutGrid, Grid3x3, Layers,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -362,6 +363,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // the main series. Purely visual — the two-click capture flow is untouched.
   const [gridOverlayOn, setGridOverlayOn] = useState(false)
   const [gridOverlayData, setGridOverlayData] = useState<GridOverlayRow[] | null>(null)
+  // ---- Task 10-l — translucent grid-area band ("80% transparent layer") ----
+  // Shaded rectangle over each active grid's lower…upper range while the grid
+  // overlay is on. Visibility + opacity persist client-side (localStorage).
+  const [gridBandOn, setGridBandOn] = useState(true)
+  const [gridBandOpacity, setGridBandOpacity] = useState(0.2) // 80% transparent
 
   // Esc cancels an armed grid capture (own listener so the big pointer effect
   // below stays untouched by grid state)
@@ -3644,6 +3650,101 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     gridLinesRef.current = { series, lines }
   }, [gridOverlayOn, gridOverlayData, symbol, tf, chartType, showExtendedHours, sessionGate, settingsVer])
 
+  // ---- Task 10-l — grid-area band: persistence, rows, pixel tracking ----
+  // Hydrate the persisted band prefs once (never a chart rebuild — pure DOM).
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem('bh-grid-band')
+      if (!v) return
+      const o = JSON.parse(v) as { on?: unknown; opacity?: unknown }
+      if (typeof o?.on === 'boolean') setGridBandOn(o.on)
+      if (typeof o?.opacity === 'number' && o.opacity >= 0 && o.opacity <= 0.5) setGridBandOpacity(o.opacity)
+    } catch { /* corrupted pref — keep defaults */ }
+  }, [])
+  const patchBand = useCallback((p: { on?: boolean; opacity?: number }) => {
+    if (p.on !== undefined) setGridBandOn(p.on)
+    if (p.opacity !== undefined) setGridBandOpacity(p.opacity)
+    try {
+      const prev = JSON.parse(localStorage.getItem('bh-grid-band') ?? '{}') as { on?: boolean; opacity?: number }
+      localStorage.setItem('bh-grid-band', JSON.stringify({ on: p.on ?? prev.on ?? true, opacity: p.opacity ?? prev.opacity ?? 0.2 }))
+    } catch { /* storage unavailable — session-only pref */ }
+  }, [])
+
+  // Which active grids get a band on THIS pane (same filter + cap as the
+  // price-line overlay — band rides the overlay toggle, not the glow).
+  const gridBandRows = useMemo(() => {
+    if (!gridOverlayOn || !gridBandOn || !Array.isArray(gridOverlayData)) return []
+    const symN = normSym(symbol)
+    return gridOverlayData
+      .filter((g) => g.status === 'active' && normSym(String(g.symbol || '')) === symN)
+      .slice(0, 2)
+      .map((g) => {
+        const lower = Number(g.lowerPrice)
+        const upper = Number(g.upperPrice)
+        if (!Number.isFinite(lower) || !Number.isFinite(upper) || !(upper > lower)) return null
+        const color = g.direction === 'sell' ? '#a855f7' : g.direction === 'buy' ? '#38bdf8' : '#10b981'
+        return { id: g.id, lower, upper, color }
+      })
+      .filter((b): b is { id: string; lower: number; upper: number; color: string } => b != null)
+  }, [gridOverlayOn, gridBandOn, gridOverlayData, symbol])
+
+  // Band DOM refs + a rAF tracker: pan/zoom/autoscale/data ticks all move the
+  // y-coordinates every frame, so instead of hooking five chart events we read
+  // priceToCoordinate() per frame and only touch the DOM when a value changed
+  // (dataset.sig gate) — two reads + 2-4 style writes per band, ~zero cost.
+  const gridBandWrapRef = useRef<HTMLDivElement | null>(null)
+  const gridBandRefs = useRef<Map<string, HTMLDivElement>>(new Map())
+  useEffect(() => {
+    if (gridBandRows.length === 0) return
+    let raf = 0
+    const tick = () => {
+      raf = requestAnimationFrame(tick)
+      const series = seriesRef.current
+      const chart = chartRef.current
+      if (!series || !chart) return
+      let paneW = 0
+      let paneH = 0
+      try {
+        const ps = chart.paneSize()
+        paneW = ps.width
+        paneH = ps.height
+      } catch { return }
+      if (!(paneW > 0) || !(paneH > 0)) return
+      const wrap = gridBandWrapRef.current
+      if (wrap && Math.abs(parseFloat(wrap.style.width || '0') - paneW) > 0.5) wrap.style.width = `${paneW}px`
+      for (const b of gridBandRows) {
+        const el = gridBandRefs.current.get(b.id)
+        if (!el) continue
+        let yL: number | null = null
+        let yU: number | null = null
+        try {
+          yL = series.priceToCoordinate(b.lower)
+          yU = series.priceToCoordinate(b.upper)
+        } catch { /* disposed chart mid-frame */ }
+        if (yL == null || yU == null) {
+          if (el.style.display !== 'none') el.style.display = 'none'
+          continue
+        }
+        const top = Math.max(0, Math.min(Number(yL), Number(yU)))
+        const bottom = Math.min(paneH, Math.max(Number(yL), Number(yU)))
+        const h = bottom - top
+        if (h <= 0.5) {
+          if (el.style.display !== 'none') el.style.display = 'none'
+          continue
+        }
+        const sig = `${top.toFixed(1)}|${h.toFixed(1)}|${paneW.toFixed(1)}`
+        if (el.dataset.sig === sig && el.style.display === 'block') continue
+        el.dataset.sig = sig
+        el.style.display = 'block'
+        el.style.top = `${top}px`
+        el.style.height = `${h}px`
+        el.style.width = `${paneW}px`
+      }
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [gridBandRows])
+
   // ---------- technical indicators: series lifecycle ----------
   // lightweight-charts v4 has no real multi-pane support: SMA/EMA/BB are line
   // overlays on the price scale, RSI/MACD are dedicated price scales squeezed
@@ -3960,6 +4061,35 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           dpr× its intended position — exactly the "line is not where I clicked"
           bug. Explicit CSS size + dpr-scaled backing store = 1:1 coordinates. */}
       <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-10 h-full w-full" aria-hidden />
+
+      {/* Task 10-l — translucent grid-area band: one shaded rectangle per
+          active grid (lower…upper), direction-tinted like the level lines.
+          Sits ABOVE the chart canvas but BELOW the drawings canvas (z-10),
+          pixels tracked by the rAF effect above. Purely decorative. */}
+      {gridBandRows.length > 0 && (
+        <div
+          ref={gridBandWrapRef}
+          aria-hidden
+          className="pointer-events-none absolute left-0 top-0 z-[5] h-full"
+        >
+          {gridBandRows.map((b) => {
+            const rgb = hexToRgbVar(b.color) ?? '16 185 129'
+            return (
+              <div
+                key={b.id}
+                ref={(el) => { if (el) gridBandRefs.current.set(b.id, el); else gridBandRefs.current.delete(b.id) }}
+                className="absolute left-0"
+                style={{
+                  display: 'none',
+                  background: `rgb(${rgb} / ${gridBandOpacity})`,
+                  borderTop: `1px solid rgb(${rgb} / ${Math.min(1, gridBandOpacity + 0.25)})`,
+                  borderBottom: `1px solid rgb(${rgb} / ${Math.min(1, gridBandOpacity + 0.25)})`,
+                }}
+              />
+            )
+          })}
+        </div>
+      )}
 
       {/* header overlay */}
       <div className={cn('pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center gap-2 border-b border-zinc-800/60 bg-zinc-950/85 px-2 backdrop-blur-sm', compact ? 'h-8' : 'h-10')}>
@@ -4357,6 +4487,56 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         >
           <Grid3x3 className="h-3.5 w-3.5" />
         </button>
+        {/* Task 10-l — grid-area band settings: on/off + transparency slider
+            (default 80% transparent). Lives next to the overlay toggle. */}
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              title="Grid area layer — transparency & visibility"
+              aria-label="Grid area layer settings"
+              className={cn(
+                'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+                gridOverlayOn && gridBandOn && gridBandRows.length > 0
+                  ? 'bg-emerald-500/25 text-emerald-400'
+                  : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',
+              )}
+            >
+              <Layers className="h-3.5 w-3.5" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent align="start" sideOffset={6} className="w-[248px] border-zinc-800 bg-zinc-950/95 p-3 text-xs text-zinc-200 backdrop-blur-sm">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-medium">Grid area layer</span>
+              <Switch
+                checked={gridBandOn}
+                onCheckedChange={(v) => patchBand({ on: v })}
+                aria-label="Show grid area layer"
+              />
+            </div>
+            <p className="mt-1 text-[10px] leading-4 text-zinc-500">
+              Shades each active grid's price range while the grid overlay (Grid3x3) is on. Tinted per direction: emerald / buy sky / sell violet.
+            </p>
+            <div className="mt-3">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] uppercase tracking-wider text-zinc-500">Transparency</span>
+                <span className="tabular-nums text-zinc-300">{Math.round((1 - gridBandOpacity) * 100)}%</span>
+              </div>
+              <Slider
+                value={[Math.round((1 - gridBandOpacity) * 100)]}
+                min={50}
+                max={100}
+                step={5}
+                onValueChange={(vals) => {
+                  const v = Array.isArray(vals) ? vals[0] : vals
+                  if (typeof v === 'number') patchBand({ opacity: (100 - v) / 100 })
+                }}
+                aria-label="Grid area layer transparency"
+                className="mt-2"
+              />
+              <div className="mt-1 flex justify-between text-[9px] text-zinc-600"><span>50%</span><span>100%</span></div>
+            </div>
+          </PopoverContent>
+        </Popover>
         <div className="mx-1 my-0.5 h-px bg-zinc-800" />
         {(
           [
