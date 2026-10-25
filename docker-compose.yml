@@ -5,7 +5,8 @@
 # Secrets come from the repo-root .env (compose reads it automatically):
 #   AUTH_SECRET / APP_ENCRYPTION_SECRET are REQUIRED — generate with
 #     bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-# Optional: ALLOW_REGISTRATION, ALLOW_SHARED_BROKER, ENABLE_METRICS,
+# Optional: ALLOW_REGISTRATION, ALLOW_SHARED_BROKER, APCA_API_KEY_ID /
+#           APCA_API_SECRET_KEY (shared paper keys), ENABLE_METRICS,
 #           DB_PUSH_ACCEPT_DATA_LOSS (=1 to allow destructive schema pushes).
 #
 # The SQLite file lives in ./db (bind-mounted) — back it up by stopping the
@@ -27,6 +28,8 @@ services:
       APP_ENCRYPTION_SECRET: ${APP_ENCRYPTION_SECRET:?set APP_ENCRYPTION_SECRET in .env}
       ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
       ALLOW_SHARED_BROKER: ${ALLOW_SHARED_BROKER:-false}
+      APCA_API_KEY_ID: ${APCA_API_KEY_ID:-}
+      APCA_API_SECRET_KEY: ${APCA_API_SECRET_KEY:-}
       ENABLE_METRICS: ${ENABLE_METRICS:-0}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DB_PUSH_ACCEPT_DATA_LOSS: ${DB_PUSH_ACCEPT_DATA_LOSS:-0}

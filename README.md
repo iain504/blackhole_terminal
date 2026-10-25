@@ -112,8 +112,10 @@ Tabs drag to reorder; panels and splitters drag to resize.
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| [Bun](https://bun.sh) | ≥ 1.1 | Runtime + package manager (scripts call `bun` directly) |
+| [Bun](https://bun.sh) | ≥ 1.3 | Runtime + package manager (scripts call `bun` directly) |
 | OS | Linux / macOS / WSL2 | `sqlite`, `bash` and a Caddy/nginx reverse proxy (optional) |
+
+> **Windows?** Run the [Docker Compose stack](#option-a--docker-compose-recommended) via Docker Desktop — no Bun, bash or WSL2 needed; or use the app from inside WSL2 for the native path. The npm scripts use POSIX-isms (`cp -r`, `tee`, `NODE_ENV=…` prefixes) that plain PowerShell can't run.
 
 > Node.js is *not* required — Bun alone runs the app, the DB tooling and the streaming service.
 
@@ -207,6 +209,16 @@ your.domain.com {
 ```
 
 No proxy at all? Everything works — you just get REST polling instead of live ticks.
+
+### Live ticks on your own PC (2 minutes)
+
+The repo's [Caddyfile](Caddyfile) works as-is on localhost — it serves the app on **:81** and routes the stream query to the sidecar:
+
+```bash
+caddy run --config Caddyfile        # Caddy is a single binary — caddyserver.com
+```
+
+Then open **http://localhost:81** instead of :3000 — the status chip flips from **Polling** to **Live**.
 
 ## Production deployment
 

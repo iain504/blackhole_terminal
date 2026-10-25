@@ -2815,3 +2815,20 @@ Work Log:
 Stage Summary:
 - Next deploy is self-diagnosing: [mem] lines every 30s reveal whether RSS climbs (OOM path) or stays flat (points to Render Events/Metrics: crash markers, instance-hours, or router). If the ceiling exit fires, the log names it explicitly instead of vanishing.
 - Still need from the user's dashboard: Events tab entries after 19:58 + Metrics→Memory graph + whether other free services share the 750 instance-hours.
+---
+Task ID: 14-local-deploy
+Agent: Z.ai Code (main)
+Task: User wants to run BLACKHOLE Terminal on their local PC — write deployment instructions, fix local-deploy gaps, commit & push.
+
+Work Log:
+- Verified the local paths against HEAD (66fa284): Docker Compose stack (Dockerfile + docker-entrypoint.sh auto db push, bind-mounted ./db) and native Bun quick start both documented in README.
+- Found & fixed a real gap: docker-compose.yml did NOT pass APCA_API_KEY_ID / APCA_API_SECRET_KEY into the app container — shared-broker keys in .env never reached the app. Added both with empty defaults (`${VAR:-}`), validated by YAML parse (12 env keys now flow).
+- README: Bun requirement corrected to ≥1.3 (matches the pinned Docker line); added Windows guidance (Docker Desktop path or WSL2 — npm scripts use POSIX-isms PowerShell can't run: cp -r, tee, NODE_ENV= prefixes); added "Live ticks on your own PC" subsection — the shipped Caddyfile works as-is on localhost (:81 app + XTransformPort=3030 → sidecar), chip flips Polling→Live.
+- Confirmed stream-client behavior for docs accuracy: io('/?XTransformPort=3030') same-origin, graceful REST-polling fallback when no proxy — so plain localhost:3000 works fully except live ticks.
+- No TS code changed (README/compose only) — lint not required; dev server untouched.
+
+Stage Summary:
+- Local deployment recommendation: Docker Desktop + `docker compose up -d --build` (works on Windows/macOS/Linux, auto db push, persistent ./db/custom.db, stream sidecar included) — avoids every Render free-tier pain (no 512MB OOM, no ephemeral DB wipes, no spin-down).
+- Native path: bun install → .env (absolute DATABASE_URL, AUTH_SECRET, APP_ENCRYPTION_SECRET) → bun run db:push → bun run dev (or build+start).
+- Optional live ticks: caddy run --config Caddyfile → browse :81.
+- Pushed so the user's fresh clone contains the fixed compose file and updated README.
