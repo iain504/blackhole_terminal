@@ -220,7 +220,7 @@ Two services, both `restart: unless-stopped`, health-checked, and the **stream s
 
 ### Option B — Render.com (free tier)
 
-The repo ships a Blueprint (`render.yaml`) — Dashboard → **New + → Blueprint → pick this repo → Apply**, then paste your Alpaca paper keys in the Environment tab. Render builds the same Dockerfile, injects `PORT`, generates stable `AUTH_SECRET` / `APP_ENCRYPTION_SECRET` once (`generateValue`), and health-checks `/api/health`. The heap is capped at 400MB so the in-app memory guard returns its polite 503 before the 512MB container OOMs.
+The repo ships a Blueprint (`render.yaml`) — Dashboard → **New + → Blueprint → pick this repo → Apply**, then paste your Alpaca paper keys in the Environment tab. Render builds the same Dockerfile, injects `PORT`, generates stable `AUTH_SECRET` / `APP_ENCRYPTION_SECRET` once (`generateValue`), and health-checks `/api/health`. Bun runs JavaScriptCore (the V8-style heap flag is ignored), so JSC is steered via `BUN_JSC_forceRamSize` and the memory guard also watches **process RSS** against a 460MB ceiling — heavy analytics return the polite 503 before the 512MB free container gets silently OOM-killed.
 
 Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite file resets on every deploy/restart — persistence needs `plan: starter` + the commented disk block), **spin-down** after 15 idle minutes (grid/algo engines tick in-process, so they pause while asleep), and **no stream sidecar** (the terminal runs over REST polling; the Live chip shows amber). Always-on + persistence = `plan: starter` + disk.
 

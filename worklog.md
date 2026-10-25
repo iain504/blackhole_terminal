@@ -2784,3 +2784,19 @@ Work Log:
 Stage Summary:
 - Render redeploy expectation: build passes smoke test; boot log shows "[entrypoint] applying prisma schema…" → "database ready: /app/db/custom.db (N bytes)" with NO "table does not exist" spam after; register a fresh account (ephemeral free-tier DB resets each deploy).
 - docker-compose stack inherits the same fix (single Dockerfile).
+---
+Task ID: 13-render-fix-3
+Agent: Z.ai Code (main)
+Task: Render deploy #3 — boot fully healthy (db push OK, 225280 bytes, no table errors) but the public URL 502s; silent pod replacement at 19:37 with no deploy line and no error output.
+
+Work Log:
+- Probed https://blackhole-terminal.onrender.com/api/health from the sandbox: instant HTTP 502 (0.26s) ×9 over 4+ min — not cold-start (~50s); no healthy upstream.
+- Evidence: user log shows pod hash change 565f78f5b4→86bbdb8797 at 19:37 with NO "Deploying..." line = platform restart; log ends silently right after "[alerts] supervisor started" — silent death is the signature of a cgroup OOM SIGKILL (no app-level log possible).
+- Root-cause candidates found in code: (1) NODE_OPTIONS=--max-old-space-size is a V8 flag — Bun (JavaScriptCore) silently ignores it; verified heap_size_limit is JSC's ~345MB heuristic with AND without the flag, so the render.yaml "400MB cap" comment never did anything; (2) memoryGuard() watched heapUsed only — blind to RSS, which is the metric the 512MB free container actually kills on (server + JSC + Prisma engine process).
+- mem-guard.ts: RSS-aware — new MEM_RSS_CEILING_MB env adds an RSS ratio (worst-of heap/RSS wins); 503 message includes "RSS N/ceiling MB"; without the env the shape/behavior is unchanged (dev safe). Validated both modes via bun imports.
+- render.yaml: BUN_JSC_forceRamSize=268435456 (JSC GC steering), NODE_OPTIONS kept but lowered to 256, MEM_RSS_CEILING_MB=460; header comment corrected (Bun ignores the V8 flag). README Render paragraph updated.
+- lint clean; tsc clean for src/ (3 pre-existing bun:test type errors in tests/, unrelated); stamp v1.80.0+151.
+
+Stage Summary:
+- The 502 most plausibly = OOM crash-loop (silent SIGKILL) possibly triggered by dashboard-opening request bursts; new deploy hardens RSS ceiling + kicks the service out of restart backoff. If 502 persists post-deploy: check Render dashboard Events (crash markers) + Metrics→Memory sawtooth at 512MB, and whether other free services consume the shared 750 instance-hours.
+- Free-tier spin-down also wipes the ephemeral disk (the 19:37 boot printed the fresh-database hint) — account created on Render is session-scoped by design.

@@ -12,12 +12,14 @@
 #     random 24-char value ONCE and keeps it stable across every later deploy
 #     — exactly what the encryption-at-rest design needs (a rotating key
 #     would make previously-encrypted TOTP secrets undecryptable).
-#   • NODE_OPTIONS caps the heap at 400MB so src/lib/mem-guard.ts can see the
-#     real ceiling: the free instance has 512MB RAM, and without a cap the
-#     heap guard (which reads the V8 heap limit) never trips — deep 1m
-#     backtests/sweeps would OOM-kill the container instead of returning the
-#     polite 503. With the cap, heavy analytics 503-and-retry like on the dev
-#     box.
+#   • BUN_JSC_forceRamSize=256MB steers Bun's JavaScriptCore heap heuristic —
+#     the V8-style NODE_OPTIONS=--max-old-space-size flag is SILENTLY IGNORED
+#     by Bun (verified: the reported limit is JSC's ~345MB default either way).
+#   • MEM_RSS_CEILING_MB=460 makes memoryGuard() watch process RSS: the free
+#     container is kernel-OOM-killed when RSS crosses 512MB, and a cgroup
+#     SIGKILL is silent — no log lines, the pod vanishes, Render's router
+#     answers 502 until the restart backoff lands. With the ceiling set, deep
+#     1m backtests/sweeps 503-and-retry like on the dev box instead of dying.
 #   • ALLOW_REGISTRATION=true so you can create the first account (the
 #     bootstrap-open-when-empty rule also applies, but explicit is clearer).
 #
@@ -70,10 +72,16 @@ services:
         sync: false
       - key: APCA_API_SECRET_KEY
         sync: false
-      # Cap the V8 heap so the in-app memory guard (503 on heavy endpoints)
-      # fires BEFORE the 512MB container OOM-kill. See mem-guard.ts.
+      # Bun/JSC heap steering (NODE_OPTIONS alone is ignored by Bun — see
+      # mem-guard.ts); kept for any Node-context tools in the image.
+      - key: BUN_JSC_forceRamSize
+        value: "268435456" # 256MB
       - key: NODE_OPTIONS
-        value: --max-old-space-size=400
+        value: --max-old-space-size=256
+      # RSS-aware memory guard — the metric the 512MB container actually dies
+      # on. Heavy endpoints return 503 before the kernel OOM-kills the pod.
+      - key: MEM_RSS_CEILING_MB
+        value: "460"
 
     # PERSISTENCE (paid plans only — uncomment together with plan: starter):
     # disks:
