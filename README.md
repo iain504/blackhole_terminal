@@ -218,7 +218,13 @@ docker compose up -d --build
 
 Two services, both `restart: unless-stopped`, health-checked, and the **stream sidecar auto-starts** with the stack: `app` on **:3000** (SQLite bind-mounted at `./db`) and `stream` on **:3030** (socket.io). Secrets are read from the repo-root `.env` (`AUTH_SECRET` / `APP_ENCRYPTION_SECRET` are required). Schema is applied on every boot by the entrypoint's `prisma db push` — set `DB_PUSH_ACCEPT_DATA_LOSS=1` only if you knowingly ship destructive schema changes.
 
-### Option B — systemd
+### Option B — Render.com (free tier)
+
+The repo ships a Blueprint (`render.yaml`) — Dashboard → **New + → Blueprint → pick this repo → Apply**, then paste your Alpaca paper keys in the Environment tab. Render builds the same Dockerfile, injects `PORT`, generates stable `AUTH_SECRET` / `APP_ENCRYPTION_SECRET` once (`generateValue`), and health-checks `/api/health`. The heap is capped at 400MB so the in-app memory guard returns its polite 503 before the 512MB container OOMs.
+
+Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite file resets on every deploy/restart — persistence needs `plan: starter` + the commented disk block), **spin-down** after 15 idle minutes (grid/algo engines tick in-process, so they pause while asleep), and **no stream sidecar** (the terminal runs over REST polling; the Live chip shows amber). Always-on + persistence = `plan: starter` + disk.
+
+### Option C — systemd
 
 ```bash
 bun run build        # next build (standalone output) + static asset copy

@@ -1,0 +1,77 @@
+# BLACKHOLE Terminal — Render.com Blueprint (free tier).
+#
+# Render reads this file when you create a Blueprint instance:
+#   Dashboard → New + → Blueprint → pick iain504/blackhole-terminal → Apply
+# Everything below is the app web service only. Deploy story:
+#
+#   • runtime: docker — builds the repo Dockerfile (multi-stage bun, Next
+#     standalone, boot-time `prisma db push` via docker-entrypoint.sh).
+#   • PORT — Render injects it and the standalone server binds it (the
+#     Dockerfile/entrypoint already honor $PORT), so no port config needed.
+#   • AUTH_SECRET / APP_ENCRYPTION_SECRET use generateValue: Render mints a
+#     random 24-char value ONCE and keeps it stable across every later deploy
+#     — exactly what the encryption-at-rest design needs (a rotating key
+#     would make previously-encrypted TOTP secrets undecryptable).
+#   • NODE_OPTIONS caps the heap at 400MB so src/lib/mem-guard.ts can see the
+#     real ceiling: the free instance has 512MB RAM, and without a cap the
+#     heap guard (which reads the V8 heap limit) never trips — deep 1m
+#     backtests/sweeps would OOM-kill the container instead of returning the
+#     polite 503. With the cap, heavy analytics 503-and-retry like on the dev
+#     box.
+#   • ALLOW_REGISTRATION=true so you can create the first account (the
+#     bootstrap-open-when-empty rule also applies, but explicit is clearer).
+#
+# FREE-TIER CONSTRAINTS (read before relying on it):
+#   1. EPHEMERAL DISK — the free plan has no persistent disks. db/custom.db
+#      lives in the container layer and is RESET on every deploy and every
+#      restart. Fine for trying the terminal; accounts/grids/algo history do
+#      not survive. Persistence needs plan: starter + the disk block below.
+#   2. SPIN-DOWN — free services sleep after 15 minutes without inbound
+#      traffic and cold-start in ~50s on the next request. The grid and algo
+#      engines tick IN-PROCESS, so while the instance sleeps your grids are
+#      NOT being managed. Always-on needs plan: starter.
+#   3. 750 instance-hours/month shared across free services — one
+#      always-on-ish web service fits; two would not.
+#   4. The stream sidecar (socket.io :3030) is deliberately NOT deployed: the
+#      browser client connects via the sandbox gateway path
+#      (/?XTransformPort=3030) and the free pool can't spare a second
+#      always-on service. Without it the terminal works over REST polling —
+#      the Live chip shows amber "Reconnecting" and live-tick streaming is
+#      simply absent. Grid/algo engines are server-side and unaffected.
+
+services:
+  - type: web
+    name: blackhole-terminal
+    runtime: docker
+    plan: free
+    region: frankfurt # pick the region closest to you at apply time
+    branch: main
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        value: file:/app/db/custom.db
+      - key: AUTH_SECRET
+        generateValue: true
+      - key: APP_ENCRYPTION_SECRET
+        generateValue: true
+      - key: ALLOW_SHARED_BROKER
+        value: "true"
+      - key: ALLOW_REGISTRATION
+        value: "true"
+      # Paste your Alpaca PAPER keys in the dashboard (Environment tab) —
+      # kept out of git on purpose.
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      # Cap the V8 heap so the in-app memory guard (503 on heavy endpoints)
+      # fires BEFORE the 512MB container OOM-kill. See mem-guard.ts.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=400
+
+    # PERSISTENCE (paid plans only — uncomment together with plan: starter):
+    # disks:
+    #   - name: blackhole-db
+    #     mountPath: /app/db
+    #     sizeGB: 1
