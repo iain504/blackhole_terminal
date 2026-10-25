@@ -39,7 +39,7 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
   ALGO_STRATEGIES,
-  ALGO_MAX_DAYS,
+  algoMaxDays,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import type { BacktestResult, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
@@ -579,9 +579,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setBtSpread(String(rec.spreadBps))
     // Task 4-a — baked setups were measured with the honest 1× capital cap
     setBtLev('1')
-    // widen the history to the window the setup was MEASURED on (capped per TF)
-    // — otherwise a 30d re-run would not reproduce the baked-in numbers
-    setDays(String(Math.min(ALGO_MAX_DAYS[rec.timeframe] ?? 30, Math.max(1, Math.round(rec.coveredDays)))))
+    // widen the history to the window the setup was MEASURED on (capped per
+    // TF/asset — stocks 1m reach 180d, crypto 1m 45d) — otherwise a 30d
+    // re-run would not reproduce the baked-in numbers
+    setDays(String(Math.min(algoMaxDays(rec.timeframe, rec.symbol.includes('/')), Math.max(1, Math.round(rec.coveredDays)))))
     onApplySetup?.({ symbol: rec.symbol, timeframe: rec.timeframe, strategy: rec.strategy, params: rec.params })
     toast({
       title: 'Recommended setup applied',
@@ -650,7 +651,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
           <div>
             <Label htmlFor="bt-days" className="text-[10px] text-zinc-500">
               History (calendar days)
-              <span className="ml-1 text-zinc-600">· max {ALGO_MAX_DAYS[cfg.timeframe as AlgoTimeframe]} for {cfg.timeframe}</span>
+              <span className="ml-1 text-zinc-600">· max {algoMaxDays(cfg.timeframe as AlgoTimeframe, cfg.symbol.includes('/'))} for {cfg.timeframe}</span>
             </Label>
             <Input
               id="bt-days"
@@ -658,14 +659,14 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               onChange={(e) => setDays(e.target.value)}
               onBlur={() => {
                 const n = Math.round(Number(days) || 30)
-                const max = ALGO_MAX_DAYS[cfg.timeframe as AlgoTimeframe] ?? 730
+                const max = algoMaxDays(cfg.timeframe as AlgoTimeframe, cfg.symbol.includes('/'))
                 setDays(String(Math.min(max, Math.max(1, n))))
               }}
               inputMode="numeric"
               className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
             />
             {cfg.symbol.includes('/') && (
-              <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">crypto feeds serve ≈104d on 15m / 35d on 5m — deeper windows use the Alpaca crypto feed</p>
+              <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">crypto: ≈104d on 15m / 35d on 5m (Alpaca crypto feed) · 1m caps at 45d (24/7 bars ≈ 6× stock count)</p>
             )}
           </div>
           <div>

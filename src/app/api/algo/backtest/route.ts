@@ -54,7 +54,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { type Timeframe } from '@/lib/market-types'
-import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, type AlgoTimeframe } from '@/lib/algo-strategies'
+import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, algoMaxDays, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { rateLimit } from '@/lib/rate-limit'
 import {
   prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward,
@@ -298,7 +298,9 @@ async function computeBacktest(
   if (!symbol || !/^[A-Z0-9./:-]{1,15}$/.test(symbol)) {
     return { status: 400, body: { error: 'Invalid symbol' } }
   }
-  const days = Math.min(ALGO_MAX_DAYS[tf], Math.max(1, Math.round(Number(body.days) || 30)))
+  // v1.80.3 — asset-aware clamp: stocks 1m now reach 180d, crypto 1m stays at
+  // 45d (24/7 feeds 6× the bar count — see algoMaxDays in lib/algo-strategies).
+  const days = Math.min(algoMaxDays(tf, symbol.includes('/')), Math.max(1, Math.round(Number(body.days) || 30)))
   const qty = Number(body.qty)
   if (!(qty > 0)) {
     return { status: 400, body: { error: 'Quantity must be > 0' } }

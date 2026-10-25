@@ -146,13 +146,31 @@ export type AlgoTimeframe = (typeof ALGO_TIMEFRAMES)[number]
 /**
  * Max backtest history (calendar days) per algo timeframe — shared by the API
  * route (clamp) and the Backtest panel (visible hint), so the cap is never
- * applied silently.
+ * applied silently. The map is the STOCK (RTH session) ceiling: ≈390 1m bars
+ * per session → 180d ≈ 70k bars, the same scale the 5m/365d (≈28k bars) and
+ * 15m/730d (≈19k bars) windows already carry.
  *
  * Task 9-p — 1m was 120d ≈ 173k bars for 24/7 crypto (fetch + series + TWO
  * caches retaining it) — the single most reliable way to OOM the dev box.
- * 30d ≈ 43k bars keeps 1m studies useful and the heap flat.
+ * v1.80.3 — stocks go back to 180d of 1m (user ask: "1m is only 30 for now").
+ * Crypto 1m stays heap-safe via algoMaxDays(): a 24/7 feed produces ≈1,440
+ * bars/day, so 180d would be ≈259k bars — the exact allocation that OOM'd the
+ * box. Crypto keeps 45d (≈65k bars ≈ the stock cap's load).
  */
-export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> = { '1m': 30, '5m': 365, '15m': 730 }
+export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> = { '1m': 180, '5m': 365, '15m': 730 }
+
+/** Crypto-only 1m ceiling (24/7 feed — see the ALGO_MAX_DAYS note). */
+export const ALGO_1M_CRYPTO_MAX_DAYS = 45
+
+/**
+ * Asset-aware lookback ceiling — the ONLY clamp callers should use. The raw
+ * map is the stock/RTH ceiling; crypto symbols (symbol.includes('/')) must go
+ * through this so the 24/7 bar count can't 6× a window past the heap budget.
+ */
+export function algoMaxDays(tf: AlgoTimeframe, isCrypto: boolean): number {
+  if (tf === '1m' && isCrypto) return ALGO_1M_CRYPTO_MAX_DAYS
+  return ALGO_MAX_DAYS[tf]
+}
 
 export function isAlgoStrategyId(v: unknown): v is AlgoStrategyId {
   return typeof v === 'string' && v in ALGO_STRATEGIES

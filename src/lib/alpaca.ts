@@ -493,9 +493,16 @@ export async function getBars(
   const windowMs = opts?.lookbackDays != null
     ? opts.lookbackDays * 86400 * 1000
     : tf.barCount * tf.seconds * 1000
+  // v1.80.3 — scale the pagination cap with the window: the 60-page default
+  // (~60–120k bars at IEX's ~1–2k bars/page) silently truncated DEEP 1m
+  // windows (180d ≈ 70k bars ≈ 35–70 pages) — oldest pages kept, NEWEST
+  // dropped, i.e. a backtest ending weeks in the past. Chart windows (~900
+  // bars) never leave page 1, so they keep the 60 floor.
+  const estPages = Math.ceil((windowMs / (tf.seconds * 1000)) / 1500) + 6
+  const maxPages = Math.min(160, Math.max(60, estPages))
   for (const mult of [1, 5, 40]) {
     const s = new Date((before ?? end.getTime() / 1000) * 1000 - windowMs * mult)
-    const res = await fetchBarsPaged(makePath(s.toISOString().slice(0, 19) + 'Z'), keys, symbol)
+    const res = await fetchBarsPaged(makePath(s.toISOString().slice(0, 19) + 'Z'), keys, symbol, maxPages)
     rawBars = res.bars
     status = res.status
     truncated = res.truncated

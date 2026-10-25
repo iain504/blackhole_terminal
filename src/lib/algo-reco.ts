@@ -11,7 +11,7 @@ import { db } from '@/lib/db'
 import { getBars } from '@/lib/alpaca'
 import { TIMEFRAMES } from '@/lib/market-types'
 import { prepareSeries, sweepStrategies, type BacktestConfig, type SweepResult } from '@/lib/backtest'
-import { ALGO_MAX_DAYS, ALGO_TIMEFRAMES, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
+import { algoMaxDays, ALGO_TIMEFRAMES, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 import { memoryGuard } from '@/lib/mem-guard'
 import { symbolSchema } from '@/lib/validation'
@@ -347,7 +347,7 @@ export async function runRecoSweepMatrix(
       }
       const costs = costsFor(symbol)
       try {
-        const days = ALGO_MAX_DAYS[tf]
+        const days = algoMaxDays(tf, symbol.includes('/'))
         const res = await getBars(symbol, tf, userId, { lookbackDays: days })
         let bars = Array.isArray(res.bars) ? res.bars : []
         if (!res.demo && bars.length >= 80) {
