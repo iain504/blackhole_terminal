@@ -13,7 +13,7 @@ import { handleError } from '@/lib/api-helpers'
  * anonymous visitors get an empty response and the stream service simulates
  * stock ticks in demo mode (crypto always streams free from Binance).
  */
-export async function GET(req: Request) {
+export async function GET(_req: Request) {
   try {
     const user = await getSessionUser()
     if (!user) return NextResponse.json({ keyId: '', secret: '' })

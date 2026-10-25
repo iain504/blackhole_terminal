@@ -50,13 +50,12 @@
 // flags, prefix sums for SMA/σ) is precomputed ONCE by prepareSeries() and
 // reused by every optimizer combo — each combo then costs ~O(bars) with O(1)
 // per-bar indicator updates (grid of ~800 combos × 40k bars ≈ 1–2s).
-import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
+import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
 import type { Bar } from '@/lib/market-types'
 import { memoryGuard } from '@/lib/mem-guard'
 
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — same as the live engine
-const RTH_START_MIN = 9 * 60 + 30
 
 export interface BacktestConfig {
   strategy: AlgoStrategyId

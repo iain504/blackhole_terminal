@@ -11,6 +11,8 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { APP_VERSION } from '@/generated/version'
+import { rateLimitStore } from '@/lib/rate-limit'
+import { log } from '@/lib/logger'
 
 const CACHE_TTL_MS = 5000
 const DB_TIMEOUT_MS = 2000
@@ -24,11 +26,16 @@ interface HealthPayload {
   status: 'ok' | 'degraded'
   uptimeSec: number
   memoryMB: number
+  heapMB: number
   db: boolean
   algoRuns: number | null
+  gridRuns: number | null
   recoAgeMin: number | null
   stream: 'up' | 'down' | 'unknown'
+  rateLimitStore: 'db' | 'memory'
   version: string
+  sha: string
+  ts: string
 }
 
 let cache: { at: number; payload: HealthPayload; httpStatus: number } | null = null
@@ -83,12 +90,18 @@ async function compute(): Promise<{ payload: HealthPayload; httpStatus: number }
 
   // Dependent aggregates — only meaningful (and only cheap) when the DB is up.
   let algoRuns: number | null = null
+  let gridRuns: number | null = null
   let recoAgeMin: number | null = null
   if (dbOk) {
     try {
       algoRuns = await db.algoRun.count({ where: { status: 'running' } })
     } catch {
       algoRuns = null
+    }
+    try {
+      gridRuns = await db.gridTrade.count({ where: { status: 'active' } })
+    } catch {
+      gridRuns = null
     }
     try {
       const reco = await db.algoRecoCache.findFirst({ select: { updatedAt: true } })
@@ -100,15 +113,24 @@ async function compute(): Promise<{ payload: HealthPayload; httpStatus: number }
     }
   }
 
+  const mem = process.memoryUsage()
   const payload: HealthPayload = {
     status: dbOk ? 'ok' : 'degraded',
     uptimeSec: Math.round(process.uptime()),
-    memoryMB: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+    memoryMB: Math.round(mem.rss / (1024 * 1024)),
+    heapMB: Math.round(mem.heapUsed / (1024 * 1024)),
     db: dbOk,
     algoRuns,
+    gridRuns,
     recoAgeMin,
     stream: await checkStream(),
+    rateLimitStore: rateLimitStore(),
     version: APP_VERSION.display,
+    sha: APP_VERSION.sha,
+    ts: new Date().toISOString(),
+  }
+  if (!dbOk) {
+    log.warn('health_degraded', { uptimeSec: payload.uptimeSec, memoryMB: payload.memoryMB })
   }
   return { payload, httpStatus: dbOk ? 200 : 503 }
 }
@@ -135,15 +157,21 @@ export async function GET() {
   } catch (e) {
     // The probe itself must never 500 unstructured — degrade instead.
     console.warn('[health] probe failed:', e instanceof Error ? e.message : e)
+    const mem = process.memoryUsage()
     const payload: HealthPayload = {
       status: 'degraded',
       uptimeSec: Math.round(process.uptime()),
-      memoryMB: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+      memoryMB: Math.round(mem.rss / (1024 * 1024)),
+      heapMB: Math.round(mem.heapUsed / (1024 * 1024)),
       db: false,
       algoRuns: null,
+      gridRuns: null,
       recoAgeMin: null,
       stream: 'unknown',
+      rateLimitStore: rateLimitStore(),
       version: APP_VERSION.display,
+      sha: APP_VERSION.sha,
+      ts: new Date().toISOString(),
     }
     return NextResponse.json(payload, { status: 503 })
   }

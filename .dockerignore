@@ -1,0 +1,30 @@
+# Build context hygiene (Task 11-d) — keep the image small and secret-free.
+node_modules
+.next
+.git
+.gitignore
+db
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# sandbox / local artifacts
+dev.log
+server.log
+tool-results
+screens-tmp
+scripts-tmp
+archive
+upload
+agent-ctx
+.zscripts
+docs
+README.md
+
+# editor / platform
+.vscode
+.idea
+.claude
+skills
+examples

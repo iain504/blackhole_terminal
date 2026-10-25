@@ -28,6 +28,71 @@ BLACKHOLE Terminal is a full trading workstation you can run on your own machine
 
 Everything is stored locally in a single SQLite file. No cloud, no telemetry, no fabricated prices — symbols without a live upstream simply don't stream.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph browser["Browser — terminal SPA"]
+        UI["charts · watchlists · grids · algo · report"]
+    end
+    subgraph app["Next.js 16 on Bun :3000"]
+        API["/api routes — Zod-validated, DB-rate-limited"]
+        ENG["Algo engine — 15s cycle"]
+        GRID["Grid engine — 5s tick"]
+        SUP["Alert / calendar / fill supervisors"]
+    end
+    DB[("SQLite · db/custom.db")]
+    subgraph side["mini-services/stream-service :3030"]
+        SOCK["socket.io fan-out — one upstream WS per account"]
+    end
+    ALP["Alpaca REST — paper trading"]
+    BIN["Binance WebSocket"]
+    AWS["Alpaca IEX WebSocket"]
+    TG["Telegram bot API"]
+
+    UI -->|"fetch JSON"| API
+    UI <-->|"socket.io — live ticks"| SOCK
+    API --> DB
+    ENG --> DB
+    GRID --> DB
+    SUP --> DB
+    API -->|"bars · quotes · orders"| ALP
+    ENG -->|"orders + brackets"| ALP
+    GRID -->|"orders · guards"| ALP
+    API -->|"fill notifications"| TG
+    SOCK --> BIN
+    SOCK --> AWS
+```
+
+Single-process by design for a personal workstation: engines run **in-process** with restart-resilient state (each run/grid row carries its own working memory in the DB, so a reboot resumes instead of re-asking). If you ever need process isolation for the algo engine, see [Roadmap](#roadmap).
+
+## How the algo engine works
+
+One supervisor loop, evaluated every **15 seconds** (`CYCLE_MS`), strictly on **last-closed bars** — no intrabar repaint, no double-fires:
+
+1. **Resume** — on boot every `AlgoRun` in `status=running` re-hydrates its state from the DB (restart-safe).
+2. **Gate** — equity runs with the RTH gate skip entries outside **09:30–16:00 ET** (constants live in [`src/lib/sessions.ts`](src/lib/sessions.ts) — DST handled via `Intl`); entries pause after **15:45 ET** and open positions flatten (EOD rule).
+3. **Size** — each strategy converts a risk budget (USD) into a quantity via `riskSizedQty` — risk-money sizing, not "invest everything".
+4. **Evaluate** — the strategy function sees the last-closed bar (plus indicator warm-up) and returns an entry/exit intent, normalized by `normalizeAlgoParams`.
+5. **Execute** — entries go to Alpaca with bracket exits (`placeOrderWithExits`); crypto uses an OCO supervisor; every decision is journalled to `AlgoLog` with a heartbeat every 10 idle minutes.
+
+The **grid engine** (`src/lib/grid-engine.ts`, 5s tick) is the same discipline: arithmetic/geometric levels, per-lot fills with realized-PnL attribution, whole-grid maxSL/maxTP guards (absolute price or percent basis), one-sided `buy`/`sell` directions, and `closeOnStop` market-closing every open lot when a guard trips. A pure replay of the same math backs the grid backtester (`simulateGridBacktest`) — covered by tests.
+
+## Keyboard shortcuts
+
+Honest list — only shortcuts that actually exist (press **?** in the terminal to see this dialog):
+
+| Keys | Action |
+| --- | --- |
+| `Alt + Shift + E` | Toggle extended-hours (pre/post-market) data on all charts |
+| Right-click on a chart | Context menu — trade here, set an alarm, clone/delete a drawing, edit exits |
+| Long-press ~0.5s (touch) | Same chart context menu on phones and tablets |
+| `Esc` | Cancel an in-progress drawing drag, reset the drawing tool, close dialogs |
+| `↑ / ↓` on a splitter | Nudge the Positions panel splitters (keyboard resize) |
+| `?` | Open the shortcuts dialog |
+
+Tabs drag to reorder; panels and splitters drag to resize.
+
 ## Requirements
 
 | Tool | Version | Why |
@@ -96,6 +161,8 @@ Open **http://localhost:3000** — the landing page's **Login** button takes you
 | `ALLOW_REGISTRATION` | `false` | Allow new signups after the first bootstrap account |
 | `ALLOW_SHARED_BROKER` | `false` | Permit trading with the env-configured shared Alpaca keys when a user has none of their own |
 | `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | — | Optional *shared* Alpaca keys (paper recommended) |
+| `ENABLE_METRICS` | `0` | `1` exposes `GET /api/metrics` (Prometheus text format) — keep off unless you scrape it |
+| `LOG_LEVEL` | `info` | Structured JSON log level: `debug` / `info` / `warn` / `error` |
 | `DEBUG_DB` | — | Set to `1` to log Prisma queries |
 
 Full template with comments: [`.env.example`](.env.example).
@@ -127,6 +194,16 @@ your.domain.com {
 No proxy at all? Everything works — you just get REST polling instead of live ticks.
 
 ## Production deployment
+
+### Option A — Docker Compose (recommended)
+
+```bash
+docker compose up -d --build
+```
+
+Two services, both `restart: unless-stopped`, health-checked, and the **stream sidecar auto-starts** with the stack: `app` on **:3000** (SQLite bind-mounted at `./db`) and `stream` on **:3030** (socket.io). Secrets are read from the repo-root `.env` (`AUTH_SECRET` / `APP_ENCRYPTION_SECRET` are required). Schema is applied on every boot by the entrypoint's `prisma db push` — set `DB_PUSH_ACCEPT_DATA_LOSS=1` only if you knowingly ship destructive schema changes.
+
+### Option B — systemd
 
 ```bash
 bun run build        # next build (standalone output) + static asset copy
@@ -160,15 +237,25 @@ Restart=always
 
 Then `systemctl enable --now blackhole blackhole-stream` and put Caddy/nginx in front (see above).
 
+> The full go-live walkthrough — secrets, rotation, backups, TLS, hardening, rollback — lives in [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md).
+
+## Observability
+
+- **`GET /api/health`** — unauthenticated probe; `200 {status:'ok'}` or `503 {status:'degraded'}`. Non-sensitive payload: uptime, RSS/heap MB, db flag, active algo runs, active grid trades, recommendation age, stream status, rate-limit store (`db`/`memory`), version + git sha.
+- **`GET /api/metrics`** — Prometheus exposition (optional, `ENABLE_METRICS=1`): uptime, memory, db_up, algo runs, grid trades, build info.
+- **Structured logs** — server ops events emit single-line JSON (`{"t":…,"lvl":"warn","evt":"auth_login_failed","ip":…,"user":…}`) via `src/lib/logger.ts`; filter with `journalctl -u blackhole -o cat | grep '"evt":"auth_login_failed"'`. Level via `LOG_LEVEL`.
+
 ## Useful scripts
 
 | Command | What it does |
 | --- | --- |
 | `bun run dev` | Dev server on `:3000` (logs to `dev.log`) |
 | `bun run build` / `bun run start` | Production build / serve (standalone) |
+| `bun run test` | Test suite (`bun test`) — TOTP RFC vectors, rate limiter, sessions, grid math, crypto-at-rest |
 | `bun run db:push` | Apply `prisma/schema.prisma` to the SQLite file |
 | `bun run db:generate` | Regenerate the Prisma client |
-| `bun run lint` | ESLint |
+| `bun run lint` | ESLint (API routes enforce extra strictness: no implicit `any`) |
+| `bun scripts/rotate-secrets.mjs --auth` / `--encryption` / `--all` | Rotate secrets — re-encrypts every stored credential, updates `.env` + DB master row (`--dry-run` to preview) |
 
 ## Troubleshooting
 
@@ -183,8 +270,9 @@ Then `systemctl enable --now blackhole blackhole-stream` and put Caddy/nginx in 
 
 - **Use paper-trading keys first.** This is a personal trading tool, not an audited exchange.
 - Per-user broker keys, TOTP secrets and Telegram tokens are encrypted at rest with `APP_ENCRYPTION_SECRET`; session cookies are HMAC-signed.
+- Login / registration / grid-mutation endpoints are rate-limited, and the counters are **persisted in the DB** (`RateLimitBucket`) — restarting the server no longer resets brute-force windows.
 - The streaming sidecar authenticates every socket handshake against the app's session cookie — invalid sockets drop to a restricted guest mode (public crypto only).
-- Never commit your real `.env` (`.gitignore` already excludes it). If a key ever leaks into git history, **rotate it** at the provider.
+- Never commit your real `.env` (`.gitignore` already excludes it). If a key ever leaks into git history, **rotate it** at the provider. To rotate the app's own secrets: `bun scripts/rotate-secrets.mjs --all` (see the script header for exactly what it touches).
 
 ## Project structure
 
@@ -197,6 +285,18 @@ mini-services/      stream-service (socket.io live ticks, port 3030)
 prisma/             schema.prisma (SQLite)
 db/                 custom.db (created by db:push, git-ignored)
 ```
+
+## Scaling beyond SQLite
+
+SQLite is the right call for a single user — but if you outgrow it (multiple users, heavy bar ingestion), two paths are documented: [PostgreSQL](docs/DATABASE_MIGRATION.md) (provider swap + ETL) and [Turso](docs/DATABASE_MIGRATION.md) (libSQL adapter, schema stays SQLite-compatible).
+
+## Roadmap
+
+Deliberate non-goals of the current architecture, kept visible instead of forgotten:
+
+- **Algo engine worker isolation** — the engine runs in-process; extracting it to an optional worker (`ALGO_WORKER=1` child process or a separate service) would isolate a wedged cycle from HTTP, at the cost of IPC for state that is currently a simple DB read. Worth doing if you run long backtests while trading live.
+- **Mobile layout depth** — the terminal shell collapses on small screens and the chart context menu works by long-press, but dense panels (grid ladders, reports) are still desktop-first.
+- **Richer test coverage** — the suite covers the security and math cores (TOTP, crypto, rate limiting, sessions, grid serialization + backtest replay); auth-flow integration tests and API-route contract tests are the natural next layer.
 
 ## Disclaimer
 

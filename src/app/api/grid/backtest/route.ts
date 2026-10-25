@@ -60,7 +60,7 @@ const TF_SEC: Record<'15m' | '1h' | '1D', number> = { '15m': 900, '1h': 3600, '1
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
-    const rl = rateLimit(`grid-bt:${user.id}`, 10, 60_000)
+    const rl = await rateLimit(`grid-bt:${user.id}`, 10, 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: `Too many grid backtests — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },

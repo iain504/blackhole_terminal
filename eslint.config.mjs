@@ -44,7 +44,17 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  // Task 11-g — API routes are the trust boundary (auth, broker keys, real
+  // orders). Hold them to a stricter bar than the UI code: no implicit `any`
+  // on request/response handling, no dead vars. Scoped to src/app/api/** so
+  // the rest of the app keeps its current (looser) profile.
+  files: ['src/app/api/**/*.ts'],
+  rules: {
+    '@typescript-eslint/no-explicit-any': 'error',
+    '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+  },
+}, {
+  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "archive/**", "tests/**"]
 }];
 
 export default eslintConfig;

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, resolveTradeMode, TradingOrder } from '@/lib/trading'
-import { ensureFillNotifier } from '@/lib/fill-notifier'
+
 import { handleError } from '@/lib/api-helpers'
 
 export interface FillRow {

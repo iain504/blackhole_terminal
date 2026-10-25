@@ -1,0 +1,53 @@
+# BLACKHOLE Terminal — one-command production stack (Task 11-d).
+#
+#   docker compose up -d --build
+#
+# Secrets come from the repo-root .env (compose reads it automatically):
+#   AUTH_SECRET / APP_ENCRYPTION_SECRET are REQUIRED — generate with
+#     bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# Optional: ALLOW_REGISTRATION, ALLOW_SHARED_BROKER, ENABLE_METRICS,
+#           DB_PUSH_ACCEPT_DATA_LOSS (=1 to allow destructive schema pushes).
+#
+# The SQLite file lives in ./db (bind-mounted) — back it up by stopping the
+# app and copying db/custom.db (see docs/PRODUCTION_CHECKLIST.md).
+# The stream sidecar auto-starts with the stack: the browser talks socket.io
+# directly to :3030 (publish only 3000 + 3030, or front both with Caddy).
+name: blackhole-terminal
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: file:/app/db/custom.db
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env}
+      APP_ENCRYPTION_SECRET: ${APP_ENCRYPTION_SECRET:?set APP_ENCRYPTION_SECRET in .env}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+      ALLOW_SHARED_BROKER: ${ALLOW_SHARED_BROKER:-false}
+      ENABLE_METRICS: ${ENABLE_METRICS:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_PUSH_ACCEPT_DATA_LOSS: ${DB_PUSH_ACCEPT_DATA_LOSS:-0}
+    volumes:
+      - ./db:/app/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  stream:
+    build: ./mini-services/stream-service
+    ports:
+      - "3030:3030"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3030/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 4s
+      retries: 3
+      start_period: 10s

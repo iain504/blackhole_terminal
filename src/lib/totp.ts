@@ -41,8 +41,11 @@ function base32Decode(input: string): Buffer {
   return Buffer.from(out)
 }
 
-export function totpCode(secret: string, timeStep = 30, offset = 0): string {
-  const counter = Math.floor(Date.now() / 1000 / timeStep) + offset
+/** HOTP/TOTP core over an ABSOLUTE unix second — the pure, deterministic
+ * function the RFC 6238 test vectors drive (Task 11-a). Kept separate from
+ * the wall-clock wrapper so tests never sleep or mock timers. */
+export function totpCodeAt(secret: string, timeStep: number, unixSec: number): string {
+  const counter = Math.floor(unixSec / timeStep)
   const buf = Buffer.alloc(8)
   buf.writeUInt32BE(Math.floor(counter / 0x100000000), 0)
   buf.writeUInt32BE(counter >>> 0, 4)
@@ -54,6 +57,11 @@ export function totpCode(secret: string, timeStep = 30, offset = 0): string {
     ((hmac[idx + 2] & 0xff) << 8) |
     (hmac[idx + 3] & 0xff)
   return String(code % 1000000).padStart(6, '0')
+}
+
+/** Code for the CURRENT window (`offset` = whole steps of clock drift). */
+export function totpCode(secret: string, timeStep = 30, offset = 0): string {
+  return totpCodeAt(secret, timeStep, Math.floor(Date.now() / 1000) + offset * timeStep)
 }
 
 /** Constant-time string compare: SHA-256 both sides first so every input is

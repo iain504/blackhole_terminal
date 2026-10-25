@@ -4,6 +4,7 @@ import { verifyLoginTicket, setSessionCookie, clientIp } from '@/lib/auth'
 import { verifyTotp, decryptTotpSecret, encryptTotpSecret } from '@/lib/totp'
 import { rateLimit, resetRateLimit } from '@/lib/rate-limit'
 import { readJson, handleError } from '@/lib/api-helpers'
+import { log } from '@/lib/logger'
 
 interface VerifyBody {
   ticket: string
@@ -49,8 +50,9 @@ export async function POST(req: Request) {
     // user no longer exists) — 10 attempts / 5 min.
     const keyName = user?.username || (body.ticket || 'unknown').slice(0, 24)
     const ip = clientIp(req)
-    const rl = rateLimit(`loginv:${ip}:${keyName}`, 10, 5 * 60_000)
+    const rl = await rateLimit(`loginv:${ip}:${keyName}`, 10, 5 * 60_000)
     if (!rl.ok) {
+      log.warn('auth_login_rate_limited', { ip, user: keyName })
       return NextResponse.json(
         { error: 'Too many attempts — try again later' },
         { status: 429, headers: { 'retry-after': String(rl.retryAfterSec) } }
@@ -59,6 +61,7 @@ export async function POST(req: Request) {
     if (user && isLocked(user.username)) {
       // Generic message — same shape as the rate-limit response, no lock
       // metadata leaked.
+      log.warn('auth_login_rate_limited', { ip, user: user.username, reason: 'lockout' })
       return NextResponse.json(
         { error: 'Too many attempts — try again later' },
         { status: 429, headers: { 'retry-after': '900' } }
@@ -67,11 +70,13 @@ export async function POST(req: Request) {
     const secret = user ? decryptTotpSecret(user.totpSecret) : null
     if (!user || !secret || !verifyTotp(secret, body.code || '')) {
       if (user) recordFailure(user.username)
+      // Structured ops event (Task 11-c) — no codes, no secrets, just shape.
+      log.warn('auth_login_failed', { ip, user: user?.username ?? 'unknown', reason: !user ? 'no-user' : !secret ? 'undecryptable-secret' : 'bad-code' })
       return NextResponse.json({ error: 'Invalid 2FA code' }, { status: 401 })
     }
     // Success: clear failure counter + rate budget.
     failures.delete(user.username)
-    resetRateLimit(`loginv:${ip}:${user.username}`)
+    void resetRateLimit(`loginv:${ip}:${user.username}`)
     // Migrate legacy plaintext TOTP secret to encrypted-at-rest (one-time).
     if (!user.totpSecret.startsWith('enc:')) {
       try {
@@ -81,6 +86,7 @@ export async function POST(req: Request) {
       }
     }
     await setSessionCookie(user.id)
+    log.info('auth_login_ok', { user: user.username, ip })
     return NextResponse.json({ user: { id: user.id, username: user.username } })
   } catch (e) {
     return handleError(e)

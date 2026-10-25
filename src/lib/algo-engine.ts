@@ -22,13 +22,12 @@ import { barsFor } from '@/lib/bars-cache'
 import { closePositionFull, getAccount, getPositions, placeOrderWithExits, resolveTradeMode, tradeSymbol, type TradeMode } from '@/lib/trading'
 import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
-import { sessionOf, etDateKey, etMinutesOfDay } from '@/lib/sessions'
+import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
 
 const CYCLE_MS = 15000
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
-const RTH_START_MIN = 9 * 60 + 30
 const HEARTBEAT_MS = 10 * 60000 // one info heartbeat per 10 idle minutes
 
 interface AlgoRunRow {

@@ -39,7 +39,9 @@ export function encrypt(plain: string): string {
 export function decrypt(payload: string): string | null {
   try {
     const [ivHex, tagHex, dataHex] = payload.split('.')
-    if (!ivHex || !tagHex || !dataHex) return null
+    // dataHex may be '' (empty plaintext is legal — GCM handles it, Task 11-a);
+    // only genuinely MISSING segments are malformed.
+    if (ivHex == null || tagHex == null || dataHex == null) return null
     const iv = Buffer.from(ivHex, 'hex')
     const tag = Buffer.from(tagHex, 'hex')
     const data = Buffer.from(dataHex, 'hex')

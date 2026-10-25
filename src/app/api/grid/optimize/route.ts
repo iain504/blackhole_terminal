@@ -16,7 +16,7 @@ import { rateLimit } from '@/lib/rate-limit'
 import { symbolSchema } from '@/lib/validation'
 import { ALGO_MAX_DAYS } from '@/lib/algo-strategies'
 import { fetchBacktestBars } from '@/lib/backtest-history'
-import { isGridDirection, isGridSpacing, type GridDirection, type GridSpacing } from '@/lib/grid-engine'
+import { isGridDirection, isGridSpacing, type GridSpacing } from '@/lib/grid-engine'
 import { optimizeGridConfig } from '@/lib/grid-optimize'
 
 export const dynamic = 'force-dynamic'
@@ -40,7 +40,7 @@ const GRID_TF_MAX_DAYS: Record<'15m' | '1h' | '1D', number> = {
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
-    const rl = rateLimit(`grid-opt:${user.id}`, 10, 60_000)
+    const rl = await rateLimit(`grid-opt:${user.id}`, 10, 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: `Too many optimize runs — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },

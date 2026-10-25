@@ -9,9 +9,13 @@
 
 export type SessionKind = 'regular' | 'extended'
 
-/** US regular session in ET minutes-of-day: 09:30 (570) → 16:00 (960). */
-const RTH_START = 9 * 60 + 30
-const RTH_END = 16 * 60
+/** US regular session in ET minutes-of-day: 09:30 (570) → 16:00 (960).
+ * SINGLE SOURCE OF TRUTH (Task 11-f): the algo engine and the backtester
+ * import these instead of redefining their own copies. */
+export const RTH_START_MIN = 9 * 60 + 30
+export const RTH_END_MIN = 16 * 60
+const RTH_START = RTH_START_MIN
+const RTH_END = RTH_END_MIN
 
 // One shared formatter (Intl formatter construction is expensive); DST is
 // handled by the timeZone database inside Intl, so half-day/offset drift

@@ -354,3 +354,17 @@ model AppSecret {
   value     String
   updatedAt DateTime @updatedAt
 }
+
+// Task 11-b — persistent fixed-window rate-limit buckets (brute-force guard
+// that SURVIVES restarts; the old in-process Map was wiped on every reboot).
+// Written by src/lib/rate-limit.ts; expired rows are pruned lazily (a small
+// random slice of calls deleteMany everything already past its window).
+// Key format: '<scope>:<identity>' — e.g. `loginv:203.0.113.9:trader`,
+// `grid:clxuser123`, `test:rl:…` (tests use the same table and clean up).
+model RateLimitBucket {
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+
+  @@index([resetAt])
+}

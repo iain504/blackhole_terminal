@@ -49,7 +49,7 @@ export async function POST(req: Request) {
     const ip = clientIp(req)
     // stricter than register: a successful call CREATES a fully-formed
     // account, so the budget is smaller
-    const rl = rateLimit(`restore:${ip}`, 3, 10 * 60_000)
+    const rl = await rateLimit(`restore:${ip}`, 3, 10 * 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: 'Too many attempts — try again later' },

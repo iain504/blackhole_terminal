@@ -51,7 +51,7 @@ interface BulkResultItem {
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
-    const rl = rateLimit(`gridbulk:${user.id}`, 5, 60_000)
+    const rl = await rateLimit(`gridbulk:${user.id}`, 5, 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: `Too many bundle imports — retry in ${rl.retryAfterSec}s` },

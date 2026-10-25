@@ -1,5 +1,0 @@
-const { db } = await import('../src/lib/db.ts')
-const { decrypt } = await import('../src/lib/crypt.ts')
-const u = await db.user.findUnique({ where: { id: 'cmvdg6y3m0000pwvpwf9hssbe' } })
-process.env.KID = decrypt(u.settings.alpacaKeyIdEnc); process.env.KSEC = decrypt(u.settings.alpacaSecretEnc)
-await import(process.env.SCRIPT)

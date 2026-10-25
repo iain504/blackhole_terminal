@@ -75,3 +75,7 @@ screens-tmp/
 # platform/subagent scratch (prevents recurring UUID auto-commits)
 agent-ctx/
 scripts-tmp/
+
+# research probes archived out of scripts-tmp (Task 11-f) + user uploads
+archive/
+upload/

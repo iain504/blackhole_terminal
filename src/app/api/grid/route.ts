@@ -191,7 +191,7 @@ export const round2 = (x: number) => Math.round(x * 100) / 100
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
-    const rl = rateLimit(`grid:${user.id}`, 10, 60_000)
+    const rl = await rateLimit(`grid:${user.id}`, 10, 60_000)
     if (!rl.ok) {
       return NextResponse.json({ error: `Too many grid starts — retry in ${rl.retryAfterSec}s` }, { status: 429 })
     }

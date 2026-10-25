@@ -112,7 +112,7 @@ export async function POST(req: NextRequest) {
   try {
     const user = await requireUser()
     // Task 3-d — per-user throttle: 6 runs / minute (CPU-heavy endpoint).
-    const rl = rateLimit(`bt:${user.id}`, 6, 60_000)
+    const rl = await rateLimit(`bt:${user.id}`, 6, 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: `Too many backtests — retry in ${rl.retryAfterSec}s`, retryAfterSec: rl.retryAfterSec },

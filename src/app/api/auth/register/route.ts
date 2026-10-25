@@ -5,6 +5,7 @@ import { verifyTotp, encryptTotpSecret } from '@/lib/totp'
 import { rateLimit, resetRateLimit } from '@/lib/rate-limit'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { registrationOpen } from '@/lib/registration'
+import { log } from '@/lib/logger'
 
 interface RegisterBody {
   username: string
@@ -17,7 +18,7 @@ interface RegisterBody {
 export async function POST(req: Request) {
   try {
     const ip = clientIp(req)
-    const rl = rateLimit(`reg:${ip}`, 5, 10 * 60_000)
+    const rl = await rateLimit(`reg:${ip}`, 5, 10 * 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: 'Too many attempts — try again later' },
@@ -38,9 +39,11 @@ export async function POST(req: Request) {
     // sanitized publish reset can always create its FIRST account. Rate
     // limiting above caps abuse of the bootstrap window.
     if (!(await registrationOpen())) {
+      log.warn('auth_register_rejected', { ip, reason: 'closed' })
       return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
     }
     if (!body.totpSecret || !verifyTotp(body.totpSecret, body.totpCode)) {
+      log.warn('auth_register_rejected', { ip, reason: 'bad-code' })
       return NextResponse.json({ error: 'Invalid 2FA code — scan the QR code and enter the 6-digit code' }, { status: 400 })
     }
     const existing = await db.user.findUnique({ where: { username } })
@@ -77,7 +80,7 @@ interface LoginBody {
 export async function PUT(req: Request) {
   try {
     const ip = clientIp(req)
-    const rl = rateLimit(`reg:${ip}`, 5, 10 * 60_000)
+    const rl = await rateLimit(`reg:${ip}`, 5, 10 * 60_000)
     if (!rl.ok) {
       return NextResponse.json(
         { error: 'Too many attempts — try again later' },
@@ -87,11 +90,13 @@ export async function PUT(req: Request) {
     const body = await readJson<LoginBody>(req)
     const user = await db.user.findUnique({ where: { username: (body.username || '').trim() } })
     if (!user || !verifyPassword(body.password || '', user.passwordHash)) {
+      // Structured ops event (Task 11-c) — username truncated, no password.
+      log.warn('auth_login_failed', { ip, user: (body.username || '').trim().slice(0, 40), reason: 'password' })
       return NextResponse.json({ error: 'Invalid username or password' }, { status: 401 })
     }
     // Successful password check clears the IP budget so legitimate logins
     // never accumulate toward the failure limit.
-    resetRateLimit(`reg:${ip}`)
+    void resetRateLimit(`reg:${ip}`)
     return NextResponse.json({ ticket: createLoginTicket(user.id), username: user.username })
   } catch (e) {
     return handleError(e)

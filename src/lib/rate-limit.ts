@@ -1,44 +1,65 @@
-// Task 3-d — per-user rate limiting (in-process).
+// Task 11-b — per-user rate limiting, now DB-PERSISTED.
 //
-// ⚠ COORDINATION NOTE: a dedicated rate-limit implementation with this EXACT
-// API (`rateLimit(key, max, windowMs) → { ok, retryAfterSec }` + `resetRateLimit`)
-// is being built by another agent. This file is the minimal, API-identical
-// placeholder so imports resolve NOW — when the real module lands it can
-// replace this file 1:1 (callers only use the two exported functions and the
-// `{ ok, retryAfterSec }` shape). Buckets live on globalThis so Next.js dev
-// HMR doesn't reset them on every module reload.
+// History: Task 3-d shipped a purely in-process fixed-window counter. The
+// 2026 deep review (Task 11) flagged it: every restart wiped all brute-force
+// counters, so `login` / `register` windows could be reset by bouncing the
+// server. Buckets now live in the RateLimitBucket table (Prisma/SQLite,
+// see schema.prisma) with the SAME call shape — only now async:
 //
-// Semantics: fixed-window counter per key. The FIRST call in a window starts
-// it; calls up to `max` pass; anything beyond returns ok:false with the whole
-// seconds until the window resets. Purely in-process (per instance) — same
-// trust model as the rest of this single-process deployment.
+//   await rateLimit(key, max, windowMs) → { ok, retryAfterSec }
+//   await resetRateLimit(key)
+//
+// Every call site is an async route handler, so the await is free. Semantics
+// are unchanged fixed-window: the FIRST call in a window starts it; calls up
+// to `max` pass; anything beyond returns ok:false with the whole seconds
+// until the window resets.
+//
+// Resilience: if the DB errors (wedged SQLite, missing table), counting
+// falls back to an in-process Map (same per-instance trust model as before)
+// and emits ONE throttled structured warning so ops notices without spam.
+// The fallback is intentional: rate limiting is a guard, not a correctness
+// dependency — a storage outage must not brick auth flows.
+//
+// Pruning: at most once per 5 minutes, a fire-and-forget deleteMany() removes
+// every row already past its window (indexed on resetAt). Keeps the table
+// tiny forever without a cron job.
+
+import { db } from '@/lib/db'
+import { log } from '@/lib/logger'
 
 export interface RateLimitResult {
   ok: boolean
   retryAfterSec: number
 }
 
+// ---- in-process fallback (also the pre-11-b behavior) ----------------------
 interface Bucket {
   count: number
   resetAt: number
 }
 
 const g = globalThis as unknown as { __rateLimitBuckets?: Map<string, Bucket> }
-const buckets: Map<string, Bucket> = (g.__rateLimitBuckets ??= new Map())
+const memoryBuckets: Map<string, Bucket> = (g.__rateLimitBuckets ??= new Map())
 
-function prune(now: number): void {
-  if (buckets.size < 5_000) return
-  for (const [k, b] of buckets) {
-    if (b.resetAt <= now) buckets.delete(k)
-  }
+let lastFallbackAt = 0
+function noteFallback(err: unknown): void {
+  const now = Date.now()
+  lastFallbackAt = now
+  if (now - (g.__rateLimitFallbackWarnedAt ?? 0) < 60_000) return
+  g.__rateLimitFallbackWarnedAt = now
+  log.warn('rate_limit_db_fallback', { err: err instanceof Error ? err.message : String(err) })
 }
 
-export function rateLimit(key: string, max: number, windowMs: number): RateLimitResult {
+/** Which store served the most recent call — surfaced by /api/health. */
+export function rateLimitStore(): 'db' | 'memory' {
+  return Date.now() - lastFallbackAt < 60_000 ? 'memory' : 'db'
+}
+
+function memoryLimit(key: string, max: number, windowMs: number): RateLimitResult {
   const now = Date.now()
-  prune(now)
-  const b = buckets.get(key)
+  const b = memoryBuckets.get(key)
   if (!b || b.resetAt <= now) {
-    buckets.set(key, { count: 1, resetAt: now + windowMs })
+    memoryBuckets.set(key, { count: 1, resetAt: now + windowMs })
     return { ok: true, retryAfterSec: 0 }
   }
   b.count++
@@ -46,6 +67,59 @@ export function rateLimit(key: string, max: number, windowMs: number): RateLimit
   return { ok: false, retryAfterSec: Math.max(1, Math.ceil((b.resetAt - now) / 1000)) }
 }
 
-export function resetRateLimit(key: string): void {
-  buckets.delete(key)
+export async function rateLimit(key: string, max: number, windowMs: number): Promise<RateLimitResult> {
+  const now = Date.now()
+  try {
+    // Bump the LIVE window's bucket (single-writer SQLite; a cross-instance
+    // race can only shift a window by one step — acceptable for this guard).
+    const bumped = await db.rateLimitBucket.updateMany({
+      where: { key, resetAt: { gt: new Date(now) } },
+      data: { count: { increment: 1 } },
+    })
+    if (bumped.count === 0) {
+      // No live row: first call ever, or the window expired → start a fresh
+      // one. A concurrent create hitting the PK conflict is fine (reset to 1).
+      const resetAt = new Date(now + windowMs)
+      try {
+        await db.rateLimitBucket.create({ data: { key, count: 1, resetAt } })
+      } catch {
+        await db.rateLimitBucket.update({ where: { key }, data: { count: 1, resetAt } })
+      }
+      return { ok: true, retryAfterSec: 0 }
+    }
+    const row = await db.rateLimitBucket.findUnique({
+      where: { key },
+      select: { count: true, resetAt: true },
+    })
+    if (!row) return { ok: true, retryAfterSec: 0 } // pruned between calls — allow
+    if (row.count <= max) return { ok: true, retryAfterSec: 0 }
+    return { ok: false, retryAfterSec: Math.max(1, Math.ceil((row.resetAt.getTime() - now) / 1000)) }
+  } catch (err) {
+    noteFallback(err)
+    return memoryLimit(key, max, windowMs)
+  } finally {
+    maybePrune()
+  }
+}
+
+export async function resetRateLimit(key: string): Promise<void> {
+  memoryBuckets.delete(key)
+  try {
+    await db.rateLimitBucket.deleteMany({ where: { key } })
+  } catch (err) {
+    noteFallback(err)
+  }
+}
+
+// ---- lazy pruning -----------------------------------------------------------
+let lastPruneAt = 0
+function maybePrune(): void {
+  const now = Date.now()
+  if (now - lastPruneAt < 5 * 60_000) return
+  lastPruneAt = now
+  db.rateLimitBucket
+    .deleteMany({ where: { resetAt: { lt: new Date(now) } } })
+    .catch(() => {
+      /* the pruner must never surface — the rate limit already answered */
+    })
 }
