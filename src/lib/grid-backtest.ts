@@ -27,7 +27,15 @@
 // keep being marked to market at each bar close through the final bar.
 //
 // Stock sizing mirrors the engine's effectiveQty (whole-share floor).
+//
+// v1.80.4 — RTH-only order gate MIRRORED from the live engine (stock grids):
+// bars outside the regular session (IEX prints pre/post/overnight bars) submit
+// NO orders — TP sells + level entries are skipped and the SL/TP guards defer
+// to the first RTH bar that still breaches — so the sim stays a faithful
+// predictor of what the gated engine will actually do. lastPrice + the equity
+// curve still update on EVERY bar (the gated engine keeps tracking state too).
 import type { Bar } from '@/lib/market-types'
+import { isRegularSession } from '@/lib/sessions'
 import {
   computeLevels, resolveGuards, guardStopText,
   type GridSpacing, type GridDirection,
@@ -140,10 +148,15 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
 
   for (let bi = 1; bi < bars.length; bi++) {
     const bar = bars[bi]
+    // v1.80.4 — same gate as the live engine, evaluated per bar OPEN time
+    // (the algo backtester classifies sessions by bar-open too). Crypto is
+    // never gated.
+    const ordersOpen = cfg.isCrypto || isRegularSession(bar.time)
 
-    if (!stopped) {
+    if (!stopped && ordersOpen) {
       // ---- guards FIRST (SL before TP — same order as evaluateGrid);
-      // sell-only fires mirrored (short SL above, short TP below) ----
+      // sell-only fires mirrored (short SL above, short TP below). Deferred
+      // on non-RTH bars exactly like the gated live engine. ----
       const slHit = slTrigger != null && (sellGrid ? bar.high >= slTrigger : bar.low <= slTrigger)
       const tpHit = tpTrigger != null && (sellGrid ? bar.low <= tpTrigger : bar.high >= tpTrigger)
       if (slHit) {
@@ -180,7 +193,7 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
       }
     }
 
-    if (!stopped) {
+    if (!stopped && ordersOpen) {
       // ---- TP sells BEFORE entries (engine order) — 'both' ONLY: a lot
       // bought at level i pays at level[i+1] ?? upperPrice when
       // lastPrice < target ≤ bar.high, sold AT target

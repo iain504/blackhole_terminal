@@ -1121,6 +1121,14 @@ export default function GridTradeDialog({
             {btBlockReason && <span className="text-[10px] text-zinc-600">{btBlockReason}</span>}
           </div>
 
+          {!isCrypto && (
+            <p className="border-t border-zinc-800/60 px-2.5 py-2 text-[10px] leading-relaxed text-zinc-500">
+              Stock grids submit orders in RTH only (09:30–16:00 ET, Mon–Fri) —
+              the engine skips orders outside regular hours (Alpaca rejects them)
+              and this backtest mirrors that. Crypto grids trade 24/7.
+            </p>
+          )}
+
           {btError && (
             <p className="flex items-start gap-1 px-2.5 pb-2 text-[11px] text-rose-400">
               <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />

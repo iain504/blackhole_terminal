@@ -29,9 +29,22 @@
 // Orders go through the same paper-broker pipeline as manual/algo orders
 // (placeOrderWithExits in trading.ts); fill records use the order's average
 // fill price when the broker reports one, else the level price.
+//
+// v1.80.4 — RTH-only ORDER gate for STOCK grids (crypto trades 24/7 and is
+// never gated): Alpaca REJECTS market orders outside the regular session
+// (09:30–16:00 ET, Mon–Fri), and every rejection is an engine failure — a
+// stock grid left running overnight used to accumulate a fail-streak and
+// park itself as 'error' (or strand lots via a failed guard close). When
+// gated: TP sells + level entries are SKIPPED (a crossing during closed
+// hours is dropped, not queued — lastPrice keeps tracking so no stale burst
+// fires at the open) and the SL/TP guards DEFER (an attempted close would
+// fail the same way; the grid stays active and the close fires on the first
+// RTH tick if the trigger still holds — static exposure overnight since
+// entries are gated too). Manual stops are NEVER gated — user intent wins.
 import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
 import { placeOrderWithExits, resolveTradeMode, type TradeMode } from '@/lib/trading'
+import { isRegularSession } from '@/lib/sessions'
 
 const GRID_CYCLE_MS = 5000
 const MIN_GRID_COUNT = 2
@@ -541,11 +554,19 @@ async function evaluateGrid(grid: {
   const sellGrid = grid.direction === 'sell'
   const buyOnly = grid.direction === 'buy'
 
+  // v1.80.4 — RTH-only order gate: stocks submit ONLY inside the regular
+  // session; crypto (symbol contains '/') trades 24/7. See the module header.
+  const ordersOpen = grid.symbol.includes('/') || isRegularSession(Math.floor(Date.now() / 1000))
+
   // ---- guards FIRST (whole-grid circuit breakers) ----
   // Triggers are RESOLVED EVERY TICK (price vs percent basis) so a config edit
   // via PUT /api/grid/[id] re-arms the guards on the next 5s cycle — the DB is
   // the single source of truth, no engine-side cache. Sell-only mirrors the
   // firing conditions (short SL fires ABOVE, TP fires BELOW).
+  // Gated ticks DEFER the guards (no closeAndStop): the close is a market
+  // order the broker would reject outside RTH, and a failed close strands
+  // lots in a parked 'error' grid — deferring keeps the grid active so the
+  // close fires at the first RTH tick if the trigger still holds.
   const { slTrigger, tpTrigger } = resolveGuards({
     maxSL: grid.maxSL,
     maxTP: grid.maxTP,
@@ -555,11 +576,11 @@ async function evaluateGrid(grid: {
     upperPrice: grid.upperPrice,
     direction: grid.direction,
   })
-  if (slTrigger != null && (sellGrid ? price >= slTrigger : price <= slTrigger)) {
+  if (ordersOpen && slTrigger != null && (sellGrid ? price >= slTrigger : price <= slTrigger)) {
     await closeAndStop(grid, 'sl', price, guardStopText('sl', grid.slBasis, grid.maxSL ?? 0, price))
     return
   }
-  if (tpTrigger != null && (sellGrid ? price <= tpTrigger : price >= tpTrigger)) {
+  if (ordersOpen && tpTrigger != null && (sellGrid ? price <= tpTrigger : price >= tpTrigger)) {
     await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price))
     return
   }
@@ -571,7 +592,7 @@ async function evaluateGrid(grid: {
   // the lot bought at level i pays at level[i+1] ?? upperPrice, on an UPWARD
   // crossing of that target this tick. 'both' only — buy-only never sells and
   // sell-only has no buy-backs.
-  if (!sellGrid && !buyOnly && L != null) {
+  if (!sellGrid && !buyOnly && L != null && ordersOpen) {
     for (const lot of [...st.lots]) {
       const target = sellTargetOf(levels, lot.levelIndex, grid.upperPrice)
       if (!(L < target && price >= target)) continue
@@ -611,7 +632,9 @@ async function evaluateGrid(grid: {
   //   both/buy: level crossed DOWNWARD this tick → market buy qtyPerGrid
   //   sell:     level crossed UPWARD this tick → market sell qtyPerGrid
   //             (short ladder — the lot is tracked inverted; a close buys back)
-  if (L != null) {
+  // Gated ticks skip entries entirely: a crossing during closed hours is
+  // DROPPED (lastPrice tracks below, so nothing stale fires at the open).
+  if (L != null && ordersOpen) {
     for (let i = 0; i < levels.length; i++) {
       const level = levels[i]
       if (sellGrid) {

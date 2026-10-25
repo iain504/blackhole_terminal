@@ -86,3 +86,32 @@ export function sessionOf(timeSec: number): SessionKind {
   const v = etMinutesOfDay(timeSec)
   return v >= RTH_START && v < RTH_END ? 'regular' : 'extended'
 }
+
+let etWeekdayFmt: Intl.DateTimeFormat | null = null
+
+/**
+ * True when `timeSec` is inside the US regular session AND on an ET weekday
+ * (Mon–Fri). sessionOf() alone is a time-of-day check — Sat/Sun 10:00 ET
+ * would pass it while the market is closed. ORDER GATES (the grid engine
+ * submits orders only here) need the weekday too: Alpaca rejects market
+ * orders outside the regular session, and every rejection counts as an
+ * engine failure (fail-streak → the grid parks itself as 'error').
+ * Holidays are NOT detected (no trading-calendar dependency) — the broker
+ * rejects honestly on the rare holiday tick. Intl failure → true (fail-open,
+ * same discipline as sessionOf: a broken formatter must never silently gate).
+ */
+export function isRegularSession(timeSec: number): boolean {
+  if (!etWeekdayFmt) {
+    etWeekdayFmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      weekday: 'short',
+    })
+  }
+  try {
+    const wd = etWeekdayFmt.format(new Date(timeSec * 1000))
+    if (wd === 'Sat' || wd === 'Sun') return false
+  } catch {
+    return true
+  }
+  return sessionOf(timeSec) === 'regular'
+}
