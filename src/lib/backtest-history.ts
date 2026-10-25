@@ -6,11 +6,16 @@
 //     takes 6–35s to paginate from the feeds, and the tune→re-run→optimize
 //     loop would otherwise re-pay that on EVERY request. Historical bars are
 //     immutable except the newest (the forming bar is dropped per request
-//     anyway), so 2min staleness is invisible to the replay. Bounded to 6
-//     entries (~60-80MB worst) — this cache duplicates the global bars-cache,
-//     and on the 1.8GB-heap dev box every retained MB is sweep headroom.
-//   • 1m windows are NEVER cached (30d ≈ 43k bars — the double retention is
-//     exactly what killed the box on repeated 1m backtests, Task 9-p).
+//     anyway), so staleness is invisible to the replay. Bounded to 6 entries
+//     — this cache duplicates the global bars-cache, and every retained MB is
+//     sweep headroom on a small box.
+//   • Task 15 — 1m windows ARE cached now (60s TTL, max 2 entries). The old
+//     "never cache 1m" rule traded a REFETCH STORM for a retention saving:
+//     every 1m optimize click re-paid the full 6–35s paginated fetch and its
+//     transient double-allocation, which on a memory-capped host (Render
+//     512MB) is exactly the repeated RSS spike that gets the pod killed
+//     mid-request. Two bounded 1m entries (~10-20MB) are strictly cheaper
+//     than a refetch spike on every click.
 //   • Binance / Alpaca / demo fallbacks stay inside getBars (lib/alpaca) —
 //     demo feeds are surfaced as an honest failure by fetchBacktestBars,
 //     NEVER replayed as fake results.
@@ -19,25 +24,46 @@ import { getBars } from '@/lib/alpaca'
 import { TIMEFRAMES, type Bar, type Timeframe } from '@/lib/market-types'
 
 const BARS_TTL_MS = 120_000
+const ONE_M_TTL_MS = 60_000
 const BARS_CACHE_MAX = 6
-const barsCache = new Map<string, { at: number; res: Awaited<ReturnType<typeof getBars>> }>()
+const ONE_M_CACHE_MAX = 2
+const barsCache = new Map<string, { at: number; tf: Timeframe; res: Awaited<ReturnType<typeof getBars>> }>()
+
+function evictOldest(isOneM: boolean): void {
+  let oldestKey: string | null = null
+  let oldestAt = Infinity
+  for (const [k, v] of barsCache) {
+    // when inserting a 1m entry prefer evicting another 1m entry (they are
+    // the biggest); fall through to the global oldest only if none cached
+    if (isOneM && v.tf !== '1m' && barsCache.size > 1) continue
+    if (v.at < oldestAt) {
+      oldestAt = v.at
+      oldestKey = k
+    }
+  }
+  if (oldestKey) barsCache.delete(oldestKey)
+}
 
 export async function getBarsCached(symbol: string, tf: Timeframe, userId: string, days: number) {
-  // Task 9-p — NEVER retain a 1m window (30d ≈ 43k bars): the tune→re-run
-  // loop's refetch for 1m costs a couple of seconds, the retained window
-  // costs tens of MB of heap for minutes. This cache duplicated the global
-  // bars-cache — the double retention is exactly what killed the box on
-  // repeated 1m backtests.
-  if (tf === '1m') return getBars(symbol, tf, userId, { lookbackDays: days })
+  // Task 15 — 1m windows are cached with a SHORTER TTL and a tighter cap
+  // (ONE_M_CACHE_MAX): the retention risk the old no-1m rule guarded against
+  // is now bounded by design, and the tune→re-run loop stops re-paying the
+  // deep paginated fetch on every click.
+  const isOneM = tf === '1m'
+  const ttl = isOneM ? ONE_M_TTL_MS : BARS_TTL_MS
   const key = `${userId}|${symbol}|${tf}|${days}`
   const hit = barsCache.get(key)
-  if (hit && Date.now() - hit.at < BARS_TTL_MS) return hit.res
+  if (hit && Date.now() - hit.at < ttl) return hit.res
   const res = await getBars(symbol, tf, userId, { lookbackDays: days })
-  barsCache.set(key, { at: Date.now(), res })
-  if (barsCache.size > BARS_CACHE_MAX) {
-    const oldest = [...barsCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
-    if (oldest) barsCache.delete(oldest[0])
+  barsCache.set(key, { at: Date.now(), tf, res })
+  // per-class cap first (a 1m insert never evicts a cheap 5m/15m window),
+  // then the global cap
+  if (isOneM) {
+    let oneMCount = 0
+    for (const v of barsCache.values()) if (v.tf === '1m') oneMCount++
+    if (oneMCount > ONE_M_CACHE_MAX) evictOldest(true)
   }
+  if (barsCache.size > BARS_CACHE_MAX) evictOldest(false)
   return res
 }
 

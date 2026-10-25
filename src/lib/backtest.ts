@@ -819,6 +819,10 @@ export interface OptimizeResult {
   plateau?: { meanNeighborScore: number; ratio: number; ok: boolean } | null
 }
 
+/** Task 15 — optional progress sink for long optimizer runs (job model UI).
+ * frac: 0..1 of the WHOLE operation; stage: short human-readable label. */
+export type BacktestProgress = (frac: number, stage?: string) => void
+
 const MAX_PER_DIM = 64
 const COMBO_BAR_BUDGET = 12_000_000 // ~1-2s of pure-JS sim work
 
@@ -871,10 +875,11 @@ export function optimizeBacktest(
   series: BacktestSeries,
   base: BacktestConfig,
   ranges: OptimizeRange[],
-  opts?: { minTrades?: number; maxCombos?: number },
+  opts?: { minTrades?: number; maxCombos?: number; onProgress?: BacktestProgress },
 ): OptimizeResult {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
+  const onProgress = opts?.onProgress
   // sanitize: known numeric params only, clamped to the strategy's def range
   const def = ALGO_STRATEGIES[base.strategy]
   const defsByKey = new Map(def.params.map((p) => [p.key, p]))
@@ -909,9 +914,16 @@ export function optimizeBacktest(
   let skipped = 0
   const idx = dims.map(() => 0)
   if (totalCombos > 0) {
+    // Task 15 — throttled progress (~25 updates over the grid, not per combo:
+    // the sink must stay O(1) against a hot sim loop)
+    const emitEvery = Math.max(1, Math.floor(totalCombos / 25))
+    onProgress?.(0, 'grid search')
     for (let combo = 0; combo < totalCombos; combo += stride) {
       // Task 9-p — per-combo heap probe (see heapAbortCheck)
       heapAbortCheck('Optimization')
+      if (onProgress && (combo % emitEvery === 0 || combo + stride >= totalCombos)) {
+        onProgress(Math.min(0.97, 0.02 + 0.95 * (combo / totalCombos)))
+      }
       // odometer decode
       let rem = combo
       for (let d = 0; d < dims.length; d++) {
@@ -980,6 +992,7 @@ export function optimizeBacktest(
       plateau = { meanNeighborScore: mean, ratio, ok: ratio >= 0.7 }
     }
   }
+  onProgress?.(1)
   return {
     results: results.slice(0, 100),
     best,
@@ -1107,12 +1120,13 @@ function sweepSig(strategy: AlgoStrategyId, params: Record<string, number>): str
 export function sweepStrategies(
   series: BacktestSeries,
   base: BacktestConfig,
-  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number },
+  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number; onProgress?: BacktestProgress },
 ): SweepResult {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const topX = Math.min(20, Math.max(1, Math.round(opts?.topX ?? 8)))
   const oosFraction = Math.min(0.5, Math.max(0, Number(opts?.oosFraction) || 0))
+  const onProgress = opts?.onProgress
   // ---- walk-forward split (Task 3-d) ----
   // IS = the head (tuning window, ALL sweep runs happen here) · OOS = the
   // untouched tail used ONLY to re-verify the selected rows afterwards.
@@ -1126,12 +1140,21 @@ export function sweepStrategies(
   let evaluated = 0
   let skipped = 0
   let skippedShorts = 0
-  for (const sid of ALGO_STRATEGY_IDS) {
+  const totalStrategies = ALGO_STRATEGY_IDS.length
+  for (let si = 0; si < totalStrategies; si++) {
+    const sid = ALGO_STRATEGY_IDS[si]
     // Task 9-p — per-strategy heap probe: the sweep runs every strategy's
     // optimizer back-to-back; catch the hot heap BETWEEN strategies (see
     // heapAbortCheck)
     heapAbortCheck('Strategy sweep')
     const def = ALGO_STRATEGIES[sid]
+    // Task 15 — per-strategy progress (the optimizer's inner frac is mapped
+    // into this strategy's slice of the whole sweep)
+    const stage = `strategy ${si + 1}/${totalStrategies} · ${def.name}`
+    onProgress?.(si / totalStrategies, stage)
+    const innerProgress: BacktestProgress | undefined = onProgress
+      ? (innerFrac) => onProgress((si + innerFrac) / totalStrategies, stage)
+      : undefined
     const cfg: BacktestConfig = { ...base, strategy: sid, params: { ...def.defaults }, collectEquity: false }
     // grid bounds per dim (same sanitized value sets the optimizer uses) —
     // captured BEFORE the runs so every candidate can be boundary-flagged
@@ -1155,7 +1178,7 @@ export function sweepStrategies(
     let scorable = baseScore > -Infinity ? 1 : 0
     let bestScore = baseScore > -Infinity ? baseScore : null
     // (2) auto grid search over the strategy's numeric params
-    const opt = optimizeBacktest(isSeries, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy })
+    const opt = optimizeBacktest(isSeries, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy, onProgress: innerProgress })
     evaluated += opt.evaluated
     skipped += opt.skipped
     for (const row of opt.results) {
@@ -1199,6 +1222,7 @@ export function sweepStrategies(
   })
   unique.sort((a, b) => (b.score - a.score) || (b.metrics.netPct - a.metrics.netPct))
   // ---- walk-forward verification of the SELECTED rows (Task 3-d) ----
+  onProgress?.(0.97, 'out-of-sample verification')
   const rows: SweepRow[] = unique.slice(0, topX).map((r) => {
     if (!oosSeries) return { ...r, oos: null }
     const oosCfg: BacktestConfig = { ...base, strategy: r.strategy, params: { ...r.params }, collectEquity: false }
@@ -1216,6 +1240,7 @@ export function sweepStrategies(
       : null
     return { ...r, oos }
   })
+  onProgress?.(1)
   return {
     rows,
     topX,
@@ -1257,6 +1282,7 @@ export interface WalkForwardOpts {
   holdoutFraction?: number // 0..0.4 — tail carved off BEFORE any tuning (default 0.2)
   minTrades?: number
   maxCombosPerFold?: number
+  onProgress?: BacktestProgress // Task 15
 }
 
 export interface WFFold {
@@ -1387,6 +1413,8 @@ export function walkForward(
   for (let k = 0; k < folds; k++) {
     // Task 9-p — per-fold heap probe (the harness runs several optimizers)
     heapAbortCheck('Walk-forward')
+    const foldStage = `fold ${k + 1}/${folds}`
+    opts.onProgress?.(k / folds, foldStage)
     const segStart = k * seg
     const isEnd = segStart + Math.floor(seg * isFraction)
     const oosStart = isEnd
@@ -1402,7 +1430,7 @@ export function walkForward(
     // per-fold compute budget — the whole harness must stay inside the same
     // COMBO_BAR_BUDGET envelope a single optimize run gets
     const budget = Math.max(30, Math.min(400, Math.floor(COMBO_BAR_BUDGET / Math.max(1, isSeries.n) / folds)))
-    const opt = optimizeBacktest(isSeries, { ...base, collectEquity: false }, opts.ranges, { minTrades, maxCombos: budget })
+    const opt = optimizeBacktest(isSeries, { ...base, collectEquity: false }, opts.ranges, { minTrades, maxCombos: budget, onProgress: opts.onProgress ? (innerFrac) => opts.onProgress!((k + innerFrac) / folds, foldStage) : undefined })
     evaluated += opt.evaluated
     const best = opt.best
     if (!best) {
@@ -1482,6 +1510,7 @@ export function walkForward(
   // ---- 4) hold-out stress test on the most trustworthy parameter set ----
   let holdout: WalkForwardResult['holdout'] = null
   if (holdoutBars != null) {
+    opts.onProgress?.(0.97, 'hold-out stress test')
     let chosen: Record<string, number> | null = null
     if (modalCount >= 2 && modalParams) chosen = modalParams
     else {
@@ -1513,7 +1542,7 @@ export function walkForward(
       }
     }
   }
-
+  opts.onProgress?.(1)
   return {
     mode: anchored ? 'anchored' : 'rolling',
     isFraction,

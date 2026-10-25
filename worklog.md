@@ -2832,3 +2832,21 @@ Stage Summary:
 - Native path: bun install → .env (absolute DATABASE_URL, AUTH_SECRET, APP_ENCRYPTION_SECRET) → bun run db:push → bun run dev (or build+start).
 - Optional live ticks: caddy run --config Caddyfile → browse :81.
 - Pushed so the user's fresh clone contains the fixed compose file and updated README.
+---
+Task ID: 15-optimizer-jobs
+Agent: Z.ai Code (main)
+Task: "Backtest -> Optimizer, very slow. It seems it did not use cached tick to do. Always HTTP 502 error with no result. Please fix."
+
+Work Log:
+- Root causes found: (1) optimize/sweep/walkforward ran as ONE synchronous HTTP request taking minutes on a small host — Render's edge router kills long requests (~100s) → deterministic bare 502 with NO result, every time; (2) the same long request is the OOM window (RSS spike while the request is in flight → silent SIGKILL → same 502); (3) getBarsCached NEVER cached 1m windows (Task 9-p dev-box rule) → every 1m optimizer click re-paid the 6–35s paginated deep fetch + its transient double allocation — the "did not use cached tick" complaint.
+- Fix A (the 502): background JOB MODEL — new src/lib/backtest-jobs.ts (in-process registry: single-flight slot shared by inline runs, ownership-checked lookup, 10min/40-job retention, progress sink). Route refactored: handleBacktest → computeBacktest(userId, body, onProgress) returning {status, body}; POST heavy modes now return 202 {jobId} in ~20ms and run DETACHED (completeJob/failJob always release the slot); new GET /api/algo/backtest?job= poll endpoint (running → frac/stage/elapsedSec · done → the exact old payload merged at top level · error → user-facing message · 404 → honest "server may have restarted"). No request lives long enough to be killed — the 502-with-no-result era is over.
+- Fix B (the cache): backtest-history.ts now caches 1m windows too — 60s TTL + max 2 one-m entries (class-aware eviction never evicts a cheap 5m/15m window for a 1m insert), global cap unchanged. Two bounded entries (~10-20MB) are strictly cheaper than a refetch spike on every click.
+- Fix C (progress): BacktestProgress callback plumbed through optimizeBacktest (throttled ~25 emits over the grid), sweepStrategies (per-strategy stage "strategy i/N · name"), walkForward (per-fold + hold-out stages); computeBacktest emits the fetch phase ("fetching ETH/USD 5m bars (120d)…") so the deep fetch never shows as bare "queued 0%".
+- Fix D (UI): BacktestPanel — post() detects 202 {jobId} → pollJob() (1.5s interval, 15min cap) with shared applyResult()/failToast() (inline path reuses them, wire shapes identical); live progress bar (frac %, stage, elapsed) with role=status/aria-live; run mode unchanged inline.
+- Verified end-to-end: API — POST 202 {jobId}; poll shows "fetching ETH/USD 5m bars (120d)…" for ~7s cold then done; warm re-run totals 418ms WALL (cache hit, sim 194ms) vs ~8s cold; sweep → 8 rows; single-flight 2nd POST → 429. Browser (agent-browser, logged in via session cookie): Backtest view → "Test all strategies" → dev.log shows POST 202 in 21ms + GET ?job= polls → ranked sweep table renders (1,800 backtests · 0.4s); Auto-tune → tick 2 params → "Run optimizer" → 202 + 2 polls → OPTIMIZER RESULTS "561 combos evaluated · sampled 561/1601 · 0.5s" with Apply-best button; zero console/page errors.
+- lint clean; tsc clean for changed files (bun:test errors in tests/ pre-existing); dev server hot-reloaded and healthy.
+
+Stage Summary:
+- Optimizer/Sweep/Walk-forward now survive ANY proxy/host: work runs detached, progress streams live (fetch → grid → OOS → hold-out), results persist in-process for 10min, and failures surface as honest messages instead of empty 502s.
+- Cached deep history now covers ALL timeframes incl. 1m — the tune→optimize loop re-runs in sub-second on warm bars.
+- Note for Render: jobs are in-process — a pod restart mid-job surfaces as "Job not found — the server may have restarted" (honest, retryable). Next deploy picks this up automatically from main.

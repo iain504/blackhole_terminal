@@ -7,6 +7,20 @@
 // walk-forward optimization with a pure hold-out tail — plus the Monte Carlo
 // bootstrap on plain runs and the vol-scaled slippage cost model.
 //
+// Task 15 — BACKGROUND JOB MODEL for the heavy modes (optimize / sweep /
+// walkforward). Those runs take minutes; as a synchronous request they were
+// killed by proxy request timeouts (Render's edge ≈100s) → the browser saw a
+// bare 502 with NO result, every time. Now:
+//   • POST mode=run        → unchanged inline request (fast single sim)
+//   • POST heavy mode      → validates nothing heavy, returns `202 { jobId }`
+//     immediately and runs the work DETACHED in this process (see
+//     src/lib/backtest-jobs.ts for the why)
+//   • GET ?job=<id>        → poll: { status:'running', frac, stage } |
+//     { status:'done', <same payload the inline POST used to return> } |
+//     { status:'error', error }
+// The single-flight guard (one heavy backtest per user) is shared by both
+// paths via the jobs lib — inline runs and jobs can never stack.
+//
 // body: {
 //   mode?: 'run' | 'optimize' | 'sweep' | 'walkforward'   (default 'run'; sweep ignores strategy)
 //   symbol, timeframe ('1m'|'5m'|'15m'), strategy (AlgoStrategyId),
@@ -44,21 +58,23 @@ import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_MAX_DAYS, 
 import { rateLimit } from '@/lib/rate-limit'
 import {
   prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward,
-  type BacktestConfig, type OptimizeRange,
+  type BacktestConfig, type OptimizeRange, type BacktestProgress,
 } from '@/lib/backtest'
 import { monteCarloBootstrap } from '@/lib/algo-regime'
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
+import {
+  createBacktestJob, getBacktestJob, tryAcquireBacktestSlot, releaseBacktestSlot,
+  completeJob, failJob, jobProgress,
+} from '@/lib/backtest-jobs'
 
 export const dynamic = 'force-dynamic'
 
 const MAX_BARS = 120_000
 
-// Task 3-d — in-process concurrency guard: one backtest AT A TIME per user
-// (each run holds ~50MB of bars + a full sim; parallel runs OOM the box).
-// ALWAYS released in the finally block inside POST().
-const runningBacktests = new Set<string>()
+/** Task 15 — heavy modes run detached as background jobs. */
+const JOB_MODES = new Set(['optimize', 'sweep', 'walkforward'])
 
-/** Task 3-d — wire format for the equity curve: ≤500 points (stride + first/last). */
+/** Task 15 — wire format for the equity curve: ≤500 points (stride + first/last). */
 function downsampleEquity(equity: { t: number; equity: number }[]): { t: number; equity: number }[] {
   if (equity.length <= 500) return equity
   // stride over n-1 gaps with max-1 slots so first + last + stride points
@@ -133,213 +149,296 @@ export async function POST(req: NextRequest) {
         { status: 429 },
       )
     }
-    // Task 3-d — one backtest at a time per user; the guard ALWAYS releases.
-    if (runningBacktests.has(user.id)) {
+    const body = await readJson<BacktestBody>(req)
+    const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
+
+    // Task 15 — heavy modes return 202 + jobId and run detached (see
+    // backtest-jobs.ts). The response is back in milliseconds; the client
+    // polls GET ?job=… for progress and the final payload.
+    if (JOB_MODES.has(mode)) {
+      // fast pre-gate: refusing to even queue on a hot heap is a 503 the UI
+      // can show immediately (the job re-gates when it actually starts)
+      const memGate = memoryGuard(0.7)
+      if (!memGate.ok) {
+        return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
+      }
+      const job = createBacktestJob(user.id)
+      if (!job) {
+        return NextResponse.json({ error: 'A backtest is already running' }, { status: 429 })
+      }
+      void (async () => {
+        try {
+          const r = await computeBacktest(user.id, body, jobProgress(job))
+          if (r.status === 200) completeJob(job, r.body)
+          else failJob(job, typeof r.body.error === 'string' ? r.body.error : `HTTP ${r.status}`)
+        } catch (e) {
+          failJob(job, e instanceof Error ? e.message : 'Backtest failed')
+        }
+      })()
+      return NextResponse.json({ jobId: job.id, pollMs: 1500, mode }, { status: 202 })
+    }
+
+    // Task 3-d — one inline backtest at a time per user; the guard ALWAYS
+    // releases. (Heavy jobs hold the same slot for their whole lifetime.)
+    if (!tryAcquireBacktestSlot(user.id)) {
       return NextResponse.json({ error: 'A backtest is already running' }, { status: 429 })
     }
-    runningBacktests.add(user.id)
     try {
-      return await handleBacktest(req, user.id)
+      const r = await computeBacktest(user.id, body)
+      return NextResponse.json(r.body, { status: r.status })
     } finally {
-      runningBacktests.delete(user.id)
+      releaseBacktestSlot(user.id)
     }
   } catch (e) {
     return handleError(e)
   }
 }
 
-async function handleBacktest(req: NextRequest, userId: string): Promise<NextResponse> {
+/**
+ * GET /api/algo/backtest?job=<id> — poll a background optimizer job (Task 15).
+ * running → { status:'running', frac, stage, startedAt, elapsedSec }
+ * done    → { status:'done', …the exact payload the inline POST returned }
+ * error   → { status:'error', error }   (validation 400s, mem-gate 503, …)
+ * 404     → unknown/expired job (or the server restarted — jobs are in-memory)
+ */
+export async function GET(req: NextRequest) {
   try {
-    // Task 9-p — gate EVERY mode (plain runs included): a deep 1m window is
-    // the heaviest single allocation in the app and 'run' used to be the one
-    // ungated entry (optimize/sweep gated after the fetch). Refusing to start
-    // on a hot heap is a 503; starting is a dead server.
-    const memGate = memoryGuard(0.7)
-    if (!memGate.ok) {
-      return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
+    const user = await requireUser()
+    const jobId = req.nextUrl.searchParams.get('job')
+    if (!jobId) {
+      return NextResponse.json({ error: 'Missing job id' }, { status: 400 })
     }
-    const body = await readJson<BacktestBody>(req)
-    const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
-
-    // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
-    // any) is only a placeholder for the shared config validation below; every
-    // sweep candidate gets its own catalog params inside sweepStrategies().
-    let strategy = body.strategy
-    if (mode === 'sweep') strategy = isAlgoStrategyId(strategy) ? strategy : 'bb-reversion'
-    if (!isAlgoStrategyId(strategy)) {
-      return NextResponse.json({ error: 'Unknown strategy' }, { status: 400 })
+    const job = getBacktestJob(user.id, jobId)
+    if (!job) {
+      return NextResponse.json(
+        { error: 'Job not found — the server may have restarted; run the optimizer again' },
+        { status: 404 },
+      )
     }
-    const tf = ALGO_TIMEFRAMES.includes(body.timeframe as AlgoTimeframe) ? (body.timeframe as AlgoTimeframe) : null
-    if (!tf) {
-      return NextResponse.json({ error: 'Timeframe must be one of 1m / 5m / 15m' }, { status: 400 })
-    }
-    const symbol = String(body.symbol ?? '').trim().toUpperCase()
-    if (!symbol || !/^[A-Z0-9./:-]{1,15}$/.test(symbol)) {
-      return NextResponse.json({ error: 'Invalid symbol' }, { status: 400 })
-    }
-    const days = Math.min(ALGO_MAX_DAYS[tf], Math.max(1, Math.round(Number(body.days) || 30)))
-    const qty = Number(body.qty)
-    if (!(qty > 0)) {
-      return NextResponse.json({ error: 'Quantity must be > 0' }, { status: 400 })
-    }
-    const capital = Math.max(100, Math.min(100_000_000, Number(body.capital) || 10000))
-    const maxTradesDay = Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
-    // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
-    // risk+usd requires riskMoney > 0 · risk+pct requires riskMoneyPct > 0.
-    const sizingMode = body.sizingMode === 'risk' ? 'risk' : 'fixed'
-    const riskBasis = body.riskBasis === 'pct' ? 'pct' : 'usd'
-    const riskMoneyRaw = Number(body.riskMoney)
-    const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
-      ? Math.min(10_000_000, riskMoneyRaw)
-      : null
-    const riskPctRaw = Number(body.riskMoneyPct)
-    const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0
-      ? Math.min(100, riskPctRaw)
-      : null
-    if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
-      return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
-    }
-    if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
-      return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
-    }
-
-    // ---- fetch the history (same source the live engine polls; TTL-cached —
-    // Task 10-a: shared fetchBacktestBars helper, identical gates/messages) ----
-    const hist = await fetchBacktestBars(symbol, tf as Timeframe, userId, days, MAX_BARS)
-    if (!hist.ok) {
-      return NextResponse.json({ error: hist.error }, { status: 400 })
-    }
-    const bars = hist.bars
-
-    // ACTUAL coverage — the feed may return less history than requested (per-
-    // feed bar caps, brand-new listings). Report the real window so the UI can
-    // say "data Jul 9 → Oct 21" instead of pretending the requested period.
-    const fromT = bars[0].time
-    const toT = bars[bars.length - 1].time
-    const nowSec = Math.floor(Date.now() / 1000)
-    const coveredDays = Math.max(1, Math.round((nowSec - fromT) / 86400))
-
-    const cfg: BacktestConfig = {
-      strategy,
-      params: normalizeAlgoParams(strategy, body.params),
-      qty: symbol.includes('/') ? qty : Math.max(1, Math.floor(qty)),
-      sizingMode,
-      riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
-      riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
-      riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
-      isCrypto: symbol.includes('/'),
-      tpMode: body.tpMode === 'pct' ? 'pct' : 'none',
-      tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0 ? Number(body.tpValue) : null,
-      slMode: body.slMode === 'pct' ? 'pct' : 'none',
-      slValue: body.slMode === 'pct' && Number(body.slValue) > 0 ? Number(body.slValue) : null,
-      maxTradesDay,
-      rthOnly: body.rthOnly !== false,
-      flattenEod: body.flattenEod !== false,
-      cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body.cooldownMin) || 0))),
-      requireNewSignal: body.requireNewSignal === true,
-      // Task 84 — execution-cost model (bps, default 0 = frictionless)
-      slippageBps: Math.min(500, Math.max(0, Math.round(Number(body.slippageBps) || 0))),
-      feeBps: Math.min(500, Math.max(0, Math.round(Number(body.feeBps) || 0))),
-      // Task 85 — bid/ask spread (bps, half charged per market fill)
-      spreadBps: Math.min(500, Math.max(0, Math.round(Number(body.spreadBps) || 0))),
-      // Task 12 — vol-scaled slippage (ATR% × impact, clamped 0.5..3)
-      dynSlip: body.dynSlip === true,
-      // Task 3-d — buying-power cap (0.1..10, default 1 = max 1× capital per position)
-      maxNotionalX: Number.isFinite(Number(body.maxNotionalX)) && Number(body.maxNotionalX) > 0
-        ? Math.min(10, Math.max(0.1, Number(body.maxNotionalX)))
-        : 1,
-      capital,
-    }
-
-    const series = prepareSeries(bars)
-    const meta = {
-      symbol,
-      timeframe: tf,
-      days,
-      bars: series.n,
-      from: fromT,
-      to: toT,
-      coveredDays,
-      source: hist.source ?? 'alpaca',
-      dataCapped: coveredDays < days - 3,
-    }
-
-    if (body.mode === 'optimize') {
-      // Task 9-l — heap guard: a grid search cannot downsize mid-flight, and
-      // over the heap ceiling it kills the PROCESS (fatal OOM), so refuse
-      // politely while the heap is hot instead of dying.
-      const mem = memoryGuard(0.7)
-      if (!mem.ok) {
-        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
-      }
-      const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
-      const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
-      const optimize = optimizeBacktest(series, cfg, ranges, { minTrades })
-      if (optimize.totalCombos === 0) {
-        return NextResponse.json({ error: 'No valid optimize ranges — tick at least one parameter and set min < max' }, { status: 400 })
-      }
-      return NextResponse.json({ optimize, meta })
-    }
-
-    if (mode === 'sweep') {
-      // Task 9-l — heap guard (see optimize branch): the all-strategies sweep
-      // is the heaviest request in the app — hundreds of sims × IS/OOS series
-      // copies. When the heap is already near its cap this is a fatal-OOM
-      // sentence; a 503 the UI can surface is strictly better.
-      const mem = memoryGuard(0.7)
-      if (!mem.ok) {
-        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
-      }
-      const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
-      const topX = Math.min(20, Math.max(1, Math.round(Number(body.topX) || 8)))
-      // Task 3-d — walk-forward fraction (0..0.5, default 0 = off)
-      const oosFraction = Number.isFinite(Number(body.oosFraction))
-        ? Math.min(0.5, Math.max(0, Number(body.oosFraction)))
-        : 0
-      const sweep = sweepStrategies(series, cfg, { minTrades, topX, oosFraction })
+    if (job.status === 'running') {
       return NextResponse.json({
-        sweep,
-        meta: { ...meta, mtmDD: true, skippedShorts: sweep.skippedShorts ?? 0 },
+        status: 'running',
+        frac: job.frac,
+        stage: job.stage,
+        startedAt: job.createdAt,
+        elapsedSec: Math.round((Date.now() - job.createdAt) / 1000),
       })
     }
-
-    if (mode === 'walkforward') {
-      // Task 12 — the heaviest mode: folds × (optimizer + verify) + hold-out.
-      // Same heap gate as the sweep, same concurrency guard as every mode.
-      const mem = memoryGuard(0.7)
-      if (!mem.ok) {
-        return NextResponse.json(memoryGuardResponse(mem), { status: 503, headers: { 'retry-after': '60' } })
-      }
-      const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
-      const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
-      const wf = walkForward(series, cfg, {
-        ranges,
-        folds: Math.min(6, Math.max(2, Math.round(Number(body.folds) || 3))),
-        isFraction: Number.isFinite(Number(body.isFraction)) ? Number(body.isFraction) : 0.7,
-        anchored: body.anchored === true,
-        holdoutFraction: Number.isFinite(Number(body.holdoutFraction)) ? Number(body.holdoutFraction) : 0.2,
-        minTrades,
-      })
-      return NextResponse.json({ walkforward: wf, meta })
+    if (job.status === 'error') {
+      return NextResponse.json({ status: 'error', error: job.error ?? 'Backtest failed' })
     }
+    return NextResponse.json({ status: 'done', ...(job.result ?? {}) })
+  } catch (e) {
+    return handleError(e)
+  }
+}
 
-    const result = runBacktest(series, cfg)
-    // Task 3-d — equity curve for the wire: downsampled to ≤500 points
-    // (stride + first/last kept; the point-per-trade array is never shipped)
-    const wire = { ...result, equity: downsampleEquity(result.equity) }
-    // Task 12 — Monte Carlo bootstrap of the realized trade sequence:
-    // resample-with-replacement confidence bands for the edge (null when
-    // there are too few trades to mean anything)
-    const mc = monteCarloBootstrap(
-      result.trades.map((t) => t.pnl),
-      capital,
-    )
-    return NextResponse.json({
+/**
+ * Task 15 — the former handleBacktest, converted to return { status, body }
+ * so both the inline path and the background-job runner share one
+ * implementation. Throws only on unexpected errors (auth/db) — validation
+ * and gate failures are returned as status+body.
+ */
+async function computeBacktest(
+  userId: string,
+  body: BacktestBody,
+  onProgress?: BacktestProgress,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  // Task 9-p — gate EVERY mode (plain runs included): a deep 1m window is
+  // the heaviest single allocation in the app and 'run' used to be the one
+  // ungated entry (optimize/sweep gated after the fetch). Refusing to start
+  // on a hot heap is a 503; starting is a dead server.
+  const memGate = memoryGuard(0.7)
+  if (!memGate.ok) {
+    return { status: 503, body: memoryGuardResponse(memGate) as Record<string, unknown> }
+  }
+  const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
+
+  // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
+  // any) is only a placeholder for the shared config validation below; every
+  // sweep candidate gets its own catalog params inside sweepStrategies().
+  let strategy = body.strategy
+  if (mode === 'sweep') strategy = isAlgoStrategyId(strategy) ? strategy : 'bb-reversion'
+  if (!isAlgoStrategyId(strategy)) {
+    return { status: 400, body: { error: 'Unknown strategy' } }
+  }
+  const tf = ALGO_TIMEFRAMES.includes(body.timeframe as AlgoTimeframe) ? (body.timeframe as AlgoTimeframe) : null
+  if (!tf) {
+    return { status: 400, body: { error: 'Timeframe must be one of 1m / 5m / 15m' } }
+  }
+  const symbol = String(body.symbol ?? '').trim().toUpperCase()
+  if (!symbol || !/^[A-Z0-9./:-]{1,15}$/.test(symbol)) {
+    return { status: 400, body: { error: 'Invalid symbol' } }
+  }
+  const days = Math.min(ALGO_MAX_DAYS[tf], Math.max(1, Math.round(Number(body.days) || 30)))
+  const qty = Number(body.qty)
+  if (!(qty > 0)) {
+    return { status: 400, body: { error: 'Quantity must be > 0' } }
+  }
+  const capital = Math.max(100, Math.min(100_000_000, Number(body.capital) || 10000))
+  const maxTradesDay = Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
+  // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
+  // risk+usd requires riskMoney > 0 · risk+pct requires riskMoneyPct > 0.
+  const sizingMode = body.sizingMode === 'risk' ? 'risk' : 'fixed'
+  const riskBasis = body.riskBasis === 'pct' ? 'pct' : 'usd'
+  const riskMoneyRaw = Number(body.riskMoney)
+  const riskMoney = Number.isFinite(riskMoneyRaw) && riskMoneyRaw > 0
+    ? Math.min(10_000_000, riskMoneyRaw)
+    : null
+  const riskPctRaw = Number(body.riskMoneyPct)
+  const riskMoneyPct = Number.isFinite(riskPctRaw) && riskPctRaw > 0
+    ? Math.min(100, riskPctRaw)
+    : null
+  if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
+    return { status: 400, body: { error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' } }
+  }
+  if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
+    return { status: 400, body: { error: 'Risk money must be a positive number when sizing mode is risk' } }
+  }
+
+  // ---- fetch the history (same source the live engine polls; TTL-cached —
+  // Task 10-a: shared fetchBacktestBars helper, identical gates/messages) ----
+  // Task 15 — the deep fetch is the SLOW phase (6–35s cold, paginated from
+  // the feeds); surface it in the job progress so the UI never shows a bare
+  // "queued 0%" while bars are streaming in.
+  onProgress?.(0.01, `fetching ${symbol} ${tf} bars (${days}d)…`)
+  const hist = await fetchBacktestBars(symbol, tf as Timeframe, userId, days, MAX_BARS)
+  if (!hist.ok) {
+    return { status: 400, body: { error: hist.error } }
+  }
+  onProgress?.(0.04, 'preparing series…')
+  const bars = hist.bars
+
+  // ACTUAL coverage — the feed may return less history than requested (per-
+  // feed bar caps, brand-new listings). Report the real window so the UI can
+  // say "data Jul 9 → Oct 21" instead of pretending the requested period.
+  const fromT = bars[0].time
+  const toT = bars[bars.length - 1].time
+  const nowSec = Math.floor(Date.now() / 1000)
+  const coveredDays = Math.max(1, Math.round((nowSec - fromT) / 86400))
+
+  const cfg: BacktestConfig = {
+    strategy,
+    params: normalizeAlgoParams(strategy, body.params),
+    qty: symbol.includes('/') ? qty : Math.max(1, Math.floor(qty)),
+    sizingMode,
+    riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
+    riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
+    riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
+    isCrypto: symbol.includes('/'),
+    tpMode: body.tpMode === 'pct' ? 'pct' : 'none',
+    tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0 ? Number(body.tpValue) : null,
+    slMode: body.slMode === 'pct' ? 'pct' : 'none',
+    slValue: body.slMode === 'pct' && Number(body.slValue) > 0 ? Number(body.slValue) : null,
+    maxTradesDay,
+    rthOnly: body.rthOnly !== false,
+    flattenEod: body.flattenEod !== false,
+    cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body.cooldownMin) || 0))),
+    requireNewSignal: body.requireNewSignal === true,
+    // Task 84 — execution-cost model (bps, default 0 = frictionless)
+    slippageBps: Math.min(500, Math.max(0, Math.round(Number(body.slippageBps) || 0))),
+    feeBps: Math.min(500, Math.max(0, Math.round(Number(body.feeBps) || 0))),
+    // Task 85 — bid/ask spread (bps, half charged per market fill)
+    spreadBps: Math.min(500, Math.max(0, Math.round(Number(body.spreadBps) || 0))),
+    // Task 12 — vol-scaled slippage (ATR% × impact, clamped 0.5..3)
+    dynSlip: body.dynSlip === true,
+    // Task 3-d — buying-power cap (0.1..10, default 1 = max 1× capital per position)
+    maxNotionalX: Number.isFinite(Number(body.maxNotionalX)) && Number(body.maxNotionalX) > 0
+      ? Math.min(10, Math.max(0.1, Number(body.maxNotionalX)))
+      : 1,
+    capital,
+  }
+
+  const series = prepareSeries(bars)
+  const meta = {
+    symbol,
+    timeframe: tf,
+    days,
+    bars: series.n,
+    from: fromT,
+    to: toT,
+    coveredDays,
+    source: hist.source ?? 'alpaca',
+    dataCapped: coveredDays < days - 3,
+  }
+
+  if (body.mode === 'optimize') {
+    // Task 9-l — heap guard: a grid search cannot downsize mid-flight, and
+    // over the heap ceiling it kills the PROCESS (fatal OOM), so refuse
+    // politely while the heap is hot instead of dying.
+    const mem = memoryGuard(0.7)
+    if (!mem.ok) {
+      return { status: 503, body: memoryGuardResponse(mem) as Record<string, unknown> }
+    }
+    const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
+    const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
+    const optimize = optimizeBacktest(series, cfg, ranges, { minTrades, onProgress })
+    if (optimize.totalCombos === 0) {
+      return { status: 400, body: { error: 'No valid optimize ranges — tick at least one parameter and set min < max' } }
+    }
+    return { status: 200, body: { optimize, meta } }
+  }
+
+  if (mode === 'sweep') {
+    // Task 9-l — heap guard (see optimize branch): the all-strategies sweep
+    // is the heaviest request in the app — hundreds of sims × IS/OOS series
+    // copies. When the heap is already near its cap this is a fatal-OOM
+    // sentence; a 503 the UI can surface is strictly better.
+    const mem = memoryGuard(0.7)
+    if (!mem.ok) {
+      return { status: 503, body: memoryGuardResponse(mem) as Record<string, unknown> }
+    }
+    const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
+    const topX = Math.min(20, Math.max(1, Math.round(Number(body.topX) || 8)))
+    // Task 3-d — walk-forward fraction (0..0.5, default 0 = off)
+    const oosFraction = Number.isFinite(Number(body.oosFraction))
+      ? Math.min(0.5, Math.max(0, Number(body.oosFraction)))
+      : 0
+    const sweep = sweepStrategies(series, cfg, { minTrades, topX, oosFraction, onProgress })
+    return {
+      status: 200,
+      body: { sweep, meta: { ...meta, mtmDD: true, skippedShorts: sweep.skippedShorts ?? 0 } },
+    }
+  }
+
+  if (mode === 'walkforward') {
+    // Task 12 — the heaviest mode: folds × (optimizer + verify) + hold-out.
+    // Same heap gate as the sweep, same concurrency guard as every mode.
+    const mem = memoryGuard(0.7)
+    if (!mem.ok) {
+      return { status: 503, body: memoryGuardResponse(mem) as Record<string, unknown> }
+    }
+    const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
+    const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
+    const wf = walkForward(series, cfg, {
+      ranges,
+      folds: Math.min(6, Math.max(2, Math.round(Number(body.folds) || 3))),
+      isFraction: Number.isFinite(Number(body.isFraction)) ? Number(body.isFraction) : 0.7,
+      anchored: body.anchored === true,
+      holdoutFraction: Number.isFinite(Number(body.holdoutFraction)) ? Number(body.holdoutFraction) : 0.2,
+      minTrades,
+      onProgress,
+    })
+    return { status: 200, body: { walkforward: wf, meta } }
+  }
+
+  const result = runBacktest(series, cfg)
+  // Task 3-d — equity curve for the wire: downsampled to ≤500 points
+  // (stride + first/last kept; the point-per-trade array is never shipped)
+  const wire = { ...result, equity: downsampleEquity(result.equity) }
+  // Task 12 — Monte Carlo bootstrap of the realized trade sequence:
+  // resample-with-replacement confidence bands for the edge (null when
+  // there are too few trades to mean anything)
+  const mc = monteCarloBootstrap(
+    result.trades.map((t) => t.pnl),
+    capital,
+  )
+  return {
+    status: 200,
+    body: {
       result: wire,
       mc,
       meta: { ...meta, mtmDD: true, skippedShorts: result.metrics.skippedShorts ?? 0, dynSlip: cfg.dynSlip === true && (cfg.slippageBps ?? 0) > 0 },
-    })
-  } catch (e) {
-    return handleError(e)
+    },
   }
 }

@@ -211,6 +211,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
   const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep' | 'walkforward'>(null)
   const [error, setError] = useState<string | null>(null)
+  // Task 15 — live progress of a background optimizer job (heavy modes run
+  // detached server-side; this mirrors the GET ?job= poll stream)
+  const [job, setJob] = useState<{ frac: number; stage: string; elapsedSec: number } | null>(null)
   const [meta, setMeta] = useState<BacktestMeta | null>(null)
   const [runRes, setRunRes] = useState<BacktestResult | null>(null)
   const [optRes, setOptRes] = useState<OptimizeResult | null>(null)
@@ -406,9 +409,97 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     return out
   }, [def, ranges])
 
+  const failToast = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward', description: string) => {
+    toast({
+      title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : mode === 'walkforward' ? 'Walk-forward failed' : 'Strategy sweep failed',
+      description,
+      variant: 'destructive',
+    })
+  }
+
+  // Task 15 — one result-application path shared by the inline response and
+  // the background-job poll (the wire shapes are identical)
+  const applyResult = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward', json: unknown) => {
+    const j = (json ?? {}) as {
+      meta?: BacktestMeta | null
+      result?: BacktestResult | null
+      mc?: MonteCarloResult | null
+      optimize?: OptimizeResult | null
+      walkforward?: WalkForwardResult | null
+      sweep?: SweepResult | null
+    }
+    setMeta(j.meta ?? null)
+    if (mode === 'run') {
+      setRunRes(j.result ?? null)
+      setMcRes(j.mc ?? null)
+      setOptRes(null)
+    } else if (mode === 'optimize') {
+      setOptRes(j.optimize ?? null)
+      setRunRes(null)
+      setMcRes(null)
+    } else if (mode === 'walkforward') {
+      setWfRes(j.walkforward ?? null)
+      setRunRes(null)
+      setOptRes(null)
+      setMcRes(null)
+    } else {
+      setSweepRes(j.sweep ?? null)
+      setRunRes(null)
+      setOptRes(null)
+      setMcRes(null)
+    }
+  }
+
+  // Task 15 — poll a background optimizer job to completion. Heavy modes
+  // (optimize/sweep/walkforward) return 202 {jobId} and run DETACHED
+  // server-side, so no HTTP request lives long enough to be killed by proxy
+  // timeouts (Render's edge ≈100s) or pod churn — no more 502-with-no-result.
+  const pollJob = async (mode: 'optimize' | 'sweep' | 'walkforward', jobId: string) => {
+    const deadline = Date.now() + 15 * 60_000
+    for (;;) {
+      if (Date.now() > deadline) {
+        setError('Optimizer still running after 15 minutes')
+        failToast(mode, 'Still running after 15 minutes — try a smaller grid or a shorter period')
+        return
+      }
+      await new Promise((r) => setTimeout(r, 1500))
+      let res: Response
+      try {
+        res = await fetch(`/api/algo/backtest?job=${encodeURIComponent(jobId)}`, { cache: 'no-store' })
+      } catch {
+        setError('Network error')
+        failToast(mode, 'Network error while polling the optimizer job')
+        return
+      }
+      const pj = (await res.json().catch(() => null)) as {
+        status?: string; frac?: number; stage?: string; elapsedSec?: number; error?: string
+      } | null
+      if (!res.ok) {
+        const msg = pj?.error || `HTTP ${res.status}`
+        setError(msg)
+        failToast(mode, msg)
+        return
+      }
+      if (pj?.status === 'running') {
+        setJob({ frac: Number(pj.frac) || 0, stage: String(pj.stage || ''), elapsedSec: Number(pj.elapsedSec) || 0 })
+        continue
+      }
+      setJob(null)
+      if (pj?.status === 'error') {
+        const msg = pj.error || 'Optimizer failed'
+        setError(msg)
+        failToast(mode, msg)
+        return
+      }
+      applyResult(mode, pj)
+      return
+    }
+  }
+
   const post = async (mode: 'run' | 'optimize' | 'sweep' | 'walkforward') => {
     setBusy(mode)
     setError(null)
+    setJob(null)
     try {
       const res = await fetch('/api/algo/backtest', {
         method: 'POST',
@@ -443,36 +534,23 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         }),
       })
       const json = await res.json().catch(() => null)
-      if (!res.ok) {
-        setError(json?.error || `HTTP ${res.status}`)
-        toast({ title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : mode === 'walkforward' ? 'Walk-forward failed' : 'Strategy sweep failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      // Task 15 — heavy modes come back as 202 {jobId}: poll to completion
+      if (res.status === 202 && json?.jobId) {
+        await pollJob(mode as 'optimize' | 'sweep' | 'walkforward', String(json.jobId))
         return
       }
-      setMeta(json.meta ?? null)
-      if (mode === 'run') {
-        setRunRes(json.result ?? null)
-        setMcRes(json.mc ?? null)
-        setOptRes(null)
-      } else if (mode === 'optimize') {
-        setOptRes(json.optimize ?? null)
-        setRunRes(null)
-        setMcRes(null)
-      } else if (mode === 'walkforward') {
-        setWfRes(json.walkforward ?? null)
-        setRunRes(null)
-        setOptRes(null)
-        setMcRes(null)
-      } else {
-        setSweepRes(json.sweep ?? null)
-        setRunRes(null)
-        setOptRes(null)
-        setMcRes(null)
+      if (!res.ok) {
+        setError(json?.error || `HTTP ${res.status}`)
+        failToast(mode, json?.error || `HTTP ${res.status}`)
+        return
       }
+      applyResult(mode, json)
     } catch {
       setError('Network error')
       toast({ title: 'Request failed', description: 'Network error', variant: 'destructive' })
     } finally {
       setBusy(null)
+      setJob(null)
     }
   }
 
@@ -816,6 +894,21 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
           </div>
         </div>
+
+        {/* ---- Task 15 — live optimizer job progress (background-job poll) ---- */}
+        {busy && job && (
+          <div className="mt-2 flex items-center gap-2" role="status" aria-live="polite">
+            <div className="h-1.5 flex-1 overflow-hidden rounded bg-zinc-800">
+              <div
+                className="h-full bg-violet-500 transition-all duration-700"
+                style={{ width: `${Math.max(3, Math.round(job.frac * 100))}%` }}
+              />
+            </div>
+            <span className="whitespace-nowrap text-[10px] tabular-nums text-zinc-400">
+              {Math.round(job.frac * 100)}% · {job.stage || 'working'} · {job.elapsedSec}s
+            </span>
+          </div>
+        )}
 
         {/* ---- optimizer ranges ---- */}
         {optOpen && (
