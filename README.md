@@ -224,6 +224,8 @@ The repo ships a Blueprint (`render.yaml`) — Dashboard → **New + → Bluepri
 
 Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite file resets on every deploy/restart — persistence needs `plan: starter` + the commented disk block), **spin-down** after 15 idle minutes (grid/algo engines tick in-process, so they pause while asleep), and **no stream sidecar** (the terminal runs over REST polling; the Live chip shows amber). Always-on + persistence = `plan: starter` + disk.
 
+**Troubleshooting — Prisma `Error code 14: Unable to open the database file`**: your Render service has a `DATABASE_URL` pointing outside the container (e.g. a dev path like `file:/home/z/my-project/db/custom.db`). The entrypoint self-heals since Task 13 (falls back to `file:/app/db/custom.db` with a loud boot log), but the clean fix is to delete the `DATABASE_URL` env var in the Render dashboard — the image default is identical — or set it to `file:/app/db/custom.db`, then redeploy. On Render, `DATABASE_URL` must always live under `/app`.
+
 ### Option C — systemd
 
 ```bash

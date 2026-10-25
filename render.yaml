@@ -49,6 +49,11 @@ services:
     autoDeploy: true
     healthCheckPath: /api/health
     envVars:
+      # Must stay under /app (the only writable location in the container).
+      # A host path like file:/home/z/my-project/db/custom.db makes Prisma
+      # fail with "Error code 14: Unable to open the database file". Since
+      # Task 13 the entrypoint self-heals to /app/db with a loud boot log,
+      # but the clean value is this default — or simply delete the var.
       - key: DATABASE_URL
         value: file:/app/db/custom.db
       - key: AUTH_SECRET

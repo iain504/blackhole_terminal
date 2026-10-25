@@ -2754,3 +2754,19 @@ Stage Summary:
 - Sweep pipeline VERIFIED end-to-end on live data (and again after recovery): catalog sweep (defaults + auto grids + boundary flags + OOS verify), walk-forward (folds/hold-out/stability), Monte Carlo — deterministic, fast (≤1.1s per sweep), costs + regime gates active.
 - Honest strategy verdict on this window: BTC/USD 15m has NO robust edge (IS +0.12% dies OOS/WFO/hold-out; MC P(loss) 90%) and AAPL's winning bb-reversion config is the untouched defaults with thin OOS. The toolkit's value is exactly this refusal to bless fragile optima.
 - No app code changes; scripts-tmp/sweep-test-12.mjs + seed-trader-12sweep.ts kept uncommitted (dev creds); probe scripts deleted after use.
+---
+Task ID: 13-render-fix
+Agent: Z.ai Code (main)
+Task: Fix Render.com deploy failure — Prisma "Error code 14: Unable to open the database file" spamming from the alerts supervisor on the live Render instance.
+
+Work Log:
+- Diagnosed from user-pasted Render logs: server boots, alerts supervisor hits prisma.alert.count() error 14 every 15s → SQLITE_CANTOPEN = DATABASE_URL points to a path that cannot be created/opened inside the container (dashboard env var with a host path like file:/home/z/my-project/db/custom.db); old entrypoint only defaulted when the var was UNSET and swallowed the db push failure with `|| echo`.
+- Hardened docker-entrypoint.sh (Task 13): strips file: prefix + ?params, resolves relative paths against /app AND rewrites DATABASE_URL to absolute (prisma would otherwise resolve relative paths against prisma/), mkdir + write-tests the db dir, self-heals to file:/app/db/custom.db with a loud multi-line boot log when the configured dir is unwritable, warns on unwritable existing db file, echoes fresh-database/registration hint, makes db-push failure message explicit ("queries will error"), and verifies the db file exists + byte-size before exec'ing the server; fallback mkdir made non-fatal so boot never aborts.
+- Validated with a 6-scenario shell harness (fake bunx on PATH, /app relocated to /tmp/bh-app): unset→default, bad host path→fallback (the exact Render case), valid custom dir→used as-is, relative→rewritten absolute, ?params→stripped for validation, existing db→ready branch with byte count. sh -n syntax check clean. All branches pass; no set -e aborts.
+- render.yaml: DATABASE_URL gotcha comment (must stay under /app; self-heal note). README Option B: troubleshooting paragraph for error 14.
+- bun run lint clean; local dev healthy (db:true, v1.80.0+147); stamped v1.80.0+149.
+
+Stage Summary:
+- Render deploys now self-heal any bad DATABASE_URL: boot log shows "[entrypoint] ⚠ … falling back to file:/app/db/custom.db" then "database ready: … (N bytes)" before the server starts.
+- User-side recommended action: delete DATABASE_URL from the Render dashboard env (or set file:/app/db/custom.db) and redeploy; fresh ephemeral DB each deploy → register a new account on the Render instance (ALLOW_REGISTRATION=true), paste Alpaca paper keys in the Environment tab.
+- Free-tier constraints unchanged and documented: ephemeral disk, 15-min spin-down, no stream sidecar (REST polling).
