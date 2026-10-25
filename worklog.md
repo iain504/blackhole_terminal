@@ -2868,3 +2868,15 @@ Stage Summary:
 - Bug: optimizer null-score crash FIXED at both the wire boundary (jsonSafe) and the render layer (fmtScore). Same hardening covers sweep / walk-forward / recommendations score cells.
 - Files: src/app/api/algo/backtest/route.ts, src/components/terminal/tabs/BacktestPanel.tsx, src/lib/backtest.ts, package.json, src/generated/version.ts.
 - Verified end-to-end in browser (v1.80.1+165): optimizer table renders '—' for non-scorable rows, no runtime error.
+
+---
+Task ID: 14-push
+Agent: Z.ai Code (main session)
+Task: Push the v1.80.1 optimizer null-score fix (follow-up to Task 14).
+
+Work Log:
+- User supplied a fresh GitHub PAT; recreated /tmp/gh-askpass.sh (chmod 700) with it.
+- Pushed main: b1300d8..8a5c7ef (1 commit — the optimizer null-score crash fix, v1.80.1+153).
+
+Stage Summary:
+- origin/main = 8a5c7ef, working tree clean, 0 commits ahead. The old PAT in the helper had been revoked — new one works.
