@@ -2895,3 +2895,23 @@ Work Log:
 
 Stage Summary:
 - Repo verified complete; failure is local to the user's copy. Dockerfile + README now self-diagnose this failure mode. Committed and pushed for the user to re-pull.
+
+---
+Task ID: 16
+Agent: Z.ai Code (main session)
+Task: Raise the backtest 1m history cap from 30d to the max Alpaca serves (user: "1m is only 30 for now. it should back to 180 or more?").
+
+Work Log:
+- Located the cap: ALGO_MAX_DAYS in src/lib/algo-strategies.ts (single source of truth for the API clamp, the panel hint/clamp, and the reco matrix window). The 30d 1m cap was Task 9-p OOM protection for CRYPTO (24/7 ≈1,440 bars/day → 30d ≈ 43k bars), not a feed limitation.
+- v1.80.3 design — asset-aware ceiling: ALGO_MAX_DAYS['1m'] 30 → 180 (stocks, RTH ≈390 bars/day → ≈70k bars, same scale as 5m/365d already in use); new algoMaxDays(tf, isCrypto) helper keeps crypto 1m at 45d (180d crypto would be ≈259k bars — the exact allocation that OOM'd the box). Crypto-only constant ALGO_1M_CRYPTO_MAX_DAYS = 45.
+- Second hidden ceiling fixed: the stock bars path used a fixed 60-page pagination cap (~60–120k bars at IEX ~1–2k bars/page) — a deep 1m window would silently truncate the NEWEST bars (forward walk hits the cap). maxPages now scales with the window (est bars / 1500 + 6, clamped 60..160).
+- Call sites switched to algoMaxDays(): backtest route clamp (days), algo-reco matrix (per-tf window), BacktestPanel (hint text, onBlur clamp, reco-apply days seeding); crypto hint copy updated.
+- package.json 1.80.2 → 1.80.3; lint clean.
+- Live probes: AAPL 1m 180d → 49,634 bars spanning 177d, truncated=false, ~3s cold; BTC/USD 1m 45d clamp → ~79k bars via Alpaca crypto deep slices, healthy.
+- API smoke (QA user + forged session, deleted after): AAPL 1m 180d → 200, meta {days:180, bars:49634, coveredDays:179, dataCapped:false}; clamp 9999→180; BTC/USD 180→45; 5m/365d regression unchanged; mode:optimize at the new depth → 202 jobId → polled to done.
+- Browser end-to-end (QA user + injected cookie, deleted after): Algo tab → Backtest panel hint renders "max 180 for 1m"; ran TSLA 1m 180d via the real UI → "data Apr 29 → Oct 23 (179d) · 49,130 closed bars · feed: alpaca", 82 trades + Monte Carlo + W/L buckets rendered; 0 console errors, 0 page errors; sticky footer intact.
+- Probe/smoke scripts removed after use (scripts-tmp stays clean); worklog updated.
+
+Stage Summary:
+- Stock 1m backtests now go back 180 days (~49-70k IEX bars, honest dataCapped flag if a symbol has less); crypto 1m stays heap-safe at 45d; newest-bar truncation risk on deep stock windows eliminated (scaled pagination cap).
+- origin/main = c997803 (v1.80.3+167), working tree clean. User should git pull + docker compose up -d --build on their PC to pick this up.
