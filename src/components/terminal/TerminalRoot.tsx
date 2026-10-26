@@ -29,6 +29,7 @@ import {
 import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
 import { onConnectChange, type StreamStatus } from '@/lib/stream-client'
+import { applyUiTheme, fetchServerUiTheme, getUiTheme, useUiTheme } from '@/lib/ui-theme'
 import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
 import { APP_VERSION } from '@/generated/version'
@@ -54,6 +55,8 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const [strategiesOpen, setStrategiesOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const meFetched = useRef(false)
+  // Task 28 — small festive flourish in the terminal footer while Christmas is on
+  const footerChristmas = useUiTheme() === 'christmas'
 
   const loadUserData = useCallback(async (u: SessionUser) => {
     const store = useTerminal.getState()
@@ -84,6 +87,13 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         const json = await res.json()
         if (json.user) {
           setUser(json.user)
+          // Task 28 — the account's saved theme wins once we know who this is
+          // (localStorage keeps the landing page instant pre-login). Absent
+          // server preference leaves the local choice untouched.
+          const serverTheme = await fetchServerUiTheme()
+          if (serverTheme && serverTheme !== getUiTheme()) {
+            applyUiTheme(serverTheme)
+          }
           await loadUserData(json.user)
         }
       } catch { /* offline */ }
@@ -434,6 +444,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         </span>
         <span className="flex items-center gap-3">
           <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
+          {footerChristmas && <span title="Christmas theme" aria-hidden>🎄</span>}
           <AppVersion />
           <LiveClock />
         </span>

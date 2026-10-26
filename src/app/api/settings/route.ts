@@ -26,6 +26,8 @@ interface UserSettings {
   // emerald, algo glow purple; the user picks both in Settings → Chart glow.
   glowGridColor?: string
   glowAlgoColor?: string
+  // Task 28 — UI theme: 'default' (Midnight) | 'christmas'. Absent = default.
+  uiTheme?: string
 }
 
 export const DEFAULT_TPSL_PERCENT = 5
@@ -67,6 +69,7 @@ export async function GET() {
         grid: safeGlow(s?.glowGridColor, DEFAULT_GLOW_GRID),
         algo: safeGlow(s?.glowAlgoColor, DEFAULT_GLOW_ALGO),
       },
+      uiTheme: s?.uiTheme === 'christmas' ? 'christmas' : 'default',
     })
   } catch (e) {
     return handleError(e)
@@ -84,6 +87,7 @@ interface PutBody {
   tpslPercent?: number
   glowGridColor?: string
   glowAlgoColor?: string
+  uiTheme?: string
 }
 
 // PUT /api/settings — update private credentials (stored encrypted, never returned).
@@ -141,6 +145,14 @@ export async function PUT(req: Request) {
         return NextResponse.json({ error: 'glowAlgoColor must be a hex color like #a855f7' }, { status: 400 })
       }
       s.glowAlgoColor = body.glowAlgoColor.toLowerCase()
+    }
+    // Task 28 — UI theme (Settings → Appearance; the client applies it live
+    // and mirrors it into localStorage)
+    if (body.uiTheme != null) {
+      if (body.uiTheme !== 'default' && body.uiTheme !== 'christmas') {
+        return NextResponse.json({ error: "uiTheme must be 'default' or 'christmas'" }, { status: 400 })
+      }
+      s.uiTheme = body.uiTheme
     }
     await db.user.update({
       where: { id: user.id },

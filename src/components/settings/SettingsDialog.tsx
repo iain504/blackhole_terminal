@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Download, FileJson, KeyRound, Loader2, Percent, PlugZap, Send, Sparkles, Upload } from 'lucide-react';
+import { Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Upload } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -16,6 +16,14 @@ import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
 import { useTerminal } from '@/store/terminal';
 import { loadIndicators } from '@/lib/indicators';
+import { cn } from '@/lib/utils';
+import {
+  applyUiTheme,
+  saveUiThemeToServer,
+  UI_THEMES,
+  useUiTheme,
+  type UiTheme,
+} from '@/lib/ui-theme';
 import BackupRestoreCard from '@/components/settings/BackupRestoreCard';
 
 export const SETTINGS_CHANGED_EVENT = 'tt:settings-changed';
@@ -63,6 +71,34 @@ export default function SettingsDialog({
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+
+  // ---- Task 28 — appearance (UI theme) ----
+  // The applied theme (html class + localStorage) IS the source of truth for
+  // display — useUiTheme re-renders the section the moment it changes.
+  const uiTheme = useUiTheme();
+  const [savingTheme, setSavingTheme] = useState(false);
+  async function handleThemeSelect(t: UiTheme) {
+    if (t === uiTheme || savingTheme) return;
+    applyUiTheme(t); // live preview + localStorage, before the round-trip
+    setSavingTheme(true);
+    try {
+      const ok = await saveUiThemeToServer(t);
+      if (ok) {
+        toast({
+          title: t === 'christmas' ? '🎄 Christmas theme on' : 'Midnight theme on',
+          description: 'Saved to your account — follows you to every device.',
+        });
+      } else {
+        toast({
+          title: 'Theme applied on this device',
+          description: 'Could not save to your account just now — it will not sync to other devices.',
+          variant: 'destructive',
+        });
+      }
+    } finally {
+      setSavingTheme(false);
+    }
+  }
 
   // ---- config backup (export / import) ----
   const [exporting, setExporting] = useState(false);
@@ -416,6 +452,56 @@ export default function SettingsDialog({
         )}
 
         <form onSubmit={handleSave} className="flex flex-col gap-5">
+          {/* ------- Appearance (Task 28) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Palette className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">Appearance</h3>
+              {savingTheme && <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" aria-label="Saving theme" />}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {UI_THEMES.map((t) => {
+                const active = uiTheme === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => void handleThemeSelect(t.id)}
+                    aria-pressed={active}
+                    disabled={savingTheme}
+                    className={cn(
+                      'flex flex-col gap-2 rounded-lg border p-3 text-left transition-colors disabled:opacity-60',
+                      active
+                        ? 'border-emerald-500/60 bg-emerald-500/10'
+                        : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700 hover:bg-zinc-900'
+                    )}
+                  >
+                    <span className="flex w-full items-center justify-between">
+                      <span className="text-sm font-medium text-zinc-100">{t.label}</span>
+                      {active && <Check className="h-4 w-4 shrink-0 text-emerald-400" aria-label="Active theme" />}
+                    </span>
+                    <span className="flex gap-1" aria-hidden>
+                      {t.swatch.map((c) => (
+                        <span
+                          key={c}
+                          className="h-4 w-4 rounded-full border border-black/40"
+                          style={{ background: c }}
+                        />
+                      ))}
+                    </span>
+                    <span className="text-xs leading-snug text-zinc-500">{t.hint}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              Applies instantly and saves to your account automatically — also
+              used on the landing page of this browser.
+            </p>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
           {/* ------- Alpaca API keys ------- */}
           <section className="flex flex-col gap-3">
             <div className="flex items-center gap-2">

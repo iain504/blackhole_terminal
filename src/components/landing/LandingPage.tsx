@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import Image from 'next/image'
 import { motion } from 'framer-motion'
 import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'
+import { useIsClient, useUiTheme } from '@/lib/ui-theme'
 
 interface TickerState {
   symbol: string
@@ -26,13 +27,22 @@ const NAV_LINKS = ['Markets', 'Trade', 'Analytics', 'Portfolio', 'Learn'] as con
 export function LandingPage({ onLaunch }: { onLaunch: () => void }) {
   const [latency, setLatency] = useState<number | null>(null)
   const onLatency = useCallback((ms: number) => setLatency(ms), [])
+  // Task 28 — Christmas theme. uiTheme is read post-mount only (mounted gate)
+  // so SSR/hydration always render the default tree; the boot script in
+  // layout.tsx already put the theme class on <html>, so COLORS are correct
+  // from first paint — only the decorative DOM (snow, chip) appears a beat
+  // later, avoiding a hydration mismatch.
+  const uiTheme = useUiTheme()
+  const isClient = useIsClient()
+  const christmas = isClient && uiTheme === 'christmas'
   return (
-    <div className="relative flex min-h-screen flex-col bg-[#08080b] text-zinc-100">
+    <div className="lp-root relative flex min-h-screen flex-col bg-[#08080b] text-zinc-100">
       <GridBackdrop />
+      {christmas && <Snowfall />}
       <div className="relative z-10 flex min-h-screen flex-col">
-        <NavBar onLaunch={onLaunch} onLatency={onLatency} />
+        <NavBar onLaunch={onLaunch} onLatency={onLatency} christmas={christmas} />
         <main className="flex-1">
-          <Hero onLaunch={onLaunch} />
+          <Hero onLaunch={onLaunch} christmas={christmas} />
         </main>
         <StatusBar latency={latency} />
       </div>
@@ -42,7 +52,7 @@ export function LandingPage({ onLaunch }: { onLaunch: () => void }) {
 
 /* ---------------------------------- nav ---------------------------------- */
 
-function NavBar({ onLaunch, onLatency }: { onLaunch: () => void; onLatency: (ms: number) => void }) {
+function NavBar({ onLaunch, onLatency, christmas }: { onLaunch: () => void; onLatency: (ms: number) => void; christmas: boolean }) {
   const [tickers, setTickers] = useState<TickerState[]>(FALLBACK_TICKERS)
 
   // Live ticker strip — polls public quote endpoint, falls back to static values.
@@ -85,7 +95,7 @@ function NavBar({ onLaunch, onLatency }: { onLaunch: () => void; onLatency: (ms:
   }, [onLatency])
 
   return (
-    <header className="sticky top-0 z-30 border-b border-white/5 bg-[#08080b]/85 backdrop-blur">
+    <header className="lp-nav sticky top-0 z-30 border-b border-white/5 bg-[#08080b]/85 backdrop-blur">
       <div className="mx-auto flex h-16 max-w-[1400px] items-center gap-6 px-4 sm:px-6 lg:px-10">
         {/* brand */}
         <button
@@ -98,6 +108,11 @@ function NavBar({ onLaunch, onLatency }: { onLaunch: () => void; onLatency: (ms:
             <span className="text-[15px] font-extrabold tracking-wide text-white">BLACKHOLE</span>
             <span className="text-[11px] font-medium text-zinc-400">Terminal</span>
           </span>
+          {christmas && (
+            <span className="ml-0.5 text-base leading-none" aria-hidden title="Christmas theme is on">
+              🎄
+            </span>
+          )}
         </button>
 
         {/* links */}
@@ -139,7 +154,7 @@ function NavBar({ onLaunch, onLatency }: { onLaunch: () => void; onLatency: (ms:
 
         <button
           onClick={onLaunch}
-          className="flex items-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors hover:bg-blue-500 sm:px-4"
+          className="lp-cta flex items-center gap-1.5 whitespace-nowrap rounded-md bg-blue-600 px-3.5 py-2 text-[13px] font-semibold text-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] transition-colors hover:bg-blue-500 sm:px-4"
         >
           <LogIn className="h-4 w-4" aria-hidden />
           Login
@@ -181,7 +196,7 @@ function Ticker({ ticker }: { ticker: TickerState }) {
 
 /* ---------------------------------- hero --------------------------------- */
 
-function Hero({ onLaunch }: { onLaunch: () => void }) {
+function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolean }) {
   return (
     <section className="mx-auto grid w-full max-w-[1400px] grid-cols-1 items-center gap-10 px-4 pb-10 pt-10 sm:px-6 lg:min-h-[calc(100vh-6.5rem)] lg:grid-cols-[1.05fr_1.2fr] lg:gap-14 lg:px-10 lg:pb-16 lg:pt-20">
       {/* left */}
@@ -200,6 +215,11 @@ function Hero({ onLaunch }: { onLaunch: () => void }) {
         <h1 className="mt-8 text-4xl font-bold leading-[1.08] tracking-tight text-white sm:text-5xl lg:text-[3.6rem]">
           Trade the Edge of the Market.
         </h1>
+        {christmas && (
+          <p className="mt-3 inline-flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1 text-xs font-medium text-red-300">
+            <span aria-hidden>🎄</span> Merry Christmas — festive theme is on
+          </p>
+        )}
         <p className="mt-4 text-lg text-zinc-400 sm:text-xl">
           Data, Perpetuals, and Insights distorted by Gravity.
         </p>
@@ -211,7 +231,7 @@ function Hero({ onLaunch }: { onLaunch: () => void }) {
         <div className="mt-8 flex flex-wrap items-center gap-3.5">
           <button
             onClick={onLaunch}
-            className="rounded-lg bg-blue-600 px-7 py-3 text-[15px] font-semibold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-500 hover:shadow-blue-500/30 active:scale-[0.98]"
+            className="lp-cta rounded-lg bg-blue-600 px-7 py-3 text-[15px] font-semibold text-white shadow-lg shadow-blue-600/20 transition-all hover:bg-blue-500 hover:shadow-blue-500/30 active:scale-[0.98]"
           >
             Launch Terminal
           </button>
@@ -398,8 +418,52 @@ function GridBackdrop() {
           WebkitMaskImage: 'radial-gradient(ellipse 95% 85% at 50% 15%, black 25%, transparent 78%)',
         }}
       />
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_55%_45%_at_72%_38%,rgba(59,130,246,0.07),transparent_70%)]" />
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_45%_40%_at_75%_55%,rgba(249,115,22,0.05),transparent_70%)]" />
+      <div className="absolute inset-0 lp-glow-blue bg-[radial-gradient(ellipse_55%_45%_at_72%_38%,rgba(59,130,246,0.07),transparent_70%)]" />
+      <div className="absolute inset-0 lp-glow-orange bg-[radial-gradient(ellipse_45%_40%_at_75%_55%,rgba(249,115,22,0.05),transparent_70%)]" />
+    </div>
+  )
+}
+
+/* ------------------------------- snowfall --------------------------------- */
+
+// Task 28 — Christmas-only decorative snow on the landing page. Seeded RNG
+// (same mulberry32 as MiniSparkline) so SSR/CSR agree and flakes are stable
+// across renders; CSS does the animation (globals.css xmas-fall) and honors
+// prefers-reduced-motion by hiding the flakes entirely.
+function Snowfall() {
+  const flakes = useMemo(() => {
+    const rnd = mulberry32(20251224)
+    const glyphs = ['❄', '❅', '•']
+    return Array.from({ length: 36 }, (_, i) => ({
+      id: i,
+      left: rnd() * 100,
+      size: 8 + rnd() * 10,
+      duration: 9 + rnd() * 14,
+      // negative delay → every flake starts mid-fall (no empty first seconds)
+      delay: -rnd() * 20,
+      drift: (rnd() - 0.5) * 14,
+      opacity: 0.35 + rnd() * 0.5,
+      glyph: glyphs[Math.floor(rnd() * glyphs.length)],
+    }))
+  }, [])
+  return (
+    <div className="xmas-snow" aria-hidden>
+      {flakes.map((f) => (
+        <span
+          key={f.id}
+          className="xmas-snowflake"
+          style={{
+            left: `${f.left}%`,
+            fontSize: f.size,
+            opacity: f.opacity,
+            animationDuration: `${f.duration}s`,
+            animationDelay: `${f.delay}s`,
+            ['--xmas-drift' as string]: `${f.drift.toFixed(1)}vw`,
+          }}
+        >
+          {f.glyph}
+        </span>
+      ))}
     </div>
   )
 }

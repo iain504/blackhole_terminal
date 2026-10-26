@@ -32,6 +32,11 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
+// Task 28 — apply the saved UI theme (localStorage 'tt_ui_theme') BEFORE
+// first paint so switching to the Christmas skin never flashes the default
+// zinc surfaces. Runs pre-hydration; <html> carries suppressHydrationWarning.
+const UI_THEME_BOOT = `(function(){try{if(localStorage.getItem('tt_ui_theme')==='christmas'){document.documentElement.classList.add('theme-christmas');}}catch(e){}})();`;
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -39,6 +44,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: UI_THEME_BOOT }} />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-zinc-950 text-zinc-200`}
       >

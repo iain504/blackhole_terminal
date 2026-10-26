@@ -21,6 +21,7 @@ import {
   type IndicatorSettings, type LinePoint,
 } from '@/lib/indicators'
 import { cn } from '@/lib/utils'
+import { chartBg, UI_THEME_CHANGE_EVENT } from '@/lib/ui-theme'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -294,6 +295,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [demo, setDemo] = useState(false)
   const [demoReason, setDemoReason] = useState<string | undefined>(undefined)
   const [settingsVer, setSettingsVer] = useState(0)
+  // Task 28 — bumped when the UI theme changes so the chart lifecycle effect
+  // re-creates the chart with the themed canvas background (lightweight-charts
+  // takes colors as JS strings and cannot follow CSS variables).
+  const [themeRev, setThemeRev] = useState(0)
+  useEffect(() => {
+    const onTheme = () => setThemeRev((r) => r + 1)
+    window.addEventListener(UI_THEME_CHANGE_EVENT, onTheme)
+    return () => window.removeEventListener(UI_THEME_CHANGE_EVENT, onTheme)
+  }, [])
   // technical indicators (persisted globally in localStorage)
   const [ind, setIndState] = useState<IndicatorSettings>(() => loadIndicators())
   const [indDataVer, setIndDataVer] = useState(0) // bumped whenever bars change
@@ -867,7 +877,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         if (axisW > 0) {
           const x0 = w - axisW
           const coverTop = Math.round(strips.vol.top * paneH)
-          ctx.fillStyle = '#09090b'
+          ctx.fillStyle = chartBg()
           ctx.fillRect(x0, coverTop, axisW, Math.round(paneH) - coverTop)
           ctx.textBaseline = 'middle'
           const axisLabel = (y: number, txt: string, color: string) => {
@@ -1701,7 +1711,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.roundRect(x, by, bw, bh, 3)
     ctx.fill()
     ctx.globalAlpha = 1
-    ctx.fillStyle = '#09090b'
+    ctx.fillStyle = chartBg()
     ctx.fillText(text, x + 6, by + 11.5)
     ctx.restore()
     return { x, y: by, w: bw, h: bh }
@@ -1726,7 +1736,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.roundRect(x, by, bw, bh, 4)
     ctx.fill()
     ctx.globalAlpha = 1
-    ctx.fillStyle = '#09090b'
+    ctx.fillStyle = chartBg()
     ctx.fillText(text, x + 7, by + 13)
     ctx.restore()
   }
@@ -1760,7 +1770,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.save()
     ctx.beginPath()
     ctx.arc(x, y, highlighted ? 4.5 : 3.5, 0, Math.PI * 2)
-    ctx.fillStyle = '#09090b'
+    ctx.fillStyle = chartBg()
     ctx.fill()
     ctx.strokeStyle = color
     ctx.lineWidth = 1.5
@@ -1791,7 +1801,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.beginPath()
     ctx.roundRect(w - bw - 4, by, bw, 16, 3)
     ctx.fill()
-    ctx.fillStyle = '#09090b'
+    ctx.fillStyle = chartBg()
     ctx.fillText(label, w - bw + 2, by + 11.5)
     ctx.restore()
   }
@@ -3097,7 +3107,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const chart = createChart(container, {
       autoSize: true,
       layout: {
-        background: { type: ColorType.Solid, color: '#09090b' },
+        background: { type: ColorType.Solid, color: chartBg() },
         textColor: '#a1a1aa',
         fontSize: 11,
       },
@@ -3600,7 +3610,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // this effect (`ind` is not a dep): the series-set / data-refill effects
     // below own indicator params, so tweaking a period never tears down the
     // chart or refetches bars/markers.
-  }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours])
+  }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours, themeRev])
 
   // ---------- grid trades overlay + live-grid glow (Task 10-b / 10-d) ----------
   // Poll lifecycle: ALWAYS on while the panel is mounted (the boundary glow
@@ -4174,7 +4184,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         'relative h-full w-full select-none overflow-hidden [-webkit-touch-callout:none]',
         focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
       )}
-      style={{ background: '#09090b' }}
+      style={{ background: 'var(--chart-bg, #09090b)' }}
       onPointerDownCapture={() => onFocus?.()}>
       {/* chart canvas is injected here by lightweight-charts */}
       {/* h-full/w-full is CRITICAL: a canvas with only inset-0 renders at its

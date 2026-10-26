@@ -166,3 +166,189 @@
 @media (prefers-reduced-motion: reduce) {
   .grid-live-glow { animation: none; opacity: 0.75; }
 }
+
+/* ===========================================================================
+   Task 28 — UI themes. "Christmas" re-skins the whole app by REDEFINING the
+   Tailwind color variables under html.theme-christmas: every solid zinc-*
+   utility compiles to var(--color-zinc-NNN), so one palette swap re-tints
+   every surface, border and text at once. Two things need extra work:
+     1. Opacity modifiers (bg-zinc-900/70 etc.) compile to LITERAL hex — they
+        get explicit color-mix overrides below (kept in sync with the classes
+        actually used in src/).
+     2. Charts take colors as JS strings — ChartPanel reads --chart-bg via
+        src/lib/ui-theme.ts chartBg() (cached, invalidated on theme change).
+   The shadcn tokens (.dark block) are re-pointed the same way.
+   =========================================================================== */
+
+:root {
+  --chart-bg: #09090b;
+}
+
+html.theme-christmas {
+  /* ---- Tailwind zinc palette → pine ramp (same lightness, green hue) ---- */
+  --color-zinc-950: #06110b;
+  --color-zinc-900: #0b1d13;
+  --color-zinc-800: #143524;
+  --color-zinc-700: #1e4a33;
+  --color-zinc-600: #2c6244;
+  --color-zinc-500: #4a8062;
+  --color-zinc-400: #74a488;
+  --color-zinc-300: #9dccb0;
+  --color-zinc-200: #c4e5d2;
+  --color-zinc-100: #e3f4ea;
+  --color-zinc-50: #f0faf4;
+
+  /* ---- shadcn tokens (mirror the .dark block, pine-tinted) ---- */
+  --background: #06110b;
+  --foreground: #e3f4ea;
+  --card: #0b1d13;
+  --card-foreground: #e3f4ea;
+  --popover: #0c2115;
+  --popover-foreground: #e3f4ea;
+  --primary: #e3f4ea;
+  --primary-foreground: #06110b;
+  --secondary: #143524;
+  --secondary-foreground: #e3f4ea;
+  --muted: #102a1b;
+  --muted-foreground: #8fb8a0;
+  --accent: #12301f;
+  --accent-foreground: #e3f4ea;
+  /* --destructive stays red (errors must read as errors in every theme) */
+  --border: rgb(163 224 185 / 0.12);
+  --input: rgb(163 224 185 / 0.16);
+  --ring: #2c6244;
+  --sidebar: #0b1d13;
+  --sidebar-border: rgb(163 224 185 / 0.12);
+
+  /* chart canvas background (ChartPanel reads it via chartBg()) */
+  --chart-bg: #07150d;
+}
+
+/* green selection highlight */
+html.theme-christmas ::selection {
+  background: rgb(34 197 94 / 0.35);
+}
+
+/* themed thin-scrollbar */
+html.theme-christmas .terminal-scroll::-webkit-scrollbar-thumb {
+  background: #2c6244;
+}
+html.theme-christmas .terminal-scroll::-webkit-scrollbar-thumb:hover {
+  background: #3d7a58;
+}
+html.theme-christmas .terminal-scroll {
+  scrollbar-color: #2c6244 transparent;
+}
+
+/* ---- opacity-modified zinc utilities compile to literal hex — re-point them
+   at the themed palette with the same alpha (color-mix, like Tailwind does
+   for its own /opacity utilities when vars are available) ---- */
+html.theme-christmas .bg-zinc-700\/60 { background-color: color-mix(in oklab, var(--color-zinc-700) 60%, transparent); }
+html.theme-christmas .bg-zinc-700\/80 { background-color: color-mix(in oklab, var(--color-zinc-700) 80%, transparent); }
+html.theme-christmas .bg-zinc-800\/40 { background-color: color-mix(in oklab, var(--color-zinc-800) 40%, transparent); }
+html.theme-christmas .bg-zinc-800\/50 { background-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent); }
+html.theme-christmas .bg-zinc-800\/60 { background-color: color-mix(in oklab, var(--color-zinc-800) 60%, transparent); }
+html.theme-christmas .bg-zinc-800\/70 { background-color: color-mix(in oklab, var(--color-zinc-800) 70%, transparent); }
+html.theme-christmas .bg-zinc-800\/80 { background-color: color-mix(in oklab, var(--color-zinc-800) 80%, transparent); }
+html.theme-christmas .bg-zinc-900\/30 { background-color: color-mix(in oklab, var(--color-zinc-900) 30%, transparent); }
+html.theme-christmas .bg-zinc-900\/40 { background-color: color-mix(in oklab, var(--color-zinc-900) 40%, transparent); }
+html.theme-christmas .bg-zinc-900\/50 { background-color: color-mix(in oklab, var(--color-zinc-900) 50%, transparent); }
+html.theme-christmas .bg-zinc-900\/60 { background-color: color-mix(in oklab, var(--color-zinc-900) 60%, transparent); }
+html.theme-christmas .bg-zinc-900\/70 { background-color: color-mix(in oklab, var(--color-zinc-900) 70%, transparent); }
+html.theme-christmas .bg-zinc-900\/80 { background-color: color-mix(in oklab, var(--color-zinc-900) 80%, transparent); }
+html.theme-christmas .bg-zinc-900\/90 { background-color: color-mix(in oklab, var(--color-zinc-900) 90%, transparent); }
+html.theme-christmas .bg-zinc-900\/95 { background-color: color-mix(in oklab, var(--color-zinc-900) 95%, transparent); }
+html.theme-christmas .bg-zinc-950\/30 { background-color: color-mix(in oklab, var(--color-zinc-950) 30%, transparent); }
+html.theme-christmas .bg-zinc-950\/40 { background-color: color-mix(in oklab, var(--color-zinc-950) 40%, transparent); }
+html.theme-christmas .bg-zinc-950\/50 { background-color: color-mix(in oklab, var(--color-zinc-950) 50%, transparent); }
+html.theme-christmas .bg-zinc-950\/60 { background-color: color-mix(in oklab, var(--color-zinc-950) 60%, transparent); }
+html.theme-christmas .bg-zinc-950\/70 { background-color: color-mix(in oklab, var(--color-zinc-950) 70%, transparent); }
+html.theme-christmas .bg-zinc-950\/75 { background-color: color-mix(in oklab, var(--color-zinc-950) 75%, transparent); }
+html.theme-christmas .bg-zinc-950\/80 { background-color: color-mix(in oklab, var(--color-zinc-950) 80%, transparent); }
+html.theme-christmas .bg-zinc-950\/85 { background-color: color-mix(in oklab, var(--color-zinc-950) 85%, transparent); }
+html.theme-christmas .bg-zinc-950\/90 { background-color: color-mix(in oklab, var(--color-zinc-950) 90%, transparent); }
+html.theme-christmas .bg-zinc-950\/95 { background-color: color-mix(in oklab, var(--color-zinc-950) 95%, transparent); }
+html.theme-christmas .border-zinc-600\/40 { border-color: color-mix(in oklab, var(--color-zinc-600) 40%, transparent); }
+html.theme-christmas .border-zinc-600\/70 { border-color: color-mix(in oklab, var(--color-zinc-600) 70%, transparent); }
+html.theme-christmas .border-zinc-700\/60 { border-color: color-mix(in oklab, var(--color-zinc-700) 60%, transparent); }
+html.theme-christmas .border-zinc-700\/80 { border-color: color-mix(in oklab, var(--color-zinc-700) 80%, transparent); }
+html.theme-christmas .border-zinc-800\/40 { border-color: color-mix(in oklab, var(--color-zinc-800) 40%, transparent); }
+html.theme-christmas .border-zinc-800\/50 { border-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent); }
+html.theme-christmas .border-zinc-800\/60 { border-color: color-mix(in oklab, var(--color-zinc-800) 60%, transparent); }
+html.theme-christmas .border-zinc-800\/70 { border-color: color-mix(in oklab, var(--color-zinc-800) 70%, transparent); }
+html.theme-christmas .border-zinc-800\/80 { border-color: color-mix(in oklab, var(--color-zinc-800) 80%, transparent); }
+html.theme-christmas .border-zinc-800\/90 { border-color: color-mix(in oklab, var(--color-zinc-800) 90%, transparent); }
+html.theme-christmas .divide-zinc-800\/50 > :not([hidden]) ~ :not([hidden]) {
+  border-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent);
+}
+html.theme-christmas .ring-zinc-600\/60 { --tw-ring-color: color-mix(in oklab, var(--color-zinc-600) 60%, transparent); }
+html.theme-christmas .text-zinc-400\/80 { color: color-mix(in oklab, var(--color-zinc-400) 80%, transparent); }
+
+/* ---- landing page specifics (arbitrary-hex utilities resist var swaps) ---- */
+html.theme-christmas .lp-root {
+  background: #050f09;
+}
+html.theme-christmas .lp-nav {
+  background: rgb(5 15 9 / 0.85);
+}
+/* nav active-link underline: blue → holly red (specificity beats the utility) */
+html.theme-christmas nav[aria-label='Primary'] a[aria-current='page']::after {
+  background-color: #ef4444;
+}
+/* CTAs: blue → holly red with a green floor glow */
+html.theme-christmas button.lp-cta {
+  background-color: #dc2626;
+  box-shadow:
+    inset 0 0 0 1px rgb(255 255 255 / 0.08),
+    0 10px 24px -8px rgb(220 38 38 / 0.45),
+    0 2px 12px -2px rgb(34 197 94 / 0.25);
+}
+html.theme-christmas button.lp-cta:hover {
+  background-color: #ef4444;
+}
+/* backdrop glows: blue/orange → green/red aurora */
+html.theme-christmas .lp-glow-blue {
+  background: radial-gradient(ellipse 55% 45% at 72% 38%, rgb(34 197 94 / 0.09), transparent 70%);
+}
+html.theme-christmas .lp-glow-orange {
+  background: radial-gradient(ellipse 45% 40% at 75% 55%, rgb(239 68 68 / 0.07), transparent 70%);
+}
+
+/* ---- snowfall (landing hero overlay; rendered by LandingPage → Snowfall) -- */
+html.theme-christmas .xmas-snow {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  overflow: hidden;
+  pointer-events: none;
+}
+html.theme-christmas .xmas-snowflake {
+  position: absolute;
+  top: -3vh;
+  color: #fff;
+  line-height: 1;
+  text-shadow: 0 0 6px rgb(255 255 255 / 0.35);
+  animation-name: xmas-fall;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+@keyframes xmas-fall {
+  0% {
+    transform: translate3d(0, -4vh, 0) rotate(0deg);
+    opacity: 0;
+  }
+  8% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translate3d(var(--xmas-drift, 2vw), 106vh, 0) rotate(220deg);
+    opacity: 0.3;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  html.theme-christmas .xmas-snowflake {
+    animation: none;
+    opacity: 0;
+  }
+}
