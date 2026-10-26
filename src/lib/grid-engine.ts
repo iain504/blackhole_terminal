@@ -53,9 +53,23 @@
 //     a real crash through. A stale lastPrice (>120s) seeds without trading.
 //   3. placeGridMarketOrder polls the broker for the REAL average fill —
 //     the reference price is only ever recorded flagged as ESTIMATED.
+//
+// v1.81.1 — position-sized closes (the "CLOSE FAILED: insufficient balance
+// for ETH (requested: 0.7, available: 0.698249999)" bug): crypto fees are
+// deducted from the RECEIVED base asset on every buy, so the broker balance
+// sits slightly BELOW the tracked lots sum and a full-size close 403s,
+// parking the grid as 'error' with lots stuck forever. Three layers:
+//   1. closeAndStop sizes the close from the LIVE broker position —
+//      min(tracked lots, held) — never overselling the balance nor the
+//      grid's own size; a zero/missing position clears the tracked lots
+//      honestly instead of erroring.
+//   2. ERROR grids can be stopped again — Stop retries the failed close
+//      (one click recovery instead of a dead row).
+//   3. Per-lot TP sells ('both' grids) are capped by the live balance too —
+//      the LAST lot's TP used to 403 on the accumulated fee shortfall.
 import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
-import { placeOrderWithExits, pollOrderFillPrice, resolveTradeMode, type TradeMode } from '@/lib/trading'
+import { getPositionForSymbol, placeOrderWithExits, pollOrderFillPrice, resolveTradeMode, type TradeMode } from '@/lib/trading'
 import { isRegularSession } from '@/lib/sessions'
 
 const GRID_CYCLE_MS = 5000
@@ -177,6 +191,24 @@ export function resolveGuards(g: {
 
 const fmtP = (n: number) => (Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4))
 const fmtPct = (n: number) => String(Math.round(n * 100) / 100)
+/** qty for messages/notes — trims float noise without losing real precision
+ *  (0.6982499990000001 -> 0.698249999, 0.7 stays 0.7) */
+const fmtQty = (n: number) => String(Number.parseFloat(n.toPrecision(10)))
+
+/**
+ * v1.81.1 — the close qty: min(tracked lots, what the broker ACTUALLY holds).
+ * `held` null = position unknown (fetch failed / no keys) — don't clamp (the
+ * broker rejects an oversell; a data hiccup must never shrink an exit).
+ * Crypto is FLOOR-quantized to 8dp (toFixed ROUNDS — 0.698249999 would round
+ * UP to 0.69825, over-requesting the exact balance that caused the incident);
+ * stocks trade whole shares (trading.ts floors entries).
+ */
+export function sizeCloseQty(tracked: number, held: number | null, isCrypto: boolean): number {
+  let q = tracked
+  if (held != null && Number.isFinite(held) && held >= 0 && held < tracked) q = held
+  if (!isCrypto) return Math.floor(q)
+  return Math.floor(Math.floor(q * 1e8) / 1e8 * 1e8) / 1e8
+}
 
 /** Guard stop message — includes the percent for percent-basis guards and the
  *  price at which the guard fired (the live price for the engine, the resolved
@@ -444,10 +476,17 @@ function effectiveQty(symbol: string, qtyPerGrid: number): number {
 // ---------- stop / close ----------
 
 /**
- * Close every open lot with ONE combined market sell (when closeOnStop) and
+ * Close every open lot with ONE combined market order (when closeOnStop) and
  * park the grid. Race-safe: the stop is CLAIMED with a conditional updateMany
  * on status 'active' — only the claimant closes (engine guard vs manual stop
  * vs concurrent cycle can never double-close).
+ *
+ * v1.81.1 — the close qty is sized from the LIVE broker position
+ * (min(tracked lots, held)), not from the tracked sum: crypto fees are
+ * deducted from the received base asset, so the balance sits below the
+ * tracked lots and a full-size close used to 403 ("insufficient balance for
+ * ETH (requested: 0.7, available: 0.698249999)"). The claim also covers
+ * status 'error' — stopping an error grid RETRIES the failed close.
  */
 async function closeAndStop(
   grid: {
@@ -458,15 +497,19 @@ async function closeAndStop(
     state: unknown
     /** Task 10-g — 'sell' grids hold short lots: the close BUYS them back */
     direction?: string | null
+    /** prior stopReason — an error row acknowledged without lots keeps its history */
+    stopReason?: string | null
   },
   reason: 'sl' | 'maxtp' | 'manual_close' | 'auto_end',
   price: number | null,
   reasonText: string,
 ): Promise<void> {
-  // claim: only one caller wins the active/paused → stopped transition
-  // (a SUSPENDED grid can still be stopped — Task 18 — its lots close as-is)
+  // claim: only one caller wins the active/paused/error → stopped transition
+  // (a SUSPENDED grid can still be stopped — Task 18 — its lots close as-is;
+  // an ERROR grid stops too — v1.81.1: that IS the retry path after a failed
+  // close, with the qty now sized from the live balance)
   const claimed = await db.gridTrade.updateMany({
-    where: { id: grid.id, status: { in: ['active', 'paused'] } },
+    where: { id: grid.id, status: { in: ['active', 'paused', 'error'] } },
     data: { status: 'stopped', stoppedAt: new Date() },
   })
   if (claimed.count === 0) return // already stopped elsewhere
@@ -478,12 +521,45 @@ async function closeAndStop(
   if (st.lots.length > 0) {
     if (grid.closeOnStop && px != null) {
       const mode = await resolveTradeMode(grid.userId)
-      const qty = st.lots.reduce((acc, l) => acc + l.qty, 0)
       const short = grid.direction === 'sell'
       const closeSide: 'buy' | 'sell' = short ? 'buy' : 'sell'
-      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, closeSide, qty, px)
+      const tracked = st.lots.reduce((acc, l) => acc + l.qty, 0)
+      // LIVE position: a long close sells qty_available (open sell exits
+      // reserve it); a short buy-back covers |qty| (the net short — buying
+      // more would flip the user long). null (fetch failed / no keys) does
+      // NOT clamp — the broker rejects an oversell, honesty over guessing.
+      const pos = await getPositionForSymbol(grid.userId, mode, grid.symbol).catch(() => null)
+      const held = pos
+        ? (closeSide === 'sell'
+            ? (Number.isFinite(pos.qtyAvailable) ? pos.qtyAvailable : pos.qty)
+            : Math.abs(pos.qty))
+        : null
+      const closeQty = sizeCloseQty(tracked, held, grid.symbol.includes('/'))
+      const cappedNote = closeQty < tracked - 1e-8
+        ? ` — broker balance is lower than the tracked lots (closed ${fmtQty(closeQty)} of ${fmtQty(tracked)}; fees / partial fills / manual sells)`
+        : ''
+
+      if (!(closeQty > 0)) {
+        // nothing actually held — the position was closed elsewhere (manually
+        // or by reserved exits). Clear the tracked lots honestly instead of
+        // ordering a doomed 0-qty close and parking the grid as 'error'.
+        await db.gridTrade.update({
+          where: { id: grid.id },
+          data: {
+            stopReason: `${stopReason} — no broker position on ${grid.symbol} (closed elsewhere) — open lots cleared`,
+            state: { ...st, lastPrice: px, lastPriceAt: Date.now(), lots: [], failCount: 0 } as unknown as object,
+          },
+        })
+        return
+      }
+
+      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, closeSide, closeQty, px)
       if (r.ok) {
-        const pnl = st.lots.reduce((acc, l) => acc + (short ? l.entryPrice - r.price : r.price - l.entryPrice) * l.qty, 0)
+        // pro-rata realized pnl on what was ACTUALLY closed (weighted avg
+        // entry × the qty the broker accepted) — when the balance shortfall
+        // ate part of the lots, pnl must not claim the unsold remainder
+        const avgEntry = tracked > 0 ? st.lots.reduce((acc, l) => acc + l.entryPrice * l.qty, 0) / tracked : 0
+        const pnl = (short ? avgEntry - r.price : r.price - avgEntry) * closeQty
         const levelList = [...new Set(st.lots.map((l) => l.levelIndex))].sort((a, b) => a - b).join(',')
         const estNote = r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''
         await db.gridFill.create({
@@ -494,12 +570,12 @@ async function closeAndStop(
             side: closeSide,
             reason,
             price: r.price,
-            qty,
+            qty: closeQty,
             pnl,
             orderId: r.orderId,
             note: short
-              ? `bought back all open grid lots (levels ${levelList})${estNote}`
-              : `closed all open grid lots (levels ${levelList})${estNote}`,
+              ? `bought back open grid lots (levels ${levelList})${estNote}`
+              : `closed open grid lots (levels ${levelList})${estNote}`,
           },
         })
         await db.gridTrade.update({
@@ -507,18 +583,20 @@ async function closeAndStop(
           data: {
             // atomic increment — a concurrent cycle fill can never be clobbered
             realizedPnl: { increment: pnl },
-            stopReason: `${stopReason} — closed ${st.lots.length} lot(s) at ${fmtP(r.price)}${r.estimated ? ' (fill estimated)' : ''}`,
+            stopReason: `${stopReason} — closed ${st.lots.length} lot(s) at ${fmtP(r.price)}${cappedNote}${estNote}`,
             state: { ...st, lastPrice: px, lastPriceAt: Date.now(), lots: [], failCount: 0 } as unknown as object,
           },
         })
         return
       }
-      // close order failed — be honest: error status, lots untouched
+      // close order failed — be honest: error status, lots untouched, and the
+      // retry is ONE CLICK away (Stop on an error grid re-attempts the close
+      // with the qty re-sized from the live balance)
       await db.gridTrade.update({
         where: { id: grid.id },
         data: {
           status: 'error',
-          stopReason: `${stopReason} — CLOSE FAILED: ${r.error}. Open lots left untouched.`,
+          stopReason: `${stopReason} — CLOSE FAILED: ${r.error}. Open lots left untouched — press Stop again to retry (the close qty is sized from the live balance).`,
           state: { ...st, lastPrice: px, failCount: 0 } as unknown as object,
         },
       })
@@ -529,6 +607,10 @@ async function closeAndStop(
     } else {
       stopReason += ' — open grid positions left running (no live price to close at)'
     }
+  } else if (grid.stopReason) {
+    // no lots to close (an error row parked for a non-close reason, e.g.
+    // engine failures) — keep the ORIGINAL reason when acknowledging the stop
+    stopReason += ` — ${grid.stopReason}`
   }
   await db.gridTrade.update({
     where: { id: grid.id },
@@ -540,11 +622,13 @@ async function closeAndStop(
 }
 
 /** Manual stop (Grid tab button). Returns false when the grid is not owned.
- *  Paused grids stop too (Task 18) — the claim covers active + paused. */
+ *  Paused grids stop too (Task 18) — the claim covers active + paused.
+ *  v1.81.1 — ERROR grids stop too: the claim retries the previously FAILED
+ *  close (sized from the live balance) instead of leaving the lots stuck. */
 export async function stopGridTrade(userId: string, gridId: string, opts?: { reason?: 'manual_close' }): Promise<boolean> {
   const grid = await db.gridTrade.findFirst({ where: { id: gridId, userId } })
   if (!grid) return false
-  if (grid.status !== 'active' && grid.status !== 'paused') return true // already stopped — idempotent
+  if (grid.status === 'stopped') return true // already stopped — idempotent
   const st = parseGridState(grid.state)
   let price: number | null = st.lastPrice
   try {
@@ -554,7 +638,10 @@ export async function stopGridTrade(userId: string, gridId: string, opts?: { rea
     const q = quotes.find((x) => x.symbol === grid.symbol)
     if (q && Number.isFinite(q.price) && q.price > 0) price = q.price
   } catch { /* fall back to the state's lastPrice */ }
-  await closeAndStop(grid, opts?.reason ?? 'manual_close', price, 'Stopped manually')
+  const reasonText = grid.status === 'error'
+    ? 'Stopped manually — retrying close after a previous CLOSE FAILED'
+    : 'Stopped manually'
+  await closeAndStop(grid, opts?.reason ?? 'manual_close', price, reasonText)
   return true
 }
 
@@ -711,14 +798,31 @@ async function evaluateGrid(grid: {
   // the lot bought at level i pays at level[i+1] ?? upperPrice, on an UPWARD
   // crossing of that target this tick. 'both' only — buy-only never sells and
   // sell-only has no buy-backs.
+  let sellSkipped = false // a balance-skipped TP must not clear lastError below
   if (!sellGrid && !buyOnly && L != null && ordersOpen) {
     for (const lot of [...st.lots]) {
       const target = sellTargetOf(levels, lot.levelIndex, grid.upperPrice)
       if (!(L < target && price >= target)) continue
       if (!(await stillActive(grid.id))) return // stopped mid-tick — stand down
-      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, 'sell', lot.qty, target)
+      // v1.81.1 — cap the per-lot TP sell by the LIVE broker balance: crypto
+      // fees are deducted from the RECEIVED base asset on every buy, so the
+      // held qty sits slightly below the tracked lot size and the LAST TP
+      // sell 403s ("insufficient balance"), failing the whole tick. Sell
+      // min(lot, held); a zero balance (closed / reserved elsewhere) keeps
+      // the lot tracked and skips the sell instead of parking the grid.
+      const pos = await getPositionForSymbol(grid.userId, mode, grid.symbol).catch(() => null)
+      const held = pos && pos.side !== 'short'
+        ? (Number.isFinite(pos.qtyAvailable) ? pos.qtyAvailable : pos.qty)
+        : null
+      const sellQty = sizeCloseQty(lot.qty, held, grid.symbol.includes('/'))
+      if (!(sellQty > 0)) {
+        sellSkipped = true
+        st.lastError = `TP sell at ${fmtP(target)} skipped — broker balance for ${grid.symbol} is 0 (closed or reserved elsewhere)`
+        continue
+      }
+      const r = await placeGridMarketOrder(grid.userId, mode, grid.id, grid.symbol, 'sell', sellQty, target)
       if (!r.ok) throw new Error(`TP sell at ${fmtP(target)} failed: ${r.error}`)
-      const pnl = (r.price - lot.entryPrice) * lot.qty
+      const pnl = (r.price - lot.entryPrice) * sellQty
       st.lots = st.lots.filter((l) => l !== lot)
       await db.gridFill.create({
         data: {
@@ -728,10 +832,10 @@ async function evaluateGrid(grid: {
           side: 'sell',
           reason: 'tp',
           price: r.price,
-          qty: lot.qty,
+          qty: sellQty,
           pnl,
           orderId: r.orderId,
-          note: `grid TP — target level ${fmtP(target)}${r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''}`,
+          note: `grid TP — target level ${fmtP(target)}${sellQty < lot.qty - 1e-8 ? ` — sold ${fmtQty(sellQty)} of ${fmtQty(lot.qty)} (broker balance after fees)` : ''}${r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''}`,
         },
       })
       // persist the removed lot + realized pnl IMMEDIATELY (crash-safe: a
@@ -792,7 +896,7 @@ async function evaluateGrid(grid: {
   // conditional on status so a concurrent stop's state is never clobbered
   st.lastPrice = price
   st.failCount = 0
-  st.lastError = undefined
+  if (!sellSkipped) st.lastError = undefined
   await db.gridTrade.updateMany({ where: { id: grid.id, status: 'active' }, data: { state: st as unknown as object } })
 }
 

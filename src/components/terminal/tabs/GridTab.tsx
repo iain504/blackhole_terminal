@@ -164,7 +164,13 @@ export default function GridTab() {
       const res = await fetch(`/api/grid/${grid.id}/stop`, { method: 'POST' })
       const json = await res.json().catch(() => null)
       if (res.ok) {
-        toast({ title: `Grid stopped — ${grid.symbol}`, description: json?.grid?.stopReason || undefined })
+        // a retried close on an error grid can fail AGAIN (status stays
+        // 'error') — surface that honestly instead of "Grid stopped"
+        if (json?.grid?.status === 'error') {
+          toast({ title: `Close retry failed — ${grid.symbol}`, description: json?.grid?.stopReason || undefined, variant: 'destructive' })
+        } else {
+          toast({ title: `Grid stopped — ${grid.symbol}`, description: json?.grid?.stopReason || undefined })
+        }
       } else {
         toast({ title: 'Could not stop grid', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
       }
@@ -492,17 +498,19 @@ export default function GridTab() {
                         {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />} Resume
                       </Button>
                     )}
-                    {(isActive || isPaused) && (
+                    {(isActive || isPaused || (g.status === 'error' && openLotsG > 0)) && (
                       <Button
                         variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                         disabled={busyId === g.id}
                         onClick={() => setStopTarget(g)}
-                        title="Stop this grid (respects its close-on-stop setting)"
+                        title={g.status === 'error'
+                          ? 'Retry the close — the close qty is sized from the live broker balance (fees can make it smaller than the tracked lots)'
+                          : 'Stop this grid (respects its close-on-stop setting)'}
                       >
                         {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Square className="h-3 w-3" />} Stop
                       </Button>
                     )}
-                    {!isActive && (
+                    {!isActive && !(g.status === 'error' && openLotsG > 0) && (
                       <Button
                         variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-500 hover:text-rose-300"
                         disabled={busyId === g.id}
@@ -578,6 +586,7 @@ export default function GridTab() {
                 ? 'Close-on-stop is ON — all open grid positions will be market-closed when the engine stops the grid.'
                 : 'Close-on-stop is OFF — the engine stops but leaves the open grid positions running. Manage them manually in Positions.'}
               {stopTarget && stopTarget.stats.openLots === 0 && ' This grid currently holds no open lots.'}
+              {stopTarget?.status === 'error' && ' This grid previously FAILED to close its lots — stopping retries the close with the qty sized from the live broker balance.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

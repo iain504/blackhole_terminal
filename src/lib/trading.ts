@@ -221,6 +221,37 @@ export async function getPositions(userId: string, mode: TradeMode) {
   return tradeFetch<TradingPosition[]>(userId, mode, '/v2/positions')
 }
 
+/** Parsed net position for ONE symbol (the grid close / per-lot exit sizing
+ *  helper). 404 → a CONFIDENT zero (flat); any other failure → null = UNKNOWN
+ *  — callers must treat null as "don't clamp" (the broker rejects an oversell
+ *  anyway; a data hiccup must never silently shrink an exit). */
+export interface SymbolPosition {
+  side: 'long' | 'short' | null
+  /** signed net qty (negative = short) */
+  qty: number
+  /** qty free to SELL against a long — open sell exits already reserve it */
+  qtyAvailable: number
+}
+
+export async function getPositionForSymbol(userId: string, mode: TradeMode, symbol: string): Promise<SymbolPosition | null> {
+  const r = await tradeFetch<TradingPosition>(userId, mode, `/v2/positions/${encodeURIComponent(tradeSymbol(symbol))}`)
+  // 404 = definitively FLAT on this account → a CONFIDENT zero (the close path
+  // clears the tracked lots; the broker truly holds nothing). Any OTHER non-OK
+  // is UNKNOWN → null: tradeFetch surfaces the ERROR JSON as `data` on non-OK
+  // responses (401/403/429 bodies are truthy), and a fabricated zero position
+  // would silently "close" lots the broker still holds.
+  if (r.status === 404) return { side: null, qty: 0, qtyAvailable: 0 }
+  const p = r.status >= 200 && r.status < 300 ? r.data : null
+  if (!p || typeof p.qty !== 'string') return null
+  const qty = Number.parseFloat(p.qty)
+  const qa = Number.parseFloat(p.qty_available)
+  return {
+    side: p.side === 'short' ? 'short' : p.side === 'long' ? 'long' : null,
+    qty: Number.isFinite(qty) ? qty : 0,
+    qtyAvailable: Number.isFinite(qa) ? qa : Number.isFinite(qty) ? qty : 0,
+  }
+}
+
 /** Statuses that count as "still working" when merging the held-leg recovery
  *  sweep into the open-order list. 'held' = the armed sibling of a live OCO
  *  pair — Alpaca keeps exactly ONE leg working (status new/open) and holds
