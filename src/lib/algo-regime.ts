@@ -180,7 +180,13 @@ export function regimeCfgFromParams(params: Record<string, number>): RegimeCfg {
     regimeAdx: (params.regimeAdx ?? 0) >= 1,
     adxMax: Number.isFinite(params.adxMax) ? params.adxMax : 25,
     hlGate: (params.hlGate ?? 0) >= 1,
-    hlMax: Number.isFinite(params.hlMax) ? params.hlMax : 48,
+    // Review calibration — the FALLBACK for a params object that skipped
+    // normalizeAlgoParams (every real path — backtest API, live run config,
+    // optimizer — normalizes first and always supplies a finite hlMax: 96 for
+    // the MR strategies, tf-aware via applyRegimePreset). Kept aligned with
+    // the calibrated 96 so a raw `{hlGate: 1}` can never silently resurrect
+    // the stale, too-tight 48-bar default (review re-check 2024-12).
+    hlMax: Number.isFinite(params.hlMax) ? params.hlMax : 96,
   }
 }
 

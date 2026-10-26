@@ -3079,3 +3079,21 @@ Work Log:
 
 Stage Summary:
 - The v1.81.1 position-sized grid close is now verified against the REAL Alpaca broker at every layer: exact-incident clamp close (sell what the broker holds, never the tracked sum), honest 404-flat clear, error-grid retry-with-success, real engine buys with visible fee shortfall, and the full UI stop flow with the capped note. No production code changes were needed — the existing fix held under live fire. Dev keys stored in .env (gitignored, ALLOW_SHARED_BROKER=true, registration closed) for future testing until revoked. Version unchanged (v1.81.1).
+
+---
+Task ID: 25
+Agent: Z.ai Code (main)
+Task: User posted a re-review of algo-regime.ts / algo-strategies.ts / backtest.ts / algo-engine.ts (targeting stale commit d840dcc) flagging: P0 missing veto statistics, P1 aggressive defaults (hlMax 48), P2 no structured veto reason, P3 ORB regime polarity, plus UI visibility of gate interception. Verify what is already landed vs. what remains, and close the gaps.
+
+Work Log:
+- Established the review baseline is stale: the reviewed d840dcc predates aaa44bb (already on main + pushed to GitHub), which landed exactly this review. Verified each item in the CURRENT code, not by claim:
+  - P0 veto stats: backtest.ts decide() counts regStats.signals on every raw entry signal, attributes each veto via regimeVetoEx + recordVeto (trend/adx/halfLife), passedRegime++ on clear; BacktestMetrics.regime: RegimeGateStats rides every run (single/sweep/optimizer/walk-forward); holdout carries regime attribution (backtest.ts:1449,1672).
+  - P1 defaults: bb-reversion + vwap-fade defaults hlMax 48→96 with calibration comments; rsi2-connors gates off by design; tfAwareHlMax() (1m→420 / 5m→84 / 15m→28 ≈ 7h of bars) exceeds the review ask.
+  - P2 structured reason: regimeVetoEx returns {veto, gate: 'trend'|'adx'|'halfLife'}; regimeVeto kept as back-compat wrapper; live engine (algo-engine.ts evalStrategy) consumes the same cfg + gate order — parity holds.
+  - P3 ORB: strategy-aware applyRegimePreset — orb15 gets ONLY the momentum-polarity 200-SMA gate (ADX/half-life correctly off for breakouts); rsi2 keeps all gates off; MR strategies get soft trend ±1.5% + ADX + tf-aware hlMax.
+  - UI visibility (review's biggest practical problem): BacktestPanel renders the gate-effectiveness block (per-gate blocked chips + passed share, line ~1185), gates-off A/B re-run button (honest baseline, line ~230/629), one-click Research/Live regime presets, walk-forward holdout veto attribution.
+- Only literal residual found: regimeCfgFromParams still fell back to hlMax: 48. Reachability check: every consumer path (backtest API route 354, normalizeAlgoRunConfig 575, engine 476) funnels through normalizeAlgoParams, which fills a finite hlMax from strategy defaults (96 for MR; rsi2's hlGate is 0 so inert) — the fallback was defensive dead code. Changed 48→96 with a comment so the stale constant can never silently resurrect (algo-regime.ts:189). No behavior change on any real path.
+- bun run lint clean. Version bumped 1.81.1 → 1.81.2 (package.json) and re-stamped via scripts/stamp-version.mjs.
+
+Stage Summary:
+- The entire re-review (P0–P3 + UI) was already implemented in aaa44bb on main and pushed to GitHub; this pass verified each item line-by-line and closed the single residual (stale hlMax fallback 48→96, no-op on real paths). Backtest gate diagnostics are fully visible in the UI with an A/B baseline. Version v1.81.2.
