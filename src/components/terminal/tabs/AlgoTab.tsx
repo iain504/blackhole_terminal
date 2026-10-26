@@ -646,13 +646,29 @@ export default function AlgoTab() {
             <BacktestPanel
               cfg={setupCfg}
               onApplyParams={(p, s) => {
+                // Task 19 — optimizer rows may carry the VIRTUAL 'tpValue'/
+                // 'slValue' dims: those configure the TP/SL percent brackets
+                // (turning them ON) instead of the strategy params.
+                const rest = { ...p }
+                const tp = rest.tpValue
+                const sl = rest.slValue
+                delete rest.tpValue
+                delete rest.slValue
+                if (tp != null && Number.isFinite(tp) && tp > 0) {
+                  setTpOn(true)
+                  setTpPct(String(tp))
+                }
+                if (sl != null && Number.isFinite(sl) && sl > 0) {
+                  setSlOn(true)
+                  setSlPct(String(sl))
+                }
                 // Task 87 — sweep rows carry their own strategy: applying one
                 // switches the setup strategy AND its params in one click
                 if (s && s !== strategy) {
                   setStrategy(s)
-                  setParams(normalizeAlgoParams(s, p))
+                  setParams(normalizeAlgoParams(s, rest))
                 } else {
-                  setParams((prev) => normalizeAlgoParams(strategy, { ...prev, ...p }))
+                  setParams((prev) => normalizeAlgoParams(strategy, { ...prev, ...rest }))
                 }
                 setShowParams(true)
               }}

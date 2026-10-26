@@ -412,6 +412,17 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step) || max <= min || step <= 0) continue
       out.push({ key: p.key, min, max, step })
     }
+    // Task 19 — the virtual TP/SL % dims ride the same range state and are
+    // sent as ordinary ranges (the engine lifts them onto the config brackets)
+    for (const key of ['tpValue', 'slValue'] as const) {
+      const r = ranges[key]
+      if (!r?.on) continue
+      const min = Number(r.min)
+      const max = Number(r.max)
+      const step = Number(r.step)
+      if (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step) || max <= min || step <= 0) continue
+      out.push({ key, min, max, step })
+    }
     return out
   }, [def, ranges])
 
@@ -937,6 +948,34 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                     <Switch checked={r.on} onCheckedChange={toggle} className="scale-90" aria-label={`Optimize ${p.label}`} />
                     <span className="min-w-28 text-[11px] text-zinc-300">{p.label}</span>
                     <span className="text-[10px] text-zinc-600">setup {paramsStr(cfg.params[p.key])}</span>
+                    {r.on && (
+                      <span className="ml-auto flex items-center gap-1">
+                        <NumIn value={r.min} onChange={(v) => patch({ min: v })} label={`${p.label} min`} />
+                        <span className="text-[10px] text-zinc-600">→</span>
+                        <NumIn value={r.max} onChange={(v) => patch({ max: v })} label={`${p.label} max`} />
+                        <span className="text-[10px] text-zinc-600">step</span>
+                        <NumIn value={r.step} onChange={(v) => patch({ step: v })} label={`${p.label} step`} />
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+              {/* Task 19 — the TP/SL % brackets as first-class optimizer dims.
+                  Sweeping one with the setup bracket OFF turns it ON for every
+                  combo; the engine clamps to a 0.1–50% sane span. */}
+              {([
+                { key: 'tpValue', label: 'Take profit %', dMin: '0.5', dMax: '4', dStep: '0.5', setup: cfg.tpMode === 'pct' && cfg.tpValue != null ? String(cfg.tpValue) : 'off' },
+                { key: 'slValue', label: 'Stop loss %', dMin: '0.25', dMax: '3', dStep: '0.25', setup: cfg.slMode === 'pct' && cfg.slValue != null ? String(cfg.slValue) : 'off' },
+              ]).map((p) => {
+                const r = ranges[p.key] ?? { on: false, min: p.dMin, max: p.dMax, step: p.dStep }
+                const toggle = (on: boolean) =>
+                  setRanges((rs) => ({ ...rs, [p.key]: { ...r, on, min: r.min || p.dMin, max: r.max || p.dMax, step: r.step || p.dStep } }))
+                const patch = (part: Partial<RangeState>) => setRanges((rs) => ({ ...rs, [p.key]: { ...r, ...part } }))
+                return (
+                  <div key={p.key} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded border-t border-zinc-800/40 px-1.5 pt-1 hover:bg-zinc-900/60">
+                    <Switch checked={r.on} onCheckedChange={toggle} className="scale-90" aria-label={`Optimize ${p.label}`} />
+                    <span className="min-w-28 text-[11px] text-sky-300/90">{p.label}</span>
+                    <span className="text-[10px] text-zinc-600">setup {p.setup}</span>
                     {r.on && (
                       <span className="ml-auto flex items-center gap-1">
                         <NumIn value={r.min} onChange={(v) => patch({ min: v })} label={`${p.label} min`} />
@@ -1568,6 +1607,9 @@ function paramsStr(v: number | undefined): string {
 }
 
 function paramLabel(strategy: AlgoStrategyId, key: string): string {
+  // Task 19 — the virtual TP/SL optimizer dims are not strategy params
+  if (key === 'tpValue') return 'TP %'
+  if (key === 'slValue') return 'SL %'
   return ALGO_STRATEGIES[strategy].params.find((p) => p.key === key)?.label ?? key
 }
 

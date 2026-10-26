@@ -855,6 +855,35 @@ function comboInvalid(strategy: AlgoStrategyId, p: Record<string, number>): bool
   return false
 }
 
+// Task 19 — TP/SL percent brackets are OPTIMIZER DIMENSIONS too. They are
+// VIRTUAL keys: unlike strategy params they configure the config-level
+// tpValue/slValue (enabling tpMode/slMode='pct' for that combo) instead of
+// merging into params. Sweeping TP/SL with the setup's bracket OFF simply
+// turns it ON for every combo — that is the point of sweeping it.
+const TP_SL_KEYS: ReadonlySet<string> = new Set(['tpValue', 'slValue'])
+/** Sane span for the virtual TP/SL % dims (percent from entry). */
+const TP_SL_SPAN = { min: 0.1, max: 50 } as const
+
+/**
+ * Task 19 — apply an optimizer override to a backtest config. Strategy-param
+ * keys merge into `params`; the virtual 'tpValue'/'slValue' keys are lifted
+ * into the config-level percent brackets (tpMode/slMode='pct') and stripped
+ * from params (runBacktest reads cfg.tpValue, and comboInvalid/param clamps
+ * must only ever see real strategy params). Returns the combined config.
+ */
+function applyOverride(base: BacktestConfig, override: Record<string, number>): BacktestConfig {
+  let cfg = base
+  const tp = override.tpValue
+  const sl = override.slValue
+  if (tp != null && Number.isFinite(tp) && tp > 0) cfg = { ...cfg, tpMode: 'pct', tpValue: tp }
+  if (sl != null && Number.isFinite(sl) && sl > 0) cfg = { ...cfg, slMode: 'pct', slValue: sl }
+  const params: Record<string, number> = { ...base.params }
+  for (const [k, v] of Object.entries(override)) {
+    if (!TP_SL_KEYS.has(k)) params[k] = v
+  }
+  return { ...cfg, params }
+}
+
 /**
  * Task 9-p — mid-matrix heap abort (mirrors the reco-matrix guard in
  * algo-reco.ts): POST-time gates cannot see allocations that happen DURING a
@@ -884,12 +913,17 @@ export function optimizeBacktest(
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const onProgress = opts?.onProgress
   // sanitize: known numeric params only, clamped to the strategy's def range
+  // (Task 19 — plus the VIRTUAL 'tpValue'/'slValue' dims, clamped to their
+  // fixed sane span and applied to the config-level brackets per combo)
   const def = ALGO_STRATEGIES[base.strategy]
   const defsByKey = new Map(def.params.map((p) => [p.key, p]))
   const clean: OptimizeRange[] = []
   for (const r of Array.isArray(ranges) ? ranges : []) {
-    const d = defsByKey.get(String(r?.key))
-    if (!d || d.bool) continue
+    const key = String(r?.key)
+    const isTpSl = TP_SL_KEYS.has(key)
+    const d = isTpSl ? null : defsByKey.get(key)
+    if (!isTpSl && (!d || d.bool)) continue
+    const span = isTpSl ? TP_SL_SPAN : { min: d!.min, max: d!.max }
     const hasValues = Array.isArray(r?.values) && r.values.length > 0
     const min = Number(r.min)
     const max = Number(r.max)
@@ -897,13 +931,13 @@ export function optimizeBacktest(
     if (!hasValues && (!Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(step))) continue
     if (!hasValues && (max <= min || step <= 0)) continue
     clean.push({
-      key: d.key,
-      min: Math.min(d.max, Math.max(d.min, min)),
-      max: Math.min(d.max, Math.max(d.min, max)),
+      key,
+      min: Math.min(span.max, Math.max(span.min, min)),
+      max: Math.min(span.max, Math.max(span.min, max)),
       step,
       // Task 87 — explicit grids are sanitized to the param's sanctioned span
       ...(hasValues
-        ? { values: r.values!.filter((v) => Number.isFinite(v)).map((v) => Math.min(d.max, Math.max(d.min, Number(v.toFixed(6))))) }
+        ? { values: r.values!.filter((v) => Number.isFinite(v)).map((v) => Math.min(span.max, Math.max(span.min, Number(v.toFixed(6))))) }
         : {}),
     })
   }
@@ -935,12 +969,12 @@ export function optimizeBacktest(
       }
       const override: Record<string, number> = {}
       for (let d = 0; d < dims.length; d++) override[dims[d].key] = dims[d].vals[idx[d]]
-      const params = { ...base.params, ...override }
-      if (comboInvalid(base.strategy, params)) {
+      const comboCfg = applyOverride(base, override)
+      if (comboInvalid(base.strategy, comboCfg.params)) {
         skipped++
         continue
       }
-      const res = runBacktest(series, { ...base, params, collectEquity: false })
+      const res = runBacktest(series, { ...comboCfg, collectEquity: false })
       evaluated++
       results.push({
         params: override,
@@ -978,11 +1012,12 @@ export function optimizeBacktest(
           continue
         }
         const params = { ...base.params, ...best.params, [d.key]: d.vals[j] }
-        if (comboInvalid(base.strategy, params)) {
+        const neighborCfg = applyOverride(base, params)
+        if (comboInvalid(base.strategy, neighborCfg.params)) {
           scores.push(null)
           continue
         }
-        const res = runBacktest(series, { ...base, params, collectEquity: false })
+        const res = runBacktest(series, { ...neighborCfg, collectEquity: false })
         const sc = backtestScore(res.metrics, minTrades)
         scores.push(sc === -Infinity ? null : sc)
         if (sc > -Infinity) neighborScores.push(sc)
@@ -1388,24 +1423,28 @@ export function walkForward(
     }
   }
 
-  // boundary flags mirror the optimizer's grid sanitization
+  // boundary flags mirror the optimizer's grid sanitization (Task 19 — the
+  // virtual 'tpValue'/'slValue' dims participate with their fixed span)
   const def = ALGO_STRATEGIES[base.strategy]
   const byKey = new Map(def.params.map((p) => [p.key, p]))
   const bounds = (Array.isArray(opts.ranges) ? opts.ranges : []).flatMap((r) => {
-    const d = byKey.get(String(r?.key))
-    if (!d || d.bool) return []
+    const key = String(r?.key)
+    const isTpSl = TP_SL_KEYS.has(key)
+    const d = isTpSl ? null : byKey.get(key)
+    if (!isTpSl && (!d || d.bool)) return []
+    const span = isTpSl ? TP_SL_SPAN : { min: d!.min, max: d!.max }
     const hasValues = Array.isArray(r.values) && r.values.length > 0
     const min = Number(r.min)
     const max = Number(r.max)
     if (!hasValues && (!Number.isFinite(min) || !Number.isFinite(max) || !(Number(r.step) > 0))) return []
     const vals = dimValues({
-      key: d.key,
-      min: Math.min(d.max, Math.max(d.min, min)),
-      max: Math.min(d.max, Math.max(d.min, max)),
+      key,
+      min: Math.min(span.max, Math.max(span.min, min)),
+      max: Math.min(span.max, Math.max(span.min, max)),
       step: Number(r.step),
-      ...(hasValues ? { values: r.values!.map((v) => Math.min(d.max, Math.max(d.min, Number(v)))) } : {}),
+      ...(hasValues ? { values: r.values!.map((v) => Math.min(span.max, Math.max(span.min, Number(v)))) } : {}),
     })
-    return [{ key: d.key, min: vals[0], max: vals[vals.length - 1] }]
+    return [{ key, min: vals[0], max: vals[vals.length - 1] }]
   })
   const onBoundary = (params: Record<string, number>): boolean =>
     bounds.some((b) => {
@@ -1449,7 +1488,10 @@ export function walkForward(
       })
       continue
     }
-    const oosRun = runBacktest(oosSeries, { ...base, params: { ...base.params, ...best.params }, collectEquity: false })
+    // Task 19 — the OOS verification replays the IS winner THROUGH the same
+    // applyOverride path, so a winner that swept TP/SL carries its percent
+    // brackets into the out-of-sample run (virtual keys never reach params)
+    const oosRun = runBacktest(oosSeries, { ...applyOverride(base, best.params), collectEquity: false })
     evaluated++
     const om = oosRun.metrics
     const oosValid = om.trades >= 3

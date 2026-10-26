@@ -25,7 +25,9 @@
 //   mode?: 'run' | 'optimize' | 'sweep' | 'walkforward'   (default 'run'; sweep ignores strategy)
 //   symbol, timeframe ('1m'|'5m'|'15m'), strategy (AlgoStrategyId),
 //   params: Record<string, number>,       base parameters
-//   ranges?: { key, min, max, step }[]    (optimize/walkforward — numeric params only)
+//   ranges?: { key, min, max, step }[]    (optimize/walkforward — numeric params
+//                                         only, PLUS the virtual 'tpValue'/
+//                                         'slValue' percent-bracket dims)
 //   days?: number                          calendar days of history
 //   qty, tpMode, tpValue, slMode, slValue, maxTradesDay, rthOnly, flattenEod,
 //   cooldownMin?: number                    (Task 70-c) no-entry minutes after a close (0..240, default 0)

@@ -2964,3 +2964,20 @@ Work Log:
 
 Stage Summary:
 - Algo export dialog is now action-first: summary + Copy/Download always visible at any viewport height, JSON opt-in and clamped. Props/interface unchanged (single call site in AlgoTab). Version v1.80.7. QA scripts kept uncommitted in scripts-tmp/ for reuse.
+
+---
+Task ID: 20
+Agent: Z.ai Code (main)
+Task: "Algo Trading: Why in Algo, TP and SL is not one of the backtest Optimizer options? I want to include them into it." — add TP/SL to the backtest optimizer, verify, push.
+
+Work Log:
+- Root cause: the optimizer swept ONLY strategy-specific params — sanitize dropped any range key not in ALGO_STRATEGIES[s].params, and TP/SL live at the CONFIG level (tpMode/tpValue/slMode/slValue), applied after entry signals. The run-setup TP/SL brackets were fixed across the whole grid.
+- Engine (src/lib/backtest.ts, v1.80.8): 'tpValue'/'slValue' are now VIRTUAL optimizer dims — sanitize accepts them with a fixed sane span (0.1–50%), and a new applyOverride(base, override) lifts them onto the config-level percent brackets (tpMode/slMode='pct') per combo while keeping them OUT of strategy params (comboInvalid + param clamps only ever see real params). Sweeping TP/SL with the setup bracket OFF simply turns it ON for every combo — that is the point. Wired through ALL three consumers: the per-combo sim loop, the Task-12 neighbor sensitivity probe (plateau analysis), and walk-forward (bounds + the OOS replay of the IS winner now run through applyOverride, so a TP/SL winner carries its brackets out-of-sample).
+- UI (BacktestPanel): the Auto-tune section gains "Take profit %" / "Stop loss %" rows under the strategy params (sky-tinted, divider) with the same tick + min/max/step inputs; defaults 0.5→4 step 0.5 (TP) / 0.25→3 step 0.25 (SL); the row shows the current setup value or 'off'. activeRanges sends them as ordinary ranges. paramLabel maps the virtual keys to "TP %" / "SL %" for the result table + sensitivity badges.
+- Apply path (AlgoTab onApplyParams): optimizer rows carrying tpValue/slValue turn the setup's TP/SL brackets ON and seed the pct fields; the remaining keys merge into strategy params as before (sweep rows keep their strategy-switch behavior).
+- Engine probe (scripts-tmp/qa-tpsl-optimizer.mjs, synthetic 4000-bar series): 18 combos = bbPeriod(2) × tp(3) × sl(3); best.params carries {bbPeriod, tpValue, slValue}; replaying the winner with/without the bracket produces different trade outcomes (bracket genuinely applied); walk-forward runs 2 folds + OOS replay with modalParams covering all three keys. PROBE OK.
+- Browser E2E (QA user, BTC/USD 15m 30d — keyless Binance history): Auto-tune → ticked BB period + TP + SL (0.5→1.5 step 0.5 each) → Run optimizer → table rows read "BB period 14 · TP % 0.5 · SL % 0.5 …"; clicking the best row set the setup TP/SL switches ON with 0.5/0.5 and bbPeriod 14. 390×844 mobile: both TP/SL rows render visible with no horizontal overflow. ZERO console/page errors. QA user + fixtures deleted.
+- Mid-task check: the earlier /tmp askpass wipe + scripts-tmp snapshot loss were re-verified as the only workspace damage; nothing else drifted.
+
+Stage Summary:
+- TP/SL are first-class backtest optimizer dimensions (grid, sensitivity/plateau, walk-forward OOS) with UI rows, honest 'TP %'/'SL %' labels, and one-click apply into the run setup. Version v1.80.8. Probe script kept in scripts-tmp/.
