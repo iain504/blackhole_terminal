@@ -56,7 +56,11 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'Stage 3 distribution chops between support and resistance — fading band extremes with an RSI filter is the consensus range-market tactic.',
     color: '#f472b6',
     intradayOnly: true,
-    defaults: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1, regimeTrend: 1, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 48 },
+    // Review calibration: hlMax 48 → 96 (48 bars is only 4h on 5m / 12h on
+    // 15m — it vetoed genuine MR setups with longer reversion horizons) and
+    // the ceiling raised to 480 so 1m charts can express a ~7h half-life.
+    // trendSoftPct 0 = the historical hard gate; the presets set 1.5.
+    defaults: { bbPeriod: 20, bbStd: 2, rsiPeriod: 14, rsiOversold: 30, rsiOverbought: 70, allowShort: 1, regimeTrend: 1, trendSoftPct: 0, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 96 },
     params: [
       { key: 'bbPeriod', label: 'BB period', min: 5, max: 100, step: 1 },
       { key: 'bbStd', label: 'BB std-dev', min: 1, max: 4, step: 0.1 },
@@ -68,10 +72,13 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
       // trends. Trend gate ON by default — mean reversion above/below the
       // 200-SMA only. ADX + half-life gates are opt-in (0 = off).
       { key: 'regimeTrend', label: 'Trend gate (200-SMA)', min: 0, max: 1, step: 1, bool: true },
+      // Review P2 #9 — soft trend gate: veto only when price is MORE than
+      // X% beyond the 200-SMA (0 = the hard binary gate).
+      { key: 'trendSoftPct', label: 'Trend gate soft ±% (0 = hard)', min: 0, max: 10, step: 0.5 },
       { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
       { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
       { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
-      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 480, step: 4 },
     ],
   },
   'rsi2-connors': {
@@ -82,19 +89,26 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'Larry Connors\u2019 most-studied mean-reversion system — designed for regular-hours equity trading; buys fear-driven dips inside a rising market.',
     color: '#22c55e',
     intradayOnly: true,
-    defaults: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5, regimeTrend: 0, regimeAdx: 0, adxMax: 25, hlGate: 0, hlMax: 48 },
+    // Review P2 #8 — the cumulative-RSI variant Connors later preferred:
+    // sum K consecutive RSI(rp) readings and buy when the sum < cumBuy
+    // (classic: cumRSI(2,2) < 35 daily). cumMode 0 keeps the classic mode.
+    defaults: { rsiPeriod: 2, rsiBuy: 10, trendSma: 200, exitSma: 5, cumMode: 0, cumBars: 2, cumBuy: 35, regimeTrend: 0, regimeAdx: 0, adxMax: 25, hlGate: 0, hlMax: 48 },
     params: [
       { key: 'rsiPeriod', label: 'RSI period', min: 2, max: 5, step: 1 },
       { key: 'rsiBuy', label: 'RSI buy below', min: 5, max: 30, step: 1 },
       { key: 'trendSma', label: 'Trend SMA', min: 50, max: 300, step: 10 },
       { key: 'exitSma', label: 'Exit SMA', min: 3, max: 20, step: 1 },
+      // Review P2 #8 — cumulative RSI mode (Connors' later refinement)
+      { key: 'cumMode', label: 'Cumulative RSI mode', min: 0, max: 1, step: 1, bool: true },
+      { key: 'cumBars', label: 'RSI bars summed', min: 2, max: 5, step: 1 },
+      { key: 'cumBuy', label: 'Cum RSI buy below', min: 10, max: 80, step: 5 },
       // Task 12 — optional extra regime gates (the strategy's own trend SMA
       // already IS the P0 trend filter, so the generic gate defaults off here)
       { key: 'regimeTrend', label: 'Extra 200-SMA gate', min: 0, max: 1, step: 1, bool: true },
       { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
       { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
       { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
-      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 480, step: 4 },
     ],
   },
   'orb15': {
@@ -105,7 +119,13 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'The classic regular-hours momentum play — the opening range sets intraday support/resistance and its break carries the day\u2019s directional bias.',
     color: '#f59e0b',
     intradayOnly: true,
-    defaults: { orMinutes: 15, onePerSide: 1, orbVolMult: 0 },
+    // Review P2 #10 — ORB gets its OWN regime logic: it is a MOMENTUM/breakout
+    // strategy, so the MR-polarity ADX-chop and half-life gates are the WRONG
+    // filter (they veto exactly the trending tape ORB feeds on) and are not
+    // exposed at all. Only the 200-SMA gate is offered — its polarity already
+    // matches breakout direction (LONG above the SMA, SHORT below), making it
+    // a momentum-alignment filter rather than a fade-blocker. Default off.
+    defaults: { orMinutes: 15, onePerSide: 1, orbVolMult: 0, regimeTrend: 0 },
     params: [
       { key: 'orMinutes', label: 'Range minutes', min: 5, max: 60, step: 5 },
       { key: 'onePerSide', label: 'One trade per side', min: 0, max: 1, step: 1, bool: true },
@@ -113,6 +133,9 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
       // × the opening-range average (0 = off). Confirms the break with
       // participation instead of fading drift.
       { key: 'orbVolMult', label: 'Breakout vol ≥ × OR avg (0=off)', min: 0, max: 5, step: 0.5 },
+      // Review P2 #10 — momentum-polarity trend gate (LONG only above the
+      // 200-SMA, SHORT only below). No ADX/half-life params on purpose.
+      { key: 'regimeTrend', label: 'Momentum gate (200-SMA)', min: 0, max: 1, step: 1, bool: true },
     ],
   },
   'vwap-fade': {
@@ -123,21 +146,111 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
     fit: 'VWAP is the institutional execution benchmark — in distribution phases price keeps snapping back to it, making deviation fades high-probability.',
     color: '#38bdf8',
     intradayOnly: true,
-    defaults: { devPct: 0.6, allowShort: 1, regimeTrend: 1, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 48 },
+    // Review calibration (same rationale as bb-reversion): hlMax 48 → 96.
+    defaults: { devPct: 0.6, allowShort: 1, regimeTrend: 1, trendSoftPct: 0, regimeAdx: 0, adxMax: 25, hlGate: 1, hlMax: 96 },
     params: [
       { key: 'devPct', label: 'Deviation %', min: 0.2, max: 5, step: 0.1 },
       { key: 'allowShort', label: 'Allow shorts', min: 0, max: 1, step: 1, bool: true },
       // Task 12 — regime gates (same toolkit as bb-reversion, P0/P1)
       { key: 'regimeTrend', label: 'Trend gate (200-SMA)', min: 0, max: 1, step: 1, bool: true },
+      // Review P2 #9 — soft trend gate (0 = hard binary)
+      { key: 'trendSoftPct', label: 'Trend gate soft ±% (0 = hard)', min: 0, max: 10, step: 0.5 },
       { key: 'regimeAdx', label: 'ADX chop gate', min: 0, max: 1, step: 1, bool: true },
       { key: 'adxMax', label: 'ADX below', min: 10, max: 40, step: 1 },
       { key: 'hlGate', label: 'Half-life gate', min: 0, max: 1, step: 1, bool: true },
-      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 120, step: 4 },
+      { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 480, step: 4 },
     ],
   },
 }
 
 export const ALGO_STRATEGY_IDS = Object.keys(ALGO_STRATEGIES) as AlgoStrategyId[]
+
+// ---------------------------------------------------------------------------
+// Regime research presets (review P0 #2 / P1 #6 / P3 #11) — one switch flips
+// the whole gate package + the cost model between DISCOVERY and REALISM:
+//   • research — every regime gate OFF, frictionless costs: measure the RAW
+//     edge of the strategy rules before any filtering (the honest baseline
+//     the gated runs are compared against).
+//   • live — gates ON, realistic costs: what a production candidate must
+//     survive (and it still needs a walk-forward pass before going live).
+// The presets are applied CLIENT-side (BacktestPanel) via applyRegimePreset()
+// below; the engines never see them — they only see concrete params/costs.
+// ---------------------------------------------------------------------------
+
+export type AlgoRegimePresetId = 'research' | 'live'
+
+export interface AlgoRegimePreset {
+  id: AlgoRegimePresetId
+  label: string
+  blurb: string
+  /** cost model (bps) seeded alongside the gates */
+  costs: { slippageBps: number; feeBps: number; spreadBps: number; dynSlip: boolean }
+}
+
+export const ALGO_REGIME_PRESETS: Record<AlgoRegimePresetId, AlgoRegimePreset> = {
+  research: {
+    id: 'research',
+    label: 'Research / Discovery',
+    blurb: 'all regime gates off · frictionless costs — measure the raw rule edge first',
+    costs: { slippageBps: 0, feeBps: 0, spreadBps: 0, dynSlip: false },
+  },
+  live: {
+    id: 'live',
+    label: 'Live Candidate',
+    blurb: 'gates on (soft trend) · realistic costs — a survivor here still needs walk-forward',
+    costs: { slippageBps: 2, feeBps: 1, spreadBps: 2, dynSlip: true },
+  },
+}
+
+/**
+ * Timeframe-aware half-life ceiling (review P0 #1 / P1 #5) — ≈7 hours of
+ * bars, so "the deviation reverts within a session-ish horizon" means the
+ * same thing on every chart: 1m → 420 bars, 5m → 84, 15m → 28. The old fixed
+ * 48 was 4h on 5m and vetoed genuine MR setups.
+ */
+export function tfAwareHlMax(tf: AlgoTimeframe): number {
+  return tf === '1m' ? 420 : tf === '5m' ? 84 : 28
+}
+
+/**
+ * Apply a regime preset to a params object (returns a NEW object — the caller
+ * must feed the result through normalizeAlgoParams). Strategy-aware:
+ *   • rsi2-connors keeps ALL gates off even in the live preset — its own
+ *     trend SMA already is the trend filter (review P2 #8);
+ *   • orb15 gets only the momentum-polarity 200-SMA gate (ADX/half-life are
+ *     the wrong polarity for breakouts — review P2 #10);
+ *   • the MR strategies (BB / VWAP-fade) get the full package with a SOFT
+ *     trend gate (±1.5% — review P2 #9) and a timeframe-aware half-life.
+ */
+export function applyRegimePreset(
+  id: AlgoRegimePresetId,
+  strategy: AlgoStrategyId,
+  tf: AlgoTimeframe,
+  params: Record<string, number>,
+): Record<string, number> {
+  const out = { ...params }
+  if (id === 'research') {
+    out.regimeTrend = 0
+    out.regimeAdx = 0
+    out.hlGate = 0
+    return out
+  }
+  if (strategy === 'rsi2-connors') {
+    out.regimeTrend = 0
+    out.regimeAdx = 0
+    out.hlGate = 0
+  } else if (strategy === 'orb15') {
+    out.regimeTrend = 1
+  } else {
+    out.regimeTrend = 1
+    out.trendSoftPct = 1.5
+    out.regimeAdx = 1
+    out.adxMax = 25
+    out.hlGate = 1
+    out.hlMax = tfAwareHlMax(tf)
+  }
+  return out
+}
 
 /** Algo runs trade intraday US sessions — restrict the chart timeframes. */
 export const ALGO_TIMEFRAMES = ['1m', '5m', '15m'] as const

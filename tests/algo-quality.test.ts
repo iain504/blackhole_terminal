@@ -192,7 +192,7 @@ describe('halfLifeFromDev — OU regression', () => {
 // Regime veto
 // ---------------------------------------------------------------------------
 describe('regimeVeto — P0 trend / P0 ADX / P1 half-life gates', () => {
-  const cfg = { regimeTrend: true, regimeAdx: false, adxMax: 25, hlGate: false, hlMax: 48 }
+  const cfg = { regimeTrend: true, trendSoftPct: 0, regimeAdx: false, adxMax: 25, hlGate: false, hlMax: 48 }
   const sma = 200
 
   test('longs above the 200-SMA pass, below are vetoed', () => {
@@ -414,7 +414,7 @@ describe('normalizeAlgoParams — Task 12 keys default cleanly', () => {
     expect(p.regimeAdx).toBe(0)
     expect(p.adxMax).toBe(25)
     expect(p.hlGate).toBe(1) // P1 half-life gate ships ON for bb-reversion
-    expect(p.hlMax).toBe(48)
+    expect(p.hlMax).toBe(96) // review calibration: 48 vetoed genuine MR setups (4h on 5m)
   })
 
   test('orb15 gains the volume filter default OFF; values clamp to range', () => {

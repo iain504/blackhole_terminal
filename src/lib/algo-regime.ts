@@ -162,6 +162,11 @@ export function halfLifeSeries(
 
 export interface RegimeCfg {
   regimeTrend: boolean // 200-SMA directional gate
+  // Review P2 #9 — SOFT trend gate: 0 = the hard binary veto (any close on the
+  // wrong side of the SMA), > 0 = veto only when price sits MORE than this
+  // many percent beyond the SMA (e.g. 1.5 → a long is still allowed 1.4%
+  // below the 200-SMA). Lets MR strategies fade shallow dips in an uptrend.
+  trendSoftPct: number
   regimeAdx: boolean // ADX < adxMax chop gate
   adxMax: number
   hlGate: boolean // half-life ≤ hlMax bars gate
@@ -171,6 +176,7 @@ export interface RegimeCfg {
 export function regimeCfgFromParams(params: Record<string, number>): RegimeCfg {
   return {
     regimeTrend: (params.regimeTrend ?? 0) >= 1,
+    trendSoftPct: Number.isFinite(params.trendSoftPct) && params.trendSoftPct > 0 ? params.trendSoftPct : 0,
     regimeAdx: (params.regimeAdx ?? 0) >= 1,
     adxMax: Number.isFinite(params.adxMax) ? params.adxMax : 25,
     hlGate: (params.hlGate ?? 0) >= 1,
@@ -180,37 +186,139 @@ export function regimeCfgFromParams(params: Record<string, number>): RegimeCfg {
 
 export const anyRegimeActive = (c: RegimeCfg): boolean => c.regimeTrend || c.regimeAdx || c.hlGate
 
+// ---------------------------------------------------------------------------
+// Gate-effectiveness diagnostics (review P0 #3) — every raw entry signal is
+// counted and each veto is attributed to the gate that fired it, so the UI can
+// say "the trend gate blocked 62% of signals" instead of leaving tuning blind.
+// `signals` counts EVERY raw entry signal on a decided bar (even while a
+// position is open — the executor may still refuse it downstream), which makes
+// the veto shares an honest measure of how much each gate thins the signal
+// stream. Counters ride BacktestMetrics.regime for every run (single, sweep,
+// optimizer, walk-forward) at zero extra cost.
+// ---------------------------------------------------------------------------
+
+export type RegimeGateId = 'trend' | 'adx' | 'halfLife'
+
+export interface RegimeVetoInfo {
+  veto: string | null
+  gate: RegimeGateId | null // which gate produced the veto (null = none)
+}
+
+export interface RegimeGateStats {
+  signals: number // raw entry signals evaluated
+  vetoedByTrend: number
+  vetoedByAdx: number
+  vetoedByHalfLife: number
+  passedRegime: number // signals that cleared every active gate
+}
+
+export const emptyRegimeStats = (): RegimeGateStats => ({
+  signals: 0,
+  vetoedByTrend: 0,
+  vetoedByAdx: 0,
+  vetoedByHalfLife: 0,
+  passedRegime: 0,
+})
+
+export function recordVeto(stats: RegimeGateStats, gate: RegimeGateId | null): void {
+  if (gate === 'trend') stats.vetoedByTrend++
+  else if (gate === 'adx') stats.vetoedByAdx++
+  else if (gate === 'halfLife') stats.vetoedByHalfLife++
+}
+
 /**
- * Veto an ENTRY signal when the regime contradicts it. Returns null when the
- * entry may fire, or a short human reason. Fail-open on NaN inputs.
+ * Veto an ENTRY signal when the regime contradicts it. Returns the veto
+ * reason AND which gate fired (the UI attributes blocked-signal counts per
+ * gate). Fail-open on NaN inputs.
  *   • trend: LONG only above the 200-SMA, SHORT only below (the classic P0 fix
- *     that stops mean-reversion from fighting a strong trend).
+ *     that stops mean-reversion from fighting a strong trend). SOFT mode
+ *     (trendSoftPct > 0) vetoes only when price is MORE than trendSoftPct
+ *     beyond the SMA — shallow penetrations still pass (review P2 #9).
  *   • ADX: only when trend STRENGTH is below adxMax (chop — the MR regime).
  *   • half-life: only when the deviation reverts fast enough (finite, ≤ hlMax).
  */
-export function regimeVeto(
+export function regimeVetoEx(
   cfg: RegimeCfg,
   side: 'buy' | 'sell',
   close: number,
   trendSma: number | null, // null = insufficient history → fail-open
   adx: number, // NaN = fail-open
   hl: number, // NaN = fail-open · Infinity = trending (veto when gated)
-): string | null {
+): RegimeVetoInfo {
   if (cfg.regimeTrend && trendSma != null && Number.isFinite(trendSma) && trendSma > 0) {
-    if (side === 'buy' && !(close > trendSma)) return `below ${REGIME_TREND_SMA}-SMA`
-    if (side === 'sell' && !(close < trendSma)) return `above ${REGIME_TREND_SMA}-SMA`
+    const soft = cfg.trendSoftPct > 0
+    const distPct = ((close - trendSma) / trendSma) * 100 // + above / − below the SMA
+    if (side === 'buy') {
+      const blocked = soft ? distPct < 0 && -distPct > cfg.trendSoftPct : !(close > trendSma)
+      if (blocked) {
+        return {
+          veto: soft
+            ? `${(-distPct).toFixed(1)}% below ${REGIME_TREND_SMA}-SMA (> soft ±${cfg.trendSoftPct}%)`
+            : `below ${REGIME_TREND_SMA}-SMA`,
+          gate: 'trend',
+        }
+      }
+    } else {
+      const blocked = soft ? distPct > 0 && distPct > cfg.trendSoftPct : !(close < trendSma)
+      if (blocked) {
+        return {
+          veto: soft
+            ? `${distPct.toFixed(1)}% above ${REGIME_TREND_SMA}-SMA (> soft ±${cfg.trendSoftPct}%)`
+            : `above ${REGIME_TREND_SMA}-SMA`,
+          gate: 'trend',
+        }
+      }
+    }
   }
   if (cfg.regimeAdx && Number.isFinite(adx) && adx >= cfg.adxMax) {
-    return `trending (ADX ${adx.toFixed(0)} ≥ ${cfg.adxMax})`
+    return { veto: `trending (ADX ${adx.toFixed(0)} ≥ ${cfg.adxMax})`, gate: 'adx' }
   }
   if (cfg.hlGate && (hl === Number.POSITIVE_INFINITY || (Number.isFinite(hl) && hl > cfg.hlMax))) {
     // Infinity is NOT finite — it must be handled explicitly: a deviation
     // with λ ≥ 0 is TRENDING, the strongest possible veto evidence.
-    return hl === Number.POSITIVE_INFINITY
-      ? 'deviation not mean-reverting (half-life ∞)'
-      : `half-life ${hl.toFixed(0)} bars > ${cfg.hlMax}`
+    return {
+      veto: hl === Number.POSITIVE_INFINITY
+        ? 'deviation not mean-reverting (half-life ∞)'
+        : `half-life ${hl.toFixed(0)} bars > ${cfg.hlMax}`,
+      gate: 'halfLife',
+    }
   }
-  return null
+  return { veto: null, gate: null }
+}
+
+/** Back-compat wrapper — engines that only need the reason string. */
+export function regimeVeto(
+  cfg: RegimeCfg,
+  side: 'buy' | 'sell',
+  close: number,
+  trendSma: number | null,
+  adx: number,
+  hl: number,
+): string | null {
+  return regimeVetoEx(cfg, side, close, trendSma, adx, hl).veto
+}
+
+// ---------------------------------------------------------------------------
+// Cutler RSI at one index (review P2 #8 — cumulative RSI mode) — simple mean
+// of the last `period` bar-to-bar gains/losses over closes[end−period..end]
+// (NOT Wilder-smoothed). This is EXACTLY the formula both engines already used
+// inline for rsi2-connors (see the parity note there), extracted into ONE
+// shared implementation so the backtest and the live engine sum K consecutive
+// readings for the cumulative mode from identical math — the parity contract
+// stays mechanical instead of "two hand-copied loops".
+// Returns NaN when the window is not fully available (callers fail closed).
+// ---------------------------------------------------------------------------
+
+export function cutlerRsiAt(closes: ArrayLike<number>, end: number, period: number): number {
+  if (period < 1 || end < period || end >= closes.length) return Number.NaN
+  let g = 0
+  let l = 0
+  for (let i = end - period + 1; i <= end; i++) {
+    const d = closes[i] - closes[i - 1]
+    if (d >= 0) g += d
+    else l -= d
+  }
+  return l === 0 ? 100 : 100 - 100 / (1 + g / l)
 }
 
 // ---------------------------------------------------------------------------

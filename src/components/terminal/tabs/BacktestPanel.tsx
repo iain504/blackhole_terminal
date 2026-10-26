@@ -26,7 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices, ShieldCheck,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -39,11 +39,15 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
   ALGO_STRATEGIES,
+  ALGO_REGIME_PRESETS,
   algoMaxDays,
+  applyRegimePreset,
+  normalizeAlgoParams,
+  type AlgoRegimePresetId,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import type { BacktestResult, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
-import type { MonteCarloResult } from '@/lib/algo-regime'
+import type { MonteCarloResult, RegimeGateStats } from '@/lib/algo-regime'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 
@@ -223,6 +227,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [meta, setMeta] = useState<BacktestMeta | null>(null)
   const [runRes, setRunRes] = useState<BacktestResult | null>(null)
   const [optRes, setOptRes] = useState<OptimizeResult | null>(null)
+  // Review P0 #4 — gates-off A/B: re-runs the SAME config with every regime
+  // gate forced off so the gated run can be quantified against its raw baseline
+  const [abRes, setAbRes] = useState<{ netPct: number; trades: number; profitFactor: number; winRate: number } | null>(null)
+  const [abBusy, setAbBusy] = useState(false)
   // win/loss breakdown granularity (Task 71-2)
   const [wlGran, setWlGran] = useState<BtGran>('hour')
 
@@ -238,12 +246,14 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setMeta(null)
     setError(null)
     setMcRes(null)
+    setAbRes(null)
   }, [cfg.strategy])
 
   // symbol / timeframe switch → the sweep was measured on other data
   useEffect(() => {
     setSweepRes(null)
     setWfRes(null)
+    setAbRes(null)
   }, [cfg.symbol, cfg.timeframe])
 
   // Task 90 — pick up the persisted recommendations feed (and any refresh job
@@ -450,6 +460,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setRunRes(j.result ?? null)
       setMcRes(j.mc ?? null)
       setOptRes(null)
+      setAbRes(null) // a fresh baseline invalidates the gates-off A/B
     } else if (mode === 'optimize') {
       setOptRes(j.optimize ?? null)
       setRunRes(null)
@@ -599,6 +610,62 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       title: 'Recommended setup applied',
       description: `${rec.symbol} ${rec.timeframe} · ${ALGO_STRATEGIES[rec.strategy].name} — costs seeded ${rec.slipBps}/${rec.feeBps}/${rec.spreadBps} bps. Hit "Run backtest" to verify on fresh bars.`,
     })
+  }
+
+  // Review P0 #4 — quantified gates-off A/B: the exact same run config with
+  // every regime gate forced to 0. One inline request (fast single sim, the
+  // 2-min bar cache makes it cheap) whose summary lands beside the gated run:
+  // "gates removed X% net / N trades" is the honest measure of what the
+  // filters cost — the review's immediate step 3, one click.
+  const runGateAb = async () => {
+    setAbBusy(true)
+    try {
+      const res = await fetch('/api/algo/backtest', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...payload,
+          mode: 'run',
+          params: { ...cfg.params, regimeTrend: 0, regimeAdx: 0, hlGate: 0 },
+        }),
+      })
+      const json = await res.json().catch(() => null)
+      const mm = (json as { result?: { metrics?: { netPct?: number; trades?: number; profitFactor?: number; winRate?: number } } } | null)?.result?.metrics
+      if (!res.ok || !mm) {
+        toast({ title: 'A/B run failed', description: (json as { error?: string } | null)?.error || `HTTP ${res.status}`, variant: 'destructive' })
+        return
+      }
+      setAbRes({ netPct: mm.netPct ?? 0, trades: mm.trades ?? 0, profitFactor: mm.profitFactor ?? 0, winRate: mm.winRate ?? 0 })
+    } catch {
+      toast({ title: 'A/B run failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setAbBusy(false)
+    }
+  }
+
+  // Review P0 #2 / P1 #6 — one-click regime presets: Research flips every
+  // gate off + frictionless costs (raw rule edge); Live Candidate arms the
+  // full gate package (strategy-aware — RSI-2 keeps its own trend filter,
+  // ORB gets only the momentum gate) + realistic costs, per timeframe.
+  const applyPreset = (id: AlgoRegimePresetId) => {
+    const p = ALGO_REGIME_PRESETS[id]
+    onApplyParams(normalizeAlgoParams(cfg.strategy, applyRegimePreset(id, cfg.strategy, cfg.timeframe as AlgoTimeframe, cfg.params)))
+    setBtSlip(String(p.costs.slippageBps))
+    setBtFee(String(p.costs.feeBps))
+    setBtSpread(String(p.costs.spreadBps))
+    setBtDynSlip(p.costs.dynSlip)
+    toast({ title: `${p.label} preset applied`, description: p.blurb })
+  }
+
+  // Review P1 #5 — mirror of the engine's rangeInert(): a range whose
+  // controlling gate is OFF is silently dropped server-side; say so inline
+  // so a ticked-but-inert dim never surprises ("no valid ranges").
+  const rangeGateOff = (key: string): string | null => {
+    if (key === 'hlMax' && (cfg.params.hlGate ?? 0) < 1) return 'half-life gate off'
+    if (key === 'adxMax' && (cfg.params.regimeAdx ?? 0) < 1) return 'ADX gate off'
+    if (key === 'trendSoftPct' && (cfg.params.regimeTrend ?? 0) < 1) return 'trend gate off'
+    if ((key === 'cumBars' || key === 'cumBuy') && (cfg.params.cumMode ?? 0) < 1) return 'cumulative RSI off'
+    return null
   }
 
   // downsample the equity curve for the chart
@@ -807,9 +874,46 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
             <p className="text-[9px] leading-tight text-zinc-600">impact breathes with volatility — high-ATR bars pay more</p>
           </div>
+          {/* Review P0 #2 / P1 #6 — one-click regime presets (discovery vs realism) */}
+          <div className="col-span-2 sm:col-span-4">
+            <Label className="text-[10px] text-zinc-500">Regime preset</Label>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              {(Object.keys(ALGO_REGIME_PRESETS) as AlgoRegimePresetId[]).map((id) => {
+                const p = ALGO_REGIME_PRESETS[id]
+                return (
+                  <Tooltip key={id}>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="outline"
+                        className={cn(
+                          'h-7 gap-1.5 border-zinc-700 px-2.5 text-[11px]',
+                          id === 'research' ? 'text-sky-300 hover:bg-zinc-800' : 'text-amber-300 hover:bg-zinc-800',
+                        )}
+                        onClick={() => applyPreset(id)}
+                      >
+                        {id === 'research' ? <FlaskConical className="h-3 w-3" aria-hidden /> : <ShieldCheck className="h-3 w-3" aria-hidden />}
+                        {p.label}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent className="max-w-72 border-zinc-700 bg-zinc-800 text-zinc-100">
+                      <p className="font-semibold">{p.label}</p>
+                      <p className="mt-0.5">{p.blurb}</p>
+                      <p className="mt-1 text-zinc-400">
+                        gates: {id === 'research' ? 'all OFF' : cfg.strategy === 'rsi2-connors' ? 'off (own trend SMA is the filter)' : cfg.strategy === 'orb15' ? 'momentum 200-SMA only' : 'trend ±1.5% soft · ADX 25 · half-life (TF-aware)'} ·
+                        costs: {p.costs.slippageBps}/{p.costs.feeBps}/{p.costs.spreadBps} bps slip/fee/spread
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                )
+              })}
+              <span className="text-[9px] leading-tight text-zinc-600">
+                one click sets the gate package + cost model — Research first (raw edge), then Live Candidate (what must survive)
+              </span>
+            </div>
+          </div>
           <div className="col-span-2 flex items-end sm:col-span-4">
             <p className="text-[10px] leading-snug text-zinc-500">
-              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Vol-scaled slip multiplies the impact by the bar's ATR% vs the dataset average (clamped 0.5–3×). Regime gates (200-SMA trend / ADX chop / half-life) veto entries that fight the regime — they live in the strategy parameters and are mirrored 1:1 by the live engine. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Vol-scaled slip multiplies the impact by the bar's ATR% vs the dataset average (clamped 0.5–3×). Regime gates (200-SMA trend — hard or soft ±% — / ADX chop / half-life) veto entries that fight the regime; they live in the strategy parameters, are mirrored 1:1 by the live engine, and every run reports how many signals each gate blocked. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
               {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
                 <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
               )}
@@ -940,6 +1044,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <div className="mt-2 flex flex-col gap-1.5">
               {def.params.filter((p) => !p.bool).map((p) => {
                 const r = ranges[p.key] ?? { on: false, min: String(p.min), max: String(p.max), step: String(p.step) }
+                const gateOff = rangeGateOff(p.key)
                 const toggle = (on: boolean) =>
                   setRanges((rs) => ({ ...rs, [p.key]: { ...r, on, min: r.min || String(p.min), max: r.max || String(p.max), step: r.step || String(p.step) } }))
                 const patch = (part: Partial<RangeState>) => setRanges((rs) => ({ ...rs, [p.key]: { ...r, ...part } }))
@@ -948,6 +1053,14 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                     <Switch checked={r.on} onCheckedChange={toggle} className="scale-90" aria-label={`Optimize ${p.label}`} />
                     <span className="min-w-28 text-[11px] text-zinc-300">{p.label}</span>
                     <span className="text-[10px] text-zinc-600">setup {paramsStr(cfg.params[p.key])}</span>
+                    {gateOff && (
+                      <span
+                        className="text-[9px] text-amber-400/80"
+                        title={`The controlling gate is OFF in the run setup — the engine drops this dimension (every combo would score identically). Turn it on in the strategy parameters to sweep it.`}
+                      >
+                        ({gateOff} — inert)
+                      </span>
+                    )}
                     {r.on && (
                       <span className="ml-auto flex items-center gap-1">
                         <NumIn value={r.min} onChange={(v) => patch({ min: v })} label={`${p.label} min`} />
@@ -1059,7 +1172,103 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <Metric label="Expectancy" value={fmtUsd(m.expectancy)} sub="per trade" cls={pnlColor(m.expectancy)} />
             <Metric label="Avg hold" value={`${m.avgHoldMin < 90 ? `${Math.round(m.avgHoldMin)}m` : `${(m.avgHoldMin / 60).toFixed(1)}h`}`} sub={`${m.tradesPerWeek.toFixed(1)} trades/wk`} cls="text-zinc-100" />
             <Metric label="Final equity" value={fmtUsd(m.finalEquity)} sub={m.suppressed > 0 ? `${m.suppressed} signals gated` : 'gates: none hit'} cls="text-zinc-100" />
+            {(m.avgFillCostBps ?? 0) > 0 && (
+              <Metric
+                label="Avg cost / fill"
+                value={`${m.avgFillCostBps!.toFixed(1)} bps`}
+                sub={`≈ ${(m.avgFillCostBps! * 2).toFixed(1)} bps round trip`}
+                cls="text-zinc-100"
+              />
+            )}
           </div>
+
+          {/* Review P0 #3/#4 — regime gate effectiveness: how many raw entry
+              signals each gate blocked, plus a one-click gates-off A/B so the
+              filters' cost is quantified, not guessed. */}
+          {m.regime && (() => {
+            const rs: RegimeGateStats = m.regime
+            const share = (n: number) => (rs.signals > 0 ? (n / rs.signals) * 100 : 0)
+            const gatesActive = (cfg.params.regimeTrend ?? 0) >= 1 || (cfg.params.regimeAdx ?? 0) >= 1 || (cfg.params.hlGate ?? 0) >= 1
+            const blockedTotal = rs.vetoedByTrend + rs.vetoedByAdx + rs.vetoedByHalfLife
+            const gateChip = (label: string, blocked: number) => (
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 tabular-nums',
+                  blocked > 0 ? 'border-amber-500/30 bg-amber-500/10 text-amber-300' : 'border-zinc-700/60 bg-zinc-900 text-zinc-500',
+                )}
+              >
+                {label} blocked <span className="font-semibold">{blocked.toLocaleString('en-US')}</span>
+                <span className="text-[9px] opacity-80">({share(blocked).toFixed(0)}%)</span>
+              </span>
+            )
+            return (
+              <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <ShieldCheck className="h-3.5 w-3.5 text-sky-400" aria-hidden />
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Regime gates</span>
+                  <Badge variant="outline" className="text-[10px] text-zinc-400" title="Every raw entry signal the strategy produced on a decided bar — the denominator of the blocked shares">
+                    {rs.signals.toLocaleString('en-US')} entry signals
+                  </Badge>
+                  {!gatesActive && (
+                    <Badge variant="outline" className="text-[10px] text-zinc-500" title="regimeTrend / regimeAdx / hlGate are all 0 in the run setup">
+                      gates off — nothing filtered
+                    </Badge>
+                  )}
+                  {gatesActive && blockedTotal === 0 && (
+                    <Badge variant="outline" className="text-[10px] text-emerald-400/90">every signal passed the gates</Badge>
+                  )}
+                  {gatesActive && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="ml-auto h-6 gap-1 border-zinc-700 px-2 text-[10px] text-zinc-300 hover:bg-zinc-800"
+                      disabled={abBusy || busy !== null}
+                      title="Re-run the EXACT same config with every regime gate forced off — the honest baseline that quantifies what the gates removed"
+                      onClick={() => void runGateAb()}
+                    >
+                      {abBusy ? <RefreshCw className="h-3 w-3 animate-spin" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
+                      A/B: gates off
+                    </Button>
+                  )}
+                </div>
+                {gatesActive && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+                    {gateChip('Trend 200-SMA', rs.vetoedByTrend)}
+                    {gateChip('ADX chop', rs.vetoedByAdx)}
+                    {gateChip('Half-life', rs.vetoedByHalfLife)}
+                    <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 tabular-nums text-emerald-300">
+                      passed <span className="font-semibold">{rs.passedRegime.toLocaleString('en-US')}</span>
+                      <span className="text-[9px] opacity-80">({share(rs.passedRegime).toFixed(0)}%)</span>
+                    </span>
+                  </div>
+                )}
+                {abRes && (
+                  <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 rounded border border-zinc-800/60 bg-zinc-950/60 px-2 py-1.5 text-[11px] tabular-nums">
+                    <span className="text-zinc-400">
+                      gates ON <span className={cn('font-semibold', pnlColor(m.netPct))}>{fmtPct(m.netPct)}</span> · {m.trades} trades · PF {m.profitFactor >= 999 ? '∞' : m.profitFactor.toFixed(2)}
+                    </span>
+                    <span className="text-zinc-400">
+                      gates OFF <span className={cn('font-semibold', pnlColor(abRes.netPct))}>{fmtPct(abRes.netPct)}</span> · {abRes.trades} trades · PF {abRes.profitFactor >= 999 ? '∞' : abRes.profitFactor.toFixed(2)}
+                    </span>
+                    <span className={cn('font-semibold', pnlColor(m.netPct - abRes.netPct))}>
+                      gates delta {fmtPct(m.netPct - abRes.netPct)}
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      {abRes.trades > m.trades
+                        ? `${(abRes.trades - m.trades).toLocaleString('en-US')} trades removed by the gates`
+                        : abRes.trades === m.trades
+                          ? 'same trade count'
+                          : 'trade count differs (gates also shift re-entry timing)'}
+                    </span>
+                  </div>
+                )}
+                <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+                  Share of RAW entry signals each gate vetoed (first matching gate wins the attribution). A gate blocking most signals is either saving you from
+                  bad trades or strangling the strategy — the A/B row tells you which: keep a gate only when the gates-ON delta is the smaller loss.
+                </p>
+              </div>
+            )
+          })()}
 
           {/* Task 12 — Monte Carlo bootstrap (improvement plan P2): resample the
               realized trade sequence to estimate how much of the edge is luck */}
@@ -1408,6 +1617,19 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               <span className="text-zinc-500">
                 hold-out <span className={cn('font-semibold tabular-nums', pnlColor(wfRes.holdout.netPct))}>{fmtPct(wfRes.holdout.netPct)}</span>
                 <span className="text-zinc-600"> · {wfRes.holdout.trades} trades · win {wfRes.holdout.winRate.toFixed(0)}% · DD {wfRes.holdout.maxDrawdownPct.toFixed(1)}%</span>
+              </span>
+            )}
+            {/* Review P1 #7 — gate contribution on the pure hold-out window */}
+            {wfRes.holdout?.regime && wfRes.holdout.regime.signals > 0 && (
+              <span
+                className="text-zinc-500"
+                title="How many of the raw entry signals each regime gate vetoed inside the pure hold-out — the filters' contribution in the one window no tuning ever saw"
+              >
+                hold-out gates{' '}
+                <span className="tabular-nums text-zinc-300">
+                  trend −{wfRes.holdout.regime.vetoedByTrend} · adx −{wfRes.holdout.regime.vetoedByAdx} · hl −{wfRes.holdout.regime.vetoedByHalfLife}
+                </span>{' '}
+                <span className="text-zinc-600">of {wfRes.holdout.regime.signals} signals</span>
               </span>
             )}
           </div>

@@ -3015,3 +3015,29 @@ Work Log:
 
 Stage Summary:
 - Mobile long-press is now preview-then-commit: the value keeps updating under the finger until the drop, and the context menu is populated with the latest position's value — desktop right-click behavior byte-identical. Version v1.81.0.
+
+---
+Task ID: 2 (review-driven backtest calibration + gate diagnostics)
+Agent: Z.ai Code (main)
+Task: Implement the code review's P0/P1/P2 recommendations for the algo backtest regime gates: veto statistics, softened defaults, Research/Live presets, soft trend gate, ORB regime polarity, RSI-2 cumulative variant, realized-cost visibility, walk-forward gate contribution.
+
+Work Log:
+- algo-regime.ts: added regimeVetoEx() returning {veto, gate} with per-gate attribution (regimeVeto kept as wrapper — parity contract intact); RegimeGateStats + emptyRegimeStats() + recordVeto(); SOFT trend gate via RegimeCfg.trendSoftPct (0 = hard binary, >0 = veto only when price is >X% beyond the 200-SMA); shared cutlerRsiAt() (Cutler/simple RSI at one index) extracted from both engines' inline loops.
+- algo-strategies.ts: bb-reversion + vwap-fade defaults hlMax 48→96 and hlMax param ceiling 120→480; new trendSoftPct param (0..10, step 0.5); rsi2-connors gains cumMode/cumBars(2..5)/cumBuy(10..80, default 35); orb15 gains ONLY a momentum-polarity regimeTrend gate (ADX/half-life deliberately not exposed — wrong polarity for breakouts); new ALGO_REGIME_PRESETS (research = all gates off + frictionless costs, live = gates on + 2/1/2 bps + dynSlip), tfAwareHlMax(tf) (1m→420, 5m→84, 15m→28 ≈7h of bars), applyRegimePreset() (strategy-aware: rsi2 stays gate-free, orb gets momentum gate, MR strategies get soft trend ±1.5% + ADX 25 + TF-aware half-life).
+- backtest.ts: decide() counts every raw entry signal and attributes vetoes per gate → metrics.regime (rides single runs, optimizer rows, sweep rows and walk-forward for free); recordFill() instrumentation at all six fill sites → metrics.avgFillCostBps (spread half + impact + fee; TP limits at fee only); rsi2-connors cumulative branch reads series.closes (new BacktestSeries field) via shared cutlerRsiAt; rangeInert() drops optimizer ranges whose controlling gate is OFF (hlMax/adxMax/trendSoftPct/cumBars/cumBuy) so grids stop wasting combos on dead dims; walk-forward holdout now carries regime gate counters.
+- algo-engine.ts: evalRaw rsi2-connors mirrored — classic mode reads the same cutlerRsiAt (byte-identical to the old inline loop) and the cumulative mode is implemented identically (sum of K consecutive cutlerRsiAt readings < cumBuy); soft trend gate flows to live automatically via shared regimeCfgFromParams.
+- BacktestPanel.tsx: "Regime preset" row (Research / Live Candidate buttons, tooltips state gates+costs per strategy); results "Regime gates" block — signals badge, per-gate blocked chips with % of raw signals, passed chip, and a one-click "A/B: gates off" run whose comparison row shows gates ON vs OFF (net%, trades, PF, delta, "N trades removed by the gates"); "Avg cost / fill" metric (≈2× round trip) when > 0; Auto-tune rows show "(gate off — inert)" hints for dims the engine will drop; walk-forward summary line shows hold-out gate contribution (trend −N · adx −N · hl −N of N signals); abRes cleared on strategy/symbol/timeframe change and on fresh runs.
+- tests/algo-quality.test.ts: RegimeCfg literals gained trendSoftPct: 0; hlMax default expectation 48→96 (review-mandated calibration).
+
+Verification (agent-browser, QA user qa-ctxpkr5w8, BTC/USD 5m 30d via Binance):
+- Run 1 (hard trend gate, hl 96): 287 signals — trend blocked 268 (93%), ADX 0, HL 0, passed 19 (7%); avg cost/fill 13.0 bps.
+- A/B gates off: −14.02% · 58 trades vs gates ON −1.57% · 7 trades → gates delta +12.45%, "51 trades removed" (message fix applied: comparison now attributes removal to the gates when the OFF run has more trades).
+- Live preset applied: trendSoftPct 1.5, adxMax 25, hlMax 84 (TF-aware 5m) confirmed in the params editor; re-run: trend blocked 45 (16% — soft gate passes shallow dips), ADX 159 (55%), passed 83 (29%); A/B: −0.46% ON vs −3.21% OFF (+2.75%), 28 trades removed.
+- RSI-2: cumulative params render; cumMode ON runs 86 trades; gates block correctly shows "gates off — nothing filtered" (rsi2 is strategy-aware gate-free).
+- Auto-tune inert hints verified for hlMax/adxMax with gates off; cumBars/cumBuy show no hint while cumMode ON (correct).
+- Zero page errors; only pre-existing benign rate-limit PK-race prisma logs in dev.log; all backtest API calls 200. Desktop 1280px and mobile 390px render. bun lint clean; 33/33 tests pass.
+
+Stage Summary:
+- Gate tuning is no longer blind: every backtest result (single/optimizer/sweep/walk-forward) now reports per-gate veto counts + shares, and one click quantifies the filters with a gates-off A/B ("gates saved +12.45%" on BTC/USD 5m in verification).
+- Defaults recalibrated per the review (hlMax 96, TF-aware in the Live preset); Research vs Live Candidate presets give discovery vs realism in one click; soft trend gate, ORB momentum polarity and cumulative RSI implemented on BOTH engines from shared code (parity contract preserved).
+- No schema/DB changes; wire additions are optional JSON fields on BacktestMetrics (regime, avgFillCostBps) and WF holdout.regime — backward compatible with old stored results.

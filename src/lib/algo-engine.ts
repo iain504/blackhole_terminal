@@ -27,6 +27,7 @@ import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
 import {
   adxSeries,
+  cutlerRsiAt,
   halfLifeSeries,
   regimeCfgFromParams,
   regimeVeto,
@@ -218,21 +219,35 @@ function evalRaw(
     if (n < trendLen + 2) return { entry: null, exit: null }
     const smaT = closes.slice(n - trendLen).reduce((a, b) => a + b, 0) / trendLen
     const rp = Math.max(2, Math.round(params.rsiPeriod ?? 2))
-    // RSI over the LAST rp bar-to-bar changes (the classic Connors reading of
-    // the most recent closes). NOTE: this used to iterate closes[1..rp] — the
-    // OLDEST bars of the rolling window — which made the signal fire on stale
-    // data (Task 62 parity fix, mirrored in src/lib/backtest.ts).
-    let g = 0, l = 0
-    for (let i = n - rp; i < n; i++) {
-      const d = closes[i] - closes[i - 1]
-      if (d >= 0) g += d; else l -= d
+    const cumMode = (params.cumMode ?? 0) >= 1
+    let rsiVal: number
+    let rsiLabel: string
+    if (cumMode) {
+      // Review P2 #8 — cumulative RSI (Connors' later refinement): sum K
+      // consecutive RSI(rp) readings and require the SUM below cumBuy.
+      // Same shared cutlerRsiAt the backtest reads — parity is one function,
+      // not two hand-copied loops. Deepest read needs closes[j−rp], j ≥ n−K.
+      const kBars = Math.max(2, Math.min(5, Math.round(params.cumBars ?? 2)))
+      if (n < rp + kBars) return { entry: null, exit: null }
+      let sum = 0
+      for (let j = n - kBars; j < n; j++) sum += cutlerRsiAt(closes, j, rp)
+      rsiVal = sum
+      rsiLabel = `cumRSI(${rp}×${kBars}) ${sum.toFixed(1)}`
+    } else {
+      // RSI over the LAST rp bar-to-bar changes (the classic Connors reading
+      // of the most recent closes). NOTE: this used to iterate closes[1..rp]
+      // — the OLDEST bars of the rolling window — which made the signal fire
+      // on stale data (Task 62 parity fix, mirrored in src/lib/backtest.ts);
+      // it now reads the SAME shared cutlerRsiAt the backtest uses.
+      rsiVal = cutlerRsiAt(closes, n - 1, rp)
+      rsiLabel = `RSI(${rp}) ${rsiVal.toFixed(1)}`
     }
-    const rsiVal = l === 0 ? 100 : 100 - 100 / (1 + g / l)
     const exitLen = Math.max(2, Math.round(params.exitSma ?? 5))
     const smaE = closes.slice(n - exitLen).reduce((a, b) => a + b, 0) / exitLen
     const exit = last.close > smaE ? `close > SMA(${exitLen}) ${fmtP(smaE)} (Connors recapture)` : null
-    if (last.close > smaT && rsiVal < (params.rsiBuy ?? 10)) {
-      return { entry: { side: 'buy', reason: `close > SMA(${trendLen}) ${fmtP(smaT)} · RSI(${rp}) ${rsiVal.toFixed(1)} < ${params.rsiBuy ?? 10}` }, exit }
+    const buyLevel = cumMode ? (params.cumBuy ?? 35) : (params.rsiBuy ?? 10)
+    if (last.close > smaT && rsiVal < buyLevel) {
+      return { entry: { side: 'buy', reason: `close > SMA(${trendLen}) ${fmtP(smaT)} · ${rsiLabel} < ${buyLevel}` }, exit }
     }
     return { entry: null, exit }
   }

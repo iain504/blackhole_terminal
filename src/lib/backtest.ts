@@ -57,15 +57,19 @@ import { memoryGuard } from '@/lib/mem-guard'
 import {
   adxSeries,
   atrPctSeries,
+  cutlerRsiAt,
   halfLifeSeries,
   regimeCfgFromParams,
-  regimeVeto,
+  regimeVetoEx,
+  emptyRegimeStats,
+  recordVeto,
   anyRegimeActive,
   REGIME_TREND_SMA,
   ADX_PERIOD,
   HL_LOOKBACK,
   HL_SMA_PERIOD,
   type RegimeCfg,
+  type RegimeGateStats,
 } from '@/lib/algo-regime'
 
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — same as the live engine
@@ -166,6 +170,15 @@ export interface BacktestMetrics {
   // Task 3-d — short entries DROPPED because the market is long-only (Alpaca
   // crypto has no shorting — trading.ts). 0 when absent/undefined for old data.
   skippedShorts?: number
+  // Review P0 #3 — regime gate effectiveness: raw entry signals evaluated,
+  // vetoes per gate (trend / ADX / half-life) and signals that cleared every
+  // active gate. With every gate off, signals = passedRegime and the vetoes
+  // are 0 (the UI renders that as "gates off — nothing filtered").
+  regime?: RegimeGateStats
+  // Review P3 #12 — average REALIZED execution cost per fill in bps (spread
+  // half + slippage impact + fee; resting TP limit legs count at their fee
+  // only). A round trip ≈ 2× this. Compare against live fills later.
+  avgFillCostBps?: number
 }
 
 export interface BacktestResult {
@@ -200,6 +213,9 @@ export interface BacktestSeries {
   hl: Float64Array // half-life (bars) of the close−SMA(50) deviation — NaN = fail-open, Infinity = trending
   atrPct: Float64Array // Wilder ATR(14) / close per bar (vol-scaled slippage)
   atrBase: number // mean ATR% across the dataset
+  // Review P2 #8 — plain closes array (shared cutlerRsiAt reads it for the
+  // cumulative-RSI mode; same values the prefix sums were built from)
+  closes: number[]
 }
 
 export function prepareSeries(bars: Bar[]): BacktestSeries {
@@ -232,7 +248,7 @@ export function prepareSeries(bars: Bar[]): BacktestSeries {
   const closesArr: number[] = new Array(n)
   for (let i = 0; i < n; i++) closesArr[i] = bars[i].close
   const hl = halfLifeSeries(closesArr, HL_LOOKBACK, HL_SMA_PERIOD)
-  return { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase }
+  return { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase, closes: closesArr }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +295,17 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     const s = slipAt(i)
     const p = exitDir === 1 ? px * (1 + s) : px * (1 - s)
     return p > 0 ? p : px
+  }
+  // Review P3 #12 — average REALIZED cost per fill in bps: every fill reports
+  // what it actually paid (spread half + slippage impact; resting TP limits
+  // are clean) plus the per-fill fee. A round trip ≈ 2× the average. Surfaced
+  // in metrics.avgFillCostBps so a backtest's costs can be compared to live
+  // fills later instead of being guessed.
+  let costBpsSum = 0
+  let costFills = 0
+  const recordFill = (i: number, limit: boolean): void => {
+    costFills++
+    costBpsSum += ((limit ? 0 : slipAt(i)) + fee) * 1e4
   }
 
   // ---- Wilder RSI (bb-reversion) — one incremental pass, O(1)/bar ----
@@ -363,20 +390,32 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       if (i + 1 < trendLen + 2) return NONE
       const smaT = smaAt(i, trendLen)
       const rp = Math.max(2, Math.round(params.rsiPeriod ?? 2))
-      // LAST rp bar-to-bar changes (parity-fixed — see algo-engine.ts)
-      let g = 0
-      let l = 0
-      for (let k = i - rp + 1; k <= i; k++) {
-        const d = bars[k].close - bars[k - 1].close
-        if (d >= 0) g += d
-        else l -= d
+      const cumMode = (params.cumMode ?? 0) >= 1
+      let rsiVal: number
+      let rsiLabel: string
+      if (cumMode) {
+        // Review P2 #8 — cumulative RSI (Connors' later refinement): sum K
+        // consecutive RSI(rp) readings and require the SUM below cumBuy —
+        // deeper oversold pooling, fewer but stronger dip signals. Reads the
+        // SAME shared cutlerRsiAt the live engine uses (parity contract).
+        const kBars = Math.max(2, Math.min(5, Math.round(params.cumBars ?? 2)))
+        if (i + 1 < rp + kBars) return NONE // deepest read needs closes[j−rp] with j ≥ i−kBars+1
+        let sum = 0
+        for (let j = i - kBars + 1; j <= i; j++) sum += cutlerRsiAt(series.closes, j, rp)
+        rsiVal = sum
+        rsiLabel = `cumRSI(${rp}×${kBars}) ${sum.toFixed(1)}`
+      } else {
+        // LAST rp bar-to-bar changes (parity-fixed — see algo-engine.ts);
+        // the shared helper is byte-identical to the old inline loop.
+        rsiVal = cutlerRsiAt(series.closes, i, rp)
+        rsiLabel = `RSI(${rp}) ${rsiVal.toFixed(1)}`
       }
-      const rsiVal = l === 0 ? 100 : 100 - 100 / (1 + g / l)
       const exitLen = Math.max(2, Math.round(params.exitSma ?? 5))
       const smaE = smaAt(i, exitLen)
       const exit = c > smaE ? 'Connors recapture (close > exit SMA)' : null
-      if (c > smaT && rsiVal < (params.rsiBuy ?? 10)) {
-        return { entry: { side: 'buy', reason: `close > trend SMA · RSI(${rp}) ${rsiVal.toFixed(1)}` }, exit }
+      const buyLevel = cumMode ? (params.cumBuy ?? 35) : (params.rsiBuy ?? 10)
+      if (c > smaT && rsiVal < buyLevel) {
+        return { entry: { side: 'buy', reason: `close > trend SMA · ${rsiLabel} < ${buyLevel}` }, exit }
       }
       return { entry: null, exit }
     }
@@ -415,16 +454,30 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   // entries that would fight the 200-SMA, an ADX spike vetoes mean-reversion
   // in a breakout, and a slow half-life vetoes "reversion" trades that are
   // actually the start of a trend. Mirrors evalStrategy() in algo-engine.ts.
+  // Review P0 #3 — every raw entry signal is counted and each veto attributed
+  // to its gate (the UI renders the per-gate blocked shares), so gate tuning
+  // is no longer blind. With every gate off the counters still record the raw
+  // signal volume (signals = passedRegime) — the honest A/B baseline.
   const regCfg: RegimeCfg = regimeCfgFromParams(params)
   const useRegime = anyRegimeActive(regCfg)
+  const regStats = emptyRegimeStats()
   const decide = (i: number): Dec => {
     const dec = rawDecide(i)
-    if (dec.entry == null || !useRegime) return dec
+    if (dec.entry == null) return dec
+    regStats.signals++
+    if (!useRegime) {
+      regStats.passedRegime++
+      return dec
+    }
     const trendSma = regCfg.regimeTrend
       ? (i + 1 >= REGIME_TREND_SMA ? (ps[i + 1] - ps[i + 1 - REGIME_TREND_SMA]) / REGIME_TREND_SMA : null)
       : null
-    const veto = regimeVeto(regCfg, dec.entry.side, bars[i].close, trendSma, adx[i], hl[i])
-    if (veto != null) return { entry: null, exit: dec.exit }
+    const vi = regimeVetoEx(regCfg, dec.entry.side, bars[i].close, trendSma, adx[i], hl[i])
+    if (vi.veto != null) {
+      recordVeto(regStats, vi.gate)
+      return { entry: null, exit: dec.exit }
+    }
+    regStats.passedRegime++
     return dec
   }
 
@@ -606,6 +659,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         pending = null
         suppressed++
       } else {
+        recordFill(i, false) // market entry — pays spread half + impact + fee
         pos = {
           side: dir,
           qty: effQty,
@@ -628,6 +682,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     //         15m — up to 15 minutes past the live exit through the close.
     const eodGate = cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN
     if (pos && eodGate) {
+      recordFill(i, false) // market-on-open flatten — pays the full market cost
       closeTrade(pos, slipPx(i, bar.open, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
       pos = null
     }
@@ -639,17 +694,21 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       let reason = ''
       if (pos.side === 1) {
         if (pos.slPx != null && bar.low <= pos.slPx) {
+          recordFill(i, false) // stop-market sell — pays the full market cost
           exitPx = slipPx(i, pos.slPx, -1) // stop-market sell — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.high >= pos.tpPx) {
+          recordFill(i, true) // resting LIMIT — fills at its price (fee only)
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
           reason = 'take profit'
         }
       } else {
         if (pos.slPx != null && bar.high >= pos.slPx) {
+          recordFill(i, false) // stop-market buy-back — pays the full market cost
           exitPx = slipPx(i, pos.slPx, 1) // stop-market buy-back — adverse drift
           reason = 'stop loss'
         } else if (pos.tpPx != null && bar.low <= pos.tpPx) {
+          recordFill(i, true) // resting LIMIT — fills at its price (fee only)
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
           reason = 'take profit'
         }
@@ -663,6 +722,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // ---- 4) evaluate the strategy on this closed bar (exits → entries) ----
     const dec = decide(i)
     if (dec.exit && pos) {
+      recordFill(i, false) // market exit at the bar close — pays the full market cost
       closeTrade(pos, slipPx(i, bar.close, pos.side === 1 ? -1 : 1), bar.time, dec.exit)
       pos = null
     }
@@ -710,6 +770,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let openAtEnd = false
   if (pos) {
     const lastBar = bars[n - 1]
+    recordFill(n - 1, false) // mark-to-market exit — charged like a real market close
     closeTrade(pos, slipPx(n - 1, lastBar.close, pos.side === 1 ? -1 : 1), lastBar.time, 'open at end of data (marked)')
     openAtEnd = true
   }
@@ -768,6 +829,11 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     openAtEnd,
     suppressed,
     skippedShorts,
+    // Review P0 #3 — gate effectiveness counters (all-zero vetoes when the
+    // gates are off; signals still counts the raw signal volume)
+    regime: regStats,
+    // Review P3 #12 — realized execution cost per fill (0 when frictionless)
+    avgFillCostBps: costFills > 0 ? costBpsSum / costFills : 0,
   }
   return { metrics, trades, equity: collectEquity ? equity : [], warmupBars: warmup }
 }
@@ -855,6 +921,22 @@ function comboInvalid(strategy: AlgoStrategyId, p: Record<string, number>): bool
   return false
 }
 
+/**
+ * Review P1 #5 — dimensionality guard: a threshold range for a gate that is
+ * currently OFF is an INERT dimension (every combo scores identically), which
+ * silently burned optimizer/sweep compute on hlMax/adxMax for strategies with
+ * those gates off (rsi2-connors) and would now also waste cumBars/cumBuy
+ * grids while the cumulative mode is off. Dropped at sanitize time so every
+ * surviving dim is live; re-enabling the gate in the setup re-arms its range.
+ */
+function rangeInert(key: string, params: Record<string, number>): boolean {
+  if (key === 'hlMax') return (params.hlGate ?? 0) < 1
+  if (key === 'adxMax') return (params.regimeAdx ?? 0) < 1
+  if (key === 'trendSoftPct') return (params.regimeTrend ?? 0) < 1
+  if (key === 'cumBars' || key === 'cumBuy') return (params.cumMode ?? 0) < 1
+  return false
+}
+
 // Task 19 — TP/SL percent brackets are OPTIMIZER DIMENSIONS too. They are
 // VIRTUAL keys: unlike strategy params they configure the config-level
 // tpValue/slValue (enabling tpMode/slMode='pct' for that combo) instead of
@@ -923,6 +1005,8 @@ export function optimizeBacktest(
     const isTpSl = TP_SL_KEYS.has(key)
     const d = isTpSl ? null : defsByKey.get(key)
     if (!isTpSl && (!d || d.bool)) continue
+    // Review P1 #5 — drop ranges whose controlling gate is OFF (inert dim)
+    if (!isTpSl && rangeInert(key, base.params)) continue
     const span = isTpSl ? TP_SL_SPAN : { min: d!.min, max: d!.max }
     const hasValues = Array.isArray(r?.values) && r.values.length > 0
     const min = Number(r.min)
@@ -1362,7 +1446,7 @@ export interface WalkForwardResult {
   aggregate: WalkForwardAggregate
   // hold-out stress test: the most trustworthy parameter set (modal when ≥2
   // folds agree, else the best valid OOS fold's winner) re-run on the tail
-  holdout: { from: number; to: number; netPct: number; winRate: number; profitFactor: number; maxDrawdownPct: number; trades: number } | null
+  holdout: { from: number; to: number; netPct: number; winRate: number; profitFactor: number; maxDrawdownPct: number; trades: number; regime?: RegimeGateStats } | null
   holdoutDisabled?: string // reason when no hold-out could be carved
   evaluated: number
   elapsedMs: number
@@ -1584,6 +1668,9 @@ export function walkForward(
         profitFactor: hm.profitFactor,
         maxDrawdownPct: hm.maxDrawdownPct,
         trades: hm.trades,
+        // Review P1 #7 — gate contribution on the pure hold-out: how many of
+        // the raw signals each regime veto removed in the honest window
+        regime: hm.regime,
       }
     }
   }
