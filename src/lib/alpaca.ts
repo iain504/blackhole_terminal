@@ -575,7 +575,21 @@ function snapshotToQuote(symbol: string, snap: StockSnapshot | CryptoSnapshot | 
   }
 }
 
-export async function getQuotes(symbols: string[], userId?: string): Promise<{ quotes: Quote[] } & DemoMeta> {
+/**
+ * Fetch quotes. `opts.trading: true` marks the caller as making a TRADING
+ * decision (engine guard, order sizing, bracket anchor): the simulator
+ * fallback is then DISABLED — a transient Alpaca data failure must hand back
+ * a missing symbol (reported in `degraded`), never a synthetic price. The
+ * v1.80.7 incident: the grid engine's quote call 429'd, silently received a
+ * simulated AAPL price ~34% under the market, fired Max SL on it and closed
+ * lots at a price that never existed. Display-grade callers (watchlists,
+ * heatmap, alerts) keep the sim fill so rows stay visible.
+ */
+export async function getQuotes(
+  symbols: string[],
+  userId?: string,
+  opts?: { trading?: boolean },
+): Promise<{ quotes: Quote[] } & DemoMeta & { degraded?: string[] }> {
   if (symbols.length === 0) return { quotes: [], demo: false }
   const stocks = symbols.filter((s) => !isCryptoSymbol(s))
   const cryptos = symbols.filter((s) => isCryptoSymbol(s))
@@ -643,6 +657,21 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
     }
   }
 
+  // TRADING callers: never synthesize. Whatever real quotes landed (Binance /
+  // Alpaca) are returned as-is; anything missing is reported in `degraded` so
+  // the engine can defer the decision to the next tick instead of trading on
+  // a simulator price.
+  if (opts?.trading === true) {
+    const haveT = new Set(quotes.map((q) => q.symbol))
+    const missing = symbols.filter((s) => !haveT.has(s))
+    return {
+      quotes,
+      demo: false,
+      source: usedBinance ? (missing.length < symbols.length ? 'binance+alpaca' : 'binance') : 'alpaca',
+      ...(missing.length > 0 ? { degraded: missing } : {}),
+    }
+  }
+
   if (quotes.length === 0) {
     return demoResult(
       (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
@@ -658,8 +687,8 @@ export async function getQuotes(symbols: string[], userId?: string): Promise<{ q
       simFilled = true
     }
   }
-  const source = usedBinance ? (simFilled ? 'binance+sim-fill' : 'binance') : simFilled ? 'alpaca+sim-fill' : 'alpaca'
-  return { quotes, demo: false, source }
+  const source2 = usedBinance ? (simFilled ? 'binance+sim-fill' : 'binance') : simFilled ? 'alpaca+sim-fill' : 'alpaca'
+  return { quotes, demo: false, source: source2 }
 }
 
 // ---------- News ----------

@@ -41,9 +41,21 @@
 // fail the same way; the grid stays active and the close fires on the first
 // RTH tick if the trigger still holds — static exposure overnight since
 // entries are gated too). Manual stops are NEVER gated — user intent wins.
+//
+// v1.80.8 — quote integrity (the "actual SL is smaller" bug): a transient
+// Alpaca DATA-feed failure used to fall through to the price SIMULATOR, and
+// the engine fired Max SL on a simulated AAPL quote (~34% under the market),
+// closing lots at 228.82 while the broker really filled 342.95. Three layers:
+//   1. getQuotes({ trading: true }) — engines NEVER receive simulator prices;
+//      a missing real quote DEFERS the grid (no orders, no fail-count).
+//   2. Quote sanity gate in evaluateGrid — a >12% single-tick jump vs the
+//     last trusted price is deferred; two agreeing suspect ticks (~10s) pass
+//     a real crash through. A stale lastPrice (>120s) seeds without trading.
+//   3. placeGridMarketOrder polls the broker for the REAL average fill —
+//     the reference price is only ever recorded flagged as ESTIMATED.
 import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
-import { placeOrderWithExits, resolveTradeMode, type TradeMode } from '@/lib/trading'
+import { placeOrderWithExits, pollOrderFillPrice, resolveTradeMode, type TradeMode } from '@/lib/trading'
 import { isRegularSession } from '@/lib/sessions'
 
 const GRID_CYCLE_MS = 5000
@@ -84,15 +96,26 @@ export interface GridLot {
   entryPrice: number
 }
 
+/** single-tick price deviation (vs the last trusted price) that marks a quote
+ *  as suspect — a real crash confirms itself on the next tick(s) instead */
+export const QUOTE_JUMP_PCT = 0.12
+/** lastPrice older than this is STALE — the next tick is a seed tick only */
+export const PRICE_STALE_MS = 120_000
+
 /** GridTrade.state Json shape — survives restarts. */
 export interface GridState {
   levels: number[]
   lastPrice: number | null
+  /** unix ms — when lastPrice was accepted (staleness seed ticks) */
+  lastPriceAt?: number
   lots: GridLot[]
   /** consecutive hard evaluation failures (reset on any success) */
   failCount?: number
   /** last hard-failure message (surfaced in the error stopReason) */
   lastError?: string
+  /** v1.80.8 sanity gate — consecutive suspect quotes + the observed price */
+  suspect?: number
+  suspectPx?: number
 }
 
 export function parseGridState(raw: unknown): GridState {
@@ -106,9 +129,12 @@ export function parseGridState(raw: unknown): GridState {
   return {
     levels,
     lastPrice: typeof s.lastPrice === 'number' && Number.isFinite(s.lastPrice) ? s.lastPrice : null,
+    lastPriceAt: typeof s.lastPriceAt === 'number' && Number.isFinite(s.lastPriceAt) ? s.lastPriceAt : undefined,
     lots,
     failCount: typeof s.failCount === 'number' ? s.failCount : 0,
     lastError: typeof s.lastError === 'string' ? s.lastError : undefined,
+    suspect: typeof s.suspect === 'number' && Number.isFinite(s.suspect) ? s.suspect : 0,
+    suspectPx: typeof s.suspectPx === 'number' && Number.isFinite(s.suspectPx) ? s.suspectPx : undefined,
   }
 }
 
@@ -353,6 +379,9 @@ interface OrderOutcome {
   ok: true
   price: number
   orderId: string
+  /** true when the broker never reported a fill and the reference price was
+   *  recorded — the fill note says so (honesty over false precision) */
+  estimated?: boolean
 }
 interface OrderFail {
   ok: false
@@ -360,7 +389,11 @@ interface OrderFail {
 }
 
 /** Market order through the SAME pipeline as manual/algo orders. Fill price
- *  = the broker's average fill price when reported, else `fallbackPrice`. */
+ *  = the broker's average fill price — polled for when the placement response
+ *  lands before the fill does (market orders usually do) — else `fallbackPrice`
+ *  flagged estimated. v1.80.8: the old code recorded the fallback AS the fill,
+ *  which is how a transient simulator quote (228.82) got written into the
+ *  fill history while the broker actually filled at 342.95. */
 async function placeGridMarketOrder(
   userId: string,
   mode: TradeMode,
@@ -385,8 +418,18 @@ async function placeGridMarketOrder(
     })
     if (r.results.length === 0) return { ok: false, error: r.errors[0] || 'order rejected' }
     const o = r.results[0]
-    const fp = Number(o.filled_avg_price)
-    return { ok: true, price: Number.isFinite(fp) && fp > 0 ? fp : fallbackPrice, orderId: o.id }
+    let fp = Number(o.filled_avg_price)
+    let estimated = false
+    if (!(Number.isFinite(fp) && fp > 0)) {
+      const polled = await pollOrderFillPrice(userId, mode, o.id)
+      if (polled != null) {
+        fp = polled
+      } else {
+        fp = fallbackPrice
+        estimated = true
+      }
+    }
+    return { ok: true, price: Number.isFinite(fp) && fp > 0 ? fp : fallbackPrice, orderId: o.id, estimated }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'order failed' }
   }
@@ -442,6 +485,7 @@ async function closeAndStop(
       if (r.ok) {
         const pnl = st.lots.reduce((acc, l) => acc + (short ? l.entryPrice - r.price : r.price - l.entryPrice) * l.qty, 0)
         const levelList = [...new Set(st.lots.map((l) => l.levelIndex))].sort((a, b) => a - b).join(',')
+        const estNote = r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''
         await db.gridFill.create({
           data: {
             gridTradeId: grid.id,
@@ -454,8 +498,8 @@ async function closeAndStop(
             pnl,
             orderId: r.orderId,
             note: short
-              ? `bought back all open grid lots (levels ${levelList})`
-              : `closed all open grid lots (levels ${levelList})`,
+              ? `bought back all open grid lots (levels ${levelList})${estNote}`
+              : `closed all open grid lots (levels ${levelList})${estNote}`,
           },
         })
         await db.gridTrade.update({
@@ -463,8 +507,8 @@ async function closeAndStop(
           data: {
             // atomic increment — a concurrent cycle fill can never be clobbered
             realizedPnl: { increment: pnl },
-            stopReason: `${stopReason} — closed ${st.lots.length} lot(s) at ${fmtP(r.price)}`,
-            state: { ...st, lastPrice: px, lots: [], failCount: 0 } as unknown as object,
+            stopReason: `${stopReason} — closed ${st.lots.length} lot(s) at ${fmtP(r.price)}${r.estimated ? ' (fill estimated)' : ''}`,
+            state: { ...st, lastPrice: px, lastPriceAt: Date.now(), lots: [], failCount: 0 } as unknown as object,
           },
         })
         return
@@ -504,7 +548,9 @@ export async function stopGridTrade(userId: string, gridId: string, opts?: { rea
   const st = parseGridState(grid.state)
   let price: number | null = st.lastPrice
   try {
-    const { quotes } = await getQuotes([grid.symbol], userId)
+    // trading:true — a manual close is an ORDER decision; a transient data
+    // failure must fall back to the state's last REAL price, never a sim quote
+    const { quotes } = await getQuotes([grid.symbol], userId, { trading: true })
     const q = quotes.find((x) => x.symbol === grid.symbol)
     if (q && Number.isFinite(q.price) && q.price > 0) price = q.price
   } catch { /* fall back to the state's lastPrice */ }
@@ -557,6 +603,60 @@ async function evaluateGrid(grid: {
   }
   const sellGrid = grid.direction === 'sell'
   const buyOnly = grid.direction === 'buy'
+
+  // ---- quote sanity gate (v1.80.8 — the 228.82 incident) ----
+  // getQuotes({ trading }) already guarantees keyed engines never see
+  // simulator fallbacks; this is the second line of defense against a bad
+  // tape print or a stale lastPrice after downtime. A trading decision may
+  // only run on a price that is plausible against the last TRUSTED price:
+  //   • lastPrice older than PRICE_STALE_MS → SEED tick: accept the quote,
+  //     trade nothing (the restart rule — a compressed crossing burst would
+  //     otherwise fire every level between the stale and current price)
+  //   • fresh lastPrice + |Δ| > QUOTE_JUMP_PCT → suspect tick: defer. If two
+  //     consecutive suspect quotes AGREE (within 2%) it was a real crash —
+  //     accept and evaluate normally (~10s reaction, not a false close).
+  const nowMs = Date.now()
+  if (st.lastPrice != null) {
+    const fresh = typeof st.lastPriceAt === 'number' && nowMs - st.lastPriceAt < PRICE_STALE_MS
+    if (!fresh) {
+      await db.gridTrade.updateMany({
+        where: { id: grid.id, status: 'active' },
+        data: {
+          state: {
+            ...st, lastPrice: price, lastPriceAt: nowMs, suspect: 0, suspectPx: undefined, failCount: 0,
+          } as unknown as object,
+        },
+      })
+      return
+    }
+    const dev = Math.abs(price / st.lastPrice - 1)
+    if (dev > QUOTE_JUMP_PCT) {
+      const agree = (st.suspect ?? 0) > 0
+        && typeof st.suspectPx === 'number'
+        && Math.abs(price / st.suspectPx - 1) < 0.02
+      if (!agree) {
+        const suspectCount = (st.suspect ?? 0) + 1
+        await db.gridTrade.updateMany({
+          where: { id: grid.id, status: 'active' },
+          data: {
+            state: {
+              ...st,
+              suspect: suspectCount,
+              suspectPx: price,
+              lastError: `Quote sanity gate: ${fmtP(price)} is ${(dev * 100).toFixed(1)}% from the last trusted ${fmtP(st.lastPrice)} — tick deferred`,
+            } as unknown as object,
+          },
+        })
+        console.warn(`[grid] ${grid.symbol}: suspect quote ${fmtP(price)} (${(dev * 100).toFixed(1)}% vs ${fmtP(st.lastPrice)}) — deferred tick #${suspectCount}`)
+        return
+      }
+      // two independent ticks agree — real move; fall through and trade on it
+      console.warn(`[grid] ${grid.symbol}: suspect price confirmed on a second tick (${fmtP(price)}) — accepting`)
+    }
+  }
+  st.suspect = 0
+  st.suspectPx = undefined
+  st.lastPriceAt = nowMs
 
   // v1.80.4 — RTH-only order gate: stocks submit ONLY inside the regular
   // session; crypto (symbol contains '/') trades 24/7. See the module header.
@@ -631,7 +731,7 @@ async function evaluateGrid(grid: {
           qty: lot.qty,
           pnl,
           orderId: r.orderId,
-          note: `grid TP — target level ${fmtP(target)}`,
+          note: `grid TP — target level ${fmtP(target)}${r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''}`,
         },
       })
       // persist the removed lot + realized pnl IMMEDIATELY (crash-safe: a
@@ -678,8 +778,8 @@ async function evaluateGrid(grid: {
           qty,
           orderId: r.orderId,
           note: sellGrid
-            ? `grid level ${i + 1}/${levels.length} at ${fmtP(level)} (sell-only)`
-            : `grid level ${i + 1}/${levels.length} at ${fmtP(level)}`,
+            ? `grid level ${i + 1}/${levels.length} at ${fmtP(level)} (sell-only)${r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''}`
+            : `grid level ${i + 1}/${levels.length} at ${fmtP(level)}${r.estimated ? ' — fill ESTIMATED (broker had not reported its average fill)' : ''}`,
         },
       })
       // persist the new lot IMMEDIATELY (crash-safe: a later failed order in
@@ -718,7 +818,11 @@ async function gridCycle(entry: { busy: boolean }): Promise<void> {
     const priceByKey = new Map<string, number>()
     for (const [userId, symbols] of byUser) {
       try {
-        const { quotes } = await getQuotes([...symbols], userId)
+        // v1.80.8 — trading:true: the engine makes ORDER decisions, so a
+        // transient data-feed failure must return a MISSING quote, never the
+        // simulator's price (the 228.82 incident: a 429 fed the engine a sim
+        // AAPL quote ~34% under the market and Max SL closed lots on it)
+        const { quotes } = await getQuotes([...symbols], userId, { trading: true })
         for (const q of quotes) {
           if (Number.isFinite(q.price) && q.price > 0) priceByKey.set(`${userId}|${q.symbol}`, q.price)
         }
@@ -730,7 +834,21 @@ async function gridCycle(entry: { busy: boolean }): Promise<void> {
     for (const grid of grids) {
       try {
         const price = priceByKey.get(`${grid.userId}|${grid.symbol}`)
-        if (price == null) throw new Error('no live price for symbol')
+        if (price == null) {
+          // missing real quote → DEFER (same philosophy as the RTH gate):
+          // static exposure, no orders, no fail-count — a data hiccup must
+          // not park the grid as 'error' and must never trade on a guess
+          const st = parseGridState(grid.state)
+          const note = 'No real quote this tick (data feed hiccup) — evaluation deferred'
+          if (st.lastError !== note) {
+            await db.gridTrade.updateMany({
+              where: { id: grid.id, status: 'active' },
+              data: { state: { ...st, lastError: note } as unknown as object },
+            }).catch(() => { /* row gone */ })
+          }
+          console.warn(`[grid] ${grid.symbol}: no real quote this tick — deferred`)
+          continue
+        }
         await evaluateGrid(grid, price)
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)

@@ -2981,3 +2981,22 @@ Work Log:
 
 Stage Summary:
 - TP/SL are first-class backtest optimizer dimensions (grid, sensitivity/plateau, walk-forward OOS) with UI rows, honest 'TP %'/'SL %' labels, and one-click apply into the run setup. Version v1.80.8. Probe script kept in scripts-tmp/.
+
+---
+Task ID: 21
+Agent: Z.ai Code (main)
+Task: "Grid Auto Engine has a bug. Actual SL is smaller." — the grid engine fired Max SL and closed lots at 228.82 while the planned SL was 284.23 (and the real broker fill was ~342.95). Diagnose, fix, E2E, push.
+
+Work Log:
+- Forensics (DB was already wiped by a sandbox reset — reconstructed from the user's paste): BUY 344.76 = a REAL Alpaca fill (level 12 of the 308.95–377.61 auto plan, SL 8% → 284.23); the "SELL max SL 228.82" is exactly today's SIMULATOR AAPL price (sim seed 228.93 in reproduction), while the trade-history row shows the real close 344.76→342.95 (−$1.81). Chain: a transient Alpaca DATA-feed failure made getQuotes fall through to the price simulator → the engine fired Max SL on a synthetic price ~34% under the market → the market SELL went through the (healthy) TRADING API → the POST response had no filled_avg_price yet → the engine recorded the fallback price (the fake quote) as the fill → phantom −115.96 in grid details vs real −1.81 in history.
+- Fix 1 — getQuotes(symbols, userId, { trading: true }) (alpaca.ts): trading-decision callers NEVER receive simulator prices; missing symbols come back as `degraded: [...]` instead. Display-grade callers keep the sim fill.
+- Fix 2 — grid-engine gridCycle: quotes fetched with trading:true; a missing real quote now DEFERS the grid (mirrors the RTH gate: static exposure, no orders, no fail-count so an outage can't park grids as 'error') with a persisted state note "No real quote this tick (data feed hiccup) — evaluation deferred". stopGridTrade (manual close price) also trading:true.
+- Fix 3 — quote sanity gate in evaluateGrid (defense in depth): lastPriceAt staleness (>120s) → SEED tick (accept price, trade nothing — also prevents the compressed crossing burst after downtime); fresh lastPrice + >12% single-tick deviation (QUOTE_JUMP_PCT) → suspect tick deferred; two consecutive suspect quotes agreeing within 2% pass a real crash through (~10s reaction). GridState += lastPriceAt/suspect/suspectPx.
+- Fix 4 — placeGridMarketOrder polls the broker (new pollOrderFillPrice in trading.ts, 3×400ms via getOrderById) for the REAL average fill instead of recording the reference price as fact; unresolved fills are flagged `estimated` and say so in the fill note + stopReason.
+- Same landmine defused in the sibling engines: algo-engine % TP/SL bracket anchor and strategy.ts rule-fire % exits now trading:true (missing quote → the honest "no live quote" paths).
+- Probe (scripts-tmp/qa-grid-quote-gate.mjs + cleanup): QA user w/ fake paper keys; Scenario A recreates the incident (AAPL 308.95–377.61, planted lot @344.76, SL 284.23) — BEFORE the fix the engine SL-closed it at sim 228.93 within 5s (observed on the stale pre-restart server); AFTER: grid stays active, 0 fills, lot intact, state note "No real quote this tick…". Scenario B (BTC/USD, real keyless Binance quotes): seeded lastPrice 15% under market → dev.log shows "suspect quote 80232.47 (17.6% vs 68197.60) — deferred tick #1" then "confirmed on a second tick — accepting" → lastPrice converges to the real price, suspect cleared, active.
+- Browser E2E (agent-browser, QA session): Grid tab renders both rows (AAPL active · 1 lot · fills 0 · SL ≈284.23; BTC live real price); Details dialog: "No fills yet", OPEN LOTS 1, TOTAL P/L +0.01 — the phantom max-SL sell is structurally impossible now; 390px mobile no horizontal overflow; footer sticky; ZERO console/page errors. QA user + grids + fills deleted.
+- Ops note: the engine interval survives Next dev HMR (global __ttGridEngine guard) — the first probe run "failed" because the stale pre-fix timer was still running; a dev-server restart loaded the fix. Left as-is (restart semantics are fine for dev).
+
+Stage Summary:
+- The grid engine can no longer trade on synthetic prices: sim fallback is banned for trading decisions (degraded → defer), a >12% single-tick jump needs a confirming second tick, stale lastPrice seeds without trading, and fill prices are broker-polled or flagged ESTIMATED. The reported "actual SL is smaller" (228.82 vs 284.23 vs real 342.95) is fixed at all three layers. Version v1.80.9.

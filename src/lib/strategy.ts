@@ -225,7 +225,10 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
         const needsRef = r.tpMode === 'pct' || r.slMode === 'pct'
         let ref: number | null = null
         if (needsRef) {
-          const { quotes } = await getQuotes([symbol], userId)
+          // v1.80.8 — trading:true: % exits anchor to this quote, so a data
+          // hiccup must fail the rule honestly (no quote → failNote below),
+          // never anchor legs to a simulator price
+          const { quotes } = await getQuotes([symbol], userId, { trading: true })
           ref = quotes.find((q) => q.symbol === symbol)?.price ?? null
           if (ref == null) failNote = 'No live quote available to resolve % TP/SL'
         }

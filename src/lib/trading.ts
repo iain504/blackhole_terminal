@@ -1597,6 +1597,35 @@ export async function getOrderById(userId: string, mode: TradeMode, orderId: str
   return { data: null, status: last?.status || 404, error: last?.error || 'Order not found on paper or live', mode }
 }
 
+/**
+ * Poll an order for its REAL average fill price. A market order returns from
+ * POST before the fill lands — `filled_avg_price` in the placement response
+ * is usually empty, and the v1.80.7 grid incident recorded the reference
+ * quote as the fill while the broker actually filled ~34% away (the quote
+ * itself was a transient simulator fallback). Engine callers now poll a few
+ * hundred ms for the broker's own number; a canceled/rejected order that can
+ * never fill returns null so the caller can fail honestly.
+ */
+export async function pollOrderFillPrice(
+  userId: string,
+  mode: TradeMode,
+  orderId: string,
+  attempts = 3,
+  delayMs = 400,
+): Promise<number | null> {
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, delayMs))
+    const r = await getOrderById(userId, mode, orderId)
+    const o = r.data
+    if (!o) continue
+    const fp = Number(o.filled_avg_price)
+    if (Number.isFinite(fp) && fp > 0) return fp
+    const st = String(o.status || '')
+    if (st === 'canceled' || st === 'rejected' || st === 'expired') return null
+  }
+  return null
+}
+
 // ---------- attach TP/SL to an EXISTING position (chart [TP]/[SL] drag-add) ----------
 
 export interface AttachExitsResult {

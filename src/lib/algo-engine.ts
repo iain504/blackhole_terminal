@@ -584,7 +584,10 @@ async function cycle(runId: string) {
           let spreadBps: number | null = null
           if (run.tpMode === 'pct' || run.slMode === 'pct' || run.sizingMode === 'risk') {
             try {
-              const { quotes } = await getQuotes([run.symbol], run.userId)
+              // v1.80.8 — trading:true: the anchor prices TP/SL bracket legs,
+              // so a transient data failure must yield NO quote (the honest
+              // "entering without bracket legs" path below), never a sim price
+              const { quotes } = await getQuotes([run.symbol], run.userId, { trading: true })
               const q = quotes.find((x) => x.symbol === run.symbol)
               ref = q?.price ?? null
               const b = q?.bid
