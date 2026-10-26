@@ -12,8 +12,8 @@
 //     and recreated as paused via POST /api/algo/rules-import (never auto-armed)
 //   • load entries back into the run-setup form, or start them directly as
 //     live runs (paper mode only — mirrors the POST /api/algo guards)
-import { useRef, useState } from 'react'
-import { Copy, Download, FileJson, PauseCircle, RotateCcw, TriangleAlert, Upload } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { ChevronDown, Copy, Download, FileJson, PauseCircle, RotateCcw, TriangleAlert, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -44,8 +44,17 @@ export function downloadJsonFile(filename: string, data: unknown) {
 // Task 9-n — export no longer relies on the bare anchor download: sandboxed
 // preview iframes silently swallow blob downloads (no `allow-downloads`), so
 // the user saw "Config exported" and NO file — and with no file, import had
-// nothing to import. The dialog ALWAYS shows the JSON (copy path pairs with
-// the import dialog's paste path) and still offers a real download.
+// nothing to import. The dialog ALWAYS offers a real download + a copy path
+// (pairs with the import dialog's paste path).
+//
+// Task 19 — the raw JSON is NO LONGER rendered by default: "export all" blobs
+// (every run + drawer rule) can be thousands of lines, and the unclamped
+// textarea pushed the Copy/Download actions below the fold where the dialog
+// could not scroll to them. The dialog now leads with a compact summary
+// (what's inside + size) and the actions, with the JSON behind an opt-in
+// "Show JSON" preview (max-height, internally scrollable). The textarea stays
+// mounted (visually hidden) so the execCommand copy fallback still works when
+// sandboxed iframes deny the async clipboard.
 
 export interface AlgoExportDialogProps {
   open: boolean
@@ -58,7 +67,22 @@ export function AlgoExportDialog({ open, onOpenChange, filename, data }: AlgoExp
   const { toast } = useToast()
   const taRef = useRef<HTMLTextAreaElement | null>(null)
   const [copied, setCopied] = useState(false)
+  // Task 19 — the JSON preview starts COLLAPSED every time the dialog opens;
+  // the summary + actions are the primary content now.
+  const [showJson, setShowJson] = useState(false)
+  useEffect(() => {
+    if (!open) setShowJson(false)
+  }, [open])
   const json = open ? JSON.stringify(data ?? null, null, 2) : ''
+
+  // compact summary of what the envelope contains (Task 19) — derived straight
+  // from the export payload so it always matches what would be downloaded
+  const envelope = (data ?? null) as
+    | { configs?: { name?: string; enabled?: boolean }[]; rules?: unknown[] }
+    | null
+  const configs = Array.isArray(envelope?.configs) ? envelope?.configs ?? [] : []
+  const rules = Array.isArray(envelope?.rules) ? envelope?.rules : []
+  const bytes = new Blob([json]).size
 
   const copyJson = async () => {
     try {
@@ -96,20 +120,47 @@ export function AlgoExportDialog({ open, onOpenChange, filename, data }: AlgoExp
             Export algo configs
           </DialogTitle>
           <DialogDescription className="text-xs">
-            <span className="font-mono text-zinc-400">{filename}</span> — download the file, or copy the JSON
-            (embeds/previews may block downloads; the copy pairs with Import configs → paste).
+            Download the file, or copy the JSON — embeds/previews may block downloads;
+            the copy pairs with Import configs → paste.
           </DialogDescription>
         </DialogHeader>
-        <Textarea
-          ref={taRef}
-          readOnly
-          value={json}
-          onFocus={(e) => e.currentTarget.select()}
-          className="min-h-44 resize-y border-zinc-800 bg-zinc-950 font-mono text-[10px] leading-snug"
-          aria-label="Exported config JSON"
-        />
+        {/* Task 19 — compact content summary instead of the raw JSON blob */}
+        <div className="rounded-md border border-zinc-800 bg-zinc-950/60 p-3">
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+            <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-300">
+              {configs.length} config{configs.length === 1 ? '' : 's'}
+            </Badge>
+            {rules.length > 0 && (
+              <Badge variant="outline" className="border-violet-500/40 text-[10px] text-violet-300">
+                {rules.length} rule{rules.length === 1 ? '' : 's'}
+              </Badge>
+            )}
+            <span className="tabular-nums">{bytes.toLocaleString('en-US')} bytes · v2 envelope</span>
+          </div>
+          {configs.length > 0 && (
+            <ul className="mt-2 flex max-h-20 flex-wrap gap-1 overflow-y-auto terminal-scroll">
+              {configs.map((c, i) => (
+                <li key={i}>
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      'max-w-full text-[10px] font-normal',
+                      c.enabled ? 'border-emerald-500/40 text-emerald-300' : 'border-zinc-800 text-zinc-400',
+                    )}
+                    title={c.enabled ? 'exported enabled' : 'exported disabled/paused'}
+                  >
+                    {c.name || `config ${i + 1}`}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
         <DialogFooter className="flex-row items-center gap-2 sm:justify-between">
-          <span className="text-[10px] text-zinc-500">{new Blob([json]).size.toLocaleString('en-US')} bytes · v2 envelope</span>
+          <span className="text-[10px] text-zinc-500">
+            {filename ? <span className="font-mono">{filename}</span> : 'algo configs'}
+          </span>
           <span className="flex items-center gap-2">
             <Button
               variant="outline"
@@ -137,6 +188,38 @@ export function AlgoExportDialog({ open, onOpenChange, filename, data }: AlgoExp
             </Button>
           </span>
         </DialogFooter>
+
+        {/* Task 19 — opt-in raw JSON: collapsed so it can never push the
+            actions off-screen; max-height + internal scroll when expanded.
+            The textarea is always mounted (sr-only while collapsed) so the
+            execCommand copy fallback keeps working when the clipboard API
+            is denied by sandboxed iframes. */}
+        <div>
+          <button
+            type="button"
+            className="flex w-full items-center gap-1.5 rounded-md px-1 py-1 text-[11px] text-zinc-500 hover:text-zinc-300"
+            onClick={() => setShowJson((v) => !v)}
+            aria-expanded={showJson}
+          >
+            <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', showJson && 'rotate-180')} aria-hidden />
+            {showJson ? 'Hide JSON' : 'Show JSON'}
+          </button>
+          <Textarea
+            ref={taRef}
+            readOnly
+            value={json}
+            onFocus={(e) => e.currentTarget.select()}
+            className={cn(
+              'border-zinc-800 bg-zinc-950 font-mono text-[10px] leading-snug',
+              showJson
+                ? 'mt-1 max-h-56 resize-none overflow-y-auto terminal-scroll'
+                : 'sr-only',
+            )}
+            aria-label="Exported config JSON"
+            aria-hidden={!showJson}
+            tabIndex={showJson ? 0 : -1}
+          />
+        </div>
       </DialogContent>
     </Dialog>
   )

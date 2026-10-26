@@ -2950,3 +2950,17 @@ Work Log:
 
 Stage Summary:
 - Auto Grid = watchlist → scan → reasons → curated auto-start, with the full lifecycle (planned end, guards, suspend/resume/stop) and persisted "why" history. Commit fee241e (v1.80.6). PUSH PENDING — the stored GitHub PAT still returns 401 (rotated/expired in the earlier snapshot wipe); will push the moment a fresh PAT arrives.
+
+---
+Task ID: 19
+Agent: Z.ai Code (main)
+Task: "The window pop up by clicking export in Algo Trading does not need to show the json content. it is too long and prevent me to scroll to the bottom for download all." — rework the export dialog, verify, push.
+
+Work Log:
+- Root cause: AlgoExportDialog (AlgoConfigIO.tsx) rendered the FULL export JSON in an unclamped resize-y Textarea above the action footer. "Export all run configs" with several runs + drawer rules produces a multi-thousand-line blob, so the dialog grew past the viewport and the Copy/Download buttons sat below the fold with no scroll to reach them.
+- Rework (v1.80.7): the dialog now leads with a compact summary card derived from the envelope itself (N configs / N rules badges, per-config name chips incl. enabled-state tint, byte size, v2 envelope) followed immediately by the Copy JSON + Download .json actions. The raw JSON moved behind an opt-in "Show JSON" collapsible (chevron toggle, resets collapsed on each open); when expanded the Textarea is clamped to max-h-56 with internal scroll so it can never push anything off-screen. The textarea stays mounted with sr-only while collapsed so the execCommand copy fallback (sandboxed iframes denying the async clipboard) keeps working; tabIndex/aria-hidden track visibility.
+- Workspace incident mid-task: a platform snapshot restore chmod'ed 66 tracked files to 755 (mode-only, zero content diffs) and wiped untracked scripts-tmp. Verified no content drift, `git checkout`-ed the 66 mode-only files (kept the Task 19 edit), recreated the QA scripts.
+- E2E (agent-browser, QA user + 6 stopped algo runs across 4 strategies — stopped rows are engine-inert so the fake keys never touch the broker): Export all at 1280×800 → dialog 346px (was unbounded), summary "6 configs · 5,013 bytes · v2 envelope", Download fully visible (y=479), JSON collapsed; Show JSON → textarea 224px, internally scrollable, Download still visible; Hide → back to 346px; 1280×560 short viewport → Download STILL fully visible (the exact reported failure, now impossible by construction); single-run export → "1 config" + correct enabled flag; Copy JSON → button flips to "Copied — copy again" (clipboard path OK); 390×844 mobile → dialog 420px, Download visible, collapsed by default. ZERO console/page errors. QA user + 6 runs + watchlist deleted.
+
+Stage Summary:
+- Algo export dialog is now action-first: summary + Copy/Download always visible at any viewport height, JSON opt-in and clamped. Props/interface unchanged (single call site in AlgoTab). Version v1.80.7. QA scripts kept uncommitted in scripts-tmp/ for reuse.
