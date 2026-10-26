@@ -7,7 +7,7 @@
 // account exists the server answers 409 and the affordance points at
 // Settings → Backup & Restore instead.
 
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   BarChart3,
@@ -66,6 +66,40 @@ export default function AuthForms({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+
+  // Task 27 — smooth 2FA: ref to the hidden <input> that drives the OTP slots
+  // (focus() lands the caret on the first digit without clicking a slot).
+  const otpInputRef = useRef<HTMLInputElement | null>(null);
+  // Task 27 — the last code we AUTO-submitted; keyed by VALUE so a full code
+  // pasted OVER another full code (6→6 chars, no length transition) still
+  // fires, while an unchanged code never resubmits itself.
+  const lastAutoSubmitted = useRef('');
+
+  // Task 27 — the moment the 6-digit step appears (login verify + register
+  // setup), park focus on the FIRST digit so the user can just start typing
+  // the code from their authenticator. A short delay lets the step-2 content
+  // (QR image, labels) finish mounting first.
+  useEffect(() => {
+    if (step !== 2) return;
+    const focusTimer = window.setTimeout(() => {
+      otpInputRef.current?.focus();
+    }, 50);
+    return () => window.clearTimeout(focusTimer);
+  }, [step]);
+
+  // Task 27 — auto-submit as soon as a (new) 6-digit code is complete — typed,
+  // pasted, or autofilled — so sign-in/sign-up needs no extra button click.
+  // The value latch prevents resubmitting the same code (e.g. while the 401
+  // from a wrong code is still in flight / displayed); editing any digit
+  // produces a different value and re-arms the auto-submit. The Verify button
+  // stays available for a deliberate retry of the same code.
+  useEffect(() => {
+    if (loading || step !== 2 || code.length !== 6) return;
+    if (lastAutoSubmitted.current === code) return;
+    lastAutoSubmitted.current = code;
+    if (mode === 'register') void submitRegister(code);
+    else void submitVerify(code);
+  }, [code, step, mode, loading, submitRegister, submitVerify]);
 
   // ---- restore-from-backup dialog (Task 9-r) ----
   type RestorePhase = 'check' | 'ready' | 'unavailable' | 'done';
@@ -235,9 +269,12 @@ export default function AuthForms({
     }
   }
 
-  async function handleRegister(e: React.FormEvent) {
-    e.preventDefault();
-    if (!setup || code.length !== 6) {
+  // Task 27 — the core create-account call; `completed` is the just-finished
+  // code handed over by the OTP auto-submit (dodges stale-state timing).
+  async function submitRegister(completed?: string) {
+    if (loading) return; // auto-submit can race a click/Enter — one shot only
+    const otp = completed ?? code;
+    if (!setup || otp.length !== 6) {
       setError('Enter the 6-digit code from your authenticator.');
       return;
     }
@@ -251,7 +288,7 @@ export default function AuthForms({
           username: username.trim(),
           password,
           totpSecret: setup.secret,
-          totpCode: code,
+          totpCode: otp,
         }),
       });
       if (!res.ok)
@@ -267,9 +304,16 @@ export default function AuthForms({
     }
   }
 
-  async function handleVerify(e: React.FormEvent) {
+  function handleRegister(e: React.FormEvent) {
     e.preventDefault();
-    if (!ticket || code.length !== 6) {
+    void submitRegister();
+  }
+
+  // Task 27 — the core login-verify call; `completed` same as submitRegister.
+  async function submitVerify(completed?: string) {
+    if (loading) return; // auto-submit can race a click/Enter — one shot only
+    const otp = completed ?? code;
+    if (!ticket || otp.length !== 6) {
       setError('Enter the 6-digit code from your authenticator.');
       return;
     }
@@ -279,7 +323,7 @@ export default function AuthForms({
       const res = await fetch('/api/auth/login/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ticket, code }),
+        body: JSON.stringify({ ticket, code: otp }),
       });
       if (!res.ok)
         throw new Error(
@@ -292,6 +336,11 @@ export default function AuthForms({
     } finally {
       setLoading(false);
     }
+  }
+
+  function handleVerify(e: React.FormEvent) {
+    e.preventDefault();
+    void submitVerify();
   }
 
   async function copySecret() {
@@ -470,6 +519,7 @@ export default function AuthForms({
               <div className="flex flex-col items-center gap-2">
                 <Label className="text-zinc-300">Enter 6-digit code</Label>
                 <InputOTP
+                  ref={otpInputRef}
                   maxLength={6}
                   value={code}
                   onChange={setCode}
@@ -505,6 +555,7 @@ export default function AuthForms({
                   Enter the 6-digit code from your authenticator app
                 </p>
                 <InputOTP
+                  ref={otpInputRef}
                   maxLength={6}
                   value={code}
                   onChange={setCode}

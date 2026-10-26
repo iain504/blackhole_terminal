@@ -3113,3 +3113,18 @@ Work Log:
 
 Stage Summary:
 - Auto Grid now sizes by RISK MONEY: '% of equity' gives every symbol's grid the same dollar allocation with qty derived per symbol (TSLA vs ECHO end up with the same money behind), unaffordable whole-share stocks are skipped with the minimum % needed, crypto honors the $1/level broker minimum, and a start batch can never deploy more than 100% of equity. Fixed-qty mode remains for back-compat. Version v1.82.0.
+
+---
+Task ID: 27
+Agent: Z.ai Code (main)
+Task: User ask — make sign up / login smoother: when the 6-digit 2FA step appears, focus should land on the FIRST digit automatically, and when all six numbers are entered the form should submit itself (no Verify/Create-account click).
+
+Work Log:
+- AuthForms.tsx refactor: handleRegister/handleVerify split into core submitRegister(completed?)/submitVerify(completed?) (button onSubmit wrappers + auto-submit share one path; `completed` carries the just-finished code so no stale-state timing). Both gain a `if (loading) return` guard so auto-submit can never race a click/Enter into a double POST.
+- Autofocus: otpInputRef (the hidden [data-input-otp] <input> behind input-otp's slots — verified the wrapper passes ref through, React 19 ref-as-prop → forwardRef) + a step-change effect that focus()es it 50ms after step 2 mounts. Works for BOTH login verify and register setup.
+- Auto-submit: FIRST attempt used input-otp's onComplete — browser E2E caught a real edge: it only fires on a <6→6 LENGTH transition, so a full code pasted/autofilled OVER another full code (6→6, e.g. fixing a wrong code via paste or password-manager autofill) silently never submitted. Replaced with a value-latched effect: fires when step===2 && code.length===6 && code !== lastAutoSubmitted.current; latch keyed by VALUE (6→6 overwrite fires; the same code never resubmits while its 401 is showing; editing any digit re-arms; StrictMode-safe). Verify/Create-account button stays for a deliberate same-code retry.
+- Browser E2E (agent-browser, QA user created via Prisma scrypt hash + raw-base32 TOTP secret — legacy plaintext passthrough; codes computed by replicating totpCodeAt): desktop 1440×900 — login: step2 autofocus OK (activeElement === [data-input-otp]); typed wrong 000000 → auto POST /api/auth/login/verify 401 + "Invalid 2FA code" shown, no click; correct code filled OVER the full wrong code → auto POST 200 → terminal rendered as qa-otp-ux; register (ALLOW_REGISTRATION=true temporarily, secret read from the manual-entry <code> DOM, TOTP computed): step2 autofocus OK → typed 6 digits → auto POST /api/auth/register 200 → terminal as qa-otp-reg. Mobile 390×844 — autofocus OK, OTP row 240px fits, screenshots saved (qa-otp-ux-register.png / qa-otp-ux-mobile.png). Zero page errors, zero dev.log errors.
+- Cleanup: both QA users + watchlists deleted, ALLOW_REGISTRATION removed from .env (server restarted; 2fa/setup 403 confirms closed again), rate-limit buckets untouched (3 of 5 reg budget used).
+
+Stage Summary:
+- Sign-in/sign-up 2FA is now zero-click: the first digit is focused the moment the code step appears, and a complete 6-digit code submits itself (typed, pasted, or autofilled-over — the 6→6 overwrite edge caught by E2E and fixed via the value-latch). Double-submit is impossible (loading guard + value latch). Version v1.82.1.
