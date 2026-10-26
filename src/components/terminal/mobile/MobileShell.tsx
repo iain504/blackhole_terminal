@@ -2,17 +2,18 @@
 
 // Mobile shell (Task 56) — clones the TradingView mobile app chrome from the
 // user's screen dumps (IMG_1748 / IMG_1749): a fixed bottom tab bar
-// (Watchlist · Chart · Trades · Report · Menu) with safe-area padding and a
-// stack of full-screen views. Only rendered below 768px (useIsMobile) — the
-// desktop terminal is untouched. State (watchlists, tabs, alerts, strategies)
-// is the SAME zustand store the desktop uses, so edits from either side stay
-// in sync and the layout autosave keeps working.
+// (Watchlist · Chart · Grid · Algo · Trades · Report · Menu) with safe-area
+// padding and a stack of full-screen views. Only rendered below 768px
+// (useIsMobile) — the desktop terminal is untouched. State (watchlists, tabs,
+// alerts, strategies) is the SAME zustand store the desktop uses, so edits
+// from either side stay in sync and the layout autosave keeps working.
 
 import { useCallback, useEffect, useState } from 'react'
 import { useTerminal } from '@/store/terminal'
 import { MobileWatchlist } from './MobileWatchlist'
 import { MobileChartView } from './MobileChartView'
 import PositionsTab from '../tabs/PositionsTab'
+import GridTab from '../tabs/GridTab'
 import ReportTab from '../tabs/ReportTab'
 import HeatmapTab from '../tabs/HeatmapTab'
 import CalendarTab from '../tabs/CalendarTab'
@@ -23,10 +24,10 @@ import { cn } from '@/lib/utils'
 import {
   Bookmark, CandlestickChart, Layers, ChartColumnBig, Menu as MenuIcon,
   Settings2, BellRing, Bot, Flame, CalendarDays, LogOut, Home,
-  ChevronLeft, ChevronRight, ShieldCheck, Rocket,
+  ChevronLeft, ChevronRight, ShieldCheck, Rocket, LayoutGrid,
 } from 'lucide-react'
 
-type MobileView = 'watchlist' | 'chart' | 'trades' | 'report' | 'menu' | 'tool' | 'algo'
+type MobileView = 'watchlist' | 'chart' | 'grid' | 'trades' | 'report' | 'menu' | 'tool' | 'algo'
 type ToolTab = 'heatmap' | 'calendar' | 'algo'
 
 const TOOL_TITLES: Record<ToolTab, string> = {
@@ -39,9 +40,13 @@ const VIEW_KEY = 'tt:mobileView'
 
 // 'algo' is a first-class bottom-nav tab (Task 75) — the algo workspace was
 // previously buried in Menu → Algo Trading; it now sits next to Trades/Report.
+// 'grid' joined it (v1.80.5) — Grid Trading was entirely absent from mobile
+// before; the full GridTab mission-control (monitor / stop / edit / export /
+// import-start) now renders as a first-class tab next to Chart.
 const NAV: { id: Exclude<MobileView, 'tool'>; label: string; icon: typeof Bookmark }[] = [
   { id: 'watchlist', label: 'Watchlist', icon: Bookmark },
   { id: 'chart', label: 'Chart', icon: CandlestickChart },
+  { id: 'grid', label: 'Grid', icon: LayoutGrid },
   { id: 'algo', label: 'Algo', icon: Rocket },
   { id: 'trades', label: 'Trades', icon: Layers },
   { id: 'report', label: 'Report', icon: ChartColumnBig },
@@ -66,7 +71,7 @@ export function MobileShell({
     if (typeof window === 'undefined') return 'watchlist'
     try {
       const v = localStorage.getItem(VIEW_KEY)
-      if (v && ['watchlist', 'chart', 'algo', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
+      if (v && ['watchlist', 'chart', 'grid', 'algo', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
     } catch {
       /* private mode */
     }
@@ -163,6 +168,16 @@ export function MobileShell({
           </div>
         )}
 
+        {/* first-class Grid tab (v1.80.5) — the full GridTab mission-control:
+            live grid list, P&L, fills, stop / edit-when-flat / delete and
+            export-import (import can START a grid without the chart tool).
+            Creation via the chart's two-click Grid tool stays desktop-only. */}
+        {view === 'grid' && (
+          <div className="min-h-0 flex-1">
+            <GridTab />
+          </div>
+        )}
+
         {view === 'tool' && (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="flex h-11 shrink-0 items-center gap-1 border-b border-zinc-800 bg-zinc-900/80 px-1.5">
@@ -204,6 +219,7 @@ export function MobileShell({
               {menuRow('Alerts', BellRing, onOpenAlerts, { badge: activeAlerts, badgeClass: 'border-amber-500/40 text-amber-400' })}
               {menuRow('Strategy orders', Bot, onOpenStrategies, { badge: armedStrategies, badgeClass: 'border-violet-500/40 text-violet-400' })}
               {menuRow('Algo Trading', Rocket, () => { setToolTab('algo'); go('tool') })}
+              {menuRow('Grid Trading', LayoutGrid, () => go('grid'))}
               {menuRow('Heat Map', Flame, () => { setToolTab('heatmap'); go('tool') })}
               {menuRow('Economic Calendar', CalendarDays, () => { setToolTab('calendar'); go('tool') })}
               {onExit && menuRow('Back to landing page', Home, onExit)}
