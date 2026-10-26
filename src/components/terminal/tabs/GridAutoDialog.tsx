@@ -5,6 +5,10 @@
 // user pick which accepted grids to start, then start them. The grid engine
 // owns the rest: percent SL/TP guards + the planned autoEndAt force-stop, and
 // every grid can be paused/resumed/stopped from the Grid tab at any time.
+// Task 18-b — RISK-MONEY sizing: default '% of equity' gives every symbol's
+// grid the SAME dollar allocation (a fixed qty puts 10–100× more money behind
+// a $400 stock than a $4 stock). The report shows the resolved qty + the
+// money behind per symbol; the start batch is capped at 100% of equity.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Loader2, Play, ScanSearch, Sparkles, Info, CircleAlert, History } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
@@ -41,6 +45,11 @@ interface AutoPlan {
   tpTriggerApprox: number
   maxEndDays: number
   preset: string
+  sizing?: 'fixed' | 'equityPct'
+  sizingPct?: number
+  equityAtPlan?: number
+  allocation?: number
+  moneyBehind?: number
   trendPct: number
   rangePct: number
   crossovers: number
@@ -72,6 +81,9 @@ interface AutoResponse {
   watchlist: string
   preset: string
   presetLabel: string
+  sizing: { mode: 'fixed'; qty: number } | { mode: 'equityPct'; pct: number; equity: number }
+  plannedDeployment: number
+  plannedDeploymentPct: number | null
   maxEndDays: number
   days: number
   timeframe: string
@@ -125,7 +137,9 @@ export default function GridAutoDialog({
   const activeWatchlistId = useTerminal((s) => s.activeWatchlistId)
 
   const [watchlistId, setWatchlistId] = useState<string>('')
+  const [sizingMode, setSizingMode] = useState<'fixed' | 'equityPct'>('equityPct')
   const [qty, setQty] = useState('1')
+  const [equityPct, setEquityPct] = useState('5')
   const [preset, setPreset] = useState<string>('balanced')
   const [endDays, setEndDays] = useState('30')
   const [windowDays, setWindowDays] = useState('60')
@@ -162,10 +176,18 @@ export default function GridAutoDialog({
   const startableCount = selected.size
 
   const scan = async () => {
-    const q = Number(qty)
-    if (!Number.isFinite(q) || q <= 0) {
-      toast({ title: 'Quantity per grid must be a positive number', variant: 'destructive' })
-      return
+    if (sizingMode === 'fixed') {
+      const q = Number(qty)
+      if (!Number.isFinite(q) || q <= 0) {
+        toast({ title: 'Quantity per grid must be a positive number', variant: 'destructive' })
+        return
+      }
+    } else {
+      const p = Number(equityPct)
+      if (!Number.isFinite(p) || p < 0.1 || p > 100) {
+        toast({ title: 'Equity % per grid must be between 0.1 and 100', variant: 'destructive' })
+        return
+      }
     }
     setScanning(true)
     setReport(null)
@@ -176,7 +198,8 @@ export default function GridAutoDialog({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           watchlistId,
-          qtyPerGrid: q,
+          sizing: sizingMode,
+          ...(sizingMode === 'fixed' ? { qtyPerGrid: Number(qty) } : { equityPct: Number(equityPct) }),
           preset,
           maxEndDays: Math.round(Number(endDays) || 30),
           days: Math.round(Number(windowDays) || 60),
@@ -214,7 +237,8 @@ export default function GridAutoDialog({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           watchlistId,
-          qtyPerGrid: Number(qty),
+          sizing: sizingMode,
+          ...(sizingMode === 'fixed' ? { qtyPerGrid: Number(qty) } : { equityPct: Number(equityPct) }),
           preset,
           maxEndDays: Math.round(Number(endDays) || 30),
           days: Math.round(Number(windowDays) || 60),
@@ -286,14 +310,53 @@ export default function GridAutoDialog({
             </Select>
           </div>
           <div className="space-y-1.5">
-            <Label className="text-[11px] text-zinc-400">Qty / grid level</Label>
-            <Input
-              value={qty}
-              onChange={(e) => setQty(e.target.value)}
-              inputMode="decimal"
-              className="h-8 border-zinc-800 bg-zinc-900 text-xs"
-              aria-label="Quantity per grid level"
-            />
+            <div className="flex items-center justify-between gap-1">
+              <Label className="text-[11px] text-zinc-400">Sizing</Label>
+              <div className="flex overflow-hidden rounded border border-zinc-800" role="group" aria-label="Position sizing mode">
+                <button
+                  type="button"
+                  onClick={() => setSizingMode('equityPct')}
+                  aria-pressed={sizingMode === 'equityPct'}
+                  className={cn(
+                    'px-1.5 py-0.5 text-[9px] font-medium transition-colors',
+                    sizingMode === 'equityPct' ? 'bg-emerald-600 text-white' : 'bg-zinc-900 text-zinc-500 hover:text-zinc-300',
+                  )}
+                >
+                  % equity
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSizingMode('fixed')}
+                  aria-pressed={sizingMode === 'fixed'}
+                  className={cn(
+                    'px-1.5 py-0.5 text-[9px] font-medium transition-colors',
+                    sizingMode === 'fixed' ? 'bg-emerald-600 text-white' : 'bg-zinc-900 text-zinc-500 hover:text-zinc-300',
+                  )}
+                >
+                  fixed qty
+                </button>
+              </div>
+            </div>
+            {sizingMode === 'fixed' ? (
+              <Input
+                value={qty}
+                onChange={(e) => setQty(e.target.value)}
+                inputMode="decimal"
+                className="h-8 border-zinc-800 bg-zinc-900 text-xs"
+                aria-label="Quantity per grid level"
+              />
+            ) : (
+              <div className="relative">
+                <Input
+                  value={equityPct}
+                  onChange={(e) => setEquityPct(e.target.value)}
+                  inputMode="decimal"
+                  className="h-8 border-zinc-800 bg-zinc-900 pr-6 text-xs"
+                  aria-label="Percent of equity per grid"
+                />
+                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-zinc-500">%</span>
+              </div>
+            )}
           </div>
           <div className="space-y-1.5">
             <Label className="text-[11px] text-zinc-400">Guard preset</Label>
@@ -332,6 +395,12 @@ export default function GridAutoDialog({
           </div>
         </div>
 
+        <p className="text-[10px] leading-snug text-zinc-600">
+          {sizingMode === 'equityPct'
+            ? '% of equity gives EVERY symbol\u2019s grid the same dollar allocation — the qty per level is derived per symbol (TSLA vs ECHO end up with the same money behind). Needs Alpaca keys; expensive stocks are skipped honestly when the budget can\u2019t fund 1 whole share per level. The batch never deploys more than 100% of equity.'
+            : 'Fixed qty uses the SAME quantity per level on every symbol — the money behind a full grid scales with the share price (a $400 stock carries ~100\u00d7 more than a $4 stock).'}
+        </p>
+
         <div className="flex items-center gap-2">
           <Button
             size="sm"
@@ -345,9 +414,21 @@ export default function GridAutoDialog({
           {report && (
             <span className="text-[11px] text-zinc-500">
               {report.days}d {report.timeframe} window · {report.presetLabel} · ends after {report.maxEndDays}d
+              {report.sizing?.mode === 'equityPct' && (
+                <> · {report.sizing.pct}% of ${report.sizing.equity.toLocaleString('en-US')} equity/grid</>
+              )}
+              {report.sizing?.mode === 'fixed' && (
+                <> · qty {report.sizing.qty}/level</>
+              )}
             </span>
           )}
         </div>
+        {report && report.sizing?.mode === 'equityPct' && (
+          <p className="text-[10px] tabular-nums text-zinc-500">
+            Planned deployment: <span className="font-medium text-zinc-300">${report.plannedDeployment.toLocaleString('en-US')}</span>
+            {report.plannedDeploymentPct != null && <> ({report.plannedDeploymentPct}% of equity)</>}
+          </p>
+        )}
 
         {/* ---- per-symbol report ---- */}
         {report && (
@@ -402,7 +483,10 @@ export default function GridAutoDialog({
                     )}
                     {r.plan && (
                       <span className="text-[11px] tabular-nums text-zinc-500">
-                        {fmtPrice(r.plan.lowerPrice)}–{fmtPrice(r.plan.upperPrice)} · {r.plan.gridCount} lvl · {r.plan.backtest.fillsCount} fills ·{' '}
+                        {fmtPrice(r.plan.lowerPrice)}–{fmtPrice(r.plan.upperPrice)} · {r.plan.gridCount} lvl · qty {r.plan.qtyPerGrid}/grid
+                        {r.plan.moneyBehind != null && (
+                          <span title="Worst-case money behind the full grid (all levels filled)"> · ${r.plan.moneyBehind.toLocaleString('en-US')} behind</span>
+                        )} · {r.plan.backtest.fillsCount} fills ·{' '}
                         <span className={pnlCls(r.plan.backtest.totalPnl)}>P/L {r.plan.backtest.totalPnl}</span> · DD {r.plan.backtest.maxDrawdown}
                       </span>
                     )}

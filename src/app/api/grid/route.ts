@@ -67,6 +67,13 @@ export interface GridAutoPlanDto {
   tpTriggerApprox: number
   maxEndDays: number
   preset: string
+  /** Task 18-b — sizing provenance (absent sizing = pre-18-b fixed rows) */
+  sizing?: 'fixed' | 'equityPct'
+  sizingPct?: number
+  equityAtPlan?: number
+  allocation?: number
+  /** worst-case money behind the full grid: qty × center × gridCount */
+  moneyBehind?: number
   trendPct: number
   rangePct: number
   crossovers: number

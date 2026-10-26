@@ -3097,3 +3097,19 @@ Work Log:
 
 Stage Summary:
 - The entire re-review (P0–P3 + UI) was already implemented in aaa44bb on main and pushed to GitHub; this pass verified each item line-by-line and closed the single residual (stale hlMax fallback 48→96, no-op on real paths). Backtest gate diagnostics are fully visible in the UI with an A/B baseline. Version v1.81.2.
+
+---
+Task ID: 26
+Agent: Z.ai Code (main)
+Task: User ask — Auto Grid qty is fixed per level, so TSLA vs ECHO carry ~10x+ different money behind a full grid; add a % (risk-money) sizing concept so every symbol's grid gets the same dollar allocation.
+
+Work Log:
+- Confirmed the mechanism: every grid fill is qty × price-delta, so simulateGridBacktest money metrics (PnL/DD/score) scale LINEARLY with qtyPerGrid and the width×count sweep ranking is qty-invariant → the sweep can run on a reference qty of 1, qty is derived from the WINNER's price × levels, and the plan's money metrics are rescaled exactly (verified live: identical ranges/levels/fills/winRate between pct & fixed scans; P/L scales by the resolved qty; score sign preserved).
+- grid-auto.ts: new GridAutoSizing union — {mode:'fixed',qty} (legacy, untouched) | {mode:'equityPct',pct,equity}. Per-symbol resolution: stocks floor to whole shares (qty<1 → SKIP with the minimum % needed, e.g. "5% ($499.73) cannot fund a whole-share TSLA grid — 16 levels × $391.69 needs ≥ $6267.04 (≥ 63% of equity)"), crypto floors to 8 decimals + $1/level broker min notional (skip if under). Plan gains sizing/sizingPct/equityAtPlan/allocation/moneyBehind (both modes).
+- Route: body gains sizing:'fixed'|'equityPct' + equityPct (0.1–100); equity read ONCE per request via getAccount(userId, resolveTradeMode) (scan needs keys too in pct mode; honest 400s on missing keys / unreadable equity). START batch enforces a RISK BUDGET: cumulative planned deployment never exceeds account equity — over-budget tails flip to skip with "Risk budget exhausted — $X of $Y equity already planned…". Response echoes sizing + plannedDeployment(+% of equity).
+- GridAutoPlanDto extended (optional fields, old rows unaffected); GridAutoDialog: sizing segmented toggle (% equity is the DEFAULT — the user's ask), adaptive input (% vs qty), concept explainer line, per-row "$X behind" chip, "Planned deployment: $X (Y% of equity)" summary. Grid tab detail view inherits the info via autoPlan details.
+- Verification: bun lint clean; tsc clean for app sources (fixed getAccount TradeFetchResult unwrap — .data). API probe scripts-tmp/qa-auto-sizing.mjs — 49/49 PASS on LIVE paper keys (equity $9,994.59): BTC fixed 1/level = $1,922,525 behind vs pct 5% = $499.72 (the exact complaint); ECHO $356.84, F $370.88 (2 sh/lvl rounds down), ETH/USD $499.73, TSLA honest ≥63% skip; risk-budget start at 60% deployed $5,934 ≤ equity and capped ECHO/ETH with the honest reason; started grid stopped+deleted via API.
+- Browser E2E (agent-browser, QA user + injected tt_session): Auto Grid dialog renders the sizing toggle (% equity default) + % input; scan on the QA watchlist → "Planned deployment: $1,227.45 (12.3% of equity)", per-row "$ behind" chips, full TSLA whole-share skip reason visible; toggle to fixed qty swaps the input; back to % equity — zero page errors, zero console errors; screenshot scripts-tmp/qa-auto-sizing-ui.png. QA user/watchlist/grids deleted; no orders were left on the broker.
+
+Stage Summary:
+- Auto Grid now sizes by RISK MONEY: '% of equity' gives every symbol's grid the same dollar allocation with qty derived per symbol (TSLA vs ECHO end up with the same money behind), unaffordable whole-share stocks are skipped with the minimum % needed, crypto honors the $1/level broker minimum, and a start batch can never deploy more than 100% of equity. Fixed-qty mode remains for back-compat. Version v1.82.0.
