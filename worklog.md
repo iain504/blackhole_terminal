@@ -3000,3 +3000,18 @@ Work Log:
 
 Stage Summary:
 - The grid engine can no longer trade on synthetic prices: sim fallback is banned for trading decisions (degraded → defer), a >12% single-tick jump needs a confirming second tick, stale lastPrice seeds without trading, and fill prices are broker-polled or flagged ESTIMATED. The reported "actual SL is smaller" (228.82 vs 284.23 vs real 342.95) is fixed at all three layers. Version v1.80.9.
+
+---
+Task ID: 22
+Agent: Z.ai Code (main)
+Task: "Enhance: in mobile chart view, the right click menu populate too early. it should keep update the value until user drop, then populate the value of latest position." — rework the touch long-press into a hold-preview + drop-commit flow, E2E, push.
+
+Work Log:
+- Root cause: the 550ms touch long-press (and Android's native contextmenu ~500ms in) opened the context menu MID-GESTURE, snapshotting price/pane/paneValue at the hold point — while the user was still fine-tuning the finger position. The menu value was locked too early; dragging after the hold did nothing.
+- Rework (v1.81.0, ChartPanel.tsx): the hold now arms a LIVE PREVIEW instead of opening the menu — a dashed crosshair + pane-aware value pill (price / RSI / MACD / volume via fmtPaneValue) drawn on the overlay canvas follows the pressed finger; pan/zoom is frozen during the preview (applyOptions handleScroll/handleScale false) so dragging fine-tunes the value instead of scrolling history. On the DROP (pointerup) the preview clears, pan/zoom is restored, and the menu opens at the LATEST finger position (hitTest tolMul 2), populated with the latest position's price/value. pointercancel aborts without opening; a second finger aborts without opening; Escape aborts; Android's native contextmenu is swallowed when touchDown (timer keeps ownership); desktop right-click keeps the instant menu.
+- Stray-click guard: since the menu now opens exactly where the finger lifted, browsers synthesizing a compat click after touchend could hit an edge-clamped menu item — ContextMenu gained a 450ms openedAt grace (onClickCapture swallow on all 7 menu roots) + preventDefault on the drop pointerup (cancels compat mouse events). Deliberate taps (>450ms) unaffected.
+- New __ttDbg.scroll() probe (chart.options().handleScroll/handleScale) joining the existing E2E debug handle.
+- E2E (agent-browser, 390×844, QA user via real register API, synthetic PointerEvents driving the exact listener pipeline): hold 850ms → menu count 0 (previously open), pill "288.46" at press point → drag to y=430 → pill follows "232.31", menu STILL absent → drop → menu opens at (154,434) = drop point +4 with header "AAPL · 232.31" and items "Add price alert at 232.31 / Buy limit @ 232.31 / Sell limit @ 232.31" — the LATEST value, not the press value. scroll probe: resting all-true → during hold all-false → after drop all-true. T1 pointercancel → no menu + restored; T2 second finger → no menu + restored; T3 Escape → no menu + restored; T4 short tap 120ms → no menu; T5 >10px drift before 550ms → no menu (pan gesture preserved); T6 desktop contextmenu → instant menu at cursor ("AAPL · 273.21" at 184/304; desktop 1280×800 "AAPL · 279.42" at 404/304); T7 stray-click guard: menu-item click at 67ms swallowed (menu stays, nothing fires), same click at 8.9s fires normally. ZERO page errors, ZERO console errors, lint clean. QA user + scripts kept/removed: qa-ctx-user.mjs + png-diff.mjs left in scripts-tmp/ for reuse.
+
+Stage Summary:
+- Mobile long-press is now preview-then-commit: the value keeps updating under the finger until the drop, and the context menu is populated with the latest position's value — desktop right-click behavior byte-identical. Version v1.81.0.

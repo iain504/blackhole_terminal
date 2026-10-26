@@ -279,6 +279,14 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const feedStateRef = useRef('')
   const dragRef = useRef<DragState | null>(null)
   const draftRef = useRef<{ kind: DrawingKind; p1: DrawingPoint; p2: DrawingPoint } | null>(null)
+  // long-press HOLD PREVIEW (mobile right-click): after the 550ms hold the
+  // context menu no longer pops under the still-pressed finger — that locked
+  // in the price/value too early while the user was still fine-tuning. Now
+  // the hold arms a live crosshair + value pill that FOLLOWS the finger, and
+  // the menu is populated with the value of the LATEST position on the drop
+  // (pointerup). Written by the pointer effect, drawn by renderOverlay.
+  // cx/cy are viewport coords (for openMenuAt), x/y container-relative (for the canvas).
+  const holdPreviewRef = useRef<{ pointerId: number; cx: number; cy: number; x: number; y: number } | null>(null)
   const rafRef = useRef(0)
 
   // ui state
@@ -1400,8 +1408,57 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       else if (p1 && p2) segPath(ctx, p1, p2, w, draft.kind === 'fib')
       ctx.restore()
     }
-     
-  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt, ethShown])
+
+    // ---- long-press hold preview (mobile right-click v2) ----
+    // While the finger fine-tunes its position after the 550ms hold, a dashed
+    // crosshair + value pill keeps the pointed VALUE live (price / RSI / MACD
+    // / volume). The context menu itself is only populated with the value of the
+    // LATEST position when the finger drops (pointerup) — see holdPreviewRef.
+    const hp = holdPreviewRef.current
+    if (hp) {
+      const pane = paneAt(hp.y)
+      ctx.save()
+      ctx.strokeStyle = 'rgba(161,161,170,0.8)'
+      ctx.lineWidth = 1
+      ctx.setLineDash([4, 3])
+      // horizontal leg stays inside the pointed pane (a strip's value means
+      // nothing in the neighbouring strips); the vertical leg spans the chart
+      clipToPane(ctx, pane, w)
+      hlinePath(ctx, hp.y, w)
+      ctx.restore()
+      ctx.save()
+      ctx.strokeStyle = 'rgba(161,161,170,0.8)'
+      ctx.lineWidth = 1
+      ctx.setLineDash([4, 3])
+      vlinePath(ctx, hp.x, h)
+      ctx.restore()
+      const hpVal = pane === 'price' ? priceAt(hp.y) : valueAtPane(pane, hp.y)
+      if (hpVal != null) {
+        const label = pane === 'price' ? fmtPaneValue(undefined, hpVal) : `${pane.toUpperCase()} ${fmtPaneValue(pane, hpVal)}`
+        ctx.save()
+        ctx.font = '600 11px ui-monospace, monospace'
+        const bw = ctx.measureText(label).width + 14
+        const bh = 20
+        // above-right of the fingertip, clamped inside the chart — the finger
+        // must not cover the value it is fine-tuning
+        const px = Math.max(4, Math.min(hp.x + 14, w - bw - 4))
+        const py = Math.max(4, hp.y - bh - 12)
+        ctx.fillStyle = 'rgba(9,9,11,0.92)'
+        ctx.strokeStyle = 'rgba(82,82,91,0.9)'
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.roundRect(px, py, bw, bh, 5)
+        ctx.fill()
+        ctx.stroke()
+        ctx.fillStyle = '#fafafa'
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(label, px + 7, py + bh / 2 + 0.5)
+        ctx.restore()
+      }
+    }
+
+  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt, ethShown, paneAt, valueAtPane])
   // keep the redraw scheduler pointed at the freshest overlay renderer
   // (see the stale-closure note above scheduleRedraw)
   renderOverlayRef.current = renderOverlay
@@ -2426,15 +2483,22 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // ---- touch long-press = right click (mobile context menu) ----
     // Phones have no right-click: pressing and HOLDING ~550ms opens the same
     // context menu (set alarm on a line, clone, delete, trade here…). Any real
-    // movement (pan/zoom), a second finger, or lifting early cancels it.
-    // On Android the browser ALSO fires a native contextmenu ~500ms into the
-    // hold — lastNativeCtxAt de-duplicates the two paths.
+    // movement (pan/zoom) BEFORE the hold, a second finger, or lifting early
+    // cancels it. On Android the browser ALSO fires a native contextmenu
+    // ~500ms into the hold — touch-originated ones are swallowed so the timer
+    // owns the flow.
+    //
+    // v2 — the menu no longer pops under the still-pressed finger (it
+    // populated its price/value too early, while the user was still dragging
+    // to fine-tune the spot). The hold now arms a LIVE PREVIEW instead: a
+    // dashed crosshair + value pill follows the finger (pan/zoom frozen), and
+    // only when the finger DROPS (pointerup) is the menu opened — populated
+    // with the value of the LATEST finger position.
     let lpTimer: ReturnType<typeof setTimeout> | null = null
     let lpX = 0
     let lpY = 0
     let lpPointerId = -1
     let touchDown = false
-    let lastNativeCtxAt = 0
     const cancelLongPress = () => {
       if (lpTimer) {
         clearTimeout(lpTimer)
@@ -2458,18 +2522,36 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // empty chart: custom menu with price-aware actions (alert / trade / hline)
       setMenu({ x, y, hit: { type: 'chart', part: 'whole' }, price, pane, paneValue })
     }
+    const endHoldPreview = (openMenu: boolean) => {
+      const hp = holdPreviewRef.current
+      if (!hp) return
+      holdPreviewRef.current = null
+      // the chart is created without handleScroll/handleScale overrides, so
+      // the library defaults (true) ARE the resting state we froze — restore
+      try { chartRef.current?.applyOptions({ handleScroll: true, handleScale: true }) } catch { /* chart gone */ }
+      scheduleRedraw()
+      if (openMenu) {
+        // THE DROP: hit-test + price/value snapshot at the LATEST finger
+        // position (fingers are imprecise → wider tolerance, tolMul 2)
+        openMenuAt(hp.cx, hp.cy, 2)
+      }
+    }
     const fireLongPress = () => {
       lpTimer = null
-      // native contextmenu already opened the menu — don't open it twice
-      if (Date.now() - lastNativeCtxAt < 700) return
-      // a drag may have started on this same press — abandon it, the menu takes over
+      // a drag may have started on this same press — abandon it, the preview takes over
       dragRef.current = null
       exitDragRef.current = null
       pendingDragRef.current = null
       el.style.cursor = ''
       try { navigator.vibrate?.(15) } catch { /* unsupported */ }
-      // fingers are imprecise — open with the WIDER hit tolerance (tolMul 2)
-      openMenuAt(lpX, lpY, 2)
+      // arm the live preview (NOT the menu): the value keeps updating while
+      // the finger moves; the drop populates the menu with the latest value
+      const r = el.getBoundingClientRect()
+      holdPreviewRef.current = { pointerId: lpPointerId, cx: lpX, cy: lpY, x: lpX - r.left, y: lpY - r.top }
+      // dragging is now VALUE TRACKING — freeze the chart's pan/zoom so the
+      // finger fine-tunes the crosshair instead of scrolling the history
+      try { chartRef.current?.applyOptions({ handleScroll: false, handleScale: false }) } catch { /* chart gone */ }
+      scheduleRedraw()
     }
 
     // Floating trade panels (ticket / advisor) live INSIDE this container — a
@@ -2494,6 +2576,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // never receives the click. The trade ticket (incl. its drag header)
       // gets the same pass-through.
       if (inFloatingPanel(e.target)) return
+      // a second finger while the hold-preview is live aborts it WITHOUT
+      // opening the menu — the gesture turned into a pinch / a new tap
+      if (holdPreviewRef.current) endHoldPreview(false)
       // arm the touch long-press timer (mobile right-click equivalent).
       // Interactive HTML (header buttons, toolbars) is excluded — a held
       // finger there means a slow tap, not a chart menu.
@@ -2816,6 +2901,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     const onPointerMove = (e: PointerEvent) => {
       // finger drifted — this is a pan/zoom, not a hold: cancel the long-press
       if (lpTimer !== null && e.pointerId === lpPointerId && Math.hypot(e.clientX - lpX, e.clientY - lpY) > 10) cancelLongPress()
+      // HOLD-PREVIEW: the value follows the finger until the drop (pan/zoom is
+      // frozen — this is fine-tuning, not panning); the menu is populated on
+      // the pointerup with this LATEST position
+      const hp = holdPreviewRef.current
+      if (hp && e.pointerId === hp.pointerId) {
+        const { x, y } = rel(e)
+        hp.cx = e.clientX
+        hp.cy = e.clientY
+        hp.x = x
+        hp.y = y
+        scheduleRedraw()
+        return
+      }
       // over a floating panel: no hover hit-testing / cursor games — the
       // canvas isn't the event owner here (and a drawing under the panel must
       // not light up or grab the cursor while the panel is used)
@@ -2872,6 +2970,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       if (e.pointerId === lpPointerId) {
         cancelLongPress()
         touchDown = false
+        // THE DROP: the menu opens here, populated with the value of the
+        // LATEST finger position. pointercancel (the browser took the
+        // gesture over) aborts the preview without opening anything.
+        // preventDefault also cancels the touch's compatibility mouse events
+        // (mousedown/mouseup) so no phantom click follows the menu open.
+        if (e.type === 'pointerup') e.preventDefault()
+        endHoldPreview(e.type === 'pointerup')
       }
     }
 
@@ -2879,14 +2984,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       // floating trade panels own their own surface — no chart menu, and the
       // browser's native menu stays available (inputs inside the panels)
       if (inFloatingPanel(e.target)) return
-      // on Android a touch long-press fires this NATIVE event ~500ms in —
-      // remember it so the synthesized timer doesn't open a second menu
-      lastNativeCtxAt = Date.now()
-      cancelLongPress()
       e.preventDefault()
       e.stopPropagation()
-      // touch-originated long-press uses the wider finger tolerance
-      openMenuAt(e.clientX, e.clientY, touchDown ? 2 : 1)
+      // touch-originated (Android fires this NATIVE event ~500ms into the
+      // hold): swallow it WITHOUT cancelling the hold timer and WITHOUT
+      // opening the menu — the 550ms timer arms the live preview, and the
+      // drop (pointerup) populates the menu with the latest position's value
+      if (touchDown) return
+      cancelLongPress()
+      // desktop right-click keeps the instant menu at the cursor
+      openMenuAt(e.clientX, e.clientY, 1)
     }
 
     const onDoubleClick = (e: MouseEvent) => {
@@ -2940,6 +3047,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // a live hold-preview aborts without opening the menu
+        endHoldPreview(false)
         if (dragRef.current) {
           // abort an in-flight line drag (exit/ghost/pending): nulling the drag
           // makes the trailing pointerup commit nothing and onMove a no-op
@@ -2966,6 +3075,9 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     window.addEventListener('keydown', onKeyDown)
     return () => {
       cancelLongPress()
+      // unmount mid-hold: clear the preview AND un-freeze pan/zoom, otherwise
+      // the next chart instance would come up scroll-locked
+      endHoldPreview(false)
       el.removeEventListener('pointerdown', onPointerDown, true)
       el.removeEventListener('pointermove', onPointerMove, true)
       el.removeEventListener('pointerleave', onPointerLeave)
@@ -3413,6 +3525,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           try { return chart.priceScale(id).options().scaleMargins ?? null } catch { return null }
         }
         return { right: probe('right'), vol: probe('vol'), rsi: probe('rsi'), macd: probe('macd') }
+      },
+      // long-press hold-preview (mobile right-click v2): pan/zoom must be
+      // FROZEN while the finger fine-tunes and restored on the drop
+      scroll: () => {
+        try {
+          const o = chart.options()
+          return { handleScroll: o.handleScroll, handleScale: o.handleScale }
+        } catch {
+          return null
+        }
       },
       oldestBarTime: () => barsRef.current[0]?.time ?? null,
       lastBarTime: () => barsRef.current[barsRef.current.length - 1]?.time ?? null,
@@ -4853,6 +4975,23 @@ function ContextMenu({
     }
   }, [onClose])
 
+  // Stray-click guard (mobile long-press v2): the menu now opens ON THE DROP
+  // (pointerup), i.e. exactly where the finger just lifted. Some browsers
+  // synthesize a compat click right after touchend at that same point, and an
+  // edge-clamped menu can cover it — without a guard the click would land on
+  // a menu item and fire it accidentally. Any click within ~450ms of the menu
+  // opening is swallowed; a deliberate human tap always comes later.
+  const openedAtRef = useRef(Date.now())
+  useEffect(() => {
+    openedAtRef.current = Date.now()
+  }, [menu])
+  const swallowStrayClick = (e: React.MouseEvent) => {
+    if (Date.now() - openedAtRef.current < 450) {
+      e.preventDefault()
+      e.stopPropagation()
+    }
+  }
+
   if (!container) return null
   const w = container.clientWidth
   const h = container.clientHeight
@@ -4866,6 +5005,7 @@ function ContextMenu({
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -4922,6 +5062,7 @@ function ContextMenu({
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -4994,6 +5135,7 @@ function ContextMenu({
         className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -5040,6 +5182,7 @@ function ContextMenu({
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -5075,6 +5218,7 @@ function ContextMenu({
         className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -5104,6 +5248,7 @@ function ContextMenu({
         className="absolute z-40 w-56 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
@@ -5153,6 +5298,7 @@ function ContextMenu({
         className="absolute z-40 w-60 rounded-md border border-zinc-700/80 bg-zinc-900 py-1 text-xs shadow-xl"
         style={{ left, top }}
         onPointerDown={(e) => e.stopPropagation()}
+        onClickCapture={swallowStrayClick}
         role="menu"
       >
         <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
