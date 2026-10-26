@@ -51,6 +51,37 @@ export interface GridStatsDto {
   levels: number[]
 }
 
+export interface GridAutoPlanDto {
+  center: number
+  windowDays: number
+  bars: number
+  lowerPrice: number
+  upperPrice: number
+  gridCount: number
+  spacing: string
+  direction: string
+  qtyPerGrid: number
+  maxSLPct: number
+  maxTPPct: number
+  slTriggerApprox: number
+  tpTriggerApprox: number
+  maxEndDays: number
+  preset: string
+  trendPct: number
+  rangePct: number
+  crossovers: number
+  backtest: {
+    totalPnl: number
+    realizedPnl: number
+    openPnl: number
+    maxDrawdown: number
+    fillsCount: number
+    openLots: number
+    winRate: number | null
+    score: number
+  }
+}
+
 export interface GridTradeDto {
   id: string
   symbol: string
@@ -76,6 +107,10 @@ export interface GridTradeDto {
   lastPrice: number | null
   lots: GridLotDto[]
   stats: GridStatsDto
+  /** Task 18 — auto-grid provenance (absent = manual grid) */
+  auto: boolean
+  autoPlan: GridAutoPlanDto | null
+  autoEndAt: string | null
 }
 
 /** Row + stats → the client DTO (state.levels / state.lots / lastPrice ride along). */
@@ -97,6 +132,9 @@ export function toDto(row: {
   stopReason: string | null
   realizedPnl: number
   feePaid: number
+  auto?: boolean
+  autoPlan?: unknown
+  autoEndAt?: Date | null
   state: unknown
   startedAt: Date
   stoppedAt: Date | null
@@ -128,6 +166,9 @@ export function toDto(row: {
     lastPrice: st.lastPrice,
     lots: st.lots,
     stats,
+    auto: row.auto ?? false,
+    autoPlan: (row.autoPlan ?? null) as GridAutoPlanDto | null,
+    autoEndAt: row.autoEndAt?.toISOString() ?? null,
   }
 }
 

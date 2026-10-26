@@ -416,13 +416,14 @@ async function closeAndStop(
     /** Task 10-g — 'sell' grids hold short lots: the close BUYS them back */
     direction?: string | null
   },
-  reason: 'sl' | 'maxtp' | 'manual_close',
+  reason: 'sl' | 'maxtp' | 'manual_close' | 'auto_end',
   price: number | null,
   reasonText: string,
 ): Promise<void> {
-  // claim: only one caller wins the active → stopped transition
+  // claim: only one caller wins the active/paused → stopped transition
+  // (a SUSPENDED grid can still be stopped — Task 18 — its lots close as-is)
   const claimed = await db.gridTrade.updateMany({
-    where: { id: grid.id, status: 'active' },
+    where: { id: grid.id, status: { in: ['active', 'paused'] } },
     data: { status: 'stopped', stoppedAt: new Date() },
   })
   if (claimed.count === 0) return // already stopped elsewhere
@@ -494,11 +495,12 @@ async function closeAndStop(
   })
 }
 
-/** Manual stop (Grid tab button). Returns false when the grid is not owned. */
+/** Manual stop (Grid tab button). Returns false when the grid is not owned.
+ *  Paused grids stop too (Task 18) — the claim covers active + paused. */
 export async function stopGridTrade(userId: string, gridId: string, opts?: { reason?: 'manual_close' }): Promise<boolean> {
   const grid = await db.gridTrade.findFirst({ where: { id: gridId, userId } })
   if (!grid) return false
-  if (grid.status !== 'active') return true // already stopped — idempotent
+  if (grid.status !== 'active' && grid.status !== 'paused') return true // already stopped — idempotent
   const st = parseGridState(grid.state)
   let price: number | null = st.lastPrice
   try {
@@ -540,6 +542,8 @@ async function evaluateGrid(grid: {
   state: unknown
   /** Task 10-g — absent reads as 'both' */
   direction?: string | null
+  /** Task 18 — planned end: the engine force-stops the grid at this time */
+  autoEndAt?: Date | null
 }, price: number): Promise<void> {
   const st = parseGridState(grid.state)
   const levels = st.levels
@@ -583,6 +587,21 @@ async function evaluateGrid(grid: {
   if (ordersOpen && tpTrigger != null && (sellGrid ? price <= tpTrigger : price >= tpTrigger)) {
     await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price))
     return
+  }
+
+  // ---- planned end (Task 18 — auto grids): due date + orders open → stop now.
+  // Same RTH deferral as the guards for stocks: a close market order placed
+  // outside the session would be rejected and strand lots in an 'error' grid.
+  if (grid.autoEndAt != null && Date.now() >= grid.autoEndAt.getTime()) {
+    if (ordersOpen) {
+      await closeAndStop(
+        grid, 'auto_end', price,
+        `Auto grid reached its planned end (started with a ${grid.autoEndAt.toISOString().slice(0, 10)} expiry)`,
+      )
+      return
+    }
+    // stock grid outside RTH — keep running; the close fires at the first
+    // in-session tick (stopReason stays absent until it actually fires)
   }
 
   const L = st.lastPrice
@@ -780,6 +799,11 @@ export interface StartGridInput {
   /** Task 10-g — 'both' | 'buy' | 'sell' (default 'both') */
   direction?: string
   closeOnStop: boolean
+  /** Task 18 — auto-grid provenance (the watchlist scan's plan snapshot) */
+  auto?: boolean
+  autoPlan?: unknown
+  /** planned end — the engine force-stops the grid when now ≥ autoEndAt */
+  autoEndAt?: Date | null
 }
 
 /** Validate + create + start a grid trade (engine auto-resumes via the loop). */
@@ -802,6 +826,9 @@ export async function startGridTrade(input: StartGridInput) {
       direction: isGridDirection(input.direction) ? input.direction : 'both',
       closeOnStop: input.closeOnStop,
       status: 'active',
+      auto: input.auto ?? false,
+      autoPlan: (input.autoPlan ?? undefined) as object | undefined,
+      autoEndAt: input.autoEndAt ?? null,
       state: state as unknown as object,
     },
   })

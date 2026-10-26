@@ -307,9 +307,19 @@ model GridTrade {
   direction   String    @default("both")
   // when the grid stops (manual or guard), market-close open grid positions
   closeOnStop Boolean   @default(true)
-  // 'active' | 'stopped' | 'error'
+  // 'active' | 'paused' | 'stopped' | 'error' — 'paused' (Task 18) is a SUSPENDED
+  // grid: the engine tick queries status 'active' only, so a paused grid places
+  // NO orders and evaluates NO guards; resume flips it back to 'active'.
   status      String    @default("active")
   stopReason  String?
+  // ---- Task 18 — auto grid provenance ----
+  // true when the Auto Grid watchlist scan created this grid
+  auto        Boolean   @default(false)
+  // the scan's plan snapshot: why it started (reason/score/regime metrics),
+  // the backtest evidence and the end conditions — shown in the Grid tab
+  autoPlan    Json?
+  // planned end (auto preset): the engine stops the grid when now ≥ autoEndAt
+  autoEndAt   DateTime?
   // engine-maintained cached stats (recomputable from fills)
   realizedPnl Float     @default(0)
   feePaid     Float     @default(0)
@@ -331,7 +341,7 @@ model GridFill {
   userId      String
   levelIndex  Int
   side        String // 'buy' | 'sell'
-  reason      String   @default("grid") // 'grid' | 'tp' | 'sl' | 'maxtp' | 'manual_close'
+  reason      String   @default("grid") // 'grid' | 'tp' | 'sl' | 'maxtp' | 'manual_close' | 'auto_end'
   price       Float
   qty         Float
   pnl         Float? // realized P&L on sells (vs the paired buy lot)
@@ -342,6 +352,25 @@ model GridFill {
 
   @@index([gridTradeId, ts])
   @@index([userId])
+}
+
+// Task 18 — one Auto Grid watchlist scan ('scan' = analyze only, the report
+// powers the dialog's preview) or 'start' run (grids actually created). The
+// full per-symbol report (decision, reason, regime metrics, backtest evidence,
+// chosen setup, end conditions) is persisted so the "why" survives reloads.
+model GridAutoRun {
+  id        String   @id @default(cuid())
+  userId    String
+  mode      String   @default("start") // 'scan' | 'start'
+  watchlist String   // watchlist NAME at scan time (display)
+  scanned   Int
+  started   Int
+  skipped   Int
+  failed    Int      @default(0) // start attempts that errored
+  report    Json     // GridAutoDecision[] — see src/lib/grid-auto.ts
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 
 // Task 9-j — per-install master secret store. The platform publish pipeline

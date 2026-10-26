@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
-  Download, Upload, Copy,
+  Download, Upload, Copy, Sparkles, Pause, Play,
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { Button } from '@/components/ui/button'
@@ -32,8 +32,9 @@ import { fmtPrice } from '@/lib/market-types'
 import GridTradeDialog from '@/components/chart/GridTradeDialog'
 import { gridSetupFromRow, downloadGridSetup, buildGridSetupBundle, downloadGridSetupBundle } from '@/lib/grid-setup'
 import GridBundleImportDialog from './GridBundleImportDialog'
+import GridAutoDialog from './GridAutoDialog'
 import { tabPanes, type Tab } from '@/store/terminal'
-import type { GridTradeDto, GridFillDto } from '@/app/api/grid/route'
+import type { GridTradeDto, GridFillDto, GridAutoPlanDto } from '@/app/api/grid/route'
 
 /** API rows gain slBasis/tpBasis ('price'|'percent') via Task 10-a — treat as
  * optional strings so pre-10-a rows (and the base DTO type) keep working. */
@@ -49,6 +50,7 @@ const resolveTrigger = (bound: number, pct: number, kind: 'sl' | 'tp') =>
 
 const STATUS_CLS: Record<string, string> = {
   active: 'border-emerald-500/40 text-emerald-400',
+  paused: 'border-amber-500/40 text-amber-400',
   stopped: 'border-zinc-700 text-zinc-400',
   error: 'border-rose-500/40 text-rose-400',
 }
@@ -90,6 +92,7 @@ const REASON_LABEL: Record<string, string> = {
   sl: 'max SL',
   maxtp: 'max TP',
   manual_close: 'manual',
+  auto_end: 'auto end',
 }
 
 interface GridData {
@@ -125,6 +128,8 @@ export default function GridTab() {
   const [importSymbol, setImportSymbol] = useState<string | null>(null)
   // Task 10-l — ALL-setups bundle import (file/paste → preview → bulk start)
   const [bundleImportOpen, setBundleImportOpen] = useState(false)
+  // Task 18 — Auto Grid watchlist scan + start dialog
+  const [autoOpen, setAutoOpen] = useState(false)
   const activeTab = useTerminal(useShallow((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? null))
   const chartSymbol = useMemo(() => focusedSymbol(activeTab), [activeTab])
 
@@ -168,6 +173,39 @@ export default function GridTab() {
     } finally {
       setBusyId(null)
       setStopTarget(null)
+      void load()
+    }
+  }
+
+  /** Task 18 — suspend (pause) / resume a grid. The engine only evaluates
+   *  status 'active' rows, so pause = full freeze (no orders, no guards). */
+  const pauseResume = async (grid: GridRow, action: 'pause' | 'resume') => {
+    setBusyId(grid.id)
+    try {
+      const res = await fetch(`/api/grid/${grid.id}/${action}`, { method: 'POST' })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        toast({
+          title: action === 'pause' ? `Grid suspended — ${grid.symbol}` : `Grid resumed — ${grid.symbol}`,
+          description: action === 'pause'
+            ? 'The engine freezes it (no orders, no guard checks) until you resume.'
+            : 'The next engine tick picks it up with its open lots intact.',
+        })
+      } else {
+        toast({
+          title: action === 'pause' ? 'Could not suspend grid' : 'Could not resume grid',
+          description: json?.error || `HTTP ${res.status}`,
+          variant: 'destructive',
+        })
+      }
+    } catch {
+      toast({
+        title: action === 'pause' ? 'Could not suspend grid' : 'Could not resume grid',
+        description: 'Network error',
+        variant: 'destructive',
+      })
+    } finally {
+      setBusyId(null)
       void load()
     }
   }
@@ -233,6 +271,16 @@ export default function GridTab() {
           {openLots} open lot{openLots === 1 ? '' : 's'}
         </Badge>
         <span className="ml-auto text-[11px] text-zinc-500">engine tick every 5s · paper orders</span>
+        {/* Task 18 — one-click Auto Grid: scan a watchlist, start the winners */}
+        <Button
+          size="sm"
+          className="h-7 gap-1.5 bg-emerald-600 px-2 text-[11px] text-white hover:bg-emerald-500"
+          onClick={() => setAutoOpen(true)}
+          title="Scan a watchlist and auto-start the symbols where a grid backtests profitably — full reasons + setups shown"
+        >
+          <Sparkles className="h-3.5 w-3.5" aria-hidden />
+          Auto grid
+        </Button>
         {/* Task 10-l — one-click export of ALL grid setups as one bundle */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -302,12 +350,13 @@ export default function GridTab() {
         <div className="terminal-scroll max-h-[70vh] min-h-0 flex-1 space-y-2 overflow-y-auto pr-0.5">
           {grids.map((g) => {
             const isActive = g.status === 'active'
+            const isPaused = g.status === 'paused'
             const openLotsG = g.stats.openLots
             return (
               <div key={g.id} className="flex flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-xs">
                   <span
-                    className={cn('inline-block h-2 w-2 shrink-0 rounded-full', isActive ? 'animate-pulse bg-emerald-400' : g.status === 'error' ? 'bg-rose-500' : 'bg-zinc-600')}
+                    className={cn('inline-block h-2 w-2 shrink-0 rounded-full', isActive ? 'animate-pulse bg-emerald-400' : isPaused ? 'bg-amber-400' : g.status === 'error' ? 'bg-rose-500' : 'bg-zinc-600')}
                     title={g.status}
                     aria-hidden
                   />
@@ -315,6 +364,15 @@ export default function GridTab() {
                   <Badge variant="outline" className={cn('text-[10px]', STATUS_CLS[g.status] ?? 'border-zinc-700 text-zinc-400')}>
                     {g.status}
                   </Badge>
+                  {g.auto && (
+                    <Badge
+                      variant="outline"
+                      className="text-[10px] border-violet-500/40 text-violet-400"
+                      title="Created by the Auto Grid watchlist scan — see Details for the reason + end conditions"
+                    >
+                      AUTO
+                    </Badge>
+                  )}
                   <span className="font-medium tabular-nums text-zinc-300">{fmtPrice(g.lowerPrice)} – {fmtPrice(g.upperPrice)}</span>
                   <Badge variant="outline" className="text-[10px] text-zinc-500">
                     {g.gridCount} levels · {g.spacing}
@@ -371,6 +429,11 @@ export default function GridTab() {
                 <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-zinc-800/60 px-3 py-1.5 text-[11px] text-zinc-500">
                   <span title={fmtClock(g.startedAt)}>started {rel(g.startedAt)}</span>
                   <span>· running {fmtDuration(g.stats.durationSec)}</span>
+                  {g.autoEndAt && (isActive || isPaused) && (
+                    <span className="text-violet-400/90" title={`Planned auto end: ${fmtClock(g.autoEndAt)} — the engine stops (and closes per close-on-stop) at this time`}>
+                      · ends {fmtClock(g.autoEndAt)}
+                    </span>
+                  )}
                   {g.stoppedAt && <span title={fmtClock(g.stoppedAt)}>· stopped {rel(g.stoppedAt)}</span>}
                   {g.stopReason && (
                     <span className={cn('flex items-start gap-1', g.status === 'error' ? 'text-rose-400' : 'text-amber-400/90')}>
@@ -410,6 +473,26 @@ export default function GridTab() {
                       </Button>
                     )}
                     {isActive && (
+                      <Button
+                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-amber-400 hover:text-amber-300"
+                        disabled={busyId === g.id}
+                        onClick={() => void pauseResume(g, 'pause')}
+                        title="Suspend this grid — the engine freezes it (no orders, no guard checks) until you resume"
+                      >
+                        {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pause className="h-3 w-3" />} Suspend
+                      </Button>
+                    )}
+                    {isPaused && (
+                      <Button
+                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
+                        disabled={busyId === g.id}
+                        onClick={() => void pauseResume(g, 'resume')}
+                        title="Resume this suspended grid — the next engine tick continues with its open lots intact"
+                      >
+                        {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />} Resume
+                      </Button>
+                    )}
+                    {(isActive || isPaused) && (
                       <Button
                         variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                         disabled={busyId === g.id}
@@ -451,6 +534,9 @@ export default function GridTab() {
         onOpenChange={setBundleImportOpen}
         onImported={() => void load()}
       />
+
+      {/* Task 18 — Auto Grid: watchlist scan → per-symbol reasons → start */}
+      <GridAutoDialog open={autoOpen} onOpenChange={setAutoOpen} onStarted={() => void load()} />
 
       {/* setup import (Task 10-f) — opens the create dialog with the import
           panel expanded; the applied setup retargets the new grid to its own
@@ -529,6 +615,34 @@ export default function GridTab() {
 
           {detail && (
             <>
+              {/* Task 18 — auto-grid plan: why the scan started it + end conditions */}
+              {detail.grid.auto && detail.grid.autoPlan && (() => {
+                const ap = detail.grid.autoPlan as GridAutoPlanDto & { reason?: string; details?: string[] }
+                const bt = ap.backtest
+                return (
+                  <div className="rounded border border-violet-500/30 bg-violet-500/5 p-2.5">
+                    <p className="flex items-center gap-1.5 text-[11px] font-semibold text-violet-300">
+                      <Sparkles className="h-3 w-3" aria-hidden /> Auto Grid — why this started
+                    </p>
+                    {ap.reason && <p className="mt-1 text-[11px] leading-snug text-zinc-200">{ap.reason}</p>}
+                    {ap.details && ap.details.length > 0 && (
+                      <ul className="mt-1 space-y-0.5 text-[10px] leading-snug text-zinc-500">
+                        {ap.details.map((d, i) => <li key={i}>· {d}</li>)}
+                      </ul>
+                    )}
+                    <p className="mt-1.5 text-[10px] leading-snug text-zinc-400">
+                      Ends: SL {fmtPrice(ap.slTriggerApprox)} (−{ap.maxSLPct}% below lower) · TP {fmtPrice(ap.tpTriggerApprox)} (+{ap.maxTPPct}% above upper)
+                      {detail.grid.autoEndAt ? ` · or on ${fmtClock(detail.grid.autoEndAt)} (planned end)` : ''}
+                      {' · '}{ap.preset} preset · {ap.windowDays}d window
+                    </p>
+                    {bt && (
+                      <p className="mt-0.5 text-[10px] leading-snug text-zinc-500">
+                        Backtest evidence: score {bt.score} · P/L {signed(bt.totalPnl)} · max DD {bt.maxDrawdown} · {bt.fillsCount} fills · drift {ap.trendPct > 0 ? '+' : ''}{ap.trendPct}% · {ap.crossovers} midline crossings
+                      </p>
+                    )}
+                  </div>
+                )
+              })()}
               <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
                 <div className="rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                   <p className="text-[10px] uppercase tracking-wider text-zinc-500">Total P/L</p>
