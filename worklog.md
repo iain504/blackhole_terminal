@@ -2915,3 +2915,20 @@ Work Log:
 Stage Summary:
 - Stock 1m backtests now go back 180 days (~49-70k IEX bars, honest dataCapped flag if a symbol has less); crypto 1m stays heap-safe at 45d; newest-bar truncation risk on deep stock windows eliminated (scaled pagination cap).
 - origin/main = c997803 (v1.80.3+167), working tree clean. User should git pull + docker compose up -d --build on their PC to pick this up.
+
+---
+Task ID: 17
+Agent: Z.ai Code (main)
+Task: "mobile layout missing grid" — Grid Trade was entirely absent from the mobile shell; add it, verify, push.
+
+Work Log:
+- Workspace had been rolled back to a pre-Task-13 snapshot (HEAD = 12-sweep) while origin/main carried 15 newer commits incl. Task 16 (1m 180d) and the v1.80.4 RTH grid gate — verified remote contained all local-only content (12-sweep worklog etc.), then git reset --hard origin/main (72953d7).
+- Root cause: MobileShell.tsx had no grid view anywhere — MobileView union, NAV array, view renderer and the localStorage restore allowlist all omitted it (desktop TabBar always had the grid TabType). GridTab itself is layout-agnostic (flex-wrap header, grid-cols-2 sm:grid-cols-4 stats, self-scrolling list) so it renders 1:1 on mobile.
+- Fix (v1.80.5): 'grid' added as a FIRST-CLASS bottom-nav tab — Watchlist · Chart · Grid · Algo · Trades · Report · Menu (LayoutGrid icon, Task 75 Algo precedent) — rendered like AlgoTab in a min-h-0 flex-1 wrapper; Menu gained a "Grid Trading" row for parity with "Algo Trading"; tt:mobileView restore allowlist gained 'grid'. Header comment updated.
+- Mobile scope note: the two-click grid-creation chart tool stays desktop-only, but mobile users can still START grids via Import setup / Import all (setup JSON retargets symbol via onApplySymbol, falls back to focused symbol → 'BTC/USD'), plus full monitor/stop/edit-when-flat/delete/export coverage.
+- E2E (agent-browser, real API + QA fixtures): registered throwaway user through POST /api/auth/register (bootstrap window — DB was wiped by the same snapshot; self-generated TOTP secret + RFC 6238 code) and inserted one STOPPED GridTrade row + 3 GridFills via Prisma (stopped = inert, engine only resumes 'active'; grid POST itself needs per-user Alpaca keys which the wipe removed).
+- Verified 390×844: bottom nav shows all 7 items with Grid highlighted when active; Grid tab renders header badges (0 active / realized / 1 open lot), header actions (Export all, Import all, Import setup, refresh) and the AAPL row (stopped badge, range, SL/TP chips, fills, R/U P&L, stop reason, Export/Delete/Details); Details dialog shows TOTAL/REALIZED/UNREALIZED P&L, win rate, best/worst level, fills table. Menu → "Grid Trading" row navigates correctly. 320×568: zero clipped nav items (graceful label truncation), header wraps cleanly. Desktop 1280×800 regression: desktop terminal + TabBar unchanged. ZERO console/page errors throughout. QA user + rows deleted afterwards.
+- Ops: package.json 1.80.4 → 1.80.5; single dev instance kept (a restart attempt hit EADDRINUSE and exited; the running server hot-reloaded the change and the restamped version.ts — health shows v1.80.5+162 sha ec9767f).
+
+Stage Summary:
+- Mobile shell now exposes Grid Trading as a first-class tab + menu row; no desktop changes; version v1.80.5; commits ec9767f (feature) + ec00c11 (stamp drift); scripts-tmp/qa-mobile-grid*.mjs kept uncommitted for reuse.
