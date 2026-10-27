@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import {
   createChart, ColorType, CrosshairMode, LineStyle, UTCTimestamp, Time,
   IChartApi, ISeriesApi, IPriceLine, MouseEventParams, CandlestickData, LineData,
+  SeriesMarker,
 } from 'lightweight-charts'
 import { useTerminal, Drawing, DrawingKind, DrawingPoint, DrawingPane, DRAW_COLORS, Alert } from '@/store/terminal'
 import { detectSrLevels, SrBar } from '@/lib/sr'
@@ -35,7 +36,7 @@ import {
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
   ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
   Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
-  LayoutGrid, Grid3x3, Layers,
+  LayoutGrid, Grid3x3, Layers, Tag,
 } from 'lucide-react'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
@@ -386,6 +387,25 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // overlay is on. Visibility + opacity persist client-side (localStorage).
   const [gridBandOn, setGridBandOn] = useState(true)
   const [gridBandOpacity, setGridBandOpacity] = useState(0.2) // 80% transparent
+
+  // ---- Historical BUY/SELL fill markers (Task 32) ----
+  // Every FILLED order on this symbol (manual, grid or algo) becomes an arrow
+  // on the bar in effect at its fill time — green ▲ "BUY" below the bar, red
+  // ▼ "SELL" above it (TradingView-style, like the user's reference image).
+  // Data comes from /api/trading/fills?limit=500&symbol=…; several fills on
+  // the same bar merge into one arrow with a "×N" count. On by default,
+  // toggleable in the toolbar, choice mirrored to localStorage.
+  const [tradeMarkersOn, setTradeMarkersOn] = useState(true)
+  const tradeFillsRef = useRef<{ side: string; filledAt: string }[]>([])
+  // Applies (or clears) the markers on the CURRENT series. Called after every
+  // bars (re)load, after the fills fetch, and on toggle/series swaps.
+  const applyTradeMarkersRef = useRef<() => void>(() => {})
+  // Restore the saved toggle choice (default ON — only '0' turns it off).
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('bh-trade-markers') === '0') setTradeMarkersOn(false)
+    } catch { /* ignore */ }
+  }, [])
 
   // Esc cancels an armed grid capture (own listener so the big pointer effect
   // below stays untouched by grid state)
@@ -3099,6 +3119,60 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     }
   }, [hitTest, createDrawing, patchDrawing, patchAlert, patchExitPrice, addExitToPosition, patchPendingOrder, symbol, timeAt, priceAt, yOf, yOfPane, valueAtPane, paneAt, scheduleRedraw, setDrawingTool, toast])
 
+  // ---------- historical BUY/SELL fill markers (Task 32) ----------
+  // Paints tradeFillsRef onto the CURRENT series: each filled order snaps to
+  // the bar in effect at its fill time (binary search — a marker time that
+  // doesn't exactly match a data point would throw in lightweight-charts),
+  // same-bar same-side fills merge into one arrow with a ×N count.
+  const applyTradeMarkers = useCallback(() => {
+    const series = seriesRef.current
+    if (!series) return
+    const clear = () => { try { series.setMarkers([]) } catch { /* series swapping */ } }
+    if (!tradeMarkersOn) { clear(); return }
+    const bars = barsRef.current
+    const fills = tradeFillsRef.current
+    if (bars.length === 0 || fills.length === 0) { clear(); return }
+    const last = bars[bars.length - 1]
+    // last bar with time <= ts (bars ascending by time)
+    const barAt = (ts: number): Bar | null => {
+      if (ts < bars[0].time) return null
+      if (ts >= last.time) return last
+      let lo = 0
+      let hi = bars.length - 1
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1
+        if (bars[mid].time <= ts) lo = mid
+        else hi = mid - 1
+      }
+      return bars[lo]
+    }
+    const byBar = new Map<number, { buy: number; sell: number }>()
+    for (const f of fills) {
+      const t = Math.floor(new Date(f.filledAt).getTime() / 1000)
+      if (!Number.isFinite(t)) continue
+      const bar = barAt(t)
+      if (!bar) continue // older than the loaded history
+      const acc = byBar.get(bar.time) ?? { buy: 0, sell: 0 }
+      if (f.side === 'buy') acc.buy += 1
+      else if (f.side === 'sell') acc.sell += 1
+      byBar.set(bar.time, acc)
+    }
+    const markers: SeriesMarker<Time>[] = [...byBar.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .flatMap(([time, acc]): SeriesMarker<Time>[] => {
+        const out: SeriesMarker<Time>[] = []
+        if (acc.buy > 0) {
+          out.push({ time: time as UTCTimestamp, position: 'belowBar', shape: 'arrowUp', color: '#22c55e', text: acc.buy > 1 ? `BUY ×${acc.buy}` : 'BUY' })
+        }
+        if (acc.sell > 0) {
+          out.push({ time: time as UTCTimestamp, position: 'aboveBar', shape: 'arrowDown', color: '#ef4444', text: acc.sell > 1 ? `SELL ×${acc.sell}` : 'SELL' })
+        }
+        return out
+      })
+    try { series.setMarkers(markers) } catch { /* series swapping */ }
+  }, [tradeMarkersOn])
+  applyTradeMarkersRef.current = applyTradeMarkers
+
   // ---------- chart lifecycle ----------
   useEffect(() => {
     const container = containerRef.current
@@ -3379,6 +3453,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         // (a chunk that filtered down to zero new bars must NOT shift anything)
         const prev = chart.timeScale().getVisibleLogicalRange()
         applyBars(merged)
+        applyTradeMarkersRef.current() // extended history may contain older fills (Task 32)
         const added = merged.length - bars.length
         if (prev && added > 0) {
           chart.timeScale().setVisibleLogicalRange({ from: prev.from + added, to: prev.to + added })
@@ -3452,6 +3527,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         barsRef.current = shown
 
         applyBars(shown)
+        applyTradeMarkersRef.current() // BUY/SELL arrows for the freshly loaded window (Task 32)
         // TradingView-like: show recent window, not the whole history
         if (shown.length > 0) {
           const from = Math.max(0, shown.length - 150)
@@ -3611,6 +3687,49 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     // below own indicator params, so tweaking a period never tears down the
     // chart or refetches bars/markers.
   }, [symbol, tf, chartType, settingsVer, scheduleRedraw, sessionGate, showExtendedHours, themeRev])
+
+  // ---- Task 32: BUY/SELL fill markers ----
+  // A symbol switch must never show the PREVIOUS symbol's fills: drop them
+  // synchronously (the per-symbol fetch below restores them shortly).
+  useEffect(() => {
+    tradeFillsRef.current = []
+  }, [symbol])
+
+  // Fetch this symbol's filled orders (up to the most recent 500) and paint
+  // them as arrows. Silent-failure contract like the other overlays; refetches
+  // when the broker credentials change and whenever a fill lands while the
+  // panel is open (tt:positions-changed from the trading flows).
+  useEffect(() => {
+    let alive = true
+    const fetchFills = async () => {
+      try {
+        const res = await fetch(`/api/trading/fills?limit=500&symbol=${encodeURIComponent(symbol)}`, { cache: 'no-store' })
+        if (!res.ok || !alive) return
+        const j = (await res.json().catch(() => null)) as { fills?: { side?: unknown; filledAt?: unknown }[] } | null
+        if (!alive || !j || !Array.isArray(j.fills)) return
+        tradeFillsRef.current = j.fills.filter(
+          (f): f is { side: string; filledAt: string } =>
+            typeof f.side === 'string' && typeof f.filledAt === 'string' &&
+            (f.side === 'buy' || f.side === 'sell'),
+        )
+        applyTradeMarkersRef.current()
+      } catch { /* markers optional */ }
+    }
+    void fetchFills()
+    const onPosChanged = () => { void fetchFills() }
+    window.addEventListener('tt:positions-changed', onPosChanged)
+    return () => {
+      alive = false
+      window.removeEventListener('tt:positions-changed', onPosChanged)
+    }
+  }, [symbol, settingsVer])
+
+  // Toggle / series swap (chartType·tf·theme rebuild the chart) → re-paint
+  // from the already-fetched fills (the lifecycle effect re-applies after its
+  // async bar load too — this covers the toggle with bars already loaded).
+  useEffect(() => {
+    applyTradeMarkersRef.current()
+  }, [tradeMarkersOn, symbol, tf, chartType, themeRev])
 
   // ---------- grid trades overlay + live-grid glow (Task 10-b / 10-d) ----------
   // Poll lifecycle: ALWAYS on while the panel is mounted (the boundary glow
@@ -4618,6 +4737,25 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           )}
         >
           <Grid3x3 className="h-3.5 w-3.5" />
+        </button>
+        {/* Task 32 — historical BUY/SELL fill arrows on the bars (manual,
+            grid and algo fills). Toggle persists to localStorage. */}
+        <button
+          title="Show historical BUY/SELL fills on chart"
+          aria-label="Show historical BUY/SELL fills on chart"
+          aria-pressed={tradeMarkersOn}
+          onClick={() =>
+            setTradeMarkersOn((v) => {
+              try { localStorage.setItem('bh-trade-markers', v ? '0' : '1') } catch { /* ignore */ }
+              return !v
+            })
+          }
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            tradeMarkersOn ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100',
+          )}
+        >
+          <Tag className="h-3.5 w-3.5" />
         </button>
         {/* Task 10-l — grid-area band settings: on/off + transparency slider
             (default 80% transparent). Lives next to the overlay toggle. */}

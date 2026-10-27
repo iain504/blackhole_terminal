@@ -14,8 +14,13 @@ export interface FillRow {
   filledAt: string
 }
 
-// GET /api/trading/fills?mode=paper&since=<ISO> — recently FILLED orders,
-// used by the client to fire sound + toast notifications.
+// GET /api/trading/fills?mode=paper&since=<ISO>                      — recently FILLED
+//   orders, used by the client to fire sound + toast notifications (default
+//   limit 30, unchanged).
+// GET /api/trading/fills?limit=500&symbol=AAPL                        — historical fills
+//   for the chart's BUY/SELL markers (Task 32): up to 500 most recent filled
+//   orders (Alpaca per-call max), optionally narrowed to one symbol (compare
+//   is normalization-tolerant — "BTC/USD" matches "BTCUSD").
 export async function GET(req: Request) {
   try {
     const user = await getSessionUser()
@@ -24,8 +29,13 @@ export async function GET(req: Request) {
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const sinceRaw = searchParams.get('since') || ''
     const since = sinceRaw ? new Date(sinceRaw).getTime() : 0
+    // Task 32 — optional deeper window + symbol filter for chart markers
+    const limitRaw = parseInt(searchParams.get('limit') || '30', 10)
+    const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 30, 1), 500)
+    const normSymOf = (s: string) => s.replace(/[^A-Za-z0-9]/g, '').toUpperCase()
+    const symFilter = normSymOf(searchParams.get('symbol') || '')
 
-    const r = await getClosedOrders(user.id, mode, 30)
+    const r = await getClosedOrders(user.id, mode, limit)
     if (!r.data) {
       // no keys configured is a quiet no-op for the poller
       if (r.error === 'no-keys') return NextResponse.json({ mode, fills: [], configured: false })
@@ -39,6 +49,7 @@ export async function GET(req: Request) {
     }
     const fills: FillRow[] = orderList
       .filter((o) => o.status === 'filled' && o.filled_at && new Date(o.filled_at).getTime() >= since)
+      .filter((o) => !symFilter || normSymOf(String(o.symbol || '')) === symFilter)
       .map((o) => ({
         id: o.id,
         symbol: o.symbol,

@@ -3193,3 +3193,20 @@ Work Log:
 
 Stage Summary:
 - Economic Calendar filter choices (High/Medium/Low + Country) are now permanent: mirrored to localStorage for an instant paint and saved per-account via /api/calendar/filters (CalendarFilterPref), restored on any device after reload/login; refreshes respect exclusions and newly-appearing currencies show automatically; Clear/Reset persists. Fixed the refresh-undo-exclusions bug along the way. Version v1.85.0.
+
+---
+Task ID: 32
+Agent: Z.ai Code (main)
+Task: User ask — indicate historical BUY and SELL on the chart (reference image: TradingView-style green BUY arrows below the bar, red SELL arrows above it).
+
+Work Log:
+- Data: /api/trading/fills gained optional `limit` (1..500, default 30 — the sound/toast poller is untouched) and `symbol` params (normalization-tolerant compare, "BTC/USD" matches "BTCUSD"). Markers use the most recent 500 FILLED orders — every fill counts (manual, grid, algo, bracket legs).
+- Chart (ChartPanel): applyTradeMarkers() snaps every fill to the bar IN EFFECT at its fill time (binary search over barsRef — lightweight-charts throws on marker times that don't exactly match a data point; fills newer than the last bar snap to it, older-than-window fills skip). Same-bar same-side fills MERGE into one arrow with a ×N count ("BUY ×3") so a busy grid bar stays readable. BUY = #22c55e arrowUp belowBar, SELL = #ef4444 arrowDown aboveBar, sorted by time. SeriesMarker type; series.setMarkers (native — the [E]/⚡ axis icons remain the custom overlay).
+- Wiring: fills fetch effect per symbol (?limit=500&symbol=…, silent-failure like the other overlays) → tradeFillsRef → apply; re-applied after every bar load AND loadOlder prepend (via applyTradeMarkersRef, no effect-dep coupling), on toggle/chartType/tf/theme series rebuilds, and on tt:positions-changed (fills landing while the panel is open repaint without reload). Symbol switch drops fills synchronously so the previous symbol's markers can never flash on the new chart.
+- UI: new toolbar Tag button next to "Show grid trades on chart" — "Show historical BUY/SELL fills on chart", aria-pressed, emerald active; choice persists in localStorage 'bh-trade-markers' (default ON, only '0' turns it off).
+- E2E (agent-browser, QA user qa-mk32 on the reserved paper account + 12 real F fills: 2 fresh buy/sell @ 11.72 + 10 from Task 30 rounds): 1D — all 12 fill arrows merged into "BUY ×7" below + "SELL ×5" above today's daily bar; 5m — arrows distributed on the correct bars (fresh pair at 19:59, "BUY ×4"/"BUY ×2"/"SELL ×3" clusters at 17:22-17:23); toggle off → arrows vanish + aria-pressed false + ls '0'; toggle on + full reload → choice and arrows both persist; tt:positions-changed dispatch → marker refetch confirmed 200 in dev.log twice (16:00 ET close stopped a live fill from rendering, but the refetch→paint chain is the proven initial-load path). Zero page errors, zero dev.log errors (only the pre-existing Radix DialogContent aria warning). Screenshots scripts-tmp/qa32-chart-5m.png / qa32-toggled-off.png / qa32-after-reload.png.
+- Gotcha: this sandbox reaps shell children after every Bash call — dev server restarts need PYTHON DOUBLE-FORK daemonization (see Task 31). Also placing a market order at/after 16:00 ET just queues it for next open ("accepted", no fill) — pos shows FLAT.
+- Cleanup: pending QA order cancelled, QA user deleted, broker FLAT, session file removed; fixture kept at scripts-tmp/qa32-markers.mjs (gitignored). bun lint clean.
+
+Stage Summary:
+- The chart now shows historical executions TradingView-style: every filled order (manual/grid/algo) paints a green BUY arrow below or red SELL arrow above the bar in effect, same-bar fills merge with ×N counts, refreshed live as fills land, toggleable (and remembered) from the chart toolbar. Version v1.86.0.
