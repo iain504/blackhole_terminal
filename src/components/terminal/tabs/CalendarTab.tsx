@@ -1,6 +1,6 @@
 'use client'
 
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, Bell, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -70,6 +70,50 @@ function eventKey(ev: CalEvent): string {
 type Imp = 'high' | 'medium' | 'low'
 const IMP_ALL: Imp[] = ['high', 'medium', 'low']
 
+/* ------------------------------------------------ persistent filters (31) ---
+ * The user's Importance (High/Medium/Low) and Country filter choices are
+ * PERMANENT: mirrored into localStorage for an instant paint and saved to
+ * the account via /api/calendar/filters so they survive reloads and follow
+ * the user across devices.
+ *
+ * Representation: importance = the ENABLED levels; country = the EXCLUDED
+ * codes. Storing exclusions (not inclusions) means countries/currencies that
+ * newly appear in the feed are visible automatically — only what the user
+ * deliberately switched OFF stays off.
+ */
+
+const FILTERS_LS_KEY = 'tt:cal:filters'
+
+function sanitizeImpArr(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null
+  return [...new Set(v.filter((x): x is Imp => x === 'high' || x === 'medium' || x === 'low'))]
+}
+
+function sanitizeStrArr(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null
+  return v.filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 12)
+}
+
+/** Read the localStorage mirror (null fields = no saved choice yet). */
+function loadLocalFilters(): { imp: string[] | null; countryExclusions: string[] | null } | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = localStorage.getItem(FILTERS_LS_KEY)
+    if (!raw) return null
+    const o = JSON.parse(raw) as Record<string, unknown>
+    return { imp: sanitizeImpArr(o.imp), countryExclusions: sanitizeStrArr(o.countryExclusions) }
+  } catch {
+    return null
+  }
+}
+
+/** Refresh the localStorage mirror (never throws — private mode etc.). */
+function mirrorLocalFilters(imp: Set<string>, excl: Set<string>): void {
+  try {
+    localStorage.setItem(FILTERS_LS_KEY, JSON.stringify({ imp: [...imp], countryExclusions: [...excl] }))
+  } catch { /* ignore */ }
+}
+
 /* -------------------------------------------------------------- component */
 
 export default function CalendarTab() {
@@ -78,9 +122,86 @@ export default function CalendarTab() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // ---- filters (Task 23 #2): importance + country ----
-  const [impSel, setImpSel] = useState<Set<string>>(new Set(IMP_ALL))
-  const [countrySel, setCountrySel] = useState<Set<string>>(new Set())
+  // ---- filters (Task 23 #2 · PERMANENT since Task 31): importance + country ----
+  // countryExcl (what the user switched OFF) is the stored truth; the included
+  // set is derived from it + the countries present in the current feed, so new
+  // currencies show up automatically and user exclusions are never undone.
+  const [impSel, setImpSel] = useState<Set<string>>(() => {
+    const l = loadLocalFilters()
+    return new Set(l?.imp ?? IMP_ALL) // an empty saved array stays empty (all levels off)
+  })
+  const [countryExcl, setCountryExcl] = useState<Set<string>>(
+    () => new Set(loadLocalFilters()?.countryExclusions ?? []),
+  )
+
+  // user-driven change → optimistic state + localStorage mirror + debounced PUT
+  const touchedRef = useRef(false)
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingSaveRef = useRef<{ imp: string[]; countryExclusions: string[] } | null>(null)
+
+  const applyFilterChange = useCallback((imp: Set<string>, excl: Set<string>) => {
+    setImpSel(imp)
+    setCountryExcl(excl)
+    touchedRef.current = true
+    mirrorLocalFilters(imp, excl)
+    pendingSaveRef.current = { imp: [...imp], countryExclusions: [...excl] }
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null
+      const payload = pendingSaveRef.current
+      pendingSaveRef.current = null
+      if (!payload) return
+      void fetch('/api/calendar/filters', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(() => { /* offline — optimistic state kept, next change re-saves */ })
+    }, 600)
+  }, [])
+
+  // Flush a still-pending save when the tab unmounts.
+  useEffect(
+    () => () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current)
+        saveTimerRef.current = null
+      }
+      const p = pendingSaveRef.current
+      pendingSaveRef.current = null
+      if (p) {
+        void fetch('/api/calendar/filters', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(p),
+        }).catch(() => { /* ignore */ })
+      }
+    },
+    [],
+  )
+
+  // Server-side hydration (per-account permanence): the saved choice wins over
+  // localStorage unless the user already interacted during this mount.
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const res = await fetch('/api/calendar/filters', { cache: 'no-store' })
+        if (!res.ok || !alive) return
+        const j = (await res.json()) as { imp?: unknown; countryExclusions?: unknown }
+        const imp = sanitizeImpArr(j.imp)
+        const excl = sanitizeStrArr(j.countryExclusions)
+        if (!imp || !excl || touchedRef.current || !alive) return
+        const impSet = new Set(imp)
+        const exclSet = new Set(excl)
+        setImpSel(impSet)
+        setCountryExcl(exclSet)
+        mirrorLocalFilters(impSet, exclSet) // keep the mirror fresh
+      } catch { /* offline — localStorage state stands */ }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [])
 
   // ---- event alarms (Task 28 #3): grey = off (default), colored = on ----
   const [alarms, setAlarms] = useState<Set<string>>(new Set())
@@ -96,13 +217,9 @@ export default function CalendarTab() {
       setEvents(evs)
       // tolerate mirror-specific sources ('forexfactory-xml' / '-json')
       setSource(data.source?.startsWith('forexfactory') ? 'forexfactory' : 'sample')
-      // register any NEW countries/currencies that appeared, keep the user's
-      // exclusions untouched
-      setCountrySel((prev) => {
-        const next = new Set(prev)
-        for (const ev of evs) if (ev.country) next.add(ev.country)
-        return next
-      })
+      // New countries/currencies register themselves via the derived
+      // `countrySel` (known options − persisted exclusions) — the user's
+      // exclusions are never undone by a refresh (Task 31).
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load calendar')
     } finally {
@@ -200,6 +317,13 @@ export default function CalendarTab() {
       .map(([value, count]) => ({ value, label: value, count }))
   }, [events])
 
+  // INCLUDED countries = every country in the current feed minus the user's
+  // persisted exclusions (derived, so new currencies auto-register visible).
+  const countrySel = useMemo(
+    () => new Set(countryOptions.map((o) => o.value).filter((v) => !countryExcl.has(v))),
+    [countryOptions, countryExcl],
+  )
+
   // Apply the filters BEFORE day grouping
   const filtered = useMemo(
     () =>
@@ -247,8 +371,16 @@ export default function CalendarTab() {
 
   const today = dayKey(new Date())
   const hasData = events.length > 0
-  const filtersActive = impSel.size !== IMP_ALL.length || countrySel.size < countryOptions.length
+  // active = an importance level is off OR at least one FEED country is excluded
+  // (stale exclusions for countries no longer in the feed don't count)
+  const filtersActive =
+    impSel.size !== IMP_ALL.length || countryOptions.some((o) => countryExcl.has(o.value))
   const hiddenCount = events.length - filtered.length
+
+  const clearAllFilters = useCallback(
+    () => applyFilterChange(new Set(IMP_ALL), new Set()),
+    [applyFilterChange],
+  )
 
   return (
     <div className="flex h-full flex-col bg-zinc-950/40">
@@ -305,14 +437,12 @@ export default function CalendarTab() {
             return (
               <button
                 key={imp}
-                onClick={() =>
-                  setImpSel((prev) => {
-                    const next = new Set(prev)
-                    if (next.has(imp)) next.delete(imp)
-                    else next.add(imp)
-                    return next
-                  })
-                }
+                onClick={() => {
+                  const next = new Set(impSel)
+                  if (next.has(imp)) next.delete(imp)
+                  else next.add(imp)
+                  applyFilterChange(next, countryExcl) // remembered (Task 31)
+                }}
                 aria-pressed={on}
                 title={`${IMPORTANCE_LABEL[imp]} importance events`}
                 className={cn(
@@ -326,12 +456,17 @@ export default function CalendarTab() {
             )
           })}
         </div>
-        {/* country / currency multi-select */}
+        {/* country / currency multi-select — exclusions are remembered (Task 31) */}
         <FilterMultiSelect
           label="Country"
           options={countryOptions}
           selected={countrySel}
-          onChange={setCountrySel}
+          onChange={(nextIncluded) => {
+            const nextExcl = new Set(
+              countryOptions.map((o) => o.value).filter((v) => !nextIncluded.has(v)),
+            )
+            applyFilterChange(impSel, nextExcl)
+          }}
         />
         {filtersActive && (
           <div className="ml-auto flex items-center gap-2">
@@ -339,10 +474,7 @@ export default function CalendarTab() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => {
-                setImpSel(new Set(IMP_ALL))
-                setCountrySel(new Set(countryOptions.map((o) => o.value)))
-              }}
+              onClick={clearAllFilters}
               className="h-6 gap-1 rounded px-1.5 text-[10px] text-zinc-400 hover:text-zinc-100"
             >
               <X className="size-3" aria-hidden="true" />
@@ -416,10 +548,7 @@ export default function CalendarTab() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => {
-                setImpSel(new Set(IMP_ALL))
-                setCountrySel(new Set(countryOptions.map((o) => o.value)))
-              }}
+              onClick={clearAllFilters}
               className="h-7 border-zinc-800 bg-zinc-900 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
             >
               <X className="size-3.5" aria-hidden="true" />

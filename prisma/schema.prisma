@@ -162,6 +162,18 @@ model CalendarAlarm {
   @@index([userId])
 }
 
+// Task 31 — Economic Calendar filter preferences, ONE row per user (same
+// shape as Layout): the Importance (High/Medium/Low) and Country filter
+// choices the user made are stored so they survive reloads and follow the
+// account across devices. Both columns hold JSON string arrays. The client
+// also mirrors them into localStorage for an instant pre-auth paint.
+model CalendarFilterPref {
+  userId            String   @id
+  imp               String   // JSON array of enabled importance levels (subset of high|medium|low)
+  countryExclusions String   // JSON array of EXCLUDED country/currency codes — everything else shows
+  updatedAt         DateTime @updatedAt
+}
+
 // Telegram order-fill / position-close notification watcher — one cursor per
 // (user, mode). positions: snapshot of the open positions at the last cycle
 // ({symbol: {side, qty, avgEntry}}) used to detect closures; seen: recently
