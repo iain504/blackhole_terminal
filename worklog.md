@@ -3163,3 +3163,17 @@ Work Log:
 
 Stage Summary:
 - Position Source attribution no longer collapses mixed inventory: every still-open FIFO lot is decoded and the badge shows EVERY source with its qty (dominant first), so an algo position on a grid-active symbol displays "Algo · <strategy> N" + "Grid M" instead of a wrong plain "Grid". Single-source positions render unchanged; legacy API fields remain dominant-slice for compatibility. Version v1.83.1.
+
+---
+Task ID: 30
+Agent: Z.ai Code (main)
+Task: User ask — Trade History needs date-range selection: Today / This week / This month / YTD / custom start–end date.
+
+Work Log:
+- API (/api/trading/history): optional `from`/`to` ISO params filter matched trades by EXIT time (the CLOSED column). The FIFO walk now runs uncapped over the whole recent closed-orders window and the date filter is applied BEFORE the limit, so a narrow range isn't crowded out by newer trades (matchClosedTrades(orderList, 1000) — 500 orders can't produce more; matchFifo's `max` semantics untouched, positions route unaffected). ReportTab (same endpoint, no params) behaves identically to before. Invalid/unparseable bounds are ignored (Date.parse NaN guards), not 500s.
+- UI (PositionsTab): Task 82 range selector in the Trade history panel header — compact select (All / Today / This week / This month / YTD / Custom) + when Custom, two date inputs (From/To, min/max cross-constraints). Bounds are computed in the BROWSER's timezone: presets anchor at local midnight (Today; Monday-start week via (getDay()+6)%7; 1st of month; Jan 1), custom `to` = end of that local day (23:59:59.999). histRangeQuery() → from/to params; a range change gives `refresh` a new useCallback identity so the 10s effect re-fires immediately and the auto-refresh keeps using the current range. Ranged views fetch limit=300 (server max) instead of 150. Count badge + realized P&L (panel header AND the account-strip "closed" chip) reflect the filtered set; empty state gains "No closed trades in the selected date range."; header wraps (flex-wrap) and the hint text hides below lg.
+- Verification (agent-browser, QA user on the reserved paper account — 26 real closed trades in-window from prior task rounds): All = 26 rows (default fetch limit=150, no params — unchanged); Today → fetch limit=300&from=2026-10-27T00:00:00Z, 6 rows all "27 Oct"; This week → from=2026-10-26 (Monday), 23 rows spanning 26–27 Oct; This month → from=2026-10-01, 26 rows; YTD → from=2026-01-01, 26 rows; Custom 10/27→10/27 → from&to params (to=23:59:59.999), 6 rows; Custom future range → 0 rows + the new empty message; back to All → 26. Desktop 1440×900 screenshot (custom select + date inputs inline, count/P&L filtered) + mobile 390×844 (no horizontal overflow, header wraps). Zero page/console errors, zero dev.log errors. QA user + fake run deleted; broker flat.
+- Note: last session's git realign holds — local main tracks origin/main; PAT (re-issued by user) stored in ~/.git-credentials, pushes work.
+
+Stage Summary:
+- Trade History is date-filterable: All / Today / This week / This month / YTD presets plus a custom start–end range, computed in the browser timezone, filtered server-side by exit time before the limit, with count + realized P&L reflecting the selection. Version v1.84.0.

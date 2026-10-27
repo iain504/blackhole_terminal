@@ -15,7 +15,7 @@
 // columns sort asc/desc by clicking the header (click again cycles desc →
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -117,6 +117,49 @@ function fmtCompactDT(iso: string | null | undefined): string {
   return new Date(t).toLocaleString('en-GB', {
     day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
   })
+}
+
+// Task 82 — Trade history date range. Bounds are computed in the BROWSER's
+// timezone (local midnight) and sent as ISO `from`/`to`; the server filters
+// by exit time (the CLOSED column). 'This week' starts Monday (ISO weeks).
+type HistRange = 'all' | 'today' | 'week' | 'month' | 'ytd' | 'custom'
+const HIST_RANGE_LABELS: Record<HistRange, string> = {
+  all: 'All', today: 'Today', week: 'This week', month: 'This month', ytd: 'YTD', custom: 'Custom',
+}
+const HIST_RANGES = Object.keys(HIST_RANGE_LABELS) as HistRange[]
+
+/** local midnight of `d` (browser timezone) */
+const localMidnight = (d = new Date()): Date => new Date(d.getFullYear(), d.getMonth(), d.getDate())
+
+/** from/to URLSearchParams for a history range — '' when unbounded ('all',
+ * or custom with neither date picked). Custom `to` = end of that local day. */
+function histRangeQuery(range: HistRange, fromStr: string, toStr: string): string {
+  if (range === 'all') return ''
+  const p = new URLSearchParams()
+  const iso = (s: string, endOfDay = false): string | null => {
+    const d = new Date(`${s}T00:00:00`)
+    if (!Number.isFinite(d.getTime())) return null
+    return endOfDay
+      ? new Date(localMidnight(d).getTime() + 86400000 - 1).toISOString()
+      : d.toISOString()
+  }
+  if (range === 'custom') {
+    if (fromStr) {
+      const f = iso(fromStr)
+      if (f) p.set('from', f)
+    }
+    if (toStr) {
+      const t = iso(toStr, true)
+      if (t) p.set('to', t)
+    }
+    return p.toString()
+  }
+  const start = localMidnight()
+  if (range === 'week') start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
+  else if (range === 'month') start.setDate(1)
+  else if (range === 'ytd') start.setMonth(0, 1)
+  p.set('from', start.toISOString())
+  return p.toString()
 }
 
 /** Manual / Algo / Grid source badge (Task 65, grid in Task 10-k): algo rows
@@ -290,6 +333,15 @@ export default function PositionsTab() {
   const [posSort, setPosSort] = useState<SortState>(null)
   const [pendSort, setPendSort] = useState<SortState>(null)
   const [histSort, setHistSort] = useState<SortState>(null)
+  // Task 82 — Trade history date range (server-side exit-time filter; a range
+  // change gives `refresh` a new identity so the fetch effect re-fires)
+  const [histRange, setHistRange] = useState<HistRange>('all')
+  const [histFrom, setHistFrom] = useState('')
+  const [histTo, setHistTo] = useState('')
+  const histQuery = useMemo(
+    () => histRangeQuery(histRange, histFrom, histTo),
+    [histRange, histFrom, histTo],
+  )
 
   const refresh = useCallback(async () => {
     setRefreshing(true)
@@ -315,7 +367,9 @@ export default function PositionsTab() {
     }
     const hist = async (mode: Mode): Promise<HistoryData> => {
       try {
-        const res = await fetch(`/api/trading/history?mode=${mode}&limit=150`)
+        // ranged views get the full 300 cap — a narrow range shouldn't be
+        // crowded out by the 150-trade default window
+        const res = await fetch(`/api/trading/history?mode=${mode}&limit=${histQuery ? 300 : 150}${histQuery ? `&${histQuery}` : ''}`)
         if (!res.ok) return { trades: [], configured: true, loaded: true, error: `HTTP ${res.status}` }
         const json = await res.json()
         return { trades: (json.trades || []) as ClosedTrade[], configured: json.configured !== false, loaded: true }
@@ -328,7 +382,7 @@ export default function PositionsTab() {
     setData({ paper, live })
     setHistory({ paper: hPaper, live: hLive })
     setRefreshing(false)
-  }, [])
+  }, [histQuery])
 
   useEffect(() => {
     void refresh()
@@ -472,7 +526,11 @@ export default function PositionsTab() {
         <Badge
           variant="outline"
           className="border-zinc-700 text-[10px] text-zinc-400"
-          title="Realized round-trip trades in the history group below"
+          title={
+            histQuery
+              ? `Realized round-trips ${HIST_RANGE_LABELS[histRange]}${histRange === 'custom' ? ' range' : ''} — reflects the history group's date filter`
+              : 'Realized round-trip trades in the history group below'
+          }
         >
           <History className="mr-1 inline h-3 w-3" aria-hidden />
           {historyRows.length} closed
@@ -765,7 +823,7 @@ export default function PositionsTab() {
         style={{ flex: `${sizes[2]} 1 0%` }}
         className="flex min-h-[130px] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70"
       >
-        <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
+        <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <History className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Trade history</span>
           <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{historyRows.length}</Badge>
@@ -780,7 +838,46 @@ export default function PositionsTab() {
               {historyPnl >= 0 ? '+' : '−'}${Math.abs(historyPnl).toFixed(2)}
             </span>
           )}
-          <span className="ml-auto text-[10px] text-zinc-600">realized round-trips · paper + live · FIFO-matched fills</span>
+          {/* Task 82 — date-range selector: presets compute local-midnight
+              bounds in the browser timezone; Custom reveals start/end dates.
+              A range change re-fires the refresh effect (server-side filter). */}
+          <div className="ml-auto flex flex-wrap items-center gap-1.5">
+            <select
+              aria-label="Trade history date range"
+              title="Filter closed trades by exit date (Closed column)"
+              value={histRange}
+              onChange={(e) => setHistRange(e.target.value as HistRange)}
+              className="h-6 rounded-md border border-zinc-700 bg-zinc-950 px-1.5 text-[11px] text-zinc-300 outline-none focus:border-zinc-500"
+            >
+              {HIST_RANGES.map((r) => (
+                <option key={r} value={r}>{HIST_RANGE_LABELS[r]}</option>
+              ))}
+            </select>
+            {histRange === 'custom' && (
+              <>
+                <Input
+                  type="date"
+                  aria-label="History start date"
+                  title="From — trades closed on/after this day (inclusive)"
+                  value={histFrom}
+                  max={histTo || undefined}
+                  onChange={(e) => setHistFrom(e.target.value)}
+                  className="h-6 w-[120px] border-zinc-700 bg-zinc-950 px-1.5 text-[11px] text-zinc-300"
+                />
+                <span className="text-[10px] text-zinc-600" aria-hidden>→</span>
+                <Input
+                  type="date"
+                  aria-label="History end date"
+                  title="To — trades closed on/before this day (inclusive)"
+                  value={histTo}
+                  min={histFrom || undefined}
+                  onChange={(e) => setHistTo(e.target.value)}
+                  className="h-6 w-[120px] border-zinc-700 bg-zinc-950 px-1.5 text-[11px] text-zinc-300"
+                />
+              </>
+            )}
+            <span className="hidden text-[10px] text-zinc-600 lg:inline">realized round-trips · paper + live · FIFO-matched fills</span>
+          </div>
         </div>
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
           <table className="w-full min-w-[860px] border-collapse text-xs">
@@ -807,6 +904,8 @@ export default function PositionsTab() {
                       <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading trade history…</span>
                     ) : history.paper.configured === false && history.live.configured === false ? (
                       'No Alpaca keys configured — trade history unavailable.'
+                    ) : histQuery ? (
+                      'No closed trades in the selected date range.'
                     ) : (
                       'No closed trades yet — completed round-trips (entry + exit filled) appear here with their realized P&L.'
                     )}
