@@ -50,6 +50,24 @@ export interface PositionRow {
   runRef?: string | null
   /** when source === 'algo': strategy display name (resolved from AlgoRun) */
   strategy?: string
+  /** Task 81 — per-source inventory breakdown of the position's still-open
+   * FIFO lots. Alpaca aggregates ONE position per symbol, so when algo AND
+   * grid (or manual) inventory coexist on the same symbol, the single legacy
+   * `source` badge had to pick a winner (grid claimed everything, masking an
+   * algo position on a grid-active symbol). `sources` lists EVERY source
+   * slice with its open qty, dominant (largest qty, tie → oldest) first.
+   * Single-source positions return exactly one slice (UI renders unchanged). */
+  sources?: PositionSourceSlice[]
+}
+
+export interface PositionSourceSlice {
+  source: 'manual' | 'algo' | 'grid'
+  /** summed open qty across this slice's FIFO lots (float-trimmed) */
+  qty: number
+  /** when source === 'algo': the originating AlgoRun id prefix */
+  runRef?: string | null
+  /** when source === 'algo': strategy display name (resolved from AlgoRun) */
+  strategy?: string
 }
 
 /** An open ENTRY order (not yet — or not fully — filled) for the chart. */
@@ -159,18 +177,44 @@ export async function GET(req: Request) {
       .filter((p) => !symbolParam || normSymbol(p.symbol) === normSymbol(symbolParam))
       .map((p) => {
         // FIFO entry lots for this symbol → when the position was opened + who
-        // placed it (ttb-… manual · ttr-… algo run · ttg-… grid, or a GridFill
-        // orderId match for pre-tagging grid fills). Lookup is normalized
-        // (Task 79) so crypto 'BTCUSD' positions find 'BTC/USD' lots.
-        // Task 10-k — a grid lot ANYWHERE in the FIFO claims the source: the
-        // grid engine actively manages inventory on that symbol (Grid tab,
-        // chart glow), so an old manual dust lot being oldest must not mask it.
+        // placed it. Each lot is decoded INDIVIDUALLY (ttb-… manual · ttr-…
+        // algo run · ttg-… grid, or a GridFill orderId match for pre-tagging
+        // grid fills); lookup is normalized (Task 79) so crypto 'BTCUSD'
+        // positions find 'BTC/USD' lots.
+        // Task 81 — the old single-tag policy ("a grid lot ANYWHERE in the
+        // FIFO claims the source") collapsed mixed inventory: an algo position
+        // on a symbol where the grid engine also holds open lots was labeled
+        // plain "Grid", hiding the algo run. The lots are now aggregated into
+        // per-source slices (source + runRef key, qty summed, dominant qty
+        // first, tie → oldest) so every coexisting source stays visible.
         const lots = openLotsByNorm.get(normSymbol(p.symbol)) ?? []
         const oldest = lots[0]
-        const oldestPlan = oldest ? parseCryptoPlan(oldest.clientOrderId) : null
-        const lotIsGrid =
-          lots.some((l) => parseCryptoPlan(l.clientOrderId)?.gridRef != null) ||
-          lots.some((l) => gridOrderIds?.has(l.orderId) === true)
+        type LotSrc = { source: 'manual' | 'algo' | 'grid'; qty: number; runRef: string | null; at: number }
+        const lotSrcs: LotSrc[] = lots.map((l) => {
+          const plan = parseCryptoPlan(l.clientOrderId)
+          const isGrid = plan?.gridRef != null || gridOrderIds?.has(l.orderId) === true
+          return {
+            source: isGrid ? ('grid' as const) : plan?.runRef ? ('algo' as const) : ('manual' as const),
+            qty: l.qty,
+            runRef: !isGrid && plan?.runRef ? plan.runRef : null,
+            at: new Date(l.entryTime).getTime() || 0,
+          }
+        })
+        // merge lots into slices keyed by source (algo also by runRef, so two
+        // different runs on one symbol stay separately labeled)
+        const sliceMap = new Map<string, LotSrc>()
+        for (const ls of lotSrcs) {
+          const key = ls.source === 'algo' ? `algo:${ls.runRef ?? ''}` : ls.source
+          const cur = sliceMap.get(key)
+          if (cur) {
+            cur.qty = Number((cur.qty + ls.qty).toPrecision(10))
+            if (ls.at < cur.at) cur.at = ls.at
+          } else {
+            sliceMap.set(key, { ...ls })
+          }
+        }
+        const slices = [...sliceMap.values()].sort((a, b) => (b.qty - a.qty) || (a.at - b.at))
+        const dominant = slices[0]
         return {
           symbol: p.symbol.includes('/') ? p.symbol : p.asset_class === 'crypto' ? p.symbol.replace(/USD$/, '/USD') : p.symbol,
           tradeSymbol: p.symbol,
@@ -183,8 +227,12 @@ export async function GET(req: Request) {
           uplPct: (parseFloat(p.unrealized_plpc) || 0) * 100,
           assetClass: p.asset_class,
           openedAt: oldest?.entryTime ?? null,
-          ...(lots.length ? { source: lotIsGrid ? ('grid' as const) : oldestPlan?.runRef ? ('algo' as const) : ('manual' as const) } : {}),
-          runRef: oldestPlan?.runRef ?? null,
+          // legacy single-source fields = the DOMINANT slice (backward compat:
+          // chart consumers + the Source column sort keep working)
+          ...(slices.length
+            ? { source: dominant!.source, sources: slices.map(({ at: _at, ...s }) => s) }
+            : {}),
+          runRef: dominant?.runRef ?? null,
         }
       })
 
@@ -267,16 +315,27 @@ export async function GET(req: Request) {
     // when a position exists — orders on the OPPOSITE side (those already
     // classify as SL/TP exits above).
     const legIds = new Set<string>(orders.flatMap((o) => (o.legs || []).map((l) => l.id)))
-    // batch-resolve algo run refs → strategy names: pending rows AND position
-    // open lots share ONE resolver (trade-history) so labels stay consistent
+    // batch-resolve algo run refs → strategy names: pending rows AND every
+    // algo slice of every position share ONE resolver (trade-history) so
+    // labels stay consistent across pending/positions/history
     const pendingPlans = orders.map((o) => ({ o, plan: parseCryptoPlan(o.client_order_id) }))
     const pendingRefs = [...new Set(pendingPlans.map(({ plan }) => plan?.runRef).filter((x): x is string => !!x))]
-    const lotRefs = rows.map((r) => r.runRef).filter((x): x is string => !!x)
-    const stratNames = await resolveRunStrategyNames([...new Set([...lotRefs, ...pendingRefs])])
-    // attach strategy names to algo-attributed positions
-    const enrichedRows = rows.map((r) =>
-      r.source === 'algo' && r.runRef ? { ...r, strategy: stratNames.get(r.runRef) ?? 'Algo' } : r,
-    )
+    const sliceRefs = rows.flatMap((r) => (r.sources ?? []).filter((s) => s.source === 'algo' && s.runRef).map((s) => s.runRef as string))
+    const stratNames = await resolveRunStrategyNames([...new Set([...sliceRefs, ...pendingRefs])])
+    // attach strategy names to every algo slice (and the dominant legacy field)
+    const enrichedRows = rows.map((r) => {
+      const sources = r.sources?.map((s) =>
+        s.source === 'algo' && s.runRef ? { ...s, strategy: stratNames.get(s.runRef) ?? 'Algo' } : s,
+      )
+      const dominant = sources?.[0]
+      return {
+        ...r,
+        ...(sources ? { sources } : {}),
+        // legacy `strategy` keeps its old meaning — a name on an ALGO-source
+        // row only; mixed rows carry per-slice names in `sources`
+        strategy: dominant && dominant.source === 'algo' ? dominant.strategy : undefined,
+      }
+    })
     const pending: PendingOrderRow[] = []
     for (const { o, plan } of pendingPlans) {
       if (legIds.has(o.id)) continue

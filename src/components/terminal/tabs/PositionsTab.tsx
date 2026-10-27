@@ -58,11 +58,21 @@ interface PosConsoleRow {
 
 /** Position row + open-lot attribution fields (OPENED / SOURCE — served by
  * /api/trading/positions from the FIFO matcher's oldest open entry lot;
- * kept as a local extension so the shared trading-types file stays stable). */
+ * kept as a local extension so the shared trading-types file stays stable).
+ * Task 81 — `sources` is the per-source inventory breakdown: a position whose
+ * FIFO open lots span more than one source (algo AND grid both bought) lists
+ * every slice with its open qty instead of collapsing to one winner. */
+type SourceSlice = {
+  source: 'manual' | 'algo' | 'grid'
+  qty: number
+  runRef?: string | null
+  strategy?: string
+}
 type PositionRowExt = PositionRow & {
   openedAt?: string | null
   source?: 'manual' | 'algo' | 'grid'
   strategy?: string
+  sources?: SourceSlice[]
 }
 
 const MODES: Mode[] = ['paper', 'live']
@@ -114,8 +124,10 @@ function fmtCompactDT(iso: string | null | undefined): string {
  *  UNKNOWN source (no open entry lot in the recent closed-orders window,
  *  e.g. an old position or a pre-dating fill) used to render as "Manual" — a
  *  wrong attribution. It now shows a dim "—" like other unknown columns;
- *  only a decoded `ttb-`/external coid renders "Manual". */
-function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | 'grid' | undefined; strategy?: string }) {
+ *  only a decoded `ttb-`/external coid renders "Manual". Task 81 — an
+ *  optional qty label (shown only on multi-source rows) sizes each slice. */
+function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | undefined; strategy?: string; qty?: number }) {
+  const qtyLabel = qty != null ? ` ${fmtQtyLabel(qty)}` : ''
   if (source === 'algo') {
     return (
       <Badge
@@ -123,7 +135,7 @@ function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | 'grid' 
         className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300"
         title={strategy ? `Placed by the ${strategy} algo run` : 'Placed by an algo run'}
       >
-        {strategy ? `Algo · ${strategy}` : 'Algo'}
+        {strategy ? `Algo · ${strategy}` : 'Algo'}{qtyLabel}
       </Badge>
     )
   }
@@ -134,7 +146,7 @@ function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | 'grid' 
         className="border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-300"
         title="Placed by a grid trade"
       >
-        Grid
+        Grid{qtyLabel}
       </Badge>
     )
   }
@@ -151,9 +163,35 @@ function SourceBadge({ source, strategy }: { source: 'manual' | 'algo' | 'grid' 
   }
   return (
     <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400" title="Placed manually from the chart / ticket">
-      Manual
+      Manual{qtyLabel}
     </Badge>
   )
+}
+
+/** Task 81 — the Source cell of a POSITION row. Single-source positions keep
+ *  the classic one-badge look. A position whose still-open FIFO lots span
+ *  MULTIPLE sources (e.g. an algo entry on a symbol where the grid engine
+ *  also holds open inventory) renders one badge PER source with its open
+ *  qty — biggest holding first — so an algo position can no longer be masked
+ *  as plain "Grid" (and old manual dust can't mask an active grid either). */
+function PositionSourceCell({ source, strategy, sources }: { source?: 'manual' | 'algo' | 'grid'; strategy?: string; sources?: SourceSlice[] }) {
+  if (sources && sources.length > 1) {
+    const summary = sources
+      .map((s) => `${s.source === 'algo' && s.strategy ? `Algo · ${s.strategy}` : s.source} ${fmtQtyLabel(s.qty)}`)
+      .join(' + ')
+    return (
+      <span
+        className="flex flex-col items-start gap-1"
+        title={`Position inventory spans multiple sources (still-open FIFO lots): ${summary}`}
+      >
+        {sources.map((s, i) => (
+          <SourceBadge key={`${s.source}:${s.runRef ?? ''}:${i}`} source={s.source} strategy={s.strategy} qty={s.qty} />
+        ))}
+      </span>
+    )
+  }
+  const s = sources?.[0]
+  return <SourceBadge source={s ? s.source : source} strategy={s ? s.strategy : strategy} />
 }
 
 export default function PositionsTab() {
@@ -536,8 +574,8 @@ export default function PositionsTab() {
                     </Badge>
                   </td>
                   <td className="px-3 py-2">
-                    {r.pos.source ? (
-                      <SourceBadge source={r.pos.source} strategy={r.pos.strategy} />
+                    {r.pos.source || r.pos.sources?.length ? (
+                      <PositionSourceCell source={r.pos.source} strategy={r.pos.strategy} sources={r.pos.sources} />
                     ) : (
                       <span className="text-zinc-600">—</span>
                     )}
