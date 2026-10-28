@@ -26,7 +26,8 @@ interface UserSettings {
   // emerald, algo glow purple; the user picks both in Settings → Chart glow.
   glowGridColor?: string
   glowAlgoColor?: string
-  // Task 28 — UI theme: 'default' (Midnight) | 'christmas'. Absent = default.
+  // Task 28 — UI theme: 'default' (Midnight) | 'day' (light) | 'christmas'.
+  // Absent = default.
   uiTheme?: string
   // v1.87.0 — full-screen splash when the US regular session opens/closes.
   // Absent = enabled (default on).
@@ -72,7 +73,7 @@ export async function GET() {
         grid: safeGlow(s?.glowGridColor, DEFAULT_GLOW_GRID),
         algo: safeGlow(s?.glowAlgoColor, DEFAULT_GLOW_ALGO),
       },
-      uiTheme: s?.uiTheme === 'christmas' ? 'christmas' : 'default',
+      uiTheme: s?.uiTheme === 'christmas' ? 'christmas' : s?.uiTheme === 'day' ? 'day' : 'default',
       sessionSplash: s?.sessionSplash !== false,
     })
   } catch (e) {
@@ -154,8 +155,8 @@ export async function PUT(req: Request) {
     // Task 28 — UI theme (Settings → Appearance; the client applies it live
     // and mirrors it into localStorage)
     if (body.uiTheme != null) {
-      if (body.uiTheme !== 'default' && body.uiTheme !== 'christmas') {
-        return NextResponse.json({ error: "uiTheme must be 'default' or 'christmas'" }, { status: 400 })
+      if (body.uiTheme !== 'default' && body.uiTheme !== 'day' && body.uiTheme !== 'christmas') {
+        return NextResponse.json({ error: "uiTheme must be 'default', 'day' or 'christmas'" }, { status: 400 })
       }
       s.uiTheme = body.uiTheme
     }

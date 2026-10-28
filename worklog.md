@@ -3229,3 +3229,24 @@ Work Log:
 
 Stage Summary:
 - v1.87.0 pushed (commit c4c92fc, origin/main). Mobile chart users can now show/hide grid trades and tune the range-shadow opacity (persisted, synced with the desktop controls via localStorage + window events). Full-screen splash alerts at regular-session open (09:30 ET) / close (16:00 ET) Mon–Fri with per-account enable/disable in Settings → Trading session alerts (default ON, once-per-day, auto-dismiss 10s). New files: src/components/terminal/SessionSplash.tsx. Session math stays on the sessions.ts single source of truth.
+
+---
+Task ID: 34
+Agent: Z.ai Code (main session)
+Task: "add a day time theme."
+
+Work Log:
+- Explored: Task 28 theme system — UiTheme union ('default'|'christmas') in src/lib/ui-theme.ts, single DOM class switch (html.theme-christmas), globals.css redefines the Tailwind zinc vars + shadcn tokens under that class, localStorage tt_ui_theme + per-account user.settings.uiTheme via /api/settings, pre-paint boot script in layout.tsx, chart canvas follows --chart-bg via chartBg(); ChartPanel re-creates the chart on tt:ui-theme-changed (themeRev).
+- ui-theme.ts: added 'day' to the union + UI_THEMES card (swatch/hint), THEME_CLASS_DAY, normalize/fetchServerUiTheme accept 'day'; applyUiTheme now toggles BOTH classes and syncs meta[name=theme-color] (mobile browser chrome; META_THEME_COLOR map); new cached chartVar(name, fallback) helper (same cache pattern as chartBg, cleared on theme apply).
+- globals.css "Day" block (v1.88.0): INVERTED zinc ramp — bg-zinc-950 (page) → paper #edf0f3 … text-zinc-100/200 → dark ink, so the dark-first codebase re-skins with zero component changes; light shadcn tokens; chart canvas vars --chart-bg #ffffff / --chart-grid #e5e9ee / --chart-text #5a6273 / --chart-border #d2d8e0 / --chart-crosshair #9aa3b0 (dark defaults added to :root); day ::selection + themed scrollbar; the full opacity-modifier zinc override list duplicated under html.theme-day (those compile to literal hex); accent TEXT steps re-pointed at their -600/-700 (text-emerald-400→#059669, rose/amber/violet/sky/red/pink/teal/orange/fuchsia/purple/green — bright dark-optimized accents fail contrast on paper); landing overrides (.lp-root #eef1f5, .lp-nav light, .text-white→ink, footer .bg-black/40 + .border-white/5 light; the black-hole brand graphic stays dark).
+- layout.tsx: boot script adds theme-day class AND sets the themed meta color pre-paint (flash-free, chrome tint included).
+- ChartPanel.tsx: chart creation colors themed via chartVar() — layout.textColor, grid vert/horz lines, crosshair vert/horz (labelBackgroundColor stays #27272a dark pill — reads on any canvas), rightPriceScale/timeScale borders; overlay vol + macd-hist strip values use --chart-text; chip ink (drawChip/drawPlChip/drawAlert) is now a FIXED #09090b in every theme (chip fills are always bright — chartBg() text would turn white-on-white on the Day canvas); overlay render effect deps += themeRev so overlays repaint on theme switch.
+- /api/settings: 'day' accepted in GET passthrough + PUT validation (error message updated).
+- SettingsDialog: 3 theme cards (grid-cols-2 sm:grid-cols-3); toast title now derived from UI_THEMES (was hard-coded 'Midnight/Christmas theme on' — Day showed the wrong name).
+- LandingPage: footer version was hard-coded 'v1.28.0' → APP_VERSION.display (v1.88.0+185).
+- E2E (agent-browser; fresh DB → registered qa_theme through the real 2FA register API): Settings shows 3 cards; Day click → html.dark.theme-day, body #edf0f3, canvas #fff, LS 'day', GET /api/settings uiTheme:"day"; reload → flash-free persistence + meta #edf0f3 from the boot script; full terminal light — white chart with dark axis ink + soft grid, watchlist/quote/news/settings/trades all readable; toast fix verified ('Christmas theme on'); Christmas regression clean (pine surfaces, #07150d canvas); Midnight regression clean (no theme class, #09090b, meta #09090b); landing Day skin verified (light hero, dark text, blue CTA, footer v1.88.0+185); mobile 390×844 — menu, chart (white canvas, dark ink) and Trades all light + readable; zero console errors, dev.log clean, lint clean. Screenshots /tmp/t3-terminal-day.png, /tmp/t4-terminal-day-full.png, /tmp/t8-landing-day.png, /tmp/t11-mobile-day.png, /tmp/t12-mobile-day-chart.png, /tmp/t13-mobile-day-trades.png.
+- Sandbox gotcha (recurring): GitHub credentials lost with the shell reset — re-wrote ~/.git-credentials (chmod 600) + credential.helper store before push.
+- Cleanup: QA user qa_theme deleted, browser closed.
+
+Stage Summary:
+- v1.88.0 — new "Day" light theme alongside Midnight & Christmas, selectable in Settings → Appearance (live preview, per-account + per-device persistence, flash-free boot). The whole app re-skins via an inverted zinc ramp; the chart canvas flips to white paper with dark ink/grid via new --chart-* vars (chartVar()); accent text re-tuned for contrast; landing + mobile browser chrome follow the theme.

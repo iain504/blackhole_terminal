@@ -34,8 +34,9 @@ export const viewport: Viewport = {
 
 // Task 28 — apply the saved UI theme (localStorage 'tt_ui_theme') BEFORE
 // first paint so switching to the Christmas skin never flashes the default
-// zinc surfaces. Runs pre-hydration; <html> carries suppressHydrationWarning.
-const UI_THEME_BOOT = `(function(){try{if(localStorage.getItem('tt_ui_theme')==='christmas'){document.documentElement.classList.add('theme-christmas');}}catch(e){}})();`;
+// zinc surfaces (v1.88.0: same for the light "Day" skin). Runs pre-hydration;
+// <html> carries suppressHydrationWarning.
+const UI_THEME_BOOT = `(function(){try{var t=localStorage.getItem('tt_ui_theme');var m={christmas:'#07150d',day:'#edf0f3'}[t];if(m){document.documentElement.classList.add('theme-'+t);var el=document.querySelector('meta[name="theme-color"]');if(el)el.setAttribute('content',m);}}catch(e){}})();`;
 
 export default function RootLayout({
   children,

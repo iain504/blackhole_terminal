@@ -7,6 +7,7 @@ import Image from 'next/image'
 import { motion } from 'framer-motion'
 import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'
 import { useIsClient, useUiTheme } from '@/lib/ui-theme'
+import { APP_VERSION } from '@/generated/version'
 
 interface TickerState {
   symbol: string
@@ -366,7 +367,7 @@ function StatusBar({ latency }: { latency: number | null }) {
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" aria-hidden />
             Live
           </span>
-          <span className="tabular-nums text-zinc-600">v1.28.0</span>
+          <span className="tabular-nums text-zinc-600">{APP_VERSION.display}</span>
         </p>
       </div>
     </footer>

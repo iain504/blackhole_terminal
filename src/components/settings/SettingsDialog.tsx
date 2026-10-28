@@ -88,8 +88,9 @@ export default function SettingsDialog({
     try {
       const ok = await saveUiThemeToServer(t);
       if (ok) {
+        // label from UI_THEMES so new themes never show a stale hard-coded name
         toast({
-          title: t === 'christmas' ? '🎄 Christmas theme on' : 'Midnight theme on',
+          title: `${UI_THEMES.find((d) => d.id === t)?.label ?? 'Theme'} theme on`,
           description: 'Saved to your account — follows you to every device.',
         });
       } else {
@@ -471,7 +472,7 @@ export default function SettingsDialog({
               <h3 className="text-sm font-semibold text-zinc-100">Appearance</h3>
               {savingTheme && <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" aria-label="Saving theme" />}
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {UI_THEMES.map((t) => {
                 const active = uiTheme === t.id;
                 return (

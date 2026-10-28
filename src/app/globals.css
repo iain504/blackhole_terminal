@@ -182,6 +182,12 @@
 
 :root {
   --chart-bg: #09090b;
+  /* v1.88.0 — themed chart palette (JS-read via ui-theme.ts chartVar()) so
+     the day skin can flip the canvas to white with dark ink/grid */
+  --chart-grid: #18181b;
+  --chart-text: #a1a1aa;
+  --chart-border: #27272a;
+  --chart-crosshair: #52525b;
 }
 
 html.theme-christmas {
@@ -351,4 +357,167 @@ html.theme-christmas .xmas-snowflake {
     animation: none;
     opacity: 0;
   }
+}
+
+/* ===========================================================================
+   v1.88.0 — "Day" theme. A LIGHT daylight skin built the same way as the
+   Christmas skin — one palette swap under html.theme-day — with one twist:
+   the zinc ramp is INVERTED. Utilities that paint the page background
+   (bg-zinc-950) become paper-light while bright-text utilities
+   (text-zinc-100/200) become dark ink, so the whole dark-first codebase
+   re-skins to daylight with zero component changes.
+     - Accent TEXT steps (emerald-400 etc.) get darker -600/-700 replacements
+       below: the dark-optimized bright accents fail contrast on white.
+     - The chart canvas flips to white via the --chart-* vars (ChartPanel
+       reads them through ui-theme.ts chartVar() at build/redraw time).
+     - Chip text drawn on colored pills uses dark ink in every theme, so
+       bright chip fills stay readable on the white canvas.
+   =========================================================================== */
+
+html.theme-day {
+  /* ---- Tailwind zinc palette → daylight ramp (INVERTED lightness) ---- */
+  --color-zinc-950: #edf0f3;
+  --color-zinc-900: #f7f9fa;
+  --color-zinc-800: #e2e7ec;
+  --color-zinc-700: #c6cdd6;
+  --color-zinc-600: #9aa3b0;
+  --color-zinc-500: #6f7787;
+  --color-zinc-400: #5a6273;
+  --color-zinc-300: #3f4756;
+  --color-zinc-200: #2a3140;
+  --color-zinc-100: #1b2230;
+  --color-zinc-50: #131926;
+
+  /* ---- shadcn tokens (light-mode equivalents of the .dark block) ---- */
+  --background: #edf0f3;
+  --foreground: #1b2230;
+  --card: #f7f9fa;
+  --card-foreground: #1b2230;
+  --popover: #fbfcfd;
+  --popover-foreground: #1b2230;
+  --primary: #252c3a;
+  --primary-foreground: #f7f9fa;
+  --secondary: #e2e7ec;
+  --secondary-foreground: #1b2230;
+  --muted: #e6eaee;
+  --muted-foreground: #5a6273;
+  --accent: #dfe4ea;
+  --accent-foreground: #1b2230;
+  /* --destructive stays red (errors must read as errors in every theme) */
+  --border: rgb(27 34 48 / 0.14);
+  --input: rgb(27 34 48 / 0.18);
+  --ring: #9aa3b0;
+  --sidebar: #f7f9fa;
+  --sidebar-border: rgb(27 34 48 / 0.14);
+
+  /* ---- chart canvas: white paper, dark ink, soft grid ---- */
+  --chart-bg: #ffffff;
+  --chart-grid: #e5e9ee;
+  --chart-text: #5a6273;
+  --chart-border: #d2d8e0;
+  --chart-crosshair: #9aa3b0;
+}
+
+/* cool-green selection highlight */
+html.theme-day ::selection {
+  background: rgb(5 150 105 / 0.25);
+}
+
+/* themed thin-scrollbar */
+html.theme-day .terminal-scroll::-webkit-scrollbar-thumb {
+  background: #c6cdd6;
+}
+html.theme-day .terminal-scroll::-webkit-scrollbar-thumb:hover {
+  background: #9aa3b0;
+}
+html.theme-day .terminal-scroll {
+  scrollbar-color: #c6cdd6 transparent;
+}
+
+/* ---- opacity-modified zinc utilities compile to literal hex — re-point them
+   at the themed palette with the same alpha (same list as the Christmas
+   block, kept in sync with the classes actually used in src/) ---- */
+html.theme-day .bg-zinc-700\/60 { background-color: color-mix(in oklab, var(--color-zinc-700) 60%, transparent); }
+html.theme-day .bg-zinc-700\/80 { background-color: color-mix(in oklab, var(--color-zinc-700) 80%, transparent); }
+html.theme-day .bg-zinc-800\/40 { background-color: color-mix(in oklab, var(--color-zinc-800) 40%, transparent); }
+html.theme-day .bg-zinc-800\/50 { background-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent); }
+html.theme-day .bg-zinc-800\/60 { background-color: color-mix(in oklab, var(--color-zinc-800) 60%, transparent); }
+html.theme-day .bg-zinc-800\/70 { background-color: color-mix(in oklab, var(--color-zinc-800) 70%, transparent); }
+html.theme-day .bg-zinc-800\/80 { background-color: color-mix(in oklab, var(--color-zinc-800) 80%, transparent); }
+html.theme-day .bg-zinc-900\/30 { background-color: color-mix(in oklab, var(--color-zinc-900) 30%, transparent); }
+html.theme-day .bg-zinc-900\/40 { background-color: color-mix(in oklab, var(--color-zinc-900) 40%, transparent); }
+html.theme-day .bg-zinc-900\/50 { background-color: color-mix(in oklab, var(--color-zinc-900) 50%, transparent); }
+html.theme-day .bg-zinc-900\/60 { background-color: color-mix(in oklab, var(--color-zinc-900) 60%, transparent); }
+html.theme-day .bg-zinc-900\/70 { background-color: color-mix(in oklab, var(--color-zinc-900) 70%, transparent); }
+html.theme-day .bg-zinc-900\/80 { background-color: color-mix(in oklab, var(--color-zinc-900) 80%, transparent); }
+html.theme-day .bg-zinc-900\/90 { background-color: color-mix(in oklab, var(--color-zinc-900) 90%, transparent); }
+html.theme-day .bg-zinc-900\/95 { background-color: color-mix(in oklab, var(--color-zinc-900) 95%, transparent); }
+html.theme-day .bg-zinc-950\/30 { background-color: color-mix(in oklab, var(--color-zinc-950) 30%, transparent); }
+html.theme-day .bg-zinc-950\/40 { background-color: color-mix(in oklab, var(--color-zinc-950) 40%, transparent); }
+html.theme-day .bg-zinc-950\/50 { background-color: color-mix(in oklab, var(--color-zinc-950) 50%, transparent); }
+html.theme-day .bg-zinc-950\/60 { background-color: color-mix(in oklab, var(--color-zinc-950) 60%, transparent); }
+html.theme-day .bg-zinc-950\/70 { background-color: color-mix(in oklab, var(--color-zinc-950) 70%, transparent); }
+html.theme-day .bg-zinc-950\/75 { background-color: color-mix(in oklab, var(--color-zinc-950) 75%, transparent); }
+html.theme-day .bg-zinc-950\/80 { background-color: color-mix(in oklab, var(--color-zinc-950) 80%, transparent); }
+html.theme-day .bg-zinc-950\/85 { background-color: color-mix(in oklab, var(--color-zinc-950) 85%, transparent); }
+html.theme-day .bg-zinc-950\/90 { background-color: color-mix(in oklab, var(--color-zinc-950) 90%, transparent); }
+html.theme-day .bg-zinc-950\/95 { background-color: color-mix(in oklab, var(--color-zinc-950) 95%, transparent); }
+html.theme-day .border-zinc-600\/40 { border-color: color-mix(in oklab, var(--color-zinc-600) 40%, transparent); }
+html.theme-day .border-zinc-600\/70 { border-color: color-mix(in oklab, var(--color-zinc-600) 70%, transparent); }
+html.theme-day .border-zinc-700\/60 { border-color: color-mix(in oklab, var(--color-zinc-700) 60%, transparent); }
+html.theme-day .border-zinc-700\/80 { border-color: color-mix(in oklab, var(--color-zinc-700) 80%, transparent); }
+html.theme-day .border-zinc-800\/40 { border-color: color-mix(in oklab, var(--color-zinc-800) 40%, transparent); }
+html.theme-day .border-zinc-800\/50 { border-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent); }
+html.theme-day .border-zinc-800\/60 { border-color: color-mix(in oklab, var(--color-zinc-800) 60%, transparent); }
+html.theme-day .border-zinc-800\/70 { border-color: color-mix(in oklab, var(--color-zinc-800) 70%, transparent); }
+html.theme-day .border-zinc-800\/80 { border-color: color-mix(in oklab, var(--color-zinc-800) 80%, transparent); }
+html.theme-day .border-zinc-800\/90 { border-color: color-mix(in oklab, var(--color-zinc-800) 90%, transparent); }
+html.theme-day .divide-zinc-800\/50 > :not([hidden]) ~ :not([hidden]) {
+  border-color: color-mix(in oklab, var(--color-zinc-800) 50%, transparent);
+}
+html.theme-day .ring-zinc-600\/60 { --tw-ring-color: color-mix(in oklab, var(--color-zinc-600) 60%, transparent); }
+html.theme-day .text-zinc-400\/80 { color: color-mix(in oklab, var(--color-zinc-400) 80%, transparent); }
+
+/* ---- accent TEXT re-pointed at their -600/-700 (dark-optimized) steps:
+   the bright 200–400 accents that pop on midnight fail contrast on paper.
+   Only text utilities are touched — bg/border/washes stay as-is. ---- */
+html.theme-day .text-emerald-400 { color: #059669; }
+html.theme-day .text-emerald-300 { color: #047857; }
+html.theme-day .text-rose-400 { color: #e11d48; }
+html.theme-day .text-rose-300 { color: #be123c; }
+html.theme-day .text-rose-200 { color: #9f1239; }
+html.theme-day .text-amber-400 { color: #d97706; }
+html.theme-day .text-amber-300 { color: #b45309; }
+html.theme-day .text-amber-200 { color: #92400e; }
+html.theme-day .text-violet-400 { color: #7c3aed; }
+html.theme-day .text-violet-300 { color: #6d28d9; }
+html.theme-day .text-violet-200 { color: #5b21b6; }
+html.theme-day .text-sky-400 { color: #0284c7; }
+html.theme-day .text-sky-300 { color: #0369a1; }
+html.theme-day .text-pink-400 { color: #db2777; }
+html.theme-day .text-pink-300 { color: #be185d; }
+html.theme-day .text-red-400 { color: #dc2626; }
+html.theme-day .text-red-300 { color: #b91c1c; }
+html.theme-day .text-teal-400 { color: #0d9488; }
+html.theme-day .text-orange-400 { color: #ea580c; }
+html.theme-day .text-fuchsia-400 { color: #c026d3; }
+html.theme-day .text-purple-400 { color: #9333ea; }
+html.theme-day .text-green-400 { color: #16a34a; }
+
+/* ---- landing page specifics (dark-space utilities resist var swaps) ----
+   The "black hole" brand graphic keeps its dark center — it's a black hole. */
+html.theme-day .lp-root {
+  background: #eef1f5;
+}
+html.theme-day .lp-nav {
+  background: rgb(247 249 250 / 0.85);
+}
+html.theme-day .lp-root .text-white {
+  color: #1b2230;
+}
+html.theme-day .lp-root .bg-black\/40 {
+  background-color: rgb(27 34 48 / 0.06);
+}
+html.theme-day .lp-root .border-white\/5 {
+  border-color: rgb(27 34 48 / 0.08);
 }

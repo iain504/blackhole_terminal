@@ -22,7 +22,7 @@ import {
   type IndicatorSettings, type LinePoint,
 } from '@/lib/indicators'
 import { cn } from '@/lib/utils'
-import { chartBg, UI_THEME_CHANGE_EVENT } from '@/lib/ui-theme'
+import { chartBg, chartVar, UI_THEME_CHANGE_EVENT } from '@/lib/ui-theme'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -866,7 +866,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         const lastVol = barsRef.current.length > 0 ? barsRef.current[barsRef.current.length - 1].volume : null
         const volX = stripLabel(strips.vol.top, 'VOL', '#71717a')
         if (lastVol != null && Number.isFinite(lastVol) && lastVol > 0) {
-          stripValue(volX, strips.vol.top, fmtVolCompact(lastVol), '#a1a1aa')
+          stripValue(volX, strips.vol.top, fmtVolCompact(lastVol), chartVar('--chart-text', '#a1a1aa'))
         }
         // rsi strip title + last value
         if (strips.rsi && ibS) {
@@ -881,7 +881,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           const segs: [number | null | undefined, string][] = [
             [ibS.lastPts.macd, '#fbbf24'],
             [ibS.lastPts.sig, '#c4b5fd'],
-            [ibS.lastPts.hist, '#a1a1aa'],
+            [ibS.lastPts.hist, chartVar('--chart-text', '#a1a1aa')],
           ]
           for (const [v, color] of segs) {
             if (v == null || !Number.isFinite(v)) continue
@@ -1488,7 +1488,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       }
     }
 
-  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt, ethShown, paneAt, valueAtPane])
+  }, [symbol, showDrawings, activeColor, xOf, yOf, priceAt, timeAt, ethShown, paneAt, valueAtPane, themeRev])
   // keep the redraw scheduler pointed at the freshest overlay renderer
   // (see the stale-closure note above scheduleRedraw)
   renderOverlayRef.current = renderOverlay
@@ -1731,7 +1731,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.roundRect(x, by, bw, bh, 3)
     ctx.fill()
     ctx.globalAlpha = 1
-    ctx.fillStyle = chartBg()
+    // Chip ink is a FIXED near-black in every theme: chip fills are always
+    // bright (green/red/gray pills), so dark ink keeps them readable on the
+    // white Day canvas too (chartBg() would turn white-on-light there).
+    ctx.fillStyle = '#09090b'
     ctx.fillText(text, x + 6, by + 11.5)
     ctx.restore()
     return { x, y: by, w: bw, h: bh }
@@ -1756,7 +1759,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.roundRect(x, by, bw, bh, 4)
     ctx.fill()
     ctx.globalAlpha = 1
-    ctx.fillStyle = chartBg()
+    ctx.fillStyle = '#09090b' // fixed chip ink — see drawChip
     ctx.fillText(text, x + 7, by + 13)
     ctx.restore()
   }
@@ -1821,7 +1824,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     ctx.beginPath()
     ctx.roundRect(w - bw - 4, by, bw, 16, 3)
     ctx.fill()
-    ctx.fillStyle = chartBg()
+    ctx.fillStyle = '#09090b' // fixed chip ink — see drawChip
     ctx.fillText(label, w - bw + 2, by + 11.5)
     ctx.restore()
   }
@@ -3182,18 +3185,32 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: chartBg() },
-        textColor: '#a1a1aa',
+        // themed via --chart-* vars (Day skin flips these to dark ink on white)
+        textColor: chartVar('--chart-text', '#a1a1aa'),
         fontSize: 11,
       },
-      grid: { vertLines: { color: '#18181b' }, horzLines: { color: '#18181b' } },
+      grid: {
+        vertLines: { color: chartVar('--chart-grid', '#18181b') },
+        horzLines: { color: chartVar('--chart-grid', '#18181b') },
+      },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: '#52525b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#27272a' },
-        horzLine: { color: '#52525b', width: 1, style: LineStyle.Dashed, labelBackgroundColor: '#27272a' },
+        vertLine: {
+          color: chartVar('--chart-crosshair', '#52525b'),
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: '#27272a', // dark price pill reads on any canvas
+        },
+        horzLine: {
+          color: chartVar('--chart-crosshair', '#52525b'),
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: '#27272a',
+        },
       },
-      rightPriceScale: { borderColor: '#27272a', scaleMargins: { top: 0.1, bottom: 0.24 } },
+      rightPriceScale: { borderColor: chartVar('--chart-border', '#27272a'), scaleMargins: { top: 0.1, bottom: 0.24 } },
       timeScale: {
-        borderColor: '#27272a',
+        borderColor: chartVar('--chart-border', '#27272a'),
         timeVisible: TIMEFRAMES[tf].seconds < 86400,
         secondsVisible: false,
         rightOffset: 6,
