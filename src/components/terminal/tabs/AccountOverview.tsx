@@ -82,7 +82,10 @@ export default function AccountOverview() {
         const res = await fetch(`/api/trading/account?mode=${mode}`)
         const json = await res.json().catch(() => null)
         if (res.ok && json?.account) return { account: json.account as AccountInfo, loaded: true }
-        return { account: null, error: json?.error === 'no-keys' ? 'no-keys' : json?.error || `HTTP ${res.status}`, loaded: true }
+        // 'no-keys' (paper) / 'no-live-keys' (live) — Task 37 dual-key tokens;
+        // both mean UNCONFIGURED, not an error
+        const noKeys = json?.error === 'no-keys' || json?.error === 'no-live-keys'
+        return { account: null, error: noKeys ? 'no-keys' : json?.error || `HTTP ${res.status}`, loaded: true }
       } catch {
         return { account: null, error: 'network error', loaded: true }
       }
@@ -293,7 +296,11 @@ function AccountCard({ mode, state }: { mode: Mode; state: ModeState }) {
       ) : !a ? (
         <div className="flex h-[86px] flex-col justify-center text-[11px] text-zinc-600">
           {error === 'no-keys' ? (
-            <>No Alpaca keys — add them in Settings.</>
+            mode === 'live' ? (
+              <>No LIVE keys — add them in Settings → API keys (Live account).</>
+            ) : (
+              <>No Alpaca keys — add them in Settings.</>
+            )
           ) : (
             <>Unavailable<span className="mt-0.5 block text-[10px] text-zinc-700">{error}</span></>
           )}

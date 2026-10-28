@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode, TradingOrder } from '@/lib/trading'
+import { getClosedOrders, resolveTradeMode, isNoKeysError, TradingOrder } from '@/lib/trading'
 
 import { handleError } from '@/lib/api-helpers'
 
@@ -38,13 +38,13 @@ export async function GET(req: Request) {
     const r = await getClosedOrders(user.id, mode, limit)
     if (!r.data) {
       // no keys configured is a quiet no-op for the poller
-      if (r.error === 'no-keys') return NextResponse.json({ mode, fills: [], configured: false })
+      if (isNoKeysError(r.error)) return NextResponse.json({ mode, fills: [], configured: false })
       return NextResponse.json({ error: r.error || 'Fills fetch failed' }, { status: r.status || 502 })
     }
     // A failed fetch (401/403, network) resolves to an error OBJECT — only a
     // real array may be filtered or the poller 500s every tick.
     const orderList: TradingOrder[] = Array.isArray(r.data) ? r.data : []
-    if (orderList.length === 0 && r.error && r.error !== 'no-keys') {
+    if (orderList.length === 0 && r.error && !isNoKeysError(r.error)) {
       return NextResponse.json({ mode, fills: [], configured: true, error: r.error })
     }
     const fills: FillRow[] = orderList

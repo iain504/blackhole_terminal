@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import {
   getPositions, getOpenOrders, getClosedOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
-  TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft,
+  TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft, isNoKeysError,
 } from '@/lib/trading'
 import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
@@ -102,6 +102,13 @@ export interface AuthErrorInfo {
   message: string
 }
 
+/** Task 37 — this mode has NO usable key pair at all (vs authError: keys
+ * exist but are rejected). Rendered as an informational banner. */
+export interface KeysMissingInfo {
+  mode: string
+  message: string
+}
+
 export interface PositionsResponse {
   mode: string
   positions: PositionRow[]
@@ -111,6 +118,8 @@ export interface PositionsResponse {
   /** set when Alpaca rejected the saved keys (401) for this mode — the UI
    *  renders it as an actionable banner instead of an unlabeled error string */
   authError?: AuthErrorInfo
+  /** set when this mode has no key pair at all (Task 37) */
+  keysMissing?: KeysMissingInfo
 }
 
 // GET /api/trading/positions?mode=paper&symbol=BTC/USD
@@ -123,19 +132,27 @@ export async function GET(req: Request) {
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const symbolParam = (searchParams.get('symbol') || '').trim()
     // keep the crypto complex-order emulation running (OCO attach + cleanup)
-    // and the Telegram watcher's cursor advancing — but ONLY when broker keys
-    // exist: a keys-less account must not spawn 6s polling timers (Task 36)
-    if (await hasAlpacaKeys(user.id)) {
+    // and the Telegram watcher's cursor advancing — but ONLY when a key pair
+    // for THIS mode exists: a keys-less mode must not spawn 6s polling timers
+    // (Task 36; mode-strict since Task 37)
+    const modeHasKeys = await hasAlpacaKeys(user.id, mode)
+    if (modeHasKeys) {
       ensureCryptoOcoSupervisor(user.id, mode)
       ensureFillNotifier(user.id, mode)
+    } else if (mode === 'live' && (await hasAlpacaKeys(user.id, 'paper'))) {
+      // the Telegram fill watcher reads fills from the trade MODE — keep it
+      // alive on the paper pair when only paper keys exist so paper alerts
+      // keep flowing while live is unconfigured
+      ensureFillNotifier(user.id, 'paper')
     }
 
     const posRes = await getPositions(user.id, mode)
     const errors: string[] = []
     // 401s are surfaced via the structured `authError` banner below (Task 36)
     // — repeating the raw "request is not authorized" string in `errors` on
-    // every poll adds nothing
-    if (posRes.error && posRes.error !== 'no-keys' && posRes.status !== 401) errors.push(posRes.error)
+    // every poll adds nothing. 'no-keys'/'no-live-keys' surface via
+    // `keysMissing` (Task 37).
+    if (posRes.error && !isNoKeysError(posRes.error) && posRes.status !== 401) errors.push(posRes.error)
 
     // A failed fetch (401 on live with paper-only keys, network error) returns
     // an error OBJECT — only treat real arrays as data or the .filter below
@@ -157,22 +174,35 @@ export async function GET(req: Request) {
       getOpenOrders(user.id, mode, symbolParam || undefined, sweepSymbols),
       getClosedOrders(user.id, mode, 500),
     ])
-    if (ordRes.error && ordRes.error !== 'no-keys' && ordRes.status !== 401) errors.push(ordRes.error)
-    if (closedRes.error && closedRes.error !== 'no-keys' && closedRes.status !== 401) errors.push(closedRes.error)
+    if (ordRes.error && !isNoKeysError(ordRes.error) && ordRes.status !== 401) errors.push(ordRes.error)
+    if (closedRes.error && !isNoKeysError(closedRes.error) && closedRes.status !== 401) errors.push(closedRes.error)
 
-    // Task 36 — structured auth surfacing: a 401 (paper keys on LIVE, rotated
+    // Task 36 — structured auth surfacing: a 401 (wrong-section keys, rotated
     // keys) travels as an actionable banner; the 5-min server circuit breaker
     // keeps polling cheap until the keys are fixed in Settings.
+    // Task 37 — but ONLY when this mode still HAS a key pair: with no pair at
+    // all the honest answer is keysMissing, not a stale "401 rejected".
     const blockedMs = authBackoffMsLeft(user.id, mode)
     const saw401 = posRes.status === 401 || ordRes.status === 401 || closedRes.status === 401
     const authError: AuthErrorInfo | undefined =
-      blockedMs > 0 || saw401
+      modeHasKeys && (blockedMs > 0 || saw401)
         ? {
             mode,
             retryInSec: Math.ceil(blockedMs / 1000),
-            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — paper keys only work with Trade Mode = Paper. Check Settings → Broker keys & Trade mode. Retrying automatically.`,
+            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — an Alpaca key works on paper OR live, never both. Check Settings → API keys: the Paper and Live sections must each hold keys for their OWN account. Retrying automatically.`,
           }
         : undefined
+    // Task 37 — distinguish "keys rejected" (authError) from "no keys for this
+    // mode at all" so the UI can tell the user exactly what to add.
+    const keysMissing: KeysMissingInfo | undefined = !modeHasKeys
+      ? {
+          mode,
+          message:
+            mode === 'live'
+              ? 'No LIVE Alpaca keys configured — add your live-account keys in Settings → API keys (Live account).'
+              : 'No Alpaca keys configured — add them in Settings → API keys (Paper account).',
+        }
+      : undefined
     const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
     const closedOrders: TradingOrder[] = Array.isArray(closedRes.data) ? closedRes.data : []
     // max=0: closed TRADES are not needed here — only the open lots per symbol
@@ -407,7 +437,7 @@ export async function GET(req: Request) {
       })
     }
 
-    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, errors: errors.length ? errors : undefined, authError })
+    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, errors: errors.length ? errors : undefined, authError, keysMissing })
   } catch (e) {
     return handleError(e)
   }

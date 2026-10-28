@@ -34,6 +34,11 @@ const STRAT_CONDITIONS = ['cross_above', 'cross_below', 'bull_cross', 'bear_cros
 interface UserSettings {
   alpacaKeyIdEnc?: string
   alpacaSecretEnc?: string
+  // Task 37 — dual key pairs ride config export/import too
+  alpacaPaperKeyIdEnc?: string
+  alpacaPaperSecretEnc?: string
+  alpacaLiveKeyIdEnc?: string
+  alpacaLiveSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
   notifyFills?: boolean
@@ -76,6 +81,12 @@ export async function GET() {
     }
     if (s.alpacaKeyIdEnc) settings.alpacaKeyId = decrypt(s.alpacaKeyIdEnc) || undefined
     if (s.alpacaSecretEnc) settings.alpacaSecret = decrypt(s.alpacaSecretEnc) || undefined
+    // Task 37 — the per-account pairs travel under their own names (old files
+    // without them still import through the legacy pair below)
+    if (s.alpacaPaperKeyIdEnc) settings.alpacaPaperKeyId = decrypt(s.alpacaPaperKeyIdEnc) || undefined
+    if (s.alpacaPaperSecretEnc) settings.alpacaPaperSecret = decrypt(s.alpacaPaperSecretEnc) || undefined
+    if (s.alpacaLiveKeyIdEnc) settings.alpacaLiveKeyId = decrypt(s.alpacaLiveKeyIdEnc) || undefined
+    if (s.alpacaLiveSecretEnc) settings.alpacaLiveSecret = decrypt(s.alpacaLiveSecretEnc) || undefined
     if (s.telegramTokenEnc) settings.telegramToken = decrypt(s.telegramTokenEnc) || undefined
     if (typeof s.telegramChatId === 'string') settings.telegramChatId = s.telegramChatId
     settings.notifyFills = s.notifyFills !== false
@@ -404,6 +415,11 @@ export async function POST(req: Request) {
       const s = ((dbUser?.settings as UserSettings | null) || {}) as Record<string, unknown>
       if (str(incoming.alpacaKeyId)) s.alpacaKeyIdEnc = encrypt(str(incoming.alpacaKeyId))
       if (str(incoming.alpacaSecret)) s.alpacaSecretEnc = encrypt(str(incoming.alpacaSecret))
+      // Task 37 — per-account pairs (absent in old files → untouched)
+      if (str(incoming.alpacaPaperKeyId)) s.alpacaPaperKeyIdEnc = encrypt(str(incoming.alpacaPaperKeyId))
+      if (str(incoming.alpacaPaperSecret)) s.alpacaPaperSecretEnc = encrypt(str(incoming.alpacaPaperSecret))
+      if (str(incoming.alpacaLiveKeyId)) s.alpacaLiveKeyIdEnc = encrypt(str(incoming.alpacaLiveKeyId))
+      if (str(incoming.alpacaLiveSecret)) s.alpacaLiveSecretEnc = encrypt(str(incoming.alpacaLiveSecret))
       if (str(incoming.telegramToken)) s.telegramTokenEnc = encrypt(str(incoming.telegramToken))
       if (typeof incoming.telegramChatId === 'string') s.telegramChatId = incoming.telegramChatId.trim()
       if (typeof incoming.notifyFills === 'boolean') s.notifyFills = incoming.notifyFills

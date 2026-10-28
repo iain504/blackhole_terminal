@@ -17,7 +17,7 @@
 // - Position symbols drop the crypto slash (BTC/USD -> BTCUSD); ORDER
 //   symbols keep it (BTC/USD).
 import { db } from './db'
-import { getAlpacaKeys } from './alpaca'
+import { getAlpacaKeysForMode } from './alpaca'
 
 export type TradeMode = 'paper' | 'live'
 
@@ -96,14 +96,27 @@ function noteAuth401(userId: string, mode: TradeMode, path: string): boolean {
   return true
 }
 
+/** 'no-keys' (paper) / 'no-live-keys' (live) — tradeFetch's "this mode has
+ * no usable key pair" tokens. Routes treat both as UNCONFIGURED (quiet),
+ * never as poll errors. */
+export function isNoKeysError(e: string | undefined | null): boolean {
+  return e === 'no-keys' || e === 'no-live-keys'
+}
+
 async function tradeFetch<T>(
   userId: string,
   mode: TradeMode,
   path: string,
   init: RequestInit = {},
 ): Promise<TradeFetchResult<T>> {
-  const keys = await getAlpacaKeys(userId)
-  if (!keys) return { data: null, status: 0, error: 'no-keys' }
+  // Task 37 — MODE-STRICT keys: paper mode uses the Paper pair (or the legacy
+  // single pair, assumed paper); live mode uses ONLY the Live pair. A paper
+  // key can never reach the live host again — that mismatch was the source of
+  // the periodic "Trading live … 401" flood.
+  const keys = await getAlpacaKeysForMode(userId, mode)
+  if (!keys) {
+    return { data: null, status: 0, error: mode === 'live' ? 'no-live-keys' : 'no-keys' }
+  }
   // Task 36 — a known-rejected key must not hammer Alpaca from every poller
   const backoffLeft = authBackoffMsLeft(userId, mode)
   if (backoffLeft > 0) {
@@ -1254,6 +1267,16 @@ async function waitUntilCanceled(userId: string, host: TradeMode, orderId: strin
 
 /** Alpaca error text for "the position qty is already reserved by open exits". */
 export function friendlyExitQtyError(msg: string): string {
+  // Task 37 — no usable key pair for the requested mode → say WHERE to fix it
+  if (msg === 'no-keys') {
+    return 'No Alpaca keys configured — add them in Settings → API keys (Paper account).'
+  }
+  if (msg === 'no-live-keys') {
+    return (
+      'No LIVE Alpaca keys configured — an Alpaca key works on paper OR live, never both. ' +
+      'Add your live-account keys in Settings → API keys (Live account), or switch the trade ticket to Paper.'
+    )
+  }
   if (/insufficient qty available for order/i.test(msg)) {
     return (
       msg +

@@ -16,7 +16,7 @@
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, ShieldAlert, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, Loader2, RefreshCw, ShieldAlert, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -43,6 +43,9 @@ interface ModeData {
    *  rendered as an actionable banner. Polling continues so the banner
    *  self-clears once the keys are fixed (server breaker retries every 5 min). */
   authError?: { mode: string; retryInSec: number; message: string }
+  /** Task 37 — this mode has NO usable key pair at all (informational, vs
+   *  authError = keys exist but are rejected). */
+  keysMissing?: { mode: string; message: string }
   loaded: boolean
 }
 
@@ -358,14 +361,16 @@ export default function PositionsTab() {
         const json = await res.json()
         const errs: string[] | undefined = json.errors
         const authError = (json.authError ?? null) as ModeData['authError'] | null
+        const keysMissing = (json.keysMissing ?? null) as ModeData['keysMissing'] | null
         return {
           mode,
           positions: (json.positions || []) as PositionRowExt[],
           exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
           pending: (json.pending || []) as PendingOrderInfo[],
           // the auth banner replaces the raw repeating 401 error string
-          error: authError ? undefined : errs?.length ? errs.join(', ') : undefined,
+          error: authError || keysMissing ? undefined : errs?.length ? errs.join(', ') : undefined,
           authError: authError ?? undefined,
+          keysMissing: keysMissing ?? undefined,
           loaded: true,
         }
       } catch {
@@ -467,7 +472,7 @@ export default function PositionsTab() {
     }
   })
   const historyPnl = historyRows.reduce((acc, r) => acc + r.t.pnl, 0)
-  const noKeys = (m: Mode) => data[m].loaded && data[m].error === 'no-keys'
+  const noKeys = (m: Mode) => data[m].loaded && (data[m].keysMissing != null || data[m].error === 'no-keys')
 
   const closePosition = async (row: PosConsoleRow) => {
     const key = `${row.mode}:${row.pos.tradeSymbol}`
@@ -595,6 +600,23 @@ export default function PositionsTab() {
                 Next real attempt in ~{Math.max(1, Math.ceil(data[m].authError!.retryInSec / 60))} min.
               </span>
             )}
+          </div>
+        </div>
+      ))}
+
+      {/* Task 37 — informational banner: this mode has NO key pair saved at all
+          (distinct from the 401 banner above = keys exist but are rejected). */}
+      {MODES.filter((m) => data[m].keysMissing).map((m) => (
+        <div
+          key={`keys-${m}`}
+          role="status"
+          className="flex shrink-0 items-start gap-2 rounded-md border border-zinc-700 bg-zinc-800/60 px-3 py-2 text-xs text-zinc-300"
+        >
+          <KeyRound className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400" aria-hidden />
+          <div className="min-w-0">
+            <span className="font-semibold uppercase">{m}</span>
+            <span className="mx-1 text-zinc-500">·</span>
+            {data[m].keysMissing!.message}
           </div>
         </div>
       ))}

@@ -3,7 +3,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { encrypt, decrypt, maskKey } from '@/lib/crypt'
-import { validateAlpacaKeys } from '@/lib/alpaca'
+import { detectAlpacaKeyAccount, migrateLegacyAlpacaKeys, type AlpacaKeyCheck } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
 import {
   readJsonSafe,
@@ -15,6 +15,12 @@ import {
 interface UserSettings {
   alpacaKeyIdEnc?: string
   alpacaSecretEnc?: string
+  // Task 37 — dual key pairs (paper account + live account). One Alpaca key
+  // only ever works on ONE of the two hosts, so each gets its own slot.
+  alpacaPaperKeyIdEnc?: string
+  alpacaPaperSecretEnc?: string
+  alpacaLiveKeyIdEnc?: string
+  alpacaLiveSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
   // telegram notification toggles (default true when absent)
@@ -49,13 +55,30 @@ function safeGlow(v: unknown, fallback: string): string {
 export async function GET() {
   try {
     const user = await requireUser()
+    // Task 37 — copy the pre-dual-key single pair into its correct Paper/Live
+    // slot (account type detected via a real /v2/account probe, once per
+    // process) so the new UI shows the existing key where it belongs.
+    await migrateLegacyAlpacaKeys(user.id)
     const dbUser = await db.user.findUnique({ where: { id: user.id } })
     const s = (dbUser?.settings as UserSettings | null) || null
     const envAlpaca = Boolean(process.env.APCA_API_KEY_ID && process.env.APCA_API_SECRET_KEY)
+    const maskedOf = (kidEnc?: string) => (kidEnc ? maskKey(decrypt(kidEnc) || '') : '')
     return NextResponse.json({
       alpaca: {
-        keyIdMasked: s?.alpacaKeyIdEnc ? maskKey(decrypt(s.alpacaKeyIdEnc) || '') : '',
-        secretSet: Boolean(s?.alpacaSecretEnc),
+        paper: {
+          keyIdMasked: maskedOf(s?.alpacaPaperKeyIdEnc),
+          secretSet: Boolean(s?.alpacaPaperSecretEnc),
+        },
+        live: {
+          keyIdMasked: maskedOf(s?.alpacaLiveKeyIdEnc),
+          secretSet: Boolean(s?.alpacaLiveSecretEnc),
+        },
+        // pre-dual-key pair — still honored for PAPER when the new slots are
+        // empty; the UI surfaces it only when neither pair is set
+        legacy: {
+          keyIdMasked: maskedOf(s?.alpacaKeyIdEnc),
+          secretSet: Boolean(s?.alpacaSecretEnc),
+        },
         serverKeysPresent: envAlpaca,
       },
       telegram: {
@@ -82,6 +105,12 @@ export async function GET() {
 }
 
 interface PutBody {
+  // Task 37 — per-account key pairs. `alpacaKeyId/alpacaSecret` (legacy single
+  // pair) are still accepted so old clients/exports keep working.
+  alpacaPaperKeyId?: string
+  alpacaPaperSecret?: string
+  alpacaLiveKeyId?: string
+  alpacaLiveSecret?: string
   alpacaKeyId?: string
   alpacaSecret?: string
   telegramToken?: string
@@ -116,6 +145,18 @@ export async function PUT(req: Request) {
     const body = parsed.data as PutBody
     const dbUser = await db.user.findUnique({ where: { id: user.id } })
     const s = ((dbUser?.settings as UserSettings | null) || {}) as Record<string, unknown>
+    if (typeof body.alpacaPaperKeyId === 'string' && body.alpacaPaperKeyId.trim()) {
+      s.alpacaPaperKeyIdEnc = encrypt(body.alpacaPaperKeyId.trim())
+    }
+    if (typeof body.alpacaPaperSecret === 'string' && body.alpacaPaperSecret.trim()) {
+      s.alpacaPaperSecretEnc = encrypt(body.alpacaPaperSecret.trim())
+    }
+    if (typeof body.alpacaLiveKeyId === 'string' && body.alpacaLiveKeyId.trim()) {
+      s.alpacaLiveKeyIdEnc = encrypt(body.alpacaLiveKeyId.trim())
+    }
+    if (typeof body.alpacaLiveSecret === 'string' && body.alpacaLiveSecret.trim()) {
+      s.alpacaLiveSecretEnc = encrypt(body.alpacaLiveSecret.trim())
+    }
     if (typeof body.alpacaKeyId === 'string' && body.alpacaKeyId.trim()) {
       s.alpacaKeyIdEnc = encrypt(body.alpacaKeyId.trim())
     }
@@ -168,17 +209,23 @@ export async function PUT(req: Request) {
       where: { id: user.id },
       data: { settings: s as unknown as Prisma.InputJsonValue },
     })
-    // Auto-verify freshly saved Alpaca keys so the user knows immediately
-    // whether live data will work (invalid keys silently showed "demo" before).
-    let alpacaValidation: { valid: boolean; status: number; message: string } | null = null
-    if (typeof s.alpacaKeyIdEnc === 'string' && typeof s.alpacaSecretEnc === 'string') {
-      const keyId = decrypt(s.alpacaKeyIdEnc)
-      const secret = decrypt(s.alpacaSecretEnc)
-      if (keyId && secret) {
-        alpacaValidation = await validateAlpacaKeys(keyId, secret)
+    // Auto-verify the saved PAPER + LIVE pairs against BOTH Alpaca hosts so
+    // the user immediately knows each pair works AND belongs to the right
+    // account (a paper key in the Live section would 401 on every live call —
+    // Task 36). detectAlpacaKeyAccount answers definitively.
+    const alpacaChecks: { mode: 'paper' | 'live'; check: AlpacaKeyCheck }[] = []
+    for (const m of ['paper', 'live'] as const) {
+      const kidEnc = m === 'paper' ? s.alpacaPaperKeyIdEnc : s.alpacaLiveKeyIdEnc
+      const secEnc = m === 'paper' ? s.alpacaPaperSecretEnc : s.alpacaLiveSecretEnc
+      if (typeof kidEnc === 'string' && typeof secEnc === 'string') {
+        const keyId = decrypt(kidEnc)
+        const secret = decrypt(secEnc)
+        if (keyId && secret) {
+          alpacaChecks.push({ mode: m, check: await detectAlpacaKeyAccount(keyId, secret, m) })
+        }
       }
     }
-    return NextResponse.json({ ok: true, alpaca: alpacaValidation })
+    return NextResponse.json({ ok: true, alpacaChecks })
   } catch (e) {
     return handleError(e)
   }

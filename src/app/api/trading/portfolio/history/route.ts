@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getPortfolioHistory, resolveTradeMode, isTradeMode } from '@/lib/trading'
+import { getPortfolioHistory, resolveTradeMode, isTradeMode, isNoKeysError } from '@/lib/trading'
 import { handleError } from '@/lib/api-helpers'
 
 // GET /api/trading/portfolio/history?mode=paper&range=today|hour|day|week|month|year
@@ -106,7 +106,7 @@ export async function GET(req: Request) {
     ): Promise<{ noKeys: true } | Built | null> => {
       for (const [period, timeframe] of combos) {
         const r = await getPortfolioHistory(user.id, mode, period, timeframe)
-        if (r.error === 'no-keys') return { noKeys: true }
+        if (isNoKeysError(r.error)) return { noKeys: true }
         if (r.data && r.data.timestamp && Array.isArray(r.data.timestamp)) {
           const raw = r.data as RawHistory
           return { period, timeframe: raw.timeframe || timeframe, raw, points: build(raw, since, isHour) }

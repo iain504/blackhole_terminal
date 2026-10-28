@@ -16,7 +16,7 @@
 //                                confirmed by the asset being ACTIVE.
 // Without keys (demo mode) everything degrades to a local ET-clock estimate
 // flagged `estimated` — same fail-open philosophy as sessions.ts.
-import { getAlpacaKeys } from './alpaca'
+import { getAlpacaKeysForMode, resolveAnyAlpacaKeys } from './alpaca'
 import { resolveTradeMode, TRADE_BASE, type TradeMode } from './trading'
 import {
   isCryptoSymbol,
@@ -272,7 +272,15 @@ async function classifyCrypto(symbol: string, mode: TradeMode, keys: { keyId: st
 
 export async function getMarketHours(symbols: string[], userId?: string, modeIn?: TradeMode): Promise<MarketHoursResponse> {
   const mode = modeIn ?? await resolveTradeMode(userId)
-  const keys = await getAlpacaKeys(userId)
+  // Task 37 — prefer the key pair that MATCHES the requested mode (paper pair
+  // → paper host, live pair → live host). A paper key on the LIVE host was
+  // the Task 36 401 flood, so when no mode-matched pair exists fall back to
+  // ANY stored pair and pick the host its ORIGIN proves it works on (market
+  // session endpoints are account-agnostic — clock/calendar are identical on
+  // both hosts).
+  const strict = await getAlpacaKeysForMode(userId, mode)
+  const keys = strict ?? (await resolveAnyAlpacaKeys(userId))
+  const hostMode: TradeMode = strict ? mode : keys?.origin === 'live' ? 'live' : 'paper'
   const nowSec = Date.now() / 1000
   const hours: MarketHoursResponse['hours'] = {}
 
@@ -286,9 +294,9 @@ export async function getMarketHours(symbols: string[], userId?: string, modeIn?
   let clock: AlpacaClock | null = null
   let clockOk = false
   if (keys) {
-    clock = await fetchClock(mode, keys)
+    clock = await fetchClock(hostMode, keys)
     clockOk = clock !== null
-    const cal = await fetchCalendar(mode, keys, etDateKey(nowSec))
+    const cal = await fetchCalendar(hostMode, keys, etDateKey(nowSec))
     usCls = classifyUs(nowSec, clock, clockOk, cal.day, cal.ok)
   }
 
@@ -297,7 +305,7 @@ export async function getMarketHours(symbols: string[], userId?: string, modeIn?
   }
 
   for (const s of cryptoSyms) {
-    hours[s] = { symbol: s, asset: 'crypto', ...(await classifyCrypto(s, mode, keys)) }
+    hours[s] = { symbol: s, asset: 'crypto', ...(await classifyCrypto(s, hostMode, keys)) }
   }
 
   return {

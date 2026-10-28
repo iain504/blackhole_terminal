@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
+import { AlertTriangle, Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -30,10 +30,24 @@ export const SETTINGS_CHANGED_EVENT = 'tt:settings-changed';
 
 const INDICATORS_LS_KEY = 'tt.indicators.v1';
 
-type AlpacaValidation = { valid: boolean; status: number; message: string };
+/** Task 37 — per-section dual-host key check result (/api/settings/alpaca/test
+ * and the PUT save response). `matchesMode === false` means the keys WORK but
+ * belong to the OTHER account — the exact 401-on-live trap. */
+type AlpacaKeyCheckResult = {
+  valid: boolean;
+  detected: 'paper' | 'live' | null;
+  matchesMode: boolean | null;
+  tested?: 'typed' | 'stored';
+  message: string;
+};
 
 type SettingsState = {
-  alpaca: { keyIdMasked: string; secretSet: boolean; serverKeysPresent: boolean };
+  alpaca: {
+    paper: { keyIdMasked: string; secretSet: boolean };
+    live: { keyIdMasked: string; secretSet: boolean };
+    legacy?: { keyIdMasked: string; secretSet: boolean };
+    serverKeysPresent: boolean;
+  };
   telegram: { tokenSet: boolean; chatId: string; notifyFills?: boolean; notifyCloses?: boolean };
   tradeMode?: string;
   tpslPercent?: number;
@@ -57,8 +71,10 @@ export default function SettingsDialog({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
 
-  const [keyId, setKeyId] = useState('');
-  const [secret, setSecret] = useState('');
+  const [paperKeyId, setPaperKeyId] = useState('');
+  const [paperSecret, setPaperSecret] = useState('');
+  const [liveKeyId, setLiveKeyId] = useState('');
+  const [liveSecret, setLiveSecret] = useState('');
   const [token, setToken] = useState('');
   const [chatId, setChatId] = useState('');
   const [notifyFills, setNotifyFills] = useState(true);
@@ -74,7 +90,9 @@ export default function SettingsDialog({
   const [glowLoaded, setGlowLoaded] = useState(false);
 
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [testingPaper, setTestingPaper] = useState(false);
+  const [testingLive, setTestingLive] = useState(false);
+  const [testingTelegram, setTestingTelegram] = useState(false);
 
   // ---- Task 28 — appearance (UI theme) ----
   // The applied theme (html class + localStorage) IS the source of truth for
@@ -231,8 +249,10 @@ export default function SettingsDialog({
 
   // Any typed-but-unsaved credential — closing the dialog would lose it.
   const dirty = Boolean(
-    keyId.trim() ||
-    secret.trim() ||
+    paperKeyId.trim() ||
+    paperSecret.trim() ||
+    liveKeyId.trim() ||
+    liveSecret.trim() ||
     token.trim() ||
     chatId.trim() !== (state?.telegram?.chatId ?? '') ||
     (glowLoaded && (glowGrid !== (state?.glow?.grid ?? DEFAULT_GLOW_GRID) || glowAlgo !== (state?.glow?.algo ?? DEFAULT_GLOW_ALGO)))
@@ -294,8 +314,10 @@ export default function SettingsDialog({
     e.preventDefault();
     // Only send fields the user actually changed (non-empty = "send me").
     const payload: Record<string, string | number | boolean> = {};
-    if (keyId.trim()) payload.alpacaKeyId = keyId.trim();
-    if (secret.trim()) payload.alpacaSecret = secret.trim();
+    if (paperKeyId.trim()) payload.alpacaPaperKeyId = paperKeyId.trim();
+    if (paperSecret.trim()) payload.alpacaPaperSecret = paperSecret.trim();
+    if (liveKeyId.trim()) payload.alpacaLiveKeyId = liveKeyId.trim();
+    if (liveSecret.trim()) payload.alpacaLiveSecret = liveSecret.trim();
     if (token.trim()) payload.telegramToken = token.trim();
     if (chatId.trim()) payload.telegramChatId = chatId.trim();
     // toggles always ride along (booleans can't be "empty")
@@ -330,25 +352,42 @@ export default function SettingsDialog({
         }
         throw new Error(msg);
       }
-      const data: { ok: boolean; alpaca?: AlpacaValidation | null } = await res
+      const data: { ok: boolean; alpacaChecks?: { mode: 'paper' | 'live'; check: AlpacaKeyCheckResult }[] } = await res
         .json()
         .catch(() => ({ ok: true }));
       // Clear secret inputs so they read "unchanged" again.
-      setKeyId('');
-      setSecret('');
+      setPaperKeyId('');
+      setPaperSecret('');
+      setLiveKeyId('');
+      setLiveSecret('');
       setToken('');
-      if (data.alpaca && !data.alpaca.valid) {
-        // Saved, but Alpaca rejected the keys — say so loudly, the chart
-        // would otherwise silently keep showing demo data.
+      // Task 37 — the server verified EVERY stored pair against BOTH hosts;
+      // surface rejected pairs and wrong-section keys loudly.
+      const checks = data.alpacaChecks ?? [];
+      const rejected = checks.filter((c) => !c.check.valid);
+      const mismatched = checks.filter((c) => c.check.valid && c.check.matchesMode === false);
+      if (rejected.length > 0) {
         toast({
-          title: 'Saved, but Alpaca rejected the keys',
-          description: `${data.alpaca.message} The chart will stay in demo mode until fixed.`,
+          title: 'Saved, but Alpaca rejected some keys',
+          description: rejected.map((c) => `${c.mode.toUpperCase()}: ${c.check.message}`).join(' '),
           variant: 'destructive',
         });
-      } else if (data.alpaca?.valid) {
+      } else if (mismatched.length > 0) {
+        toast({
+          title: 'Saved — but a key is in the wrong section',
+          description: mismatched
+            .map((c) =>
+              c.check.detected === 'paper'
+                ? 'Paper-account keys are saved in the LIVE section — they will 401 on every live call. Swap the sections.'
+                : 'Live-account keys are saved in the PAPER section — swap the sections.'
+            )
+            .join(' '),
+          variant: 'destructive',
+        });
+      } else if (checks.length > 0) {
         toast({
           title: 'Settings saved — keys verified ✓',
-          description: 'Live Alpaca data is loading now.',
+          description: checks.map((c) => `${c.mode.toUpperCase()} keys OK (${c.check.detected?.toUpperCase()} account)`).join(' · '),
         });
       } else {
         toast({ title: 'Settings saved' });
@@ -367,31 +406,37 @@ export default function SettingsDialog({
     }
   }
 
-  // Verify Alpaca keys: uses what is typed (unsaved) when both fields are
-  // filled, otherwise the stored keys.
-  async function handleTestAlpaca() {
+  // Task 37 — verify the PAPER or LIVE pair: typed (unsaved) values when both
+  // fields are filled, otherwise the stored keys for that section. The server
+  // probes BOTH trading hosts so a paper key pasted into the Live section is
+  // caught before it can 401 on every real call.
+  async function handleTestAlpaca(m: 'paper' | 'live') {
+    const setTesting = m === 'paper' ? setTestingPaper : setTestingLive;
     setTesting(true);
     try {
       const res = await fetch('/api/settings/alpaca/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          alpacaKeyId: keyId.trim() || undefined,
-          alpacaSecret: secret.trim() || undefined,
+          mode: m,
+          alpacaKeyId: (m === 'paper' ? paperKeyId : liveKeyId).trim() || undefined,
+          alpacaSecret: (m === 'paper' ? paperSecret : liveSecret).trim() || undefined,
         }),
       });
-      const data = await res.json().catch(() => null);
-      if (data?.valid) {
+      const data = (await res.json().catch(() => null)) as AlpacaKeyCheckResult | null;
+      if (data?.valid && data.matchesMode !== false) {
         toast({
-          title: 'Alpaca keys working ✓',
+          title: m === 'paper' ? 'Paper keys working ✓' : 'Live keys working ✓',
           description:
             data.tested === 'typed'
               ? 'These typed keys are valid — press Save to use them.'
               : data.message || 'Saved keys are valid.',
         });
+      } else if (data?.valid && data.matchesMode === false) {
+        toast({ title: 'Wrong section for these keys', description: data.message, variant: 'destructive' });
       } else {
         toast({
-          title: 'Alpaca keys failed',
+          title: m === 'paper' ? 'Paper keys failed' : 'Live keys failed',
           description: data?.message || `Test failed (${res.status}).`,
           variant: 'destructive',
         });
@@ -408,7 +453,7 @@ export default function SettingsDialog({
   }
 
   async function handleTest() {
-    setTesting(true);
+    setTestingTelegram(true);
     try {
       const res = await fetch('/api/settings/telegram/test', { method: 'POST' });
       const data = await res.json().catch(() => null);
@@ -430,7 +475,7 @@ export default function SettingsDialog({
         variant: 'destructive',
       });
     } finally {
-      setTesting(false);
+      setTestingTelegram(false);
     }
   }
 
@@ -515,94 +560,171 @@ export default function SettingsDialog({
 
           <div className="h-px bg-zinc-800" />
 
-          {/* ------- Alpaca API keys ------- */}
+          {/* ------- Alpaca API keys (Task 37 — dual: Paper + Live) ------- */}
           <section className="flex flex-col gap-3">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <KeyRound className="h-4 w-4 text-emerald-400" />
               <h3 className="text-sm font-semibold text-zinc-100">
                 Alpaca API keys
               </h3>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              {loading && (
-                <Loader2 className="h-4 w-4 animate-spin text-zinc-500" />
+              {loading && <Loader2 className="h-4 w-4 animate-spin text-zinc-500" />}
+              {state?.tradeMode && (
+                <Badge
+                  className={
+                    state.tradeMode === 'live'
+                      ? 'border-amber-500/40 bg-amber-500/10 text-amber-400'
+                      : 'border-emerald-900 bg-emerald-950 text-emerald-400'
+                  }
+                >
+                  Trade mode: {state.tradeMode === 'live' ? 'LIVE' : 'PAPER'}
+                </Badge>
               )}
               {state?.alpaca?.serverKeysPresent && (
                 <Badge className="border-emerald-900 bg-emerald-950 text-emerald-400">
                   Server keys active
                 </Badge>
               )}
-              {state?.alpaca?.keyIdMasked && (
-                <span className="text-xs text-zinc-400">
-                  Key ID:{' '}
-                  <span className="font-mono text-zinc-200">
-                    {state.alpaca.keyIdMasked}
-                  </span>
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              One Alpaca key only works on a <span className="text-zinc-300">paper</span> OR a{' '}
+              <span className="text-zinc-300">live</span> account — never both — so save each
+              account&apos;s keys in its own section. The trade ticket&apos;s Paper/Live toggle
+              picks which pair is used; charts load market data with whichever pair is saved.
+            </p>
+
+            {/* ---- Paper account ---- */}
+            <div className="flex flex-col gap-2.5 rounded-md border border-emerald-900/60 bg-emerald-950/20 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">
+                  Paper account
                 </span>
-              )}
-              {state?.alpaca?.secretSet && (
-                <Badge className="border-zinc-700 bg-zinc-800 text-zinc-200">
-                  Secret saved
-                </Badge>
-              )}
-              {!loading &&
-                state &&
-                !state.alpaca?.serverKeysPresent &&
-                !state.alpaca?.keyIdMasked &&
-                !state.alpaca?.secretSet && (
-                  <span className="text-xs text-zinc-500">
-                    No keys configured — market data falls back to demo mode.
+                {state?.alpaca?.paper?.keyIdMasked ? (
+                  <span className="text-[11px] text-zinc-400">
+                    Key ID: <span className="font-mono text-zinc-200">{state.alpaca.paper.keyIdMasked}</span>
                   </span>
+                ) : state?.alpaca?.legacy?.keyIdMasked ? (
+                  <span className="text-[11px] text-amber-400/90">
+                    Legacy key serves Paper until saved here
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-zinc-500">Not configured</span>
                 )}
+                {state?.alpaca?.paper?.secretSet && (
+                  <Badge className="border-zinc-700 bg-zinc-800 text-zinc-200">Secret saved</Badge>
+                )}
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="alpaca-paper-key-id" className="text-xs text-zinc-400">
+                    Key ID
+                  </Label>
+                  <Input
+                    id="alpaca-paper-key-id"
+                    type="password"
+                    placeholder="unchanged"
+                    value={paperKeyId}
+                    onChange={(e) => setPaperKeyId(e.target.value)}
+                    autoComplete="off"
+                    disabled={loading || saving}
+                    className={inputClass}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="alpaca-paper-secret" className="text-xs text-zinc-400">
+                    Secret
+                  </Label>
+                  <Input
+                    id="alpaca-paper-secret"
+                    type="password"
+                    placeholder="unchanged"
+                    value={paperSecret}
+                    onChange={(e) => setPaperSecret(e.target.value)}
+                    autoComplete="off"
+                    disabled={loading || saving}
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleTestAlpaca('paper')}
+                disabled={testingPaper || saving}
+                className="w-fit border-emerald-900/70 bg-zinc-950 text-emerald-300 hover:bg-zinc-900 hover:text-emerald-200"
+              >
+                {testingPaper ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                Test paper key
+              </Button>
             </div>
 
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="alpaca-key-id" className="text-zinc-300">
-                API Key ID
-              </Label>
-              <Input
-                id="alpaca-key-id"
-                type="password"
-                placeholder="unchanged"
-                value={keyId}
-                onChange={(e) => setKeyId(e.target.value)}
-                autoComplete="off"
-                disabled={loading || saving}
-                className={inputClass}
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="alpaca-secret" className="text-zinc-300">
-                API Secret
-              </Label>
-              <Input
-                id="alpaca-secret"
-                type="password"
-                placeholder="unchanged"
-                value={secret}
-                onChange={(e) => setSecret(e.target.value)}
-                autoComplete="off"
-                disabled={loading || saving}
-                className={inputClass}
-              />
+            {/* ---- Live account ---- */}
+            <div className="flex flex-col gap-2.5 rounded-md border border-amber-900/60 bg-amber-950/10 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-amber-400">
+                  <AlertTriangle className="h-3.5 w-3.5" aria-hidden />
+                  Live account
+                </span>
+                <span className="text-[11px] font-medium text-amber-500/80">real money</span>
+                {state?.alpaca?.live?.keyIdMasked ? (
+                  <span className="text-[11px] text-zinc-400">
+                    Key ID: <span className="font-mono text-zinc-200">{state.alpaca.live.keyIdMasked}</span>
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-zinc-500">Not configured</span>
+                )}
+                {state?.alpaca?.live?.secretSet && (
+                  <Badge className="border-zinc-700 bg-zinc-800 text-zinc-200">Secret saved</Badge>
+                )}
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="alpaca-live-key-id" className="text-xs text-zinc-400">
+                    Key ID
+                  </Label>
+                  <Input
+                    id="alpaca-live-key-id"
+                    type="password"
+                    placeholder="unchanged"
+                    value={liveKeyId}
+                    onChange={(e) => setLiveKeyId(e.target.value)}
+                    autoComplete="off"
+                    disabled={loading || saving}
+                    className={inputClass}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="alpaca-live-secret" className="text-xs text-zinc-400">
+                    Secret
+                  </Label>
+                  <Input
+                    id="alpaca-live-secret"
+                    type="password"
+                    placeholder="unchanged"
+                    value={liveSecret}
+                    onChange={(e) => setLiveSecret(e.target.value)}
+                    autoComplete="off"
+                    disabled={loading || saving}
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleTestAlpaca('live')}
+                disabled={testingLive || saving}
+                className="w-fit border-amber-900/70 bg-zinc-950 text-amber-300 hover:bg-zinc-900 hover:text-amber-200"
+              >
+                {testingLive ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                Test live key
+              </Button>
             </div>
 
             <p className="text-xs leading-relaxed text-zinc-500">
-              Keys are encrypted (AES-256-GCM) and only used server-side. Get
-              keys at alpaca.markets (free). Real-time US stock + crypto data.
+              Keys are encrypted (AES-256-GCM) and only used server-side. Get keys at
+              alpaca.markets (free) — paper keys start with &quot;PK&quot;, live keys with
+              &quot;AK&quot;. Each Test proves which account a key belongs to before it can 401.
             </p>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={handleTestAlpaca}
-              disabled={testing || saving}
-              className="w-fit border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
-            >
-              {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-              Test keys
-            </Button>
           </section>
 
           <div className="h-px bg-zinc-800" />
@@ -730,10 +852,10 @@ export default function SettingsDialog({
                   type="button"
                   variant="outline"
                   onClick={handleTest}
-                  disabled={testing || saving}
+                  disabled={testingTelegram || saving}
                   className="shrink-0 border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
                 >
-                  {testing && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {testingTelegram && <Loader2 className="h-4 w-4 animate-spin" />}
                   Send test message
                 </Button>
               </div>

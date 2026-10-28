@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode } from '@/lib/trading'
+import { getClosedOrders, resolveTradeMode, isNoKeysError } from '@/lib/trading'
 import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
 import { handleError } from '@/lib/api-helpers'
 
@@ -29,7 +29,7 @@ export async function GET(req: Request) {
     const r = await getClosedOrders(user.id, mode, 500)
     if (!r.data) {
       // no keys configured is a quiet empty state (same convention as fills)
-      if (r.error === 'no-keys') {
+      if (isNoKeysError(r.error)) {
         return NextResponse.json({ mode, trades: [], configured: false })
       }
       return NextResponse.json({ error: r.error || 'Closed orders fetch failed' }, { status: r.status || 502 })

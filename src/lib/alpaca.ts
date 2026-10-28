@@ -4,7 +4,7 @@
 // deterministic demo simulator so the app always works — but the failure
 // REASON is surfaced so the UI can tell "no keys" apart from "keys rejected".
 import { db } from '@/lib/db'
-import { decrypt } from '@/lib/crypt'
+import { decrypt, encrypt } from '@/lib/crypt'
 import {
   Bar, Quote, NewsItem, MarkerData, Timeframe, TIMEFRAMES,
   isCryptoSymbol,
@@ -19,6 +19,27 @@ const ALPACA_TIMEOUT_MS = 9000
 export interface AlpacaKeys {
   keyId: string
   secret: string
+}
+
+/** Which account a Trading-API call targets (a key only works on ONE). */
+export type AlpacaKeyMode = 'paper' | 'live'
+
+/** Where a resolved key pair came from — 'legacy' = the pre-dual-key single
+ * pair (assumed PAPER), 'env' = shared process keys (operator opt-in). */
+export type KeyOrigin = 'paper' | 'live' | 'legacy' | 'env'
+
+export interface AlpacaKeysWithOrigin extends AlpacaKeys {
+  origin: KeyOrigin
+}
+
+/** Result of proving a key pair against BOTH trading hosts (Task 37). */
+export interface AlpacaKeyCheck {
+  valid: boolean
+  /** which account actually accepted the keys (null = neither / unreachable) */
+  detected: 'paper' | 'live' | null
+  /** detected === the section the keys were tested for (null = not checked) */
+  matchesMode: boolean | null
+  message: string
 }
 
 /** Why a response fell back to demo data (undefined = live data, not demo). */
@@ -84,11 +105,23 @@ export async function validateAlpacaKeys(
   }
 }
 
+// Alpaca Trading API hosts (duplicated from trading.ts — trading.ts imports
+// THIS module, so the base URLs live here to avoid a circular import).
+const PAPER_TRADE_BASE = 'https://paper-api.alpaca.markets'
+const LIVE_TRADE_BASE = 'https://api.alpaca.markets'
+
 interface UserSettings {
   alpacaKeyIdEnc?: string
   alpacaSecretEnc?: string
+  // Task 37 — DUAL key pairs: one Alpaca key only ever works on a PAPER or a
+  // LIVE account (never both), so each account gets its own encrypted slot.
+  alpacaPaperKeyIdEnc?: string
+  alpacaPaperSecretEnc?: string
+  alpacaLiveKeyIdEnc?: string
+  alpacaLiveSecretEnc?: string
   telegramTokenEnc?: string
   telegramChatId?: string
+  tradeMode?: string
 }
 
 /**
@@ -104,25 +137,205 @@ function sharedBrokerAllowed(): boolean {
   return process.env.ALLOW_SHARED_BROKER === 'true'
 }
 
-export async function getAlpacaKeys(userId?: string): Promise<AlpacaKeys | null> {
-  if (userId) {
-    const user = await db.user.findUnique({ where: { id: userId } })
-    const settings = (user?.settings as UserSettings | null) || null
-    if (settings?.alpacaKeyIdEnc && settings?.alpacaSecretEnc) {
-      const keyId = decrypt(settings.alpacaKeyIdEnc)
-      const secret = decrypt(settings.alpacaSecretEnc)
-      if (keyId && secret) return { keyId, secret }
-    }
-  }
+function envAlpacaKeys(): AlpacaKeysWithOrigin | null {
   if (!sharedBrokerAllowed()) return null
   const envId = process.env.APCA_API_KEY_ID
   const envSecret = process.env.APCA_API_SECRET_KEY
-  if (envId && envSecret) return { keyId: envId, secret: envSecret }
+  if (envId && envSecret) return { keyId: envId, secret: envSecret, origin: 'env' }
   return null
 }
 
-export async function hasAlpacaKeys(userId?: string): Promise<boolean> {
-  return (await getAlpacaKeys(userId)) !== null
+/** Decrypt one stored pair ('paper' | 'live' | 'legacy'). null = not set. */
+function pairFrom(
+  s: UserSettings | null,
+  which: 'paper' | 'live' | 'legacy',
+): AlpacaKeys | null {
+  const kidEnc =
+    which === 'live' ? s?.alpacaLiveKeyIdEnc : which === 'paper' ? s?.alpacaPaperKeyIdEnc : s?.alpacaKeyIdEnc
+  const secEnc =
+    which === 'live' ? s?.alpacaLiveSecretEnc : which === 'paper' ? s?.alpacaPaperSecretEnc : s?.alpacaSecretEnc
+  if (!kidEnc || !secEnc) return null
+  const keyId = decrypt(kidEnc)
+  const secret = decrypt(secEnc)
+  return keyId && secret ? { keyId, secret } : null
+}
+
+/**
+ * Task 37 — MODE-STRICT key resolution for the Trading API. A saved key only
+ * ever works on one host: paper keys → paper-api.alpaca.markets, live keys →
+ * api.alpaca.markets. Feeding a paper key to the live host is exactly what
+ * produced the periodic "Trading live /v2/positions -> 401" log flood (Task
+ * 36), so:
+ *  - paper mode: Paper pair → legacy single pair (pre-dual-key, assumed paper)
+ *    → env (operator opt-in).
+ *  - live mode: Live pair → env. The legacy pair NEVER serves live — its
+ *    account type is unknown-by-construction and a wrong guess is a 401.
+ */
+export async function getAlpacaKeysForMode(
+  userId: string | undefined,
+  mode: AlpacaKeyMode,
+): Promise<AlpacaKeysWithOrigin | null> {
+  if (userId) {
+    const user = await db.user.findUnique({ where: { id: userId } })
+    const s = (user?.settings as UserSettings | null) || null
+    const own = pairFrom(s, mode)
+    if (own) return { ...own, origin: mode }
+    if (mode === 'paper') {
+      const legacy = pairFrom(s, 'legacy')
+      if (legacy) return { ...legacy, origin: 'legacy' }
+    }
+  }
+  return envAlpacaKeys()
+}
+
+/**
+ * Any usable key for the MODE-AGNOSTIC data API (data.alpaca.markets accepts
+ * paper and live keys alike). Preference follows the user's tradeMode, then
+ * the other pair, then the legacy single pair, then env.
+ */
+export async function resolveAnyAlpacaKeys(userId: string | undefined): Promise<AlpacaKeysWithOrigin | null> {
+  if (userId) {
+    const user = await db.user.findUnique({ where: { id: userId } })
+    const s = (user?.settings as UserSettings | null) || null
+    const preferred: AlpacaKeyMode = s?.tradeMode === 'live' ? 'live' : 'paper'
+    for (const which of [preferred, preferred === 'paper' ? ('live' as const) : ('paper' as const)]) {
+      const own = pairFrom(s, which)
+      if (own) return { ...own, origin: which }
+    }
+    const legacy = pairFrom(s, 'legacy')
+    if (legacy) return { ...legacy, origin: 'legacy' }
+  }
+  return envAlpacaKeys()
+}
+
+export async function getAlpacaKeys(userId?: string): Promise<AlpacaKeys | null> {
+  const r = await resolveAnyAlpacaKeys(userId)
+  return r ? { keyId: r.keyId, secret: r.secret } : null
+}
+
+export async function hasAlpacaKeys(userId: string | undefined, mode?: AlpacaKeyMode): Promise<boolean> {
+  if (mode) return (await getAlpacaKeysForMode(userId, mode)) !== null
+  return (await resolveAnyAlpacaKeys(userId)) !== null
+}
+
+// ---- legacy single-pair migration (Task 37) ----
+
+const legacyMigrated = new Set<string>()
+
+/**
+ * One-time copy of the pre-dual-key `alpacaKeyIdEnc/alpacaSecretEnc` pair into
+ * the correct NEW slot. The account type is DETECTED with a real /v2/account
+ * call against both hosts (definitive — a key works on exactly one); when the
+ * network check can't decide, the pair defaults to Paper (paper keys start
+ * with "PK", and every legacy key in this deployment is one). Legacy fields
+ * are kept (never deleted) so older config exports keep round-tripping.
+ * Runs at most once per process per user, triggered from settings GET.
+ */
+export async function migrateLegacyAlpacaKeys(userId: string): Promise<void> {
+  if (legacyMigrated.has(userId)) return
+  legacyMigrated.add(userId)
+  try {
+    const user = await db.user.findUnique({ where: { id: userId } })
+    const s = (((user?.settings as UserSettings | null) || {}) as Record<string, unknown>)
+    const legacyIdEnc = s.alpacaKeyIdEnc
+    const legacySecEnc = s.alpacaSecretEnc
+    if (typeof legacyIdEnc !== 'string' || typeof legacySecEnc !== 'string') return
+    if (s.alpacaPaperKeyIdEnc && s.alpacaLiveKeyIdEnc) return // both slots already filled
+    const keyId = decrypt(legacyIdEnc)
+    const secret = decrypt(legacySecEnc)
+    if (!keyId || !secret) return
+    const check = await detectAlpacaKeyAccount(keyId, secret)
+    const target = check.detected === 'live' ? 'live' : 'paper' // undecided → paper
+    if (target === 'paper') {
+      if (s.alpacaPaperKeyIdEnc) return
+      s.alpacaPaperKeyIdEnc = encrypt(keyId)
+      s.alpacaPaperSecretEnc = encrypt(secret)
+    } else {
+      if (s.alpacaLiveKeyIdEnc) return
+      s.alpacaLiveKeyIdEnc = encrypt(keyId)
+      s.alpacaLiveSecretEnc = encrypt(secret)
+    }
+    const { Prisma } = await import('@prisma/client')
+    await db.user.update({
+      where: { id: userId },
+      data: { settings: s as unknown as Prisma.InputJsonValue },
+    })
+  } catch {
+    /* best-effort — the legacy fallback in getAlpacaKeysForMode keeps working */
+  }
+}
+
+/**
+ * Task 37 — PROVE which account a key pair belongs to by calling
+ * /v2/account on BOTH trading hosts: a key returns 200 on exactly one.
+ * This is the definitive paper-vs-live answer (key-ID prefixes PK… / AK… are
+ * only a hint) and backs the Settings test endpoint + save-time validation.
+ */
+export async function detectAlpacaKeyAccount(
+  keyId: string,
+  secret: string,
+  expectedMode?: AlpacaKeyMode,
+): Promise<AlpacaKeyCheck> {
+  const id = keyId.trim()
+  const prefixHint = id.startsWith('PK')
+    ? 'Keys starting with "PK" belong to a PAPER account.'
+    : id.startsWith('AK')
+      ? 'Keys starting with "AK" belong to a LIVE account.'
+      : ''
+  const paperStatus = await tradingAccountStatus(PAPER_TRADE_BASE, id, secret)
+  if (paperStatus >= 200 && paperStatus < 300) {
+    return {
+      valid: true,
+      detected: 'paper',
+      matchesMode: expectedMode ? expectedMode === 'paper' : null,
+      message: 'Keys verified on the PAPER account (paper-api.alpaca.markets).',
+    }
+  }
+  const liveStatus = await tradingAccountStatus(LIVE_TRADE_BASE, id, secret)
+  if (liveStatus >= 200 && liveStatus < 300) {
+    return {
+      valid: true,
+      detected: 'live',
+      matchesMode: expectedMode ? expectedMode === 'live' : null,
+      message: 'Keys verified on the LIVE account (api.alpaca.markets).',
+    }
+  }
+  if ([paperStatus, liveStatus].some((c) => c === 401 || c === 403)) {
+    return {
+      valid: false,
+      detected: null,
+      matchesMode: expectedMode ? false : null,
+      message: `Alpaca rejected these keys on BOTH the paper and live accounts (401/403). Check the Key ID and Secret.${prefixHint ? ` ${prefixHint}` : ''}`,
+    }
+  }
+  return {
+    valid: false,
+    detected: null,
+    matchesMode: null,
+    message: `Could not reach Alpaca (paper HTTP ${paperStatus}, live HTTP ${liveStatus}) — try again.`,
+  }
+}
+
+/** GET /v2/account against one trading host → HTTP status (0 = network fail). */
+async function tradingAccountStatus(base: string, keyId: string, secret: string): Promise<number> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 6000)
+  try {
+    const res = await fetch(`${base}/v2/account`, {
+      headers: {
+        'APCA-API-KEY-ID': keyId,
+        'APCA-API-SECRET-KEY': secret,
+        accept: 'application/json',
+      },
+      signal: controller.signal,
+      cache: 'no-store',
+    })
+    return res.status
+  } catch {
+    return 0
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** Returns the parsed body plus HTTP status (0 = network/timeout failure). */
