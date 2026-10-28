@@ -78,13 +78,18 @@ export async function rateLimit(key: string, max: number, windowMs: number): Pro
     })
     if (bumped.count === 0) {
       // No live row: first call ever, or the window expired → start a fresh
-      // one. A concurrent create hitting the PK conflict is fine (reset to 1).
-      const resetAt = new Date(now + windowMs)
-      try {
-        await db.rateLimitBucket.create({ data: { key, count: 1, resetAt } })
-      } catch {
-        await db.rateLimitBucket.update({ where: { key }, data: { count: 1, resetAt } })
-      }
+      // one. Must be a single ATOMIC upsert, not create-then-catch-update:
+      // N concurrent requests on a cold key all lose the create race, and
+      // every P2002 loser gets printed by Prisma's error logger even inside
+      // try/catch (the log flood seen as "prisma:error … rateLimitBucket").
+      // Upsert compiles to native INSERT … ON CONFLICT (key) DO UPDATE on
+      // SQLite, so no query ever fails. Semantics unchanged: when a
+      // concurrent creator won, we reset to count=1 with a fresh window.
+      await db.rateLimitBucket.upsert({
+        where: { key },
+        create: { key, count: 1, resetAt: new Date(now + windowMs) },
+        update: { count: 1, resetAt: new Date(now + windowMs) },
+      })
       return { ok: true, retryAfterSec: 0 }
     }
     const row = await db.rateLimitBucket.findUnique({
