@@ -148,6 +148,9 @@ export interface Strategy {
   slValue: number | null
   repeat: boolean
   status: 'armed' | 'paused' | 'placing' | 'triggered' | 'failed' | string
+  /** Task 94 — the Alpaca account this rule fires on, pinned at arm time
+   *  ('paper' default; 'live' only via the explicit opt-in flow) */
+  mode?: 'paper' | 'live'
   lastSide: string | null
   triggeredAt: string | null
   orderId: string | null

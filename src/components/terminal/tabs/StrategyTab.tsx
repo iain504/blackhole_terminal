@@ -56,7 +56,15 @@ function exitText(mode: string, value: number | null): string {
 export default function StrategyTab() {
   const { toast } = useToast()
   const [data, setData] = useState<StrategiesHistoryData | null>(null)
-  const [positions, setPositions] = useState<PositionRow[]>([])
+  // Task 94 — rules are pinned per rule, so the "current" P&L column reads
+  // the position from the rule's OWN account: both tapes are fetched.
+  // `unavailable` (review R-1#5) distinguishes "no position" from "can't
+  // see the account" (keys missing/rejected) — rendering 'flat' for the
+  // latter is a lie.
+  const [posByMode, setPosByMode] = useState<Record<'paper' | 'live', { rows: PositionRow[]; unavailable: boolean }>>({
+    paper: { rows: [], unavailable: false },
+    live: { rows: [], unavailable: false },
+  })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -72,18 +80,22 @@ export default function StrategyTab() {
         const json = (await res.json()) as StrategiesHistoryData
         setData(json)
         setError(null)
-        // live P&L for the "current" column — same mode the strategies trade
-        try {
-          const pres = await fetch(`/api/trading/positions?mode=${encodeURIComponent(json.mode)}`)
-          if (pres.ok) {
-            const pj = await pres.json()
-            setPositions((pj.positions || []) as PositionRow[])
-          } else {
-            setPositions([])
-          }
-        } catch {
-          setPositions([])
-        }
+        // live P&L for the "current" column — per pinned account (Task 94)
+        const [paperPos, livePos] = await Promise.all(
+          (['paper', 'live'] as const).map(async (m): Promise<{ rows: PositionRow[]; unavailable: boolean }> => {
+            try {
+              const pres = await fetch(`/api/trading/positions?mode=${m}`)
+              const pj = await pres.json().catch(() => ({}))
+              // the positions route reports keysMissing/authError structurally
+              // — either means "we cannot see this account", not "flat"
+              const unavailable = !pres.ok || !!pj.keysMissing || !!pj.authError
+              return { rows: (unavailable ? [] : (pj.positions || [])) as PositionRow[], unavailable }
+            } catch {
+              return { rows: [], unavailable: true }
+            }
+          }),
+        )
+        setPosByMode({ paper: paperPos, live: livePos })
       }
     } catch {
       setError('network error')
@@ -103,11 +115,17 @@ export default function StrategyTab() {
     }
   }, [load])
 
-  const posBySymbol = useMemo(() => {
-    const m = new Map<string, PositionRow>()
-    for (const p of positions) m.set(normSym(p.symbol), p)
-    return m
-  }, [positions])
+  const posMaps = useMemo(() => {
+    const build = (rows: PositionRow[]) => {
+      const m = new Map<string, PositionRow>()
+      for (const p of rows) m.set(normSym(p.symbol), p)
+      return m
+    }
+    return {
+      paper: { map: build(posByMode.paper.rows), unavailable: posByMode.paper.unavailable },
+      live: { map: build(posByMode.live.rows), unavailable: posByMode.live.unavailable },
+    }
+  }, [posByMode])
 
   const patch = async (id: string, body: Record<string, unknown>, label: string) => {
     setBusyId(id)
@@ -145,6 +163,7 @@ export default function StrategyTab() {
   }
 
   const rules = data?.rules ?? []
+  const liveCount = rules.filter((r) => r.mode === 'live').length
   const totals = rules.reduce(
     (acc, r) => ({
       armed: acc.armed + (r.status === 'armed' ? 1 : 0),
@@ -186,9 +205,18 @@ export default function StrategyTab() {
               'text-[10px]',
               data.mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400',
             )}
-            title="Strategies evaluate and trade in this mode"
+            title="Your current Trade Mode — each rule fires on its own PINNED account (chip on each row), immune to this switch"
           >
-            {data.mode}
+            trade mode: {data.mode}
+          </Badge>
+        )}
+        {liveCount > 0 && (
+          <Badge
+            variant="outline"
+            className="border-amber-500/40 text-[10px] font-bold text-amber-400"
+            title="Rules pinned to the LIVE account — real orders, real money"
+          >
+            {liveCount} live
           </Badge>
         )}
         <div className="ml-auto flex items-center gap-1.5">
@@ -218,11 +246,23 @@ export default function StrategyTab() {
           Failed to load strategy details — {error}
         </p>
       )}
-      {data && !data.configured && (
-        <p className="shrink-0 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
-          No Alpaca keys can serve the “{data.mode}” mode — fire history and trade P&L are unavailable until keys are added in Settings.
-        </p>
-      )}
+      {data && (() => {
+        // Task 94 — per-account tape availability: warn only for the accounts
+        // that pinned rules actually need
+        const hasPaper = rules.some((r) => r.mode !== 'live')
+        const hasLive = rules.some((r) => r.mode === 'live')
+        const miss: string[] = []
+        if (hasPaper && data.paperConfigured === false) miss.push('paper')
+        if (hasLive && data.liveConfigured === false) miss.push('LIVE')
+        if (miss.length === 0) return null
+        return (
+          <p className="shrink-0 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
+            No Alpaca keys can serve the {miss.join(' / ')} account{miss.length > 1 ? 's' : ''} — or they were
+            rejected (check Settings → API keys). Fire history and trade P&amp;L for those rules are unavailable
+            until fixed.
+          </p>
+        )
+      })()}
 
       {/* rules */}
       {rules.length === 0 && !error && (
@@ -245,7 +285,9 @@ export default function StrategyTab() {
 
       <div className="flex flex-col gap-2">
         {rules.map((r) => {
-          const pos = posBySymbol.get(normSym(r.symbol))
+          const account: 'paper' | 'live' = r.mode === 'live' ? 'live' : 'paper'
+          const posInfo = posMaps[account]
+          const pos = posInfo.map.get(normSym(r.symbol))
           const open = expanded[r.id] ?? r.fires.length > 0
           const hasTp = r.tpMode !== 'none' && r.tpValue != null
           const hasSl = r.slMode !== 'none' && r.slValue != null
@@ -257,6 +299,17 @@ export default function StrategyTab() {
                   {r.status === 'placing' ? 'placing…' : r.status}
                 </Badge>
                 <span className="text-sm font-semibold text-zinc-100">{r.symbol}</span>
+                {/* Task 94 — pinned account chip: amber LIVE / dim paper */}
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    'shrink-0 text-[9px] font-bold uppercase',
+                    r.mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-zinc-700 text-zinc-500',
+                  )}
+                  title="The PINNED Alpaca account this rule fires on — immune to Trade Mode flips"
+                >
+                  {r.mode === 'live' ? 'LIVE' : 'paper'}
+                </Badge>
                 <span className={cn('font-semibold', r.action === 'sell' ? 'text-rose-400' : 'text-emerald-400')}>
                   {r.action.toUpperCase()} {r.qty} @ market
                 </span>
@@ -293,17 +346,22 @@ export default function StrategyTab() {
                   {r.unresolvedFires > 0 && (
                     <span
                       className="ml-1 text-zinc-600"
-                      title={`${r.unresolvedFires} fire(s) whose entry order is not among the broker's recent closed orders (too old, still working, or never filled) — their P&L is not included`}
+                      title={`${r.unresolvedFires} fire(s) whose entry order is not among the broker's recent closed orders (too old, still working, never filled — or the fire's account tape was unavailable)`}
                     >
                       · {r.unresolvedFires} unresolved
                     </span>
                   )}
                 </span>
-                <span className="text-zinc-400" title={`Live unrealized P&L of the open position on ${r.symbol} (${data?.mode ?? 'strategy'} mode) — includes positions opened manually or by other strategies on the same symbol`}>
+                <span className="text-zinc-400" title={`Live unrealized P&L of the open position on ${r.symbol} (${account === 'live' ? 'LIVE' : 'paper'} account) — includes positions opened manually or by other strategies on the same symbol`}>
                   Current P&amp;L{' '}
                   {pos ? (
                     <span className={cn('font-semibold tabular-nums', pos.upl >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
                       {pos.side.toUpperCase()} {Math.abs(pos.qty)} · {money(pos.upl)} ({pct(pos.uplPct)})
+                    </span>
+                  ) : posInfo.unavailable ? (
+                    // review R-1#5 — never render 'flat' when the account can't be seen
+                    <span className="text-amber-500/80" title={`The ${account} account tape is unavailable (keys missing or rejected) — position state unknown`}>
+                      tape unavailable
                     </span>
                   ) : (
                     <span className="text-zinc-600">— flat</span>

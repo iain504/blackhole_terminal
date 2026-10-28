@@ -82,11 +82,16 @@ export async function bootNode(): Promise<void> {
     const { ensureStrategySupervisor } = await import('@/lib/strategy')
     const armedOwners = await db2.strategyRule.findMany({
       where: { status: 'armed' },
-      distinct: ['userId'],
-      select: { userId: true },
+      distinct: ['userId', 'mode'],
+      select: { userId: true, mode: true },
     })
-    for (const o of armedOwners) ensureStrategySupervisor(o.userId, 'paper') // rules are PINNED paper
-    if (armedOwners.length > 0) console.log(`[instrumentation] strategy supervisors resumed for ${armedOwners.length} user(s)`)
+    // Task 94 — warm per (user, mode) pair: rules are individually pinned
+    // ('live' only via the opt-in rail), and the supervisor key carries the
+    // mode even though evaluation itself is mode-agnostic
+    for (const o of armedOwners) {
+      ensureStrategySupervisor(o.userId, o.mode === 'live' ? 'live' : 'paper')
+    }
+    if (armedOwners.length > 0) console.log(`[instrumentation] strategy supervisors resumed for ${armedOwners.length} (user, mode) pair(s)`)
 
     const { ensureCryptoOcoSupervisor } = await import('@/lib/trading')
     const { ensureFillNotifier } = await import('@/lib/fill-notifier')

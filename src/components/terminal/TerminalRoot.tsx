@@ -2,7 +2,8 @@
 
 // Terminal root: auth gate, tab bar, 5s layout autosave, alert engine polling.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useTerminal, SessionUser, Alert } from '@/store/terminal'
+import { useTerminal, SessionUser, Alert, tabPanes } from '@/store/terminal'
+import { MarketStatusBadge } from '@/components/chart/MarketStatusBadge'
 import AuthForms from '@/components/auth/AuthForms'
 import SettingsDialog from '@/components/settings/SettingsDialog'
 import { TabBar } from './TabBar'
@@ -277,11 +278,14 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         const res = await fetch('/api/strategies/check', { method: 'POST' })
         if (!res.ok) return
         const json = await res.json()
-        const fired = (json.fired || []) as { id: string; symbol: string; action: string; ok: boolean; message: string }[]
+        const fired = (json.fired || []) as { id: string; symbol: string; action: string; ok: boolean; message: string; mode?: string }[]
         if (fired.length > 0 && !stopped) {
           for (const f of fired) {
             toast({
-              title: f.ok ? `🤖 Strategy fired: ${f.symbol}` : `🤖 Strategy FAILED: ${f.symbol}`,
+              // Task 94 — live fires must be unmistakable in toasts too
+              title: f.ok
+                ? `🤖 Strategy fired: ${f.symbol}${f.mode === 'live' ? ' ⚠️ LIVE' : ''}`
+                : `🤖 Strategy FAILED: ${f.symbol}${f.mode === 'live' ? ' ⚠️ LIVE' : ''}`,
               description: f.message,
               variant: f.ok ? undefined : 'destructive',
             })
@@ -451,6 +455,10 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
           <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
           {footerChristmas && <span title="Christmas theme" aria-hidden>🎄</span>}
           <AppVersion />
+          {/* Task 94 — market session indicator BESIDE the clock (user: "align
+              it with the clock at the bottom right"): active chart pane's
+              symbol + market state, sharing the clock's row */}
+          <FooterMarketStatus />
           <LiveClock />
         </span>
       </footer>
@@ -472,6 +480,23 @@ function AppVersion() {
       {APP_VERSION.display}
     </span>
   )
+}
+
+// Market-session chip beside the footer clock (Task 94 — user asked to
+// "align it with the clock at the bottom right"). Shows the ACTIVE chart
+// tab's focused pane symbol + market state; hidden on non-chart tabs.
+// Reuses MarketStatusBadge's shared tab-level poll cache (no extra requests).
+function FooterMarketStatus() {
+  const activeTab = useTerminal((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0])
+  if (!activeTab || activeTab.type !== 'chart') return null
+  const panes = tabPanes(activeTab)
+  const idx = Math.min(activeTab.focusedPane ?? 0, Math.max(0, panes.length - 1))
+  const symbol = panes[idx]?.symbol
+  if (!symbol) return null
+  // key={symbol} (review R-2#1) — the badge caches its first-seen symbol's
+  // state; without the key a symbol/tab switch would paint the OLD symbol's
+  // state (or, if the fetch fails, stick wrong until the next 60s poll)
+  return <MarketStatusBadge key={symbol} symbol={symbol} withLabel showSymbol />
 }
 
 // Ticking local clock for the footer (updates every second).

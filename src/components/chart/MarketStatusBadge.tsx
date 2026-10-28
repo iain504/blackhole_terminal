@@ -1,6 +1,10 @@
 'use client'
 
-// Market-status indicator shown next to the symbol on every chart (Task 35).
+// Market-status indicator (Task 35), relocated per user request (Task 94):
+// DESKTOP renders the labeled chip in the app FOOTER, immediately beside the
+// clock at the bottom right ("align it with the clock") — see TerminalRoot's
+// FooterMarketStatus. MOBILE (<768px, no footer) keeps the dot inside every
+// chart pane's symbol button (ChartPanel, md:hidden wrapper).
 //
 //   ● green (pulsing) — US regular trading hour
 //   ☀ yellow sun      — US pre-market (04:00 → open ET)
@@ -9,9 +13,9 @@
 //   ● green (steady)  — crypto, 24/7 open (verified via Alpaca asset status)
 //
 // States come from POST /api/market/hours (Alpaca clock + calendar + asset
-// status, server-cached 30s). This badge polls every 60s and shares one
-// in-flight request + 50s tab-level cache across all chart panes, so a 4-pane
-// grid hits the API once per poll, not four times.
+// status, server-cached 30s). The badge polls every 60s and shares one
+// in-flight request + 50s tab-level cache across ALL consumers (footer chip
+// + every mobile pane), so a 4-pane grid hits the API once per poll.
 import { useEffect, useState } from 'react'
 import { Moon, Sun } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -55,7 +59,16 @@ async function fetchEntry(symbol: string): Promise<Pack | null> {
   return p
 }
 
-export function MarketStatusBadge({ symbol }: { symbol: string }) {
+export function MarketStatusBadge({
+  symbol,
+  withLabel = false,
+  showSymbol = false,
+}: {
+  symbol: string
+  withLabel?: boolean
+  /** withLabel variant only — prefix the chip with the symbol (footer chip) */
+  showSymbol?: boolean
+}) {
   const [pack, setPack] = useState<Pack | null>(() => cache.get(symbol) ?? null)
 
   useEffect(() => {
@@ -75,11 +88,20 @@ export function MarketStatusBadge({ symbol }: { symbol: string }) {
     }
   }, [symbol])
 
-  if (!pack) return <span className="inline-block h-2 w-2" aria-hidden /> // stable width — no header jump on first paint
+  if (!pack) return withLabel ? null : <span className="inline-block h-2 w-2" aria-hidden /> // stable width — no header jump on first paint
 
   const { entry, demo } = pack
   const aria = `${entry.label}${entry.detail ? ` — ${entry.detail}` : ''}`
   const extra = demo || entry.estimated ? ' · estimate (live Alpaca check unavailable)' : ''
+
+  // Task 94 — short label for the bottom-right chip variant (aligned with
+  // the footer clock). Long human detail stays in the tooltip.
+  const shortLabel: string =
+    entry.state === 'regular' ? 'US market open'
+    : entry.state === 'open24' ? '24/7 open'
+    : entry.state === 'pre' ? 'Pre-market'
+    : entry.state === 'post' ? 'Post-market'
+    : 'Market closed'
 
   let visual: React.ReactNode
   switch (entry.state) {
@@ -102,6 +124,34 @@ export function MarketStatusBadge({ symbol }: { symbol: string }) {
       break
     default: // closed
       visual = <span className="inline-block h-2 w-2 rounded-full border border-zinc-500 bg-zinc-700/60" aria-hidden />
+  }
+
+  if (withLabel) {
+    // chip variant — desktop footer renders it BESIDE the clock (user:
+    // "align it with the clock at the bottom right"); same small-text
+    // aesthetic as the clock
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            role="img"
+            aria-label={`Market status: ${symbol} — ${aria}`}
+            className="inline-flex cursor-default items-center gap-1.5 rounded-md border border-zinc-800/80 bg-zinc-950/70 px-2 py-1 text-[10px] leading-none text-zinc-300"
+          >
+            {showSymbol && <span className="font-semibold text-zinc-100">{symbol}</span>}
+            {visual}
+            <span>{shortLabel}</span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="top" className="max-w-[300px] border-zinc-800 bg-zinc-900 text-zinc-200">
+          <div className="text-xs">
+            <div className="font-semibold">{symbol} — {entry.label}</div>
+            {entry.detail && <div className="text-zinc-400">{entry.detail}</div>}
+            {extra && <div className="mt-0.5 text-[10px] text-zinc-500">{extra.trim()}</div>}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    )
   }
 
   return (

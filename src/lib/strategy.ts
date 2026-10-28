@@ -17,7 +17,7 @@ import { sendTelegram } from '@/lib/api-helpers'
 import { Timeframe, TIMEFRAMES } from '@/lib/market-types'
 import { barsFor } from '@/lib/bars-cache'
 import { evalIndicatorSignal, isCross, IndicatorParams } from '@/lib/indicator-eval'
-import { placeOrderWithExits, ensureCryptoOcoSupervisor, TradeMode } from '@/lib/trading'
+import { placeOrderWithExits, ensureCryptoOcoSupervisor, isNoKeysError, TradeMode } from '@/lib/trading'
 
 interface UserSettings {
   telegramTokenEnc?: string
@@ -27,8 +27,9 @@ interface UserSettings {
 export interface StrategyRow {
   id: string
   symbol: string
-  /** Task 89 — the Alpaca account this rule fires on, PINNED at create time
-   *  (legacy rows read as 'paper' — create always refused live) */
+  /** Task 89/94 — the Alpaca account this rule fires on, PINNED at create
+   *  time (legacy rows read as 'paper'; 'live' only via the explicit
+   *  opt-in: liveConfirm flag + live keys checked at the API) */
   mode?: string | null
   kind: string
   condition: string
@@ -55,6 +56,8 @@ export interface StrategyFire {
   ok: boolean
   message: string
   orderId?: string
+  /** Task 94 — the pinned account the fire traded on (surfaces in toasts) */
+  mode?: 'paper' | 'live'
 }
 
 /** A 'placing' claim older than this is a dead engine mid-order → failed. */
@@ -123,6 +126,9 @@ async function logFire(
         qty: r.qty,
         ok: data.ok,
         message: data.message,
+        // Task 94 — the fire's OWN account (the rule can move later; the
+        // log stays attributable to the tape it actually traded on)
+        mode: r.mode === 'live' ? 'live' : 'paper',
         orderId: data.orderId ?? null,
       },
     })
@@ -219,9 +225,14 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
 
       const action = r.action === 'sell' ? 'sell' : 'buy'
       const qty = r.qty
-      // Task 89 — the rule fires on its PINNED account (always 'paper' since
-      // create refuses live); the caller's mode arg is legacy fallback only.
+      // Task 89/94 — the rule fires on its PINNED account ('live' only
+      // reachable through the create/PATCH opt-in rail); the caller's mode
+      // arg is legacy fallback only.
       const fireMode: TradeMode = r.mode === 'live' ? 'live' : 'paper'
+      // Task 94 (review R-1#1) — every push channel must say WHICH account
+      // fired: a paper fire and a real-money live fire used to be
+      // byte-identical on Telegram, toasts and the fire log
+      const liveTag = fireMode === 'live' ? '[LIVE] ' : ''
       let failNote: string | null = null
       let orderNote = ''
       let orderId: string | undefined
@@ -262,7 +273,12 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
             stop_loss: sl === null ? undefined : sl,
           })
           if (r2.results.length === 0) {
-            failNote = r2.errors[0] || 'Order rejected'
+            // Task 94 (review R-1#7) — the raw 'no-keys'/'no-live-keys' tokens
+            // are route-layer copy; the engine must surface human text
+            const rawErr = r2.errors[0] || 'Order rejected'
+            failNote = isNoKeysError(rawErr)
+              ? `No usable Alpaca keys for this rule's ${fireMode.toUpperCase()} account — add them in Settings → API keys`
+              : rawErr
           } else {
             orderId = r2.results[0]?.id
             const parts = [
@@ -274,17 +290,17 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
           }
         }
 
-        const message = `${ev.message} → ${action.toUpperCase()} ${qty} ${symbol} @ market${orderNote}`
+        const message = `${liveTag}${ev.message} → ${action.toUpperCase()} ${qty} ${symbol} @ market${orderNote}`
 
         if (failNote) {
           await db.strategyRule.update({
             where: { id: r.id },
             data: { status: 'failed', fireNote: failNote },
           })
-          fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${ev.message} → order FAILED: ${failNote}` })
-          await logFire(userId, r, { ok: false, message: `${ev.message} → order FAILED: ${failNote}` })
+          fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${liveTag}${ev.message} → order FAILED: ${failNote}`, mode: fireMode })
+          await logFire(userId, r, { ok: false, message: `${liveTag}${ev.message} → order FAILED: ${failNote}` })
           await notify(
-            `🤖 <b>Strategy FAILED</b>\n<b>${symbol}</b>\n${ev.message}\nAction: ${action.toUpperCase()} ${qty} @ market\nError: ${failNote}\nTime: ${new Date().toUTCString()}`,
+            `🤖 <b>Strategy FAILED</b>${fireMode === 'live' ? ' ⚠️ LIVE' : ''}\n<b>${symbol}</b>\n${ev.message}\nAction: ${action.toUpperCase()} ${qty} @ market\nAccount: ${fireMode.toUpperCase()}\nError: ${failNote}\nTime: ${new Date().toUTCString()}`,
           )
         } else {
           await db.strategyRule.update({
@@ -293,12 +309,12 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
               ? { status: 'armed', lastSide: null, orderId, fireNote: message, triggeredAt: new Date() }
               : { status: 'triggered', lastSide: ev.side, orderId, fireNote: message, triggeredAt: new Date() },
           })
-          fires.push({ id: r.id, symbol, action, qty, ok: true, message, orderId })
+          fires.push({ id: r.id, symbol, action, qty, ok: true, message, orderId, mode: fireMode })
           await logFire(userId, r, { ok: true, message, orderId })
           await notify(
-            `🤖 <b>Strategy Fired</b>\n<b>${symbol}</b>\n${message}\nTime: ${new Date().toUTCString()}`,
+            `🤖 <b>Strategy Fired</b>${fireMode === 'live' ? ' ⚠️ LIVE' : ''}\n<b>${symbol}</b>\n${message}\nAccount: ${fireMode.toUpperCase()}${fireMode === 'live' ? ' — real money' : ''}\nTime: ${new Date().toUTCString()}`,
           )
-          console.log(`[strategy] fired ${action} ${qty} ${symbol} (${r.kind} ${r.condition} ${r.level} ${r.timeframe}) order=${orderId}`)
+          console.log(`[strategy] fired ${action} ${qty} ${symbol} (${r.kind} ${r.condition} ${r.level} ${r.timeframe}) mode=${fireMode} order=${orderId}`)
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unknown error'
@@ -306,8 +322,8 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
           where: { id: r.id },
           data: { status: 'failed', fireNote: msg },
         }).catch(() => {})
-        fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${ev.message} → order FAILED: ${msg}` })
-        await logFire(userId, r, { ok: false, message: `${ev.message} → order FAILED: ${msg}` })
+        fires.push({ id: r.id, symbol, action, qty, ok: false, message: `${liveTag}${ev.message} → order FAILED: ${msg}`, mode: fireMode })
+        await logFire(userId, r, { ok: false, message: `${liveTag}${ev.message} → order FAILED: ${msg}` })
       }
     }
   }
@@ -362,7 +378,11 @@ export function ensureStrategySupervisor(userId: string, mode: TradeMode): void 
     // the process even after every rule was deleted/paused. When the user
     // has no armed rules for 3 consecutive cycles (60s), stop the timer and
     // drop the entry — the next GET/POST warms it again if rules return.
-    void db.strategyRule.count({ where: { userId, status: 'armed' } })
+    // Task 94 (review R-1#8) — count per PINNED mode so a timer keyed for an
+    // account with zero armed rules (e.g. GET warmed the user's tradeMode
+    // while every rule is pinned live) actually tears down instead of
+    // ticking forever. Evaluation itself stays mode-agnostic.
+    void db.strategyRule.count({ where: { userId, status: 'armed', mode } })
       .then((armed) => {
         if (armed > 0) {
           idle.set(key, 0)

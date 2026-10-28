@@ -4,6 +4,7 @@ import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { toDto } from '../route'
 import { ensureStrategySupervisor } from '@/lib/strategy'
+import { hasAlpacaKeys } from '@/lib/alpaca'
 
 interface PatchBody {
   status?: string // 'armed' | 'paused'
@@ -13,6 +14,11 @@ interface PatchBody {
   tpValue?: number | null
   slMode?: string
   slValue?: number | null
+  /** Task 94 — move the rule to another pinned account. paper→live is an
+   *  explicit opt-in: requires liveConfirm:true + live keys saved. live→paper
+   *  (de-escalation) needs no confirmation. */
+  mode?: string
+  liveConfirm?: boolean
 }
 
 // pct values are PERCENT magnitudes (2 = 2%)
@@ -56,10 +62,26 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
         data.lastSide = null
         data.triggeredAt = null
         data.fireNote = null
-        // Task 89 — re-warm the supervisor: the idle teardown (3 empty
-        // cycles) may have stopped the timer, and a scripted re-arm with no
-        // terminal open must still fire
-        ensureStrategySupervisor(user.id, 'paper')
+      }
+    }
+    // Task 94 — account move with the same opt-in rail as create:
+    // paper→live needs liveConfirm + live keys; live→paper is always allowed.
+    // Unknown mode values are rejected (review R-1#9) — strictness over a
+    // silent no-op that would look like success to a scripted caller.
+    if (body.mode !== undefined) {
+      if (body.mode !== 'live' && body.mode !== 'paper') {
+        return NextResponse.json({ error: 'mode must be "paper" or "live"' }, { status: 400 })
+      }
+      if (body.mode !== r.mode) {
+        if (body.mode === 'live') {
+          if (body.liveConfirm !== true) {
+            return NextResponse.json({ error: 'Moving a rule to LIVE requires explicit confirmation (liveConfirm)' }, { status: 400 })
+          }
+          if (!(await hasAlpacaKeys(user.id, 'live'))) {
+            return NextResponse.json({ error: 'No LIVE Alpaca keys saved — add them in Settings → API keys (Live account) before arming a live rule' }, { status: 400 })
+          }
+        }
+        data.mode = body.mode
       }
     }
     if (typeof body.repeat === 'boolean') data.repeat = body.repeat
@@ -95,6 +117,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const updated = await db.strategyRule.update({ where: { id }, data })
+    // re-warm the supervisor (idle teardown may have stopped the timer, and a
+    // scripted PATCH with no terminal open must still fire) — evaluation is
+    // mode-agnostic, but the warm key carries the rule's PINNED mode
+    ensureStrategySupervisor(user.id, updated.mode === 'live' ? 'live' : 'paper')
     return NextResponse.json({ strategy: toDto(updated) })
   } catch (e) {
     return handleError(e)

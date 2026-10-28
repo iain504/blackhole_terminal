@@ -94,6 +94,8 @@ export interface StrategyRuleDetail {
   slValue: number | null
   repeat: boolean
   status: string
+  /** Task 94 — the pinned Alpaca account this rule fires on */
+  mode?: 'paper' | 'live'
   lastSide: string | null
   triggeredAt: string | null
   orderId: string | null
@@ -112,5 +114,8 @@ export interface StrategyRuleDetail {
 export interface StrategiesHistoryData {
   mode: string
   configured: boolean
+  /** Task 94 — per-account closed-orders tape availability */
+  paperConfigured?: boolean
+  liveConfigured?: boolean
   rules: StrategyRuleDetail[]
 }

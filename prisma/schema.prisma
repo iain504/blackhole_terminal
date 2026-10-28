@@ -145,6 +145,12 @@ model StrategyFireLog {
   qty       Float
   ok        Boolean
   message   String
+  // Task 94 — the PINNED account the fire traded on ('paper' | 'live').
+  // Rules can MOVE accounts (live opt-in PATCH), so attribution uses the
+  // FIRE's mode, not the rule's current one — pre-move history would
+  // otherwise orphan against the wrong broker tape. Legacy rows default
+  // 'paper', which is correct (live rules could not exist before).
+  mode      String   @default("paper")
   // entry order id of the placed order (success only) — the key used to
   // attribute the resulting round-trip trade(s) from the broker's closed
   // orders (FIFO matching)

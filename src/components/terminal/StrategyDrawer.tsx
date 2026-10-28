@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
-import { Bot, Loader2, Zap } from 'lucide-react'
+import { Bot, Loader2, Zap, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ttLog } from '@/lib/console-log'
 
@@ -88,6 +88,12 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
   const [slMode, setSlMode] = useState<'none' | 'price' | 'pct'>('pct')
   const [slValue, setSlValue] = useState('1')
   const [repeat, setRepeat] = useState(false)
+  // Task 94 — account opt-in: rules default to PAPER; LIVE requires an
+  // explicit "I understand" ack (the API refuses mode:'live' without
+  // liveConfirm:true, and without live keys saved). Named acctMode so the
+  // TP/SL row's local `mode` below doesn't shadow it (review R-1#11).
+  const [acctMode, setAcctMode] = useState<'paper' | 'live'>('paper')
+  const [liveAck, setLiveAck] = useState(false)
   const [creating, setCreating] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const symTouched = useRef(false)
@@ -117,14 +123,20 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
       ? Number.isFinite(rsiLevelN) && rsiLevelN > 0 && rsiLevelN < 100
       : (cond === 'cross_above' || cond === 'cross_below' ? Number.isFinite(macdLevelN) : true)) &&
     (tpMode === 'none' || (Number.isFinite(tpN) && tpN > 0)) &&
-    (slMode === 'none' || (Number.isFinite(slN) && slN > 0))
+    (slMode === 'none' || (Number.isFinite(slN) && slN > 0)) &&
+    // LIVE opt-in gate — the ack checkbox IS the explicit confirmation
+    (acctMode === 'paper' || liveAck)
 
   const summary = `IF ${kind === 'rsi'
     ? `RSI(${parseInt(rsiPeriod, 10) || 14}) crosses ${rsiCondition === 'cross_below' ? 'below' : 'above'} ${rsiLevel || '—'}`
     : `MACD(${parseInt(fast, 10) || 12},${parseInt(slow, 10) || 26},${parseInt(signal, 10) || 9}) ${cond === 'bull_cross' ? 'bullish crossover' : cond === 'bear_cross' ? 'bearish crossover' : cond === 'cross_above' ? `crosses above ${macdLevel || '—'}` : `crosses below ${macdLevel || '—'}`}`
-  } · ${TF_LABEL[tf] ?? tf} → THEN ${action.toUpperCase()} ${qty || '—'} ${symbol.toUpperCase() || ''}`
+  } · ${TF_LABEL[tf] ?? tf} → THEN ${action.toUpperCase()} ${qty || '—'} ${symbol.toUpperCase() || ''}${acctMode === 'live' ? ' · on LIVE' : ''}`
 
   const create = async () => {
+    // Task 94 (review R-1#2) — re-entrancy guard: the TP/SL inputs' Enter
+    // handler + the arm button could double-submit (two armed rules = two
+    // orders on the same crossing, now potentially both LIVE)
+    if (creating) return
     const sym = symbol.trim().toUpperCase()
     if (!sym) return
     setCreating(true)
@@ -147,6 +159,10 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
         slMode,
         slValue: slMode === 'none' ? null : slN,
         repeat,
+        // Task 94 — pinned account + explicit live opt-in flag (the server
+        // 400s a live arm that lacks liveConfirm, so this must be sent)
+        mode: acctMode,
+        ...(acctMode === 'live' ? { liveConfirm: true } : {}),
       }
       const res = await fetch('/api/strategies', {
         method: 'POST',
@@ -156,7 +172,12 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
       const json = await res.json().catch(() => null)
       if (res.ok && json?.strategy) {
         addStrategyLocal(json.strategy as Strategy)
-        ttLog('strategy', `🤖 Armed: ${condSummary(json.strategy as Strategy)} → ${action.toUpperCase()} ${qtyN} ${sym}`, 'ok')
+        ttLog(
+          'strategy',
+          `🤖 Armed: ${condSummary(json.strategy as Strategy)} → ${action.toUpperCase()} ${qtyN} ${sym}${acctMode === 'live' ? ' (LIVE)' : ''}`,
+          'ok',
+        )
+        setLiveAck(false) // fresh confirmation for the next rule
       } else {
         setErr(json?.error || `HTTP ${res.status}`)
         ttLog('strategy', `Create strategy failed: ${json?.error || res.status}`, 'warn')
@@ -214,15 +235,25 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 text-sm font-medium">
           <span className="flex items-center gap-2">
             <Bot className="h-4 w-4 text-violet-400" /> Strategy Orders
-            {/* strategy rules fire on the paper account only — make the
-                destination of a fired order visible at a glance */}
-            <Badge
-              variant="outline"
-              className="border-emerald-500/40 text-[10px] text-emerald-400"
-              title="Strategy rules fire on the paper account — fired orders hit paper only"
-            >
-              Paper
-            </Badge>
+            {/* Task 94 — rules are individually pinned; the header badge
+                reflects whether any live rule exists (amber) or all paper */}
+            {strategies.some((r) => r.mode === 'live') ? (
+              <Badge
+                variant="outline"
+                className="border-amber-500/40 text-[10px] text-amber-400"
+                title="At least one rule fires on the LIVE account — real orders, real money. Check each rule's chip."
+              >
+                includes LIVE
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                className="border-emerald-500/40 text-[10px] text-emerald-400"
+                title="All strategy rules fire on the paper account"
+              >
+                Paper
+              </Badge>
+            )}
           </span>
           <Button variant="ghost" size="sm" onClick={onClose} className="h-7 px-2 text-xs">
             Close
@@ -386,7 +417,7 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
                   <Input
                     type="number" step="any" min={0} value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && formValid && void create()}
+                    onKeyDown={(e) => e.key === 'Enter' && formValid && !creating && void create()}
                     disabled={mode === 'none'}
                     aria-label={`${label} value`}
                     className="h-7 flex-1 border-zinc-700 bg-zinc-950 text-xs disabled:opacity-40"
@@ -420,6 +451,61 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
             </span>
           </div>
 
+          {/* account (Task 94): pinned at arm time — Paper default, LIVE
+              behind an explicit opt-in ack */}
+          <div className="mt-2 flex items-center gap-2">
+            <label className="text-[10px] uppercase tracking-wider text-zinc-500">Account</label>
+            <div className="flex overflow-hidden rounded border border-zinc-700" role="radiogroup" aria-label="Firing account">
+              <button
+                onClick={() => { setAcctMode('paper'); setLiveAck(false) }}
+                aria-pressed={acctMode === 'paper'}
+                className={cn(
+                  'px-2 py-1 text-[10px] font-semibold transition-colors',
+                  acctMode === 'paper' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-zinc-950 text-zinc-500 hover:text-zinc-300',
+                )}
+              >
+                Paper
+              </button>
+              <button
+                onClick={() => setAcctMode('live')}
+                aria-pressed={acctMode === 'live'}
+                className={cn(
+                  'px-2 py-1 text-[10px] font-semibold transition-colors',
+                  acctMode === 'live' ? 'bg-amber-500/15 text-amber-300' : 'bg-zinc-950 text-zinc-500 hover:text-zinc-300',
+                )}
+              >
+                LIVE
+              </button>
+            </div>
+            <span className="truncate text-[10px] text-zinc-600">
+              {acctMode === 'live' ? 'fires real orders — pinned to live' : 'fires on the paper account — pinned'}
+            </span>
+          </div>
+
+          {/* LIVE opt-in warning + explicit ack (Task 94) — the arm button
+              stays disabled until this box is checked */}
+          {acctMode === 'live' && (
+            <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-2" role="alert">
+              <p className="flex items-start gap-1.5 text-[11px] leading-snug text-amber-300">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+                <span>
+                  This rule fires on your <strong>LIVE account</strong> — real orders, real money, real fills.
+                  It stays live even if you later switch Trade Mode to paper.
+                </span>
+              </p>
+              <label className="mt-1.5 flex cursor-pointer items-center gap-2 text-[11px] text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={liveAck}
+                  onChange={(e) => setLiveAck(e.target.checked)}
+                  aria-label="I understand this rule will place real orders on my live account"
+                  className="h-3.5 w-3.5 accent-amber-500"
+                />
+                I understand — arm this rule on LIVE
+              </label>
+            </div>
+          )}
+
           {/* live summary */}
           <p className="mt-2 rounded bg-zinc-950/80 px-2 py-1.5 text-[11px] leading-snug text-zinc-400">
             {summary}
@@ -428,9 +514,12 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
 
           <Button
             size="sm" disabled={!formValid || creating} onClick={() => void create()}
-            className="mt-2 h-7 w-full bg-violet-600 text-xs text-white hover:bg-violet-500"
+            className={cn(
+              'mt-2 h-7 w-full text-xs text-white',
+              acctMode === 'live' ? 'bg-amber-600 hover:bg-amber-500' : 'bg-violet-600 hover:bg-violet-500',
+            )}
           >
-            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : '🤖 Arm strategy'}
+            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : acctMode === 'live' ? '🤖 Arm on LIVE' : '🤖 Arm strategy'}
           </Button>
         </div>
 
@@ -454,9 +543,21 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
                     <span className="font-medium text-zinc-200">{r.symbol}</span>
                     <span className="truncate text-zinc-400">{condSummary(r)}</span>
                   </div>
-                  <Badge variant="outline" className={cn('shrink-0 text-[10px]', statusBadgeCls(r.status))}>
-                    {r.status === 'placing' ? 'placing…' : r.status}
-                  </Badge>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {/* Task 94 — per-rule pinned account chip */}
+                    {r.mode === 'live' && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 border-amber-500/40 px-1 text-[9px] font-bold text-amber-400"
+                        title="Fires on the LIVE account — real orders, real money"
+                      >
+                        LIVE
+                      </Badge>
+                    )}
+                    <Badge variant="outline" className={cn('shrink-0 text-[10px]', statusBadgeCls(r.status))}>
+                      {r.status === 'placing' ? 'placing…' : r.status}
+                    </Badge>
+                  </span>
                 </div>
                 <div className="mt-0.5 flex items-center justify-between gap-2 pl-4">
                   <span className="truncate text-[11px] text-zinc-500" title={r.fireNote ?? undefined}>

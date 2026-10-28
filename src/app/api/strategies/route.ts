@@ -4,7 +4,8 @@ import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { TIMEFRAMES, Timeframe } from '@/lib/market-types'
 import { ensureStrategySupervisor } from '@/lib/strategy'
-import { resolveTradeMode } from '@/lib/trading'
+import { resolveTradeMode, TradeMode } from '@/lib/trading'
+import { hasAlpacaKeys } from '@/lib/alpaca'
 
 export interface StrategyDto {
   id: string
@@ -22,6 +23,8 @@ export interface StrategyDto {
   slValue: number | null
   repeat: boolean
   status: string // armed | paused | placing | triggered | failed
+  /** the Alpaca account this rule fires on — PINNED at arm time */
+  mode: 'paper' | 'live'
   lastSide: string | null
   triggeredAt: string | null
   orderId: string | null
@@ -33,7 +36,7 @@ export function toDto(r: {
   id: string; symbol: string; kind: string; condition: string; level: number
   timeframe: string; params: unknown; action: string; qty: number
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
-  repeat: boolean; status: string; lastSide: string | null
+  repeat: boolean; status: string; lastSide: string | null; mode?: string | null
   triggeredAt: Date | null; orderId: string | null; fireNote: string | null; createdAt: Date
 }): StrategyDto {
   return {
@@ -42,6 +45,9 @@ export function toDto(r: {
     action: r.action, qty: r.qty,
     tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
     repeat: r.repeat, status: r.status, lastSide: r.lastSide,
+    // Task 94 — rules may now be armed on LIVE via explicit opt-in; legacy
+    // rows (and any null) read as the safe default 'paper'
+    mode: r.mode === 'live' ? 'live' : 'paper',
     triggeredAt: r.triggeredAt?.toISOString() ?? null,
     orderId: r.orderId, fireNote: r.fireNote,
     createdAt: r.createdAt.toISOString(),
@@ -75,6 +81,13 @@ interface CreateBody {
   slMode?: string
   slValue?: number | null
   repeat?: boolean
+  /** Task 94 — which Alpaca account this rule fires on. Default 'paper'.
+   *  'live' is an explicit OPT-IN: the request must carry liveConfirm:true
+   *  (the drawer's "I understand" checkbox) and the user must have LIVE
+   *  keys saved. The mode is then PINNED on the rule — tradeMode flips in
+   *  Settings can never migrate it. */
+  mode?: string
+  liveConfirm?: boolean
 }
 
 const clampInt = (v: unknown, min: number, max: number, dflt: number): number => {
@@ -125,12 +138,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Stocks require a whole-number quantity — crypto supports fractional sizes' }, { status: 400 })
     }
 
-    // Task 89 — rules are PINNED to paper: refuse live outright (mirrors
-    // grid + algo) instead of silently firing real-money orders in whatever
-    // mode the settings happen to have. Checked BEFORE the create.
-    const mode = await resolveTradeMode(user.id)
+    // Task 94 — LIVE arming is an EXPLICIT opt-in (user request): default is
+    // paper; 'live' requires BOTH the ack flag (liveConfirm — the drawer's
+    // checkbox, so a stray fetch can never arm real-money orders) AND live
+    // keys actually saved. The chosen mode is then pinned on the rule.
+    const mode: TradeMode = body.mode === 'live' ? 'live' : 'paper'
     if (mode === 'live') {
-      return NextResponse.json({ error: 'Refusing to arm strategy rules in LIVE mode — switch the trade mode to paper' }, { status: 400 })
+      if (body.liveConfirm !== true) {
+        return NextResponse.json({ error: 'Arming on LIVE requires explicit confirmation (liveConfirm)' }, { status: 400 })
+      }
+      if (!(await hasAlpacaKeys(user.id, 'live'))) {
+        return NextResponse.json({ error: 'No LIVE Alpaca keys saved — add them in Settings → API keys (Live account) before arming a live rule' }, { status: 400 })
+      }
     }
 
     const tpMode = ['none', 'price', 'pct'].includes(body.tpMode || '') ? body.tpMode! : 'none'
@@ -168,9 +187,9 @@ export async function POST(req: Request) {
     const r = await db.strategyRule.create({
       data: {
         userId: user.id, symbol, kind, condition, level,
-        // Task 89 — PINNED account: rules are refused in live mode below, so
-        // every rule fires on paper forever, immune to tradeMode flips
-        mode: 'paper',
+        // Task 89/94 — PINNED account: fires on this mode forever, immune to
+        // tradeMode flips ('live' only reachable through the opt-in above)
+        mode,
         timeframe: validTf(body.timeframe), params,
         action, qty,
         tpMode, tpValue: tpValue != null && Number.isFinite(tpValue) ? clampPctOrKeep(tpMode, tpValue) : null,
@@ -181,8 +200,8 @@ export async function POST(req: Request) {
       },
     })
     // warm the supervisor so this rule fires even with no terminal tab open
-    // (the rule is pinned paper — see the live refusal above)
-    ensureStrategySupervisor(user.id, 'paper')
+    // (evaluation is mode-agnostic — each rule fires on its own pinned mode)
+    ensureStrategySupervisor(user.id, mode)
     return NextResponse.json({ strategy: toDto(r) })
   } catch (e) {
     return handleError(e)

@@ -4411,8 +4411,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             onClick={() => setSearchOpen(true)}
           >
             {symbol}
-            {/* Task 35 — market session indicator (green=RTH · yellow sun=pre · purple moon=post) */}
-            <MarketStatusBadge symbol={symbol} />
+            {/* Task 94 — market session indicator: DESKTOP renders it in the
+                footer beside the clock (user: "align it with the clock at the
+                bottom right") — the dot stays here for MOBILE only (<768px,
+                where the mobile shell has no footer) */}
+            <span className="md:hidden">
+              <MarketStatusBadge symbol={symbol} />
+            </span>
             {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>

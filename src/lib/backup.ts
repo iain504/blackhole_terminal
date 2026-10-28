@@ -148,6 +148,11 @@ const SPECS: Record<string, Record<string, FieldSpec>> = {
     slValue: { t: 'n' },
     repeat: { t: 'b' },
     status: { t: 's', max: 16 },
+    // Task 94 (review R-1#4) — the pinned account survives backup restore;
+    // restore normalizes anything that is not exactly 'live' to 'paper'
+    // (fail-safe: a tampered backup can never mint a live rule — that still
+    // requires the create/PATCH opt-in rail with liveConfirm + live keys)
+    mode: { t: 's', max: 8 },
     lastSide: { t: 's', max: 8 },
     triggeredAt: { t: 'd' },
     orderId: { t: 's', max: 64 },
@@ -374,7 +379,12 @@ export async function restoreBackupData(
     await tx.strategyRule.deleteMany({ where: { userId } })
     if (rows.length) {
       await tx.strategyRule.createMany({
-        data: rows.map((r) => ({ ...r, userId })) as unknown as Prisma.StrategyRuleCreateManyInput[],
+        data: rows.map((r) => ({
+          ...r,
+          // fail-safe normalize (see whitelist comment)
+          mode: r.mode === 'live' ? 'live' : 'paper',
+          userId,
+        })) as unknown as Prisma.StrategyRuleCreateManyInput[],
       })
     }
     counts.strategyRules = rows.length
