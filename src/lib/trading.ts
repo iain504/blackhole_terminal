@@ -375,11 +375,60 @@ export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: st
 }
 
 export async function getClosedOrders(userId: string, mode: TradeMode, limit = 30) {
-  return tradeFetch<TradingOrder[]>(
-    userId,
-    mode,
-    `/v2/orders?status=closed&limit=${limit}&direction=desc`,
-  )
+  // HISTORY BUG (v1.94.1) — the same Alpaca gotcha getOpenOrders works around
+  // (see its long comment): the DEFAULT (nested=false) list hides bracket/OCO
+  // legs — a closed bracket parent comes back with legs=null (verified live
+  // 2026-10-28: a canceled bracket shows in the flat closed list with
+  // legs=null, its canceled legs absent entirely). Consequence: a TP/SL leg
+  // FILL never reached the FIFO matcher (matchClosedTrades), the entry lot
+  // stayed open forever, and the whole round trip was MISSING from trade
+  // history / strategy P&L / chart fill markers — a trade that opened and
+  // closed today (exit via its own bracket leg: TP hit, SL hit, or the
+  // positions-menu OCO) looked like it never closed. Crypto was unaffected
+  // (no advanced classes → flat exit legs), which is why grid E2E never saw
+  // it. Fix: fetch BOTH closed tapes, merge by id (nested wins when it
+  // carries legs), then FLATTEN every leg into the top-level list — legs are
+  // real orders with real fills and matchFifo filters to the filled ones
+  // itself. The parent fill stays the entry; legs become the exits.
+  const [flat, nested] = await Promise.all([
+    tradeFetch<TradingOrder[]>(
+      userId,
+      mode,
+      `/v2/orders?status=closed&limit=${limit}&direction=desc`,
+    ),
+    // best-effort supplement — if the nested variant fails (rate limit,
+    // transient), the flat tape still answers, just with the old blindness
+    tradeFetch<TradingOrder[]>(
+      userId,
+      mode,
+      `/v2/orders?status=closed&limit=${limit}&direction=desc&nested=true`,
+    ),
+  ])
+  if (!flat.data) return flat // propagate the primary tape's error/auth state
+  const flatRows: TradingOrder[] = Array.isArray(flat.data) ? flat.data : []
+  const nestedRows: TradingOrder[] = Array.isArray(nested.data) ? nested.data : []
+  if (nestedRows.length === 0) return flat
+  const byId = new Map<string, TradingOrder>()
+  for (const o of flatRows) byId.set(o.id, o)
+  for (const o of nestedRows) {
+    const prev = byId.get(o.id)
+    byId.set(o.id, !prev || (o.legs?.length ?? 0) > (prev.legs?.length ?? 0) ? o : prev)
+  }
+  // phase 1: parents (flat ∪ nested, nested wins when it carries legs)
+  const parents = [...byId.values()]
+  // phase 2: flatten legs to the top level (snapshot the parents first —
+  // mutating the map while iterating it would re-visit freshly-added legs and
+  // double-count their fills; legs never carry legs of their own)
+  const merged = parents.slice()
+  for (const p of parents) {
+    for (const leg of p.legs ?? []) {
+      if (!byId.has(leg.id)) {
+        byId.set(leg.id, leg)
+        merged.push(leg)
+      }
+    }
+  }
+  return { ...flat, data: merged }
 }
 
 export interface PlaceOrderBody {
