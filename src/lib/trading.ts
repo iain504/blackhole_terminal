@@ -21,7 +21,7 @@ import { getAlpacaKeys } from './alpaca'
 
 export type TradeMode = 'paper' | 'live'
 
-const TRADE_BASE: Record<TradeMode, string> = {
+export const TRADE_BASE: Record<TradeMode, string> = {
   paper: 'https://paper-api.alpaca.markets',
   live: 'https://api.alpaca.markets',
 }

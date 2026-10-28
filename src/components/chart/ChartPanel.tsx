@@ -42,6 +42,7 @@ import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { TradeAdvisor } from './TradeAdvisor'
 import GridTradeDialog from './GridTradeDialog'
+import { MarketStatusBadge } from './MarketStatusBadge'
 import { useSymbolPositions } from './usePositions'
 import { ExitInfo, PendingOrderInfo, normSym } from './trading-types'
 import { ttLog } from '@/lib/console-log'
@@ -4410,6 +4411,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             onClick={() => setSearchOpen(true)}
           >
             {symbol}
+            {/* Task 35 — market session indicator (green=RTH · yellow sun=pre · purple moon=post) */}
+            <MarketStatusBadge symbol={symbol} />
             {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>

@@ -131,6 +131,42 @@ export function isCryptoSymbol(symbol: string): boolean {
   return symbol.includes('/')
 }
 
+// ---- Market-hours status (Task 35: per-chart session indicator) ----
+
+/** Session state of one symbol's market.
+ *  regular — US regular trading hour (green light)
+ *  pre     — US pre-market 04:00–open ET (yellow sun)
+ *  post    — US after-hours close–20:00 ET (purple moon)
+ *  closed  — outside all sessions / holiday / weekend / halted (dim dot)
+ *  open24  — crypto, 24/7 (green light; Alpaca crypto never closes) */
+export type MarketStatusState = 'regular' | 'pre' | 'post' | 'closed' | 'open24'
+
+export interface MarketStatusEntry {
+  symbol: string
+  asset: 'us_equity' | 'crypto' | 'unknown'
+  state: MarketStatusState
+  /** short label shown in tooltips, e.g. "Regular Trading Hour" */
+  label: string
+  /** longer human detail, e.g. "opens 09:30 ET" / "verified open via Alpaca" */
+  detail?: string
+  /** true when the state was NOT confirmed against the live Alpaca API
+   *  (no keys / network failure — computed from local ET clock heuristics) */
+  estimated?: boolean
+}
+
+export interface MarketHoursResponse {
+  /** US-equity market clock straight from Alpaca (absent in demo mode) */
+  us?: {
+    isOpen: boolean
+    nextOpen?: string
+    nextClose?: string
+    /** current ET wall-clock time, "HH:MM" */
+    et?: string
+  }
+  hours: Record<string, MarketStatusEntry>
+  meta: { demo: boolean }
+}
+
 // Alpaca crypto majors (v1beta3 crypto/us)
 export const CRYPTO_UNIVERSE = [
   'BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD', 'DOGE/USD', 'AVAX/USD',
