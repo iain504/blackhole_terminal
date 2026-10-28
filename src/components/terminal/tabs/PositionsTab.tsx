@@ -16,7 +16,7 @@
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, History, Loader2, RefreshCw, ShieldAlert, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -39,6 +39,10 @@ interface ModeData {
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderInfo[]
   error?: string
+  /** Task 36 — set when Alpaca rejected the saved keys (401) for this mode;
+   *  rendered as an actionable banner. Polling continues so the banner
+   *  self-clears once the keys are fixed (server breaker retries every 5 min). */
+  authError?: { mode: string; retryInSec: number; message: string }
   loaded: boolean
 }
 
@@ -353,12 +357,15 @@ export default function PositionsTab() {
         }
         const json = await res.json()
         const errs: string[] | undefined = json.errors
+        const authError = (json.authError ?? null) as ModeData['authError'] | null
         return {
           mode,
           positions: (json.positions || []) as PositionRowExt[],
           exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
           pending: (json.pending || []) as PendingOrderInfo[],
-          error: errs?.length ? errs.join(', ') : undefined,
+          // the auth banner replaces the raw repeating 401 error string
+          error: authError ? undefined : errs?.length ? errs.join(', ') : undefined,
+          authError: authError ?? undefined,
           loaded: true,
         }
       } catch {
@@ -568,6 +575,29 @@ export default function PositionsTab() {
           </Button>
         </div>
       </div>
+
+      {/* Task 36 — actionable auth banner: Alpaca rejected the saved keys (401).
+          Polling keeps running against the server's 5-min circuit breaker, so
+          the banner disappears by itself once the keys/mode are fixed. */}
+      {MODES.filter((m) => data[m].authError).map((m) => (
+        <div
+          key={`auth-${m}`}
+          role="alert"
+          className="flex shrink-0 items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+        >
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" aria-hidden />
+          <div className="min-w-0">
+            <span className="font-semibold uppercase">{m}</span>
+            <span className="mx-1 text-amber-300/60">·</span>
+            {data[m].authError!.message}
+            {data[m].authError!.retryInSec > 0 && (
+              <span className="ml-1 text-amber-300/70">
+                Next real attempt in ~{Math.max(1, Math.ceil(data[m].authError!.retryInSec / 60))} min.
+              </span>
+            )}
+          </div>
+        </div>
+      ))}
 
       {/* positions table — height follows the draggable splitter weights
           (persisted in the layout blob: autosave + export/import) */}

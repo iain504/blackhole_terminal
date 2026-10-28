@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import {
   getPositions, getOpenOrders, getClosedOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
-  TradingOrder, TradingPosition, parseCryptoPlan,
+  TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft,
 } from '@/lib/trading'
 import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
+import { hasAlpacaKeys } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 
@@ -94,12 +95,22 @@ export interface PendingOrderRow {
   createdAt: string | null
 }
 
+export interface AuthErrorInfo {
+  mode: string
+  /** seconds until the next REAL Alpaca attempt (circuit breaker, Task 36) */
+  retryInSec: number
+  message: string
+}
+
 export interface PositionsResponse {
   mode: string
   positions: PositionRow[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderRow[]
   errors?: string[]
+  /** set when Alpaca rejected the saved keys (401) for this mode — the UI
+   *  renders it as an actionable banner instead of an unlabeled error string */
+  authError?: AuthErrorInfo
 }
 
 // GET /api/trading/positions?mode=paper&symbol=BTC/USD
@@ -112,13 +123,19 @@ export async function GET(req: Request) {
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const symbolParam = (searchParams.get('symbol') || '').trim()
     // keep the crypto complex-order emulation running (OCO attach + cleanup)
-    ensureCryptoOcoSupervisor(user.id, mode)
-    // keep the Telegram fill/position-close watcher's cursor advancing
-    ensureFillNotifier(user.id, mode)
+    // and the Telegram watcher's cursor advancing — but ONLY when broker keys
+    // exist: a keys-less account must not spawn 6s polling timers (Task 36)
+    if (await hasAlpacaKeys(user.id)) {
+      ensureCryptoOcoSupervisor(user.id, mode)
+      ensureFillNotifier(user.id, mode)
+    }
 
     const posRes = await getPositions(user.id, mode)
     const errors: string[] = []
-    if (posRes.error && posRes.error !== 'no-keys') errors.push(posRes.error)
+    // 401s are surfaced via the structured `authError` banner below (Task 36)
+    // — repeating the raw "request is not authorized" string in `errors` on
+    // every poll adds nothing
+    if (posRes.error && posRes.error !== 'no-keys' && posRes.status !== 401) errors.push(posRes.error)
 
     // A failed fetch (401 on live with paper-only keys, network error) returns
     // an error OBJECT — only treat real arrays as data or the .filter below
@@ -140,8 +157,22 @@ export async function GET(req: Request) {
       getOpenOrders(user.id, mode, symbolParam || undefined, sweepSymbols),
       getClosedOrders(user.id, mode, 500),
     ])
-    if (ordRes.error && ordRes.error !== 'no-keys') errors.push(ordRes.error)
-    if (closedRes.error && closedRes.error !== 'no-keys') errors.push(closedRes.error)
+    if (ordRes.error && ordRes.error !== 'no-keys' && ordRes.status !== 401) errors.push(ordRes.error)
+    if (closedRes.error && closedRes.error !== 'no-keys' && closedRes.status !== 401) errors.push(closedRes.error)
+
+    // Task 36 — structured auth surfacing: a 401 (paper keys on LIVE, rotated
+    // keys) travels as an actionable banner; the 5-min server circuit breaker
+    // keeps polling cheap until the keys are fixed in Settings.
+    const blockedMs = authBackoffMsLeft(user.id, mode)
+    const saw401 = posRes.status === 401 || ordRes.status === 401 || closedRes.status === 401
+    const authError: AuthErrorInfo | undefined =
+      blockedMs > 0 || saw401
+        ? {
+            mode,
+            retryInSec: Math.ceil(blockedMs / 1000),
+            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — paper keys only work with Trade Mode = Paper. Check Settings → Broker keys & Trade mode. Retrying automatically.`,
+          }
+        : undefined
     const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
     const closedOrders: TradingOrder[] = Array.isArray(closedRes.data) ? closedRes.data : []
     // max=0: closed TRADES are not needed here — only the open lots per symbol
@@ -376,7 +407,7 @@ export async function GET(req: Request) {
       })
     }
 
-    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, errors: errors.length ? errors : undefined })
+    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, errors: errors.length ? errors : undefined, authError })
   } catch (e) {
     return handleError(e)
   }

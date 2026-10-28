@@ -60,6 +60,42 @@ interface TradeFetchResult<T> {
   error?: string
 }
 
+// ---- 401 auth circuit breaker (Task 36) ----
+// A rejected key (paper keys against the LIVE host, rotated/revoked keys)
+// used to be retried by every poller forever — positions every 10s, the OCO
+// supervisor every 6s, history every 60s — flooding the log with
+// "401: request is not authorized". After the FIRST 401 for a user+mode,
+// every trading-API call short-circuits LOCALLY for AUTH_BACKOFF_MS (one
+// concise log line, zero outbound traffic), then a single real attempt goes
+// through again — so fixing the keys in Settings self-heals on the next poll.
+export const AUTH_BACKOFF_MS = 5 * 60_000
+
+const authBreakers = new Map<string, { lastSeen: number; path: string }>()
+const authKeyOf = (userId: string, mode: TradeMode) => `${userId}:${mode}`
+
+/** ms remaining in the 401 backoff window for (user, mode); 0 = clear. */
+export function authBackoffMsLeft(userId: string, mode: TradeMode): number {
+  const b = authBreakers.get(authKeyOf(userId, mode))
+  return b ? Math.max(0, b.lastSeen + AUTH_BACKOFF_MS - Date.now()) : 0
+}
+
+function clearAuthBreaker(userId: string, mode: TradeMode): void {
+  authBreakers.delete(authKeyOf(userId, mode))
+}
+
+/** Record a 401. True when the breaker FRESHLY opened (caller logs once);
+ * false when it was already open (concurrent in-flight stragglers). */
+function noteAuth401(userId: string, mode: TradeMode, path: string): boolean {
+  const key = authKeyOf(userId, mode)
+  const prev = authBreakers.get(key)
+  if (prev && Date.now() - prev.lastSeen < AUTH_BACKOFF_MS) {
+    prev.lastSeen = Date.now() // stragglers keep the window slid, silently
+    return false
+  }
+  authBreakers.set(key, { lastSeen: Date.now(), path })
+  return true
+}
+
 async function tradeFetch<T>(
   userId: string,
   mode: TradeMode,
@@ -68,6 +104,15 @@ async function tradeFetch<T>(
 ): Promise<TradeFetchResult<T>> {
   const keys = await getAlpacaKeys(userId)
   if (!keys) return { data: null, status: 0, error: 'no-keys' }
+  // Task 36 — a known-rejected key must not hammer Alpaca from every poller
+  const backoffLeft = authBackoffMsLeft(userId, mode)
+  if (backoffLeft > 0) {
+    return {
+      data: null,
+      status: 401,
+      error: `auth-backoff: Alpaca rejected these keys earlier — real retry in ${Math.ceil(backoffLeft / 1000)}s`,
+    }
+  }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 9000)
   try {
@@ -94,9 +139,20 @@ async function tradeFetch<T>(
       const msg =
         (parsed as { message?: string } | null)?.message ||
         `Trading API HTTP ${res.status}`
-      console.error(`Trading ${mode} ${path} -> ${res.status}: ${msg}`)
+      if (res.status === 401) {
+        // ONE concise line when the breaker opens; short-circuited retries
+        // below stay completely silent (Task 36).
+        if (noteAuth401(userId, mode, path)) {
+          console.error(
+            `Trading ${mode} ${path} -> 401: ${msg} — auth backoff ${AUTH_BACKOFF_MS / 1000}s engaged (check Settings → API keys / Trade mode)`,
+          )
+        }
+      } else {
+        console.error(`Trading ${mode} ${path} -> ${res.status}: ${msg}`)
+      }
       return { data: parsed as T, status: res.status, error: msg }
     }
+    clearAuthBreaker(userId, mode) // a success proves the keys work again
     return { data: parsed as T, status: res.status }
   } catch (e) {
     console.error(`Trading ${mode} ${path} failed:`, e instanceof Error ? e.message : e)
