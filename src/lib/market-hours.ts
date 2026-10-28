@@ -189,17 +189,19 @@ export function classifyUs(nowSec: number, clock: AlpacaClock | null, clockOk: b
       state: 'regular',
       label: 'Regular Trading Hour',
       detail: `US market open · closes ${fmtEt(clock.next_close) ?? fmtMinutes(closeMin) + ' ET'}`,
+      nextOpen: clock.next_open,
+      nextClose: clock.next_close,
     }
   }
 
   // 2) Weekend (calendar/clock both agree it cannot be open)
   if (!weekday) {
-    return { state: 'closed', label: 'Market Closed', detail: `Weekend · opens ${fmtEt(clock?.next_open) ?? 'next session'}`, estimated }
+    return { state: 'closed', label: 'Market Closed', detail: `Weekend · opens ${fmtEt(clock?.next_open) ?? 'next session'}`, estimated, nextOpen: clock?.next_open, nextClose: clock?.next_close }
   }
 
   // 3) Trading day but the calendar reports no session → holiday
   if (calOk && !cal && clockOk) {
-    return { state: 'closed', label: 'Market Closed', detail: `Market holiday · opens ${fmtEt(clock?.next_open) ?? 'next session'}` }
+    return { state: 'closed', label: 'Market Closed', detail: `Market holiday · opens ${fmtEt(clock?.next_open) ?? 'next session'}`, nextOpen: clock?.next_open, nextClose: clock?.next_close }
   }
 
   // 4) Pre-market window: 04:00 ET → session open
@@ -209,6 +211,8 @@ export function classifyUs(nowSec: number, clock: AlpacaClock | null, clockOk: b
       label: 'Pre-Market',
       detail: `Pre-market · regular session opens ${fmtEt(clock?.next_open) ?? fmtMinutes(openMin) + ' ET'}`,
       estimated,
+      nextOpen: clock?.next_open,
+      nextClose: clock?.next_close,
     }
   }
 
@@ -219,6 +223,8 @@ export function classifyUs(nowSec: number, clock: AlpacaClock | null, clockOk: b
       label: 'Post Trading Hour',
       detail: `After-hours · reopens ${fmtEt(clock?.next_open) ?? 'next session'}`,
       estimated,
+      nextOpen: clock?.next_open,
+      nextClose: clock?.next_close,
     }
   }
 
@@ -234,6 +240,8 @@ export function classifyUs(nowSec: number, clock: AlpacaClock | null, clockOk: b
     label: 'Market Closed',
     detail: `Closed · opens ${fmtEt(clock?.next_open) ?? 'next session'}`,
     estimated,
+    nextOpen: clock?.next_open,
+    nextClose: clock?.next_close,
   }
 }
 

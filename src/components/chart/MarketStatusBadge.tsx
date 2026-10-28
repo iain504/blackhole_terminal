@@ -1,21 +1,26 @@
 'use client'
 
-// Market-status indicator (Task 35), relocated per user request (Task 94):
-// DESKTOP renders the labeled chip in the app FOOTER, immediately beside the
-// clock at the bottom right ("align it with the clock") — see TerminalRoot's
-// FooterMarketStatus. MOBILE (<768px, no footer) keeps the dot inside every
-// chart pane's symbol button (ChartPanel, md:hidden wrapper).
+// Market-status indicator (Task 35, v1.95.0): the dot lives INSIDE every
+// chart pane's symbol button again (ChartPanel header, all breakpoints —
+// user: "move back the market status back to the chart align with the
+// symbol"). The desktop footer chip was removed.
 //
-//   ● green (pulsing) — US regular trading hour
+//   ● green (pulsing) — US Regular Trading Hour
 //   ☀ yellow sun      — US pre-market (04:00 → open ET)
 //   ☾ purple moon     — US post/after-hours (close → 20:00 ET)
 //   ○ dim dot         — closed (overnight / weekend / holiday / halted)
 //   ● green (steady)  — crypto, 24/7 open (verified via Alpaca asset status)
 //
+// Tooltip: the Alpaca-sourced session detail PLUS the next open/close
+// rendered in the BROWSER's timezone — the same clock the footer uses (user:
+// "when mouse over the market status symbol, the clock on the hints should
+// be in London time, aligned with the bottom right bar clock"), so a
+// Europe/London user reads London times instead of ET.
+//
 // States come from POST /api/market/hours (Alpaca clock + calendar + asset
 // status, server-cached 30s). The badge polls every 60s and shares one
-// in-flight request + 50s tab-level cache across ALL consumers (footer chip
-// + every mobile pane), so a 4-pane grid hits the API once per poll.
+// in-flight request + 50s tab-level cache across ALL chart panes, so a
+// 4-pane grid hits the API once per poll.
 import { useEffect, useState } from 'react'
 import { Moon, Sun } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -94,6 +99,29 @@ export function MarketStatusBadge({
   const aria = `${entry.label}${entry.detail ? ` — ${entry.detail}` : ''}`
   const extra = demo || entry.estimated ? ' · estimate (live Alpaca check unavailable)' : ''
 
+  // v1.95.0 — next open/close in the BROWSER's timezone (the same clock the
+  // footer renders, e.g. Europe/London), so the hint's times are readable in
+  // the user's own wall clock instead of Alpaca's ET. Absent when the live
+  // Alpaca check failed (estimated mode) — the ET fallback strings stay.
+  const localTimes = (() => {
+    const parts: string[] = []
+    let city = ''
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+      if (tz) {
+        city = tz.includes('/') ? tz.split('/').pop()!.replace(/_/g, ' ') : tz
+        const fmt = new Intl.DateTimeFormat('en-GB', {
+          timeZone: tz, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+        })
+        if (entry.nextOpen) parts.push(`opens ${fmt.format(new Date(entry.nextOpen))}`)
+        if (entry.nextClose) parts.push(`closes ${fmt.format(new Date(entry.nextClose))}`)
+      }
+    } catch {
+      /* Intl/timezone unavailable — omit the line, ET detail still shows */
+    }
+    return parts.length > 0 ? { text: parts.join(' · '), city } : null
+  })()
+
   // Task 94 — short label for the bottom-right chip variant (aligned with
   // the footer clock). Long human detail stays in the tooltip.
   const shortLabel: string =
@@ -147,6 +175,9 @@ export function MarketStatusBadge({
           <div className="text-xs">
             <div className="font-semibold">{symbol} — {entry.label}</div>
             {entry.detail && <div className="text-zinc-400">{entry.detail}</div>}
+            {localTimes && (
+              <div className="mt-0.5 text-zinc-300">Your time ({localTimes.city}): {localTimes.text}</div>
+            )}
             {extra && <div className="mt-0.5 text-[10px] text-zinc-500">{extra.trim()}</div>}
           </div>
         </TooltipContent>
@@ -165,6 +196,9 @@ export function MarketStatusBadge({
         <div className="text-xs">
           <div className="font-semibold">{entry.label}</div>
           {entry.detail && <div className="text-zinc-400">{entry.detail}</div>}
+          {localTimes && (
+            <div className="mt-0.5 text-zinc-300">Your time ({localTimes.city}): {localTimes.text}</div>
+          )}
           {extra && <div className="mt-0.5 text-[10px] text-zinc-500">{extra.trim()}</div>}
         </div>
       </TooltipContent>

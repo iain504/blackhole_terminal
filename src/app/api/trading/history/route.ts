@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode, isNoKeysError } from '@/lib/trading'
+import { getClosedOrders, resolveTradeMode, isNoKeysError, authBackoffMsLeft } from '@/lib/trading'
 import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
 import { handleError } from '@/lib/api-helpers'
 
@@ -31,6 +31,25 @@ export async function GET(req: Request) {
       // no keys configured is a quiet empty state (same convention as fills)
       if (isNoKeysError(r.error)) {
         return NextResponse.json({ mode, trades: [], configured: false })
+      }
+      // v1.95.0 — an engaged 401 breaker must be ACTIONABLE, not a bare 401:
+      // the UI renders an amber "keys rejected — retry in N min" banner from
+      // this shape (same contract as /api/trading/positions). A history that
+      // silently rendered empty while a real account had closed trades was
+      // exactly the "my closed trade is missing" report.
+      if (r.status === 401) {
+        const retryInSec = Math.ceil(authBackoffMsLeft(user.id, mode) / 1000)
+        return NextResponse.json(
+          {
+            error: r.error || 'Alpaca rejected the saved keys',
+            authError: {
+              mode,
+              retryInSec,
+              message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — trade history for this account is unavailable until the keys are fixed.`,
+            },
+          },
+          { status: 401 },
+        )
       }
       return NextResponse.json({ error: r.error || 'Closed orders fetch failed' }, { status: r.status || 502 })
     }

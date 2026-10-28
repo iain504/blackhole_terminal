@@ -16,7 +16,7 @@
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, Loader2, RefreshCw, ShieldAlert, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, Loader2, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -54,6 +54,10 @@ interface HistoryData {
   configured: boolean
   loaded: boolean
   error?: string
+  /** v1.95.0 — this mode's keys are REJECTED (401 breaker): rendered as an
+   *  actionable amber banner. A history that silently rendered an empty list
+   *  while the account had closed trades is the "missing trade" bug class. */
+  authError?: { mode: string; retryInSec: number; message: string }
 }
 
 interface PosConsoleRow {
@@ -345,6 +349,9 @@ export default function PositionsTab() {
   const [histRange, setHistRange] = useState<HistRange>('all')
   const [histFrom, setHistFrom] = useState('')
   const [histTo, setHistTo] = useState('')
+  // v1.95.0 — symbol filter (user request): type any part of a symbol
+  // ("aapl", "btc", "F") to narrow the history table client-side
+  const [histSymbol, setHistSymbol] = useState('')
   const histQuery = useMemo(
     () => histRangeQuery(histRange, histFrom, histTo),
     [histRange, histFrom, histTo],
@@ -382,8 +389,20 @@ export default function PositionsTab() {
         // ranged views get the full 300 cap — a narrow range shouldn't be
         // crowded out by the 150-trade default window
         const res = await fetch(`/api/trading/history?mode=${mode}&limit=${histQuery ? 300 : 150}${histQuery ? `&${histQuery}` : ''}`)
-        if (!res.ok) return { trades: [], configured: true, loaded: true, error: `HTTP ${res.status}` }
-        const json = await res.json()
+        const json = await res.json().catch(() => null)
+        if (!res.ok) {
+          // v1.95.0 — never render a silent empty list: a rejected-key 401
+          // carries an actionable authError, anything else stays a visible
+          // per-mode error line above the table
+          const authError = (json?.authError ?? null) as HistoryData['authError'] | null
+          return {
+            trades: [],
+            configured: true,
+            loaded: true,
+            error: authError ? undefined : ((json?.error as string) || `HTTP ${res.status}`),
+            authError: authError ?? undefined,
+          }
+        }
         return { trades: (json.trades || []) as ClosedTrade[], configured: json.configured !== false, loaded: true }
       } catch {
         return { trades: [], configured: true, loaded: true, error: 'network error' }
@@ -456,7 +475,13 @@ export default function PositionsTab() {
       default: return null
     }
   })
-  const sortedHistory = sortRows(historyRows, histSort, ({ mode, t }) => {
+  // symbol filter (v1.95.0) — normalized so "btcusd" matches "BTC/USD",
+  // "brkb" matches "BRK.B"; empty = unfiltered
+  const histSymNorm = histSymbol.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+  const filteredHistory = histSymNorm
+    ? historyRows.filter((r) => r.t.symbol.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(histSymNorm))
+    : historyRows
+  const sortedHistory = sortRows(filteredHistory, histSort, ({ mode, t }) => {
     switch (histSort?.key) {
       case 'closed': return new Date(t.exitAt).getTime()
       case 'symbol': return t.symbol
@@ -471,7 +496,9 @@ export default function PositionsTab() {
       default: return null
     }
   })
-  const historyPnl = historyRows.reduce((acc, r) => acc + r.t.pnl, 0)
+  // realized P&L follows the FILTERED set (the header labels it "the trades
+  // in the history group below" — with a symbol filter that means the matches)
+  const historyPnl = filteredHistory.reduce((acc, r) => acc + r.t.pnl, 0)
   const noKeys = (m: Mode) => data[m].loaded && (data[m].keysMissing != null || data[m].error === 'no-keys')
 
   const closePosition = async (row: PosConsoleRow) => {
@@ -878,8 +905,10 @@ export default function PositionsTab() {
         <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <History className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Trade history</span>
-          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{historyRows.length}</Badge>
-          {historyRows.length > 0 && (
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">
+            {histSymNorm ? `${filteredHistory.length} of ${historyRows.length}` : historyRows.length}
+          </Badge>
+          {filteredHistory.length > 0 && (
             <span
               className={cn(
                 'text-[11px] font-semibold tabular-nums',
@@ -894,6 +923,31 @@ export default function PositionsTab() {
               bounds in the browser timezone; Custom reveals start/end dates.
               A range change re-fires the refresh effect (server-side filter). */}
           <div className="ml-auto flex flex-wrap items-center gap-1.5">
+            {/* v1.95.0 — symbol filter (user request): type any part of a
+                symbol to narrow the table. Normalized matching, so "btcusd"
+                finds "BTC/USD" and "brkb" finds "BRK.B". Esc clears. */}
+            <div className="relative flex items-center">
+              <Search className="pointer-events-none absolute left-1.5 h-3 w-3 text-zinc-600" aria-hidden />
+              <Input
+                value={histSymbol}
+                onChange={(e) => setHistSymbol(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Escape') setHistSymbol('') }}
+                placeholder="Filter symbol…"
+                aria-label="Filter trade history by symbol"
+                title="Type any part of a symbol (AAPL, btc, F) — case-insensitive, matches BTC/USD too"
+                className="h-6 w-[112px] border-zinc-700 bg-zinc-950 pl-[26px] pr-1.5 text-[11px] text-zinc-300 placeholder:text-zinc-600"
+              />
+              {histSymbol && (
+                <button
+                  onClick={() => setHistSymbol('')}
+                  aria-label="Clear symbol filter"
+                  title="Clear filter (Esc)"
+                  className="absolute right-1 flex h-4 w-4 items-center justify-center rounded text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+                >
+                  <X className="h-2.5 w-2.5" aria-hidden />
+                </button>
+              )}
+            </div>
             <select
               aria-label="Trade history date range"
               title="Filter closed trades by exit date (Closed column)"
@@ -931,6 +985,37 @@ export default function PositionsTab() {
             <span className="hidden text-[10px] text-zinc-600 lg:inline">realized round-trips · paper + live · FIFO-matched fills</span>
           </div>
         </div>
+        {/* v1.95.0 — per-mode availability banners: a mode whose keys are
+            missing/rejected (or whose fetch failed) is announced ABOVE the
+            table instead of silently rendering an empty list — the "closed
+            trade missing from history" class of bug. */}
+        {MODES.some((m) => history[m].configured === false || history[m].authError || history[m].error) && (
+          <div className="flex flex-col gap-0.5 border-b border-zinc-800/80 px-3 py-1.5">
+            {MODES.filter((m) => history[m].configured === false).map((m) => (
+              <p key={`nk-${m}`} className="flex items-center gap-1.5 text-[11px] text-zinc-400">
+                <KeyRound className="h-3 w-3 shrink-0 text-zinc-500" aria-hidden />
+                <span><span className="font-semibold text-zinc-300">{m === 'live' ? 'LIVE' : 'Paper'} keys not configured</span> — {m} trade history is unavailable until keys are saved in Settings → API keys.</span>
+              </p>
+            ))}
+            {MODES.filter((m) => history[m].authError).map((m) => (
+              <p key={`ae-${m}`} className="flex items-start gap-1.5 text-[11px] text-amber-400/90">
+                <ShieldAlert className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
+                <span>
+                  {history[m].authError!.message}
+                  {history[m].authError!.retryInSec > 0 && (
+                    <span className="text-zinc-500"> Next real attempt in ~{Math.max(1, Math.ceil(history[m].authError!.retryInSec / 60))} min.</span>
+                  )}
+                </span>
+              </p>
+            ))}
+            {MODES.filter((m) => history[m].error).map((m) => (
+              <p key={`err-${m}`} className="flex items-center gap-1.5 text-[11px] text-rose-400/90">
+                <TriangleAlert className="h-3 w-3 shrink-0" aria-hidden />
+                <span>{m === 'live' ? 'LIVE' : 'Paper'} history unavailable: {history[m].error}</span>
+              </p>
+            ))}
+          </div>
+        )}
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
           <table className="w-full min-w-[860px] border-collapse text-xs">
             <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
@@ -954,6 +1039,8 @@ export default function PositionsTab() {
                   <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
                     {!history.paper.loaded && !history.live.loaded ? (
                       <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading trade history…</span>
+                    ) : histSymNorm ? (
+                      `No closed trades match “${histSymbol.trim()}” — clear the symbol filter to see everything.`
                     ) : history.paper.configured === false && history.live.configured === false ? (
                       'No Alpaca keys configured — trade history unavailable.'
                     ) : histQuery ? (

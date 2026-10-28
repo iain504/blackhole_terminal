@@ -4358,12 +4358,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     <div className="relative h-full w-full">
     <div
       ref={containerRef}
-      className={cn(
-        'relative h-full w-full select-none overflow-hidden [-webkit-touch-callout:none]',
-        focused != null && (focused ? 'ring-1 ring-inset ring-emerald-500/60' : 'ring-0 ring-inset ring-transparent'),
-      )}
+      className="relative h-full w-full select-none overflow-hidden [-webkit-touch-callout:none]"
       style={{ background: 'var(--chart-bg, #09090b)' }}
       onPointerDownCapture={() => onFocus?.()}>
+      {/* v1.95.0 — focused-pane indicator (user request): GREY CORNER BRACKETS
+          wrap the focused chart in multi-pane grids (replaces the emerald
+          ring — neutral grey reads as "this is the pane you're driving" and
+          no longer competes with green P&L/long accents). Left-click anywhere
+          in a pane focuses it (onPointerDownCapture above → onFocus), and the
+          brackets move with it. Single-pane mode (focused === undefined)
+          renders nothing. */}
+      {focused && (
+        <div aria-hidden className="pointer-events-none absolute inset-0 z-40">
+          <span className="absolute left-0 top-0 h-3.5 w-3.5 border-l-2 border-t-2 border-zinc-400/90" />
+          <span className="absolute right-0 top-0 h-3.5 w-3.5 border-r-2 border-t-2 border-zinc-400/90" />
+          <span className="absolute bottom-0 left-0 h-3.5 w-3.5 border-b-2 border-l-2 border-zinc-400/90" />
+          <span className="absolute bottom-0 right-0 h-3.5 w-3.5 border-b-2 border-r-2 border-zinc-400/90" />
+        </div>
+      )}
       {/* chart canvas is injected here by lightweight-charts */}
       {/* h-full/w-full is CRITICAL: a canvas with only inset-0 renders at its
           intrinsic (backing-store) CSS size, so on devicePixelRatio > 1 screens
@@ -4411,13 +4423,11 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             onClick={() => setSearchOpen(true)}
           >
             {symbol}
-            {/* Task 94 — market session indicator: DESKTOP renders it in the
-                footer beside the clock (user: "align it with the clock at the
-                bottom right") — the dot stays here for MOBILE only (<768px,
-                where the mobile shell has no footer) */}
-            <span className="md:hidden">
-              <MarketStatusBadge symbol={symbol} />
-            </span>
+            {/* v1.95.0 — market session indicator lives HERE again, beside the
+                symbol it describes (user: "move back the market status back to
+                the chart align with the symbol"). Desktop footer chip removed;
+                every breakpoint shows the dot, the tooltip carries the detail. */}
+            <MarketStatusBadge symbol={symbol} />
             {!compact && <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />}
             {isCryptoSymbol(symbol) && <Badge variant="outline" className="ml-1 border-amber-500/40 text-[9px] text-amber-400">7×24</Badge>}
           </Button>

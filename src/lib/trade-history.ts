@@ -77,14 +77,22 @@ function cleanQty(n: number): number {
  * entry lots per symbol (the same walk — open lots are simply what remains
  * in the FIFO queues when the fills run out, so closed trades and live
  * positions always agree).
- * @param orders raw broker orders (any status mix — only filled ones are used)
+ * @param orders raw broker orders (any status mix — every REAL FILL counts: canceled/expired orders with a partial fill too)
  * @param max cap on returned trades (newest first); 0 = lots only
  */
 export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
+  // v1.95.0 — match REAL FILLS, not 'filled' orders. The old filter dropped
+  // any order whose final status wasn't 'filled', which erased whole trades:
+  // an entry/exit that PARTIALLY filled and was then canceled (or expired,
+  // done_for_day, replaced) carries a real fill (filled_qty > 0,
+  // filled_avg_price, filled_at) but ends with status 'canceled'/'expired' —
+  // the matcher never saw it, the opposing lot stayed open forever, and the
+  // round trip was MISSING from history. An order with zero fill still
+  // filters out (filled_qty 0 / no avg price / no fill time), so pure
+  // cancels stay invisible exactly as before.
   const filled = orders
     .filter(
       (o) =>
-        o.status === 'filled' &&
         o.filled_at != null &&
         o.filled_avg_price != null &&
         Number.isFinite(parseFloat(o.filled_avg_price)) &&
@@ -92,7 +100,14 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
     )
     .sort(
       (a, b) =>
-        new Date(a.filled_at as string).getTime() - new Date(b.filled_at as string).getTime(),
+        new Date(a.filled_at as string).getTime() - new Date(b.filled_at as string).getTime() ||
+        // same-instant fills (a scalp closed within the same clock second, or
+        // second-granularity feeds) must process the ENTRY first — otherwise
+        // the exit sorts ahead of its own entry and mints an inverted short
+        // trade. Older placement wins, then buy-before-sell as a last resort.
+        new Date(a.created_at ?? a.filled_at as string).getTime() -
+          new Date(b.created_at ?? b.filled_at as string).getTime() ||
+        (a.side === b.side ? 0 : a.side === 'buy' ? -1 : 1),
     )
 
   const lots = new Map<string, Lot[]>() // per symbol FIFO queue
@@ -181,7 +196,7 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
 
 /**
  * FIFO-match filled orders into round-trip trades.
- * @param orders raw broker orders (any status mix — only filled ones are used)
+ * @param orders raw broker orders (any status mix — every REAL FILL counts: canceled/expired orders with a partial fill too)
  * @param max cap on returned trades (newest first)
  */
 export function matchClosedTrades(orders: TradingOrder[], max = 200): ClosedTrade[] {

@@ -152,6 +152,12 @@ export interface MarketStatusEntry {
   /** true when the state was NOT confirmed against the live Alpaca API
    *  (no keys / network failure — computed from local ET clock heuristics) */
   estimated?: boolean
+  /** v1.95.0 — next session open/close as raw ISO instants (Alpaca clock),
+   *  when the live check succeeded. The badge tooltip renders them in the
+   *  BROWSER's timezone so the hint's clock matches the footer clock (e.g.
+   *  Europe/London) instead of the ET strings the detail line carries. */
+  nextOpen?: string
+  nextClose?: string
 }
 
 export interface MarketHoursResponse {
