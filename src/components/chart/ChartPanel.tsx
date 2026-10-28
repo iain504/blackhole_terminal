@@ -3906,10 +3906,15 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   useEffect(() => {
     try {
       const v = localStorage.getItem('bh-grid-band')
-      if (!v) return
-      const o = JSON.parse(v) as { on?: unknown; opacity?: unknown }
-      if (typeof o?.on === 'boolean') setGridBandOn(o.on)
-      if (typeof o?.opacity === 'number' && o.opacity >= 0 && o.opacity <= 0.5) setGridBandOpacity(o.opacity)
+      if (v) {
+        const o = JSON.parse(v) as { on?: unknown; opacity?: unknown }
+        if (typeof o?.on === 'boolean') setGridBandOn(o.on)
+        if (typeof o?.opacity === 'number' && o.opacity >= 0 && o.opacity <= 0.5) setGridBandOpacity(o.opacity)
+      }
+      // v1.87.0 — the overlay toggle itself persists too ('1' = on): the mobile
+      // More-sheet shares this key, and the desktop Grid3x3 choice now survives
+      // reloads like the Task-32 Tag toggle. Absent/'0' = off (default unchanged).
+      if (localStorage.getItem('bh-grid-overlay') === '1') setGridOverlayOn(true)
     } catch { /* corrupted pref — keep defaults */ }
   }, [])
   const patchBand = useCallback((p: { on?: boolean; opacity?: number }) => {
@@ -3920,6 +3925,24 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       localStorage.setItem('bh-grid-band', JSON.stringify({ on: p.on ?? prev.on ?? true, opacity: p.opacity ?? prev.opacity ?? 0.2 }))
     } catch { /* storage unavailable — session-only pref */ }
   }, [])
+  // v1.87.0 — single toggle entry point for the overlay (desktop Grid3x3
+  // button AND the mobile More-sheet event share it); mirrors to localStorage.
+  const toggleGridOverlay = useCallback(() => {
+    setGridOverlayOn((v) => {
+      const next = !v
+      try { localStorage.setItem('bh-grid-overlay', next ? '1' : '0') } catch { /* session-only */ }
+      return next
+    })
+  }, [])
+  // v1.87.0 — broadcast overlay/band state so the mobile More-sheet
+  // (MobileChartView) can mirror ON/OFF badges + the shadow-opacity slider
+  // without reaching into this component's internals (same window-event
+  // pattern as tt:toggle-eth). Fires on mount/hydration + every change.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('tt:grid-ui-changed', {
+      detail: { overlay: gridOverlayOn, bandOn: gridBandOn, opacity: gridBandOpacity },
+    }))
+  }, [gridOverlayOn, gridBandOn, gridBandOpacity])
 
   // Which active grids get a band on THIS pane (same filter + cap as the
   // price-line overlay — band rides the overlay toggle, not the glow).
@@ -4214,6 +4237,20 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       const st = useTerminal.getState()
       st.setShowExtendedHours(!st.showExtendedHours)
     }
+    // v1.87.0 — mobile More-sheet grid controls: flip the grid-trade overlay
+    // and/or patch the range-shadow (grid-area band) from the mobile chart
+    // toolbar. patchBand/toggleGridOverlay are stable ([] deps) — no resubscribes.
+    const onToggleGridOverlay = () => {
+      toggleGridOverlay()
+    }
+    const onSetGridBand = (e: Event) => {
+      const d = (e as CustomEvent).detail as { on?: unknown; opacity?: unknown } | null
+      if (!d || typeof d !== 'object') return
+      const patch: { on?: boolean; opacity?: number } = {}
+      if (typeof d.on === 'boolean') patch.on = d.on
+      if (typeof d.opacity === 'number' && isFinite(d.opacity) && d.opacity >= 0 && d.opacity <= 0.5) patch.opacity = d.opacity
+      if (patch.on !== undefined || patch.opacity !== undefined) patchBand(patch)
+    }
     window.addEventListener('tt:open-symbol-search', onSearch)
     window.addEventListener('tt:toggle-indicators', onIndicators)
     window.addEventListener('tt:open-sr', onSr)
@@ -4222,6 +4259,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     window.addEventListener('tt:set-color', onColor)
     window.addEventListener('tt:set-chart-type', onChartType)
     window.addEventListener('tt:toggle-eth', onToggleEth)
+    window.addEventListener('tt:toggle-grid-overlay', onToggleGridOverlay)
+    window.addEventListener('tt:set-grid-band', onSetGridBand)
     return () => {
       window.removeEventListener('tt:open-symbol-search', onSearch)
       window.removeEventListener('tt:toggle-indicators', onIndicators)
@@ -4231,8 +4270,10 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       window.removeEventListener('tt:set-color', onColor)
       window.removeEventListener('tt:set-chart-type', onChartType)
       window.removeEventListener('tt:toggle-eth', onToggleEth)
+      window.removeEventListener('tt:toggle-grid-overlay', onToggleGridOverlay)
+      window.removeEventListener('tt:set-grid-band', onSetGridBand)
     }
-  }, [])
+  }, [patchBand, toggleGridOverlay])
 
   // quote polling (10s) — REST fallback that keeps prevClose/OHLC fresh while
   // the websocket stream provides the fast price path (skipped while ticks
@@ -4730,7 +4771,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           title="Show grid trades on chart"
           aria-label="Show grid trades on chart"
           aria-pressed={gridOverlayOn}
-          onClick={() => setGridOverlayOn((v) => !v)}
+          onClick={toggleGridOverlay}
           className={cn(
             'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
             gridOverlayOn ? 'bg-emerald-500/25 text-emerald-400' : 'text-zinc-300 hover:bg-emerald-500/15 hover:text-emerald-400',

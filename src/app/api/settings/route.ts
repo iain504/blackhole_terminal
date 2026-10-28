@@ -28,6 +28,9 @@ interface UserSettings {
   glowAlgoColor?: string
   // Task 28 — UI theme: 'default' (Midnight) | 'christmas'. Absent = default.
   uiTheme?: string
+  // v1.87.0 — full-screen splash when the US regular session opens/closes.
+  // Absent = enabled (default on).
+  sessionSplash?: boolean
 }
 
 export const DEFAULT_TPSL_PERCENT = 5
@@ -70,6 +73,7 @@ export async function GET() {
         algo: safeGlow(s?.glowAlgoColor, DEFAULT_GLOW_ALGO),
       },
       uiTheme: s?.uiTheme === 'christmas' ? 'christmas' : 'default',
+      sessionSplash: s?.sessionSplash !== false,
     })
   } catch (e) {
     return handleError(e)
@@ -88,6 +92,7 @@ interface PutBody {
   glowGridColor?: string
   glowAlgoColor?: string
   uiTheme?: string
+  sessionSplash?: boolean
 }
 
 // PUT /api/settings — update private credentials (stored encrypted, never returned).
@@ -153,6 +158,10 @@ export async function PUT(req: Request) {
         return NextResponse.json({ error: "uiTheme must be 'default' or 'christmas'" }, { status: 400 })
       }
       s.uiTheme = body.uiTheme
+    }
+    // v1.87.0 — session splash on/off (Settings → Trading session alerts)
+    if (typeof body.sessionSplash === 'boolean') {
+      s.sessionSplash = body.sessionSplash
     }
     await db.user.update({
       where: { id: user.id },

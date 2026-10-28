@@ -8,6 +8,7 @@ import SettingsDialog from '@/components/settings/SettingsDialog'
 import { TabBar } from './TabBar'
 import { ChartWorkspace } from './ChartWorkspace'
 import { MobileShell } from './mobile/MobileShell'
+import { SessionSplash } from './SessionSplash'
 import { useIsMobile } from '@/hooks/use-mobile'
 import CalendarTab from './tabs/CalendarTab'
 import HeatmapTab from './tabs/HeatmapTab'
@@ -401,6 +402,8 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
         {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
         <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+        {/* regular-session open/close splash (v1.87.0) — above every dialog */}
+        <SessionSplash />
       </>
     )
   }
@@ -423,6 +426,8 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       {alertsOpen && <AlertsDrawer onClose={() => setAlertsOpen(false)} />}
       {strategiesOpen && <StrategyDrawer onClose={() => setStrategiesOpen(false)} />}
       <ShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+      {/* regular-session open/close splash (v1.87.0) — above every dialog */}
+      <SessionSplash />
       {/* footer stays glued to bottom on short viewports */}
       <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
         <span className="flex min-w-0 items-center">

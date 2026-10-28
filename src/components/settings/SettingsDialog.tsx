@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Upload } from 'lucide-react';
+import { Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -38,6 +38,7 @@ type SettingsState = {
   tradeMode?: string;
   tpslPercent?: number;
   glow?: { grid: string; algo: string };
+  sessionSplash?: boolean;
 };
 
 const DEFAULT_GLOW_GRID = '#10b981';
@@ -62,6 +63,9 @@ export default function SettingsDialog({
   const [chatId, setChatId] = useState('');
   const [notifyFills, setNotifyFills] = useState(true);
   const [notifyCloses, setNotifyCloses] = useState(true);
+  // v1.87.0 — session open/close splash alert (default ON; mirrored to
+  // localStorage `tt:session-splash` so SessionSplash boots flash-free)
+  const [sessionSplash, setSessionSplash] = useState(true);
   const [tpslPct, setTpslPct] = useState('5');
   const [tpslPctLoaded, setTpslPctLoaded] = useState(false);
   // Task 10-g — chart glow colors (grid running / algo running)
@@ -256,6 +260,13 @@ export default function SettingsDialog({
       setChatId(data?.telegram?.chatId ?? '');
       setNotifyFills(data?.telegram?.notifyFills !== false);
       setNotifyCloses(data?.telegram?.notifyCloses !== false);
+      const splashOn = data?.sessionSplash !== false;
+      setSessionSplash(splashOn);
+      try {
+        localStorage.setItem('tt:session-splash', splashOn ? '1' : '0');
+      } catch {
+        /* private mode */
+      }
       if (!tpslPctLoaded) {
         setTpslPct(String(data?.tpslPercent ?? 5));
         setTpslPctLoaded(true);
@@ -289,6 +300,7 @@ export default function SettingsDialog({
     // toggles always ride along (booleans can't be "empty")
     payload.notifyFills = notifyFills;
     payload.notifyCloses = notifyCloses;
+    payload.sessionSplash = sessionSplash;
     const pct = parseFloat(tpslPct);
     if (tpslPctLoaded && isFinite(pct) && pct > 0) payload.tpslPercent = pct;
     // glow colors always ride along once loaded (strings can't be "empty")
@@ -760,6 +772,33 @@ export default function SettingsDialog({
               </label>
               <p className="text-[10px] leading-snug text-zinc-600">
                 Sent through the bot above while the terminal is open. Both default ON.
+              </p>
+            </div>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- Trading session alerts (v1.87.0) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <Sunrise className="h-4 w-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">Trading session alerts</h3>
+            </div>
+            <div className="flex flex-col gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 p-2.5">
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={sessionSplash}
+                  onChange={(e) => setSessionSplash(e.target.checked)}
+                  disabled={loading || saving}
+                  className="h-3.5 w-3.5 accent-emerald-500"
+                  aria-label="Show a splash screen when regular trading opens and closes"
+                />
+                🔔 Splash screen when regular trading opens &amp; closes
+              </label>
+              <p className="text-[10px] leading-snug text-zinc-600">
+                Full-screen alert at 09:30 ET (open) and 16:00 ET (close), Mon–Fri — the hours
+                stock orders fill. Auto-dismisses after 10 seconds, once per day. Default ON.
               </p>
             </div>
           </section>

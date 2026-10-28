@@ -11,17 +11,18 @@
 // (symbol search, ticket, indicator popover, drawing color) through small
 // window-event listeners the panel exposes — see ChartPanel.tsx.
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTerminal, tabPanes, DRAW_COLORS, DrawingKind } from '@/store/terminal'
 import { TIMEFRAMES, isCryptoSymbol, Timeframe } from '@/lib/market-types'
 import { ChartPanel } from '@/components/chart/ChartPanel'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Slider } from '@/components/ui/slider'
 import { cn } from '@/lib/utils'
 import {
   ChevronDown, Pencil, Sigma, Briefcase, Ellipsis, X, Plus,
   MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Square, Type,
   CandlestickChart as CandlestickIcon, LineChart as LineChartIcon,
-  AlignHorizontalJustifyCenter, Clock, Lightbulb,
+  AlignHorizontalJustifyCenter, Clock, Lightbulb, Grid3x3, Layers,
 } from 'lucide-react'
 
 const TOOLS: { id: DrawingKind | 'cursor'; label: string; icon: typeof MousePointer2; hint?: string }[] = [
@@ -44,6 +45,38 @@ const TOOL_LABEL: Record<string, string> = {
   text: 'Text',
 }
 
+// ---- Grid-trade overlay UI state (v1.87.0) ----
+// The desktop drawing toolbar's Grid3x3 toggle + Layers popover are hidden on
+// mobile (<640px), so the More sheet mirrors them here. ChartPanel owns the
+// state and broadcasts it on every change via tt:grid-ui-changed; this view
+// lazy-initializes from the same localStorage keys the panel persists, so the
+// badges/slider are correct on first paint even before any event arrives.
+interface GridUiState {
+  overlay: boolean
+  bandOn: boolean
+  opacity: number
+}
+const GRID_UI_DEFAULT: GridUiState = { overlay: false, bandOn: true, opacity: 0.2 }
+function loadGridUi(): GridUiState {
+  if (typeof window === 'undefined') return GRID_UI_DEFAULT
+  try {
+    const band = JSON.parse(localStorage.getItem('bh-grid-band') ?? '{}') as {
+      on?: unknown
+      opacity?: unknown
+    }
+    return {
+      overlay: localStorage.getItem('bh-grid-overlay') === '1',
+      bandOn: typeof band?.on === 'boolean' ? band.on : true,
+      opacity:
+        typeof band?.opacity === 'number' && band.opacity >= 0 && band.opacity <= 0.5
+          ? band.opacity
+          : 0.2,
+    }
+  } catch {
+    return GRID_UI_DEFAULT
+  }
+}
+
 export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => void }) {
   const tabs = useTerminal((s) => s.tabs)
   const activeTabId = useTerminal((s) => s.activeTabId)
@@ -61,6 +94,25 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
   const [tfOpen, setTfOpen] = useState(false)
   const [drawOpen, setDrawOpen] = useState(false)
   const [moreOpen, setMoreOpen] = useState(false)
+  // grid overlay + range shadow state, mirrored from ChartPanel via events
+  const [gridUi, setGridUi] = useState<GridUiState>(loadGridUi)
+
+  // ChartPanel broadcasts {overlay, bandOn, opacity} on mount/hydration and
+  // every toggle/slider change — keep the More sheet in sync (it re-reads
+  // loadGridUi() on open too, covering panels mounted before this sheet).
+  useEffect(() => {
+    const onGridUi = (e: Event) => {
+      const d = (e as CustomEvent).detail as Partial<GridUiState> | null
+      if (!d || typeof d !== 'object') return
+      setGridUi((prev) => ({
+        overlay: typeof d.overlay === 'boolean' ? d.overlay : prev.overlay,
+        bandOn: typeof d.bandOn === 'boolean' ? d.bandOn : prev.bandOn,
+        opacity: typeof d.opacity === 'number' && d.opacity >= 0 && d.opacity <= 0.5 ? d.opacity : prev.opacity,
+      }))
+    }
+    window.addEventListener('tt:grid-ui-changed', onGridUi)
+    return () => window.removeEventListener('tt:grid-ui-changed', onGridUi)
+  }, [])
 
   const active = tabs.find((t) => t.id === activeTabId)
   const chartTab = active?.type === 'chart' ? active : tabs.find((t) => t.type === 'chart')
@@ -168,7 +220,10 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
           <Briefcase className="h-[18px] w-[18px]" />
         </button>
         <button
-          onClick={() => setMoreOpen(true)}
+          onClick={() => {
+            setGridUi(loadGridUi()) // re-sync in case the panel remounted
+            setMoreOpen(true)
+          }}
           aria-label="More chart actions"
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-zinc-300 active:bg-zinc-800"
         >
@@ -330,6 +385,85 @@ export function MobileChartView({ onOpenWatchlist }: { onOpenWatchlist: () => vo
                 </span>
               </button>
             )}
+
+            {/* ---- Grid trades on chart (v1.87.0) — mirrors the desktop drawing
+                toolbar's Grid3x3 overlay toggle + Layers shadow popover, which
+                are hidden below 640px. State lives in ChartPanel; commands go
+                out as tt:toggle-grid-overlay / tt:set-grid-band events and the
+                panel broadcasts tt:grid-ui-changed back. Choice persists. ---- */}
+            <div
+              className="rounded-lg border border-zinc-800 bg-zinc-950 p-1"
+              role="group"
+              aria-label="Grid trades on chart"
+            >
+              <button
+                onClick={() => window.dispatchEvent(new CustomEvent('tt:toggle-grid-overlay'))}
+                aria-pressed={gridUi.overlay}
+                className="flex h-11 w-full items-center gap-2 rounded-md px-2 text-sm text-zinc-200 active:bg-zinc-800"
+              >
+                <Grid3x3 className="h-4 w-4 text-emerald-400" aria-hidden />
+                <span className="min-w-0 flex-1 text-left">Grid trades on chart</span>
+                <span
+                  className={cn(
+                    'rounded border px-1.5 py-0.5 text-[10px] font-semibold',
+                    gridUi.overlay
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-500',
+                  )}
+                >
+                  {gridUi.overlay ? 'ON' : 'OFF'}
+                </span>
+              </button>
+              {gridUi.overlay && (
+                <button
+                  onClick={() =>
+                    window.dispatchEvent(new CustomEvent('tt:set-grid-band', { detail: { on: !gridUi.bandOn } }))
+                  }
+                  aria-pressed={gridUi.bandOn}
+                  className="flex h-11 w-full items-center gap-2 rounded-md px-2 text-sm text-zinc-200 active:bg-zinc-800"
+                >
+                  <Layers className="h-4 w-4 text-sky-400" aria-hidden />
+                  <span className="min-w-0 flex-1 text-left">Range shadow</span>
+                  <span
+                    className={cn(
+                      'rounded border px-1.5 py-0.5 text-[10px] font-semibold',
+                      gridUi.bandOn
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                        : 'border-zinc-800 bg-zinc-900 text-zinc-500',
+                    )}
+                  >
+                    {gridUi.bandOn ? 'ON' : 'OFF'}
+                  </span>
+                </button>
+              )}
+              {gridUi.overlay && gridUi.bandOn && (
+                <div className="px-2 pb-2 pt-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-zinc-500">Shadow opacity</span>
+                    <span className="text-xs tabular-nums text-zinc-300">{Math.round(gridUi.opacity * 100)}%</span>
+                  </div>
+                  <Slider
+                    value={[Math.round(gridUi.opacity * 100)]}
+                    min={0}
+                    max={50}
+                    step={5}
+                    onValueChange={(vals) => {
+                      const v = Array.isArray(vals) ? vals[0] : vals
+                      if (typeof v === 'number' && isFinite(v)) {
+                        window.dispatchEvent(new CustomEvent('tt:set-grid-band', { detail: { opacity: v / 100 } }))
+                      }
+                    }}
+                    aria-label="Grid range shadow opacity"
+                    className="mt-2.5"
+                  />
+                  <div className="mt-1 flex justify-between text-[9px] text-zinc-600"><span>0%</span><span>50%</span></div>
+                  <p className="mt-1 text-[10px] leading-4 text-zinc-600">
+                    Shades each active grid's price range while Grid trades is on — tinted per direction: emerald / buy sky / sell violet.
+                  </p>
+                </div>
+              )}
+            </div>
+
             <button
               onClick={() => {
                 setMoreOpen(false)
