@@ -206,7 +206,7 @@ export default function GridBundleImportDialog({
                 {r.ok ? (
                   <span className="text-emerald-400/90">grid started</span>
                 ) : (
-                  <span className="min-w-0 truncate text-rose-300">{r.error}</span>
+                  <span title={r.error} className="min-w-0 truncate text-rose-300">{r.error}</span>
                 )}
               </div>
             ))}

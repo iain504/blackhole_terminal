@@ -404,7 +404,7 @@ async function computeBacktest(
     }
     const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
     const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
-    const optimize = optimizeBacktest(series, cfg, ranges, { minTrades, onProgress })
+    const optimize = await optimizeBacktest(series, cfg, ranges, { minTrades, onProgress })
     if (optimize.totalCombos === 0) {
       return { status: 400, body: { error: 'No valid optimize ranges — tick at least one parameter and set min < max' } }
     }
@@ -426,7 +426,7 @@ async function computeBacktest(
     const oosFraction = Number.isFinite(Number(body.oosFraction))
       ? Math.min(0.5, Math.max(0, Number(body.oosFraction)))
       : 0
-    const sweep = sweepStrategies(series, cfg, { minTrades, topX, oosFraction, onProgress })
+    const sweep = await sweepStrategies(series, cfg, { minTrades, topX, oosFraction, onProgress })
     return {
       status: 200,
       body: { sweep, meta: { ...meta, mtmDD: true, skippedShorts: sweep.skippedShorts ?? 0 } },
@@ -442,7 +442,7 @@ async function computeBacktest(
     }
     const ranges = Array.isArray(body.ranges) ? (body.ranges as OptimizeRange[]) : []
     const minTrades = Math.min(200, Math.max(1, Math.round(Number(body.minTrades) || 8)))
-    const wf = walkForward(series, cfg, {
+    const wf = await walkForward(series, cfg, {
       ranges,
       folds: Math.min(6, Math.max(2, Math.round(Number(body.folds) || 3))),
       isFraction: Number.isFinite(Number(body.isFraction)) ? Number(body.isFraction) : 0.7,

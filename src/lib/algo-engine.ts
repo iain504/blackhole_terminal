@@ -19,7 +19,7 @@
 // mid-day rebuild correct state.
 import { db } from '@/lib/db'
 import { barsFor } from '@/lib/bars-cache'
-import { closePositionFull, getAccount, getPositions, placeOrderWithExits, resolveTradeMode, tradeSymbol, type TradeMode } from '@/lib/trading'
+import { closePositionFull, getAccount, getPositions, placeOrderWithExits, tradeSymbol, type TradeMode } from '@/lib/trading'
 import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
@@ -42,12 +42,23 @@ const CYCLE_MS = 15000
 const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
 const HEARTBEAT_MS = 10 * 60000 // one info heartbeat per 10 idle minutes
 
+// Task 89 — the PINNED trade mode of a run row (legacy rows default to
+// 'paper' — algos always refused to start in live mode). A run orders against
+// THIS account forever; the user's Settings → tradeMode flip never migrates it.
+const runModeOf = (m: string | null | undefined): TradeMode => (m === 'live' ? 'live' : 'paper')
+
+/** Task 89 — running-run cap per user: each run is a 15s engine cycle issuing
+ * bars/positions/quotes calls + SQLite state writes; unbounded runs would
+ * churn the Alpaca rate budget for no benefit. */
+export const ALGO_MAX_RUNNING_RUNS = 20
+
 interface AlgoRunRow {
   id: string
   userId: string
   symbol: string
   timeframe: string
   strategy: string
+  mode?: string | null
   params: unknown
   qty: number
   // Task 78 — Risk Money sizing ('fixed' legacy · 'risk' derives qty at entry).
@@ -78,6 +89,10 @@ interface AlgoState {
   demoNoted?: boolean
   cryptoNoted?: boolean // one-time "crypto runs 24/7, session guards ignored" journal line
   lastBeat?: number // last heartbeat epoch ms
+  identity?: string // Task 89 — symbol|tf|strategy the session memory belongs to
+  posUnknownNoted?: boolean // Task 89 — one-time fail-closed journal line
+  entrySuppressedNoted?: boolean // Task 89 — one-time per-episode suppression journal
+  lastFedBarTime?: number // Task 89 — accumulators consumed through this bar (price data, always advances)
   // session accumulators (reset each ET day, regular-session bars only)
   vwapNum?: number
   vwapDen?: number
@@ -392,8 +407,37 @@ async function cycle(runId: string) {
     const params = normalizeAlgoParams(strategy, run.params)
     const tf = (TIMEFRAMES[run.timeframe as Timeframe] ? run.timeframe : '5m') as Timeframe
     const tfSec = TIMEFRAMES[tf].seconds
-    const mode: TradeMode = await resolveTradeMode(run.userId)
+    // Task 89 — PINNED mode (was resolveTradeMode at every cycle: flipping
+    // Settings → tradeMode mid-run used to silently migrate a paper-tuned
+    // algo onto the live account, bypassing the live-mode start refusals).
+    const mode: TradeMode = runModeOf(run.mode)
     const st = (run.state && typeof run.state === 'object' ? run.state : {}) as AlgoState
+
+    // Task 89 — identity clobber guard: updateAlgoRunConfig wipes the session
+    // memory when symbol/tf/strategy change, but an IN-FLIGHT cycle used to
+    // write its stale state copy AFTER the wipe, resurrecting the OLD
+    // instrument's ORB/VWAP accumulators on the new symbol. The cycle now
+    // re-wipes on any identity mismatch, so whichever write lands last is
+    // always consistent with the CURRENT config.
+    const identity = `${run.symbol}|${tf}|${run.strategy}`
+    if (st.identity != null && st.identity !== identity) {
+      delete st.lastBarTime
+      delete st.lastFedBarTime
+      st.entrySuppressedNoted = false
+      st.vwapNum = 0
+      st.vwapDen = 0
+      st.orHigh = undefined
+      st.orLow = undefined
+      st.orDone = false
+      st.firedLong = false
+      st.firedShort = false
+      st.prevLongSignal = false
+      st.prevShortSignal = false
+      st.freshGateSide = undefined
+      st.lastGate = undefined
+      await log(runId, run.userId, 'info', `Instrument/strategy changed (${st.identity} → ${identity}) — session memory wiped`)
+    }
+    st.identity = identity
 
     // ---- session gate ----
     // Crypto symbols (contain '/') trade 24/7 on Binance data — the equity
@@ -462,27 +506,55 @@ async function cycle(runId: string) {
       await log(runId, run.userId, 'info', `New session ${dayKey} — counters reset`)
     }
 
-    // ---- consume any not-yet-fed closed bars into the accumulators ----
+    // ---- consume not-yet-fed closed bars into the accumulators ----
+    // Task 89 — IN BAR ORDER (future-contamination fix): the old loop fed
+    // ALL unconsumed bars — including the 30-bar replay window — BEFORE the
+    // replay evaluated, so a replayed bar i was judged against a VWAP/OR that
+    // already contained bars i+1..lastClosedIdx (vwap-fade's |dev| exit could
+    // fire or not fire wrongly after downtime). Bars BEFORE the replay window
+    // feed here; the replay loop and the main eval feed their own bars
+    // just-in-time, exactly like the backtest's per-bar order.
     const isNewBar = st.lastBarTime !== evalBar.time
+    const orMinutes = Math.max(5, Math.round(params.orMinutes ?? 15))
+    const replayFrom = Math.max(0, lastClosedIdx - 30)
     if (isNewBar) {
-      const orMinutes = Math.max(5, Math.round(params.orMinutes ?? 15))
+      // Task 89 — feed guard runs on lastFedBarTime (accumulators), NOT
+      // lastBarTime (decisions): during a posUnknown episode the decision
+      // marker lags (exits re-evaluated) while the price accumulators keep
+      // consuming — without the split the replay would double-feed bars.
       const fromIdx = Math.max(1, lastClosedIdx - 400)
-      for (let i = fromIdx; i <= lastClosedIdx; i++) {
-        if (!st.lastBarTime || bars[i].time > (st.lastBarTime as number)) {
+      for (let i = fromIdx; i < replayFrom; i++) {
+        if (!st.lastFedBarTime || bars[i].time > (st.lastFedBarTime as number)) {
           feedAccumulators(strategy, orMinutes, bars[i], st, dayKey, isCrypto)
         }
       }
     }
 
     // ---- broker position on this symbol ----
+    // Task 89 — FAIL CLOSED on broker-data failure: an exception or a non-OK
+    // body used to be read as "no position" (assume flat), so an entry in
+    // that cycle could STACK a second position the engine can't see, and a
+    // strategy exit on that bar was silently skipped and never retried.
+    // posUnknown now suppresses entries for the cycle and keeps the bar
+    // UNCONSUMED (the exit re-evaluates on the next cycle, like the backtest).
     let pos: { side: 'long' | 'short'; qty: number } | null = null
+    let posUnknown = false
     try {
       const posRes = await getPositions(run.userId, mode)
       const positions = Array.isArray(posRes.data) ? posRes.data : []
+      if (!Array.isArray(posRes.data) && posRes.error) throw new Error(posRes.error)
       const mine = positions.find((p) => p.symbol === tradeSymbol(run.symbol) || p.symbol === run.symbol)
       const q = mine ? Number(mine.qty) : 0
       if (mine && Math.abs(q) > 1e-9) pos = { side: mine.side === 'short' ? 'short' : 'long', qty: Math.abs(q) }
-    } catch { /* positions unavailable — assume flat */ }
+      posUnknown = false
+    } catch {
+      posUnknown = true
+      if (!st.posUnknownNoted) {
+        await log(runId, run.userId, 'error', 'Broker positions unavailable this cycle — entries suppressed, exits re-checked next cycle (fail-closed)')
+        st.posUnknownNoted = true
+      }
+    }
+    if (!posUnknown) st.posUnknownNoted = false
 
     // ---- EOD flatten (equity symbols only — crypto never force-flattens) ----
     if (eodActive && pos && nowMinEt >= EOD_FLATTEN_MIN) {
@@ -502,12 +574,14 @@ async function cycle(runId: string) {
     // close) rather than raw detection time — Task 84 parity. Both the gate
     // window and the per-side signal memory live in run.state, so dev-server
     // restarts / hot reloads keep them.
-    if (!pos && st.hadPosition && run.cooldownMin > 0) {
+    // Task 89 — a posUnknown cycle is NOT a close: don't arm the re-entry
+    // cooldown on a book we couldn't see, and don't clear hadPosition
+    if (!posUnknown && !pos && st.hadPosition && run.cooldownMin > 0) {
       st.cooldownUntil = (evalBar.time + tfSec) * 1000 + Math.round(run.cooldownMin) * 60000
       const until = new Date(st.cooldownUntil).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
       await log(runId, run.userId, 'info', `Cooldown gate engaged — no entries for ${run.cooldownMin}m after the position close (until ${until})`)
     }
-    st.hadPosition = !!pos
+    st.hadPosition = posUnknown ? st.hadPosition : !!pos
     if (st.cooldownUntil && Date.now() >= st.cooldownUntil) {
       await log(runId, run.userId, 'info', 'Cooldown gate released — entries re-armed')
       delete st.cooldownUntil
@@ -525,9 +599,15 @@ async function cycle(runId: string) {
       // logged as such); entries stay suppressed (stale price). The per-side
       // signal memory is refreshed per replayed bar so the fresh-signal edge
       // gate stays honest.
-      const missedFrom = Math.max(0, lastClosedIdx - 30)
+      const missedFrom = replayFrom
       for (let i = missedFrom; i < lastClosedIdx; i++) {
         if (st.lastBarTime && bars[i].time <= st.lastBarTime) continue
+        // Task 89 — feed this bar's accumulators JUST IN TIME (before its own
+        // eval, and only if not already fed on a previous cycle) so a replayed
+        // bar is never judged against future bars nor double-counted
+        if (!st.lastFedBarTime || bars[i].time > (st.lastFedBarTime as number)) {
+          feedAccumulators(strategy, orMinutes, bars[i], st, dayKey, isCrypto)
+        }
         const r = evalStrategy(strategy, params, bars.slice(0, i + 1), st)
         if (r.exit && pos) {
           const f = await flattenPosition(run.userId, mode, run.symbol)
@@ -543,6 +623,12 @@ async function cycle(runId: string) {
         }
         st.prevLongSignal = r.entry?.side === 'buy'
         st.prevShortSignal = r.entry?.side === 'sell'
+      }
+
+      // Task 89 — the eval bar itself feeds last (just-in-time, only when
+      // genuinely unfed — the replay loop fed everything before it)
+      if (!st.lastFedBarTime || bars[lastClosedIdx].time > (st.lastFedBarTime as number)) {
+        feedAccumulators(strategy, orMinutes, bars[lastClosedIdx], st, dayKey, isCrypto)
       }
 
       const closed = bars.slice(0, lastClosedIdx + 1)
@@ -561,7 +647,16 @@ async function cycle(runId: string) {
       }
 
       // 2) entries (flat book + gates + day capacity)
-      if (res.entry && !pos) {
+      // Task 89 — fail-closed: when the broker book is UNKNOWN, the engine
+      // must never ADD exposure on top of a position it cannot see (the old
+      // assume-flat path stacked a second invisible position).
+      if (res.entry && posUnknown) {
+        if (!st.entrySuppressedNoted) {
+          await log(runId, run.userId, 'error', `Entry signal suppressed — broker positions unavailable (fail-closed; no new exposure while the book is unknown): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
+          st.entrySuppressedNoted = true
+        }
+      } else if (res.entry && !pos) {
+        st.entrySuppressedNoted = false
         // re-entry gates (Task 70-c): wall-clock cooldown + edge-triggered
         // fresh-signal re-entry (fire only on a false→true signal transition
         // vs the previously processed closed bar)
@@ -615,7 +710,9 @@ async function cycle(runId: string) {
                 }
               }
             } catch { ref = null }
-            if (ref == null) await log(runId, run.userId, 'error', 'No live quote for % TP/SL — entering without bracket legs')
+            // Task 89 — a missing quote no longer degrades into a naked entry:
+            // the fail-closed gate below SKIPS the bar when a % leg can't be
+            // priced (a configured stop is never silently dropped).
           }
           anchorPx = anchorPx ?? ref
           const pctPx = (m: string, v: number | null, kind: 'tp' | 'sl'): number | undefined => {
@@ -641,7 +738,7 @@ async function cycle(runId: string) {
             let riskEquity: number | null = null
             if (run.riskBasis === 'pct') {
               try {
-                const acct = await getAccount(run.userId, await resolveTradeMode(run.userId))
+                const acct = await getAccount(run.userId, mode)
                 const eq = Number(acct.data?.equity)
                 riskEquity = Number.isFinite(eq) && eq > 0 ? eq : null
               } catch { riskEquity = null }
@@ -667,10 +764,38 @@ async function cycle(runId: string) {
               await log(runId, run.userId, 'info', `Risk sizing unavailable (${why}) — using fixed qty ${run.qty}`)
             }
           }
-          if (qty <= 0) {
+          const storedLegInvalid = (run.tpMode === 'pct' && !(run.tpValue != null && run.tpValue > 0)) ||
+            (run.slMode === 'pct' && !(run.slValue != null && run.slValue > 0))
+          if (ref == null && (run.tpMode === 'pct' || run.slMode === 'pct')) {
+            // Task 89 — FAIL CLOSED: a % TP/SL that can't be priced used to
+            // mean "enter without bracket legs" — a data hiccup silently
+            // downgraded the user's stop to none (and for orb15/crypto left
+            // the position with NO protection). The entry is skipped this
+            // bar; the signal memory keeps the edge-gate semantics honest.
+            await log(runId, run.userId, 'error', 'No live quote to price the % TP/SL bracket — entry SKIPPED this bar (fail-closed; a configured stop is never dropped)')
+          } else if (storedLegInvalid) {
+            // Task 89 — a STORED-INVALID % leg (null/≤ 0 value with mode
+            // 'pct', e.g. from an import) must never degrade into a naked
+            // entry either — same fail-closed posture, explicit journal.
+            await log(runId, run.userId, 'error', 'Configured % TP/SL has an invalid stored value — entry SKIPPED this bar (fix the run settings; a configured stop is never dropped)')
+          } else if (qty <= 0) {
             await log(runId, run.userId, 'error', 'qty rounds to 0 — fix the run quantity')
           } else {
-            try {
+            // Task 89 — fresh re-read before the order: a Stop/flatten,
+            // Delete, or config edit that landed mid-cycle must not be
+            // followed by a fresh entry (the old check ran once at cycle
+            // top, ~1-3s of network work earlier).
+            const fresh = await db.algoRun.findUnique({
+              where: { id: runId },
+              select: { status: true, symbol: true, timeframe: true, strategy: true },
+            })
+            if (!fresh) {
+              // run deleted mid-cycle — nothing left to journal to
+            } else if (fresh.status !== 'running' || `${fresh.symbol}|${fresh.timeframe}|${fresh.strategy}` !== identity) {
+              await log(runId, run.userId, 'info', 'Entry aborted — the run was stopped or reconfigured mid-cycle')
+            }
+            if (fresh && fresh.status === 'running' && `${fresh.symbol}|${fresh.timeframe}|${fresh.strategy}` === identity) {
+              try {
               // crypto entries carry their TP/SL plan in the client_order_id —
               // keep the OCO supervisor alive so the legs attach on fill
               if (run.symbol.includes('/')) ensureCryptoOcoSupervisor(run.userId, mode)
@@ -711,6 +836,7 @@ async function cycle(runId: string) {
             } catch (e) {
               await log(runId, run.userId, 'error', `Order error: ${e instanceof Error ? e.message : e}`)
             }
+            }
           }
         }
       }
@@ -720,7 +846,12 @@ async function cycle(runId: string) {
       st.prevLongSignal = res.entry?.side === 'buy'
       st.prevShortSignal = res.entry?.side === 'sell'
       if (!res.entry) st.freshGateSide = undefined // signal ended — re-arm the note
-      st.lastBarTime = evalBar.time
+      // Task 89 — bar consumption is now SPLIT: accumulators are price data
+      // (always consumed) but the DECISION marker waits until the broker book
+      // is trusted again, so an exit skipped during a posUnknown cycle is
+      // re-evaluated on the next cycle exactly like the backtest would.
+      st.lastFedBarTime = evalBar.time
+      if (!posUnknown) st.lastBarTime = evalBar.time
     } else if (!st.lastBeat || Date.now() - st.lastBeat > HEARTBEAT_MS) {
       // idle heartbeat
       st.lastBeat = Date.now()
@@ -766,6 +897,9 @@ export function stopEngine(runId: string) {
 export async function startAlgoRun(cfg: {
   userId: string
   symbol: string
+  /** Task 89 — the Alpaca account this run trades on, pinned for its whole
+   *  life (start refuses live, so this is 'paper' today; omitted = paper) */
+  mode?: TradeMode
   timeframe: string
   strategy: AlgoStrategyId
   params: unknown
@@ -789,6 +923,7 @@ export async function startAlgoRun(cfg: {
     data: {
       userId: cfg.userId,
       symbol: cfg.symbol,
+      mode: cfg.mode === 'live' ? 'live' : 'paper',
       timeframe: cfg.timeframe,
       strategy: cfg.strategy,
       params: normalizeAlgoParams(cfg.strategy, cfg.params) as unknown as object,
@@ -860,8 +995,11 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   const st = (run.state && typeof run.state === 'object' ? run.state : {}) as AlgoState
   if (identityChanged) {
     // instrument/strategy switch → forget session memory + signal edges so
-    // the next cycle starts clean on the new instrument/strategy
+    // the next cycle starts clean on the new instrument/strategy (Task 89:
+    // also the feed cursor + fail-closed suppression note)
     delete st.lastBarTime
+    delete st.lastFedBarTime
+    st.entrySuppressedNoted = false
     st.vwapNum = 0
     st.vwapDen = 0
     st.orHigh = undefined
@@ -950,7 +1088,8 @@ export async function stopAlgoRun(runId: string, flatten: boolean) {
   const run = await db.algoRun.findUnique({ where: { id: runId } })
   if (!run) return null
   if (flatten) {
-    const f = await flattenPosition(run.userId, await resolveTradeMode(run.userId), run.symbol)
+    // Task 89 — flatten hits the run's PINNED account, not the current tradeMode
+    const f = await flattenPosition(run.userId, runModeOf(run.mode), run.symbol)
     if (f.ok) {
       await log(runId, run.userId, 'trade', `Flatten on stop — closed ${run.symbol}${f.note}`)
     } else {

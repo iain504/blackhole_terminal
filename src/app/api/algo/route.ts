@@ -6,8 +6,9 @@ import { resolveTradeMode } from '@/lib/trading'
 import { hasAlpacaKeys } from '@/lib/alpaca'
 import { ensureAlgoEngines, startAlgoRun } from '@/lib/algo-engine'
 import {
-  isAlgoStrategyId, ALGO_TIMEFRAMES, type AlgoTimeframe,
+  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
+import { ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
 
 export const dynamic = 'force-dynamic'
 
@@ -139,7 +140,9 @@ export async function POST(req: NextRequest) {
     const user = await requireUser()
     const body = await readJson<AlgoStartBody>(req)
     const symbol = String(body?.symbol ?? '').trim().toUpperCase()
-    if (!symbol || symbol.length > 24) {
+    // Task 89 — charset validation (was length-only): junk like "A B!" passed
+    // and only failed downstream at the broker. Same rule as config import.
+    if (!symbol || !SYMBOL_RE.test(symbol)) {
       return NextResponse.json({ error: 'Invalid symbol' }, { status: 400 })
     }
     const tf = String(body?.timeframe ?? '5m')
@@ -164,6 +167,15 @@ export async function POST(req: NextRequest) {
     if (autoStart && mode === 'live') {
       return NextResponse.json({ error: 'Refusing to start algo runs in LIVE mode — switch the trade mode to paper' }, { status: 400 })
     }
+    // Task 89 — cap the number of RUNNING runs per user: each one is a 15s
+    // engine cycle (bars + positions + quotes + state writes); unbounded runs
+    // would churn the Alpaca rate budget and SQLite for no benefit.
+    if (autoStart) {
+      const runningCount = await db.algoRun.count({ where: { userId: user.id, status: 'running' } })
+      if (runningCount >= ALGO_MAX_RUNNING_RUNS) {
+        return NextResponse.json({ error: `Too many running algo runs (${runningCount}) — the limit is ${ALGO_MAX_RUNNING_RUNS}. Stop one before starting another.` }, { status: 400 })
+      }
+    }
     const clampPct = (v: unknown): number | null => {
       const n = Number(v)
       return Number.isFinite(n) && n > 0 ? Math.min(100, Math.max(0.01, n)) : null
@@ -183,12 +195,24 @@ export async function POST(req: NextRequest) {
     if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
       return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
     }
+    // Task 89 — a % leg with an absent/≤0 value is REJECTED: the engine used
+    // to store tpValue/slValue = null with mode 'pct' and then silently drop
+    // the leg at entry (naked market order). The UI blocks this client-side;
+    // this is the API backstop (imports predate it but the engine's
+    // stored-leg fail-closed gate catches those at runtime).
+    if (body?.tpMode === 'pct' && clampPct(body?.tpValue) == null) {
+      return NextResponse.json({ error: 'TP % must be a positive number when TP mode is pct' }, { status: 400 })
+    }
+    if (body?.slMode === 'pct' && clampPct(body?.slValue) == null) {
+      return NextResponse.json({ error: 'SL % must be a positive number when SL mode is pct' }, { status: 400 })
+    }
     if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
     const run = await startAlgoRun({
       userId: user.id,
       symbol,
+      mode: autoStart ? mode : 'paper',
       timeframe: tf as AlgoTimeframe,
       strategy,
       params: body?.params,

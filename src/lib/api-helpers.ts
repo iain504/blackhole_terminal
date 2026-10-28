@@ -6,17 +6,40 @@ export function json(data: unknown, status = 200) {
   return NextResponse.json(data, { status })
 }
 
+/** Task 89 — thrown by readJson for malformed/oversized bodies; handleError
+ *  maps it to a clean 400 (it used to surface as a 500 with parser noise). */
+export class BadRequestError extends Error {}
+
 export function handleError(e: unknown) {
   if (e instanceof UnauthorizedError) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+  if (e instanceof BadRequestError) {
+    return NextResponse.json({ error: e.message }, { status: 400 })
+  }
   console.error('API error:', e)
-  const message = e instanceof Error ? e.message : 'Internal error'
-  return NextResponse.json({ error: message }, { status: 500 })
+  // Task 89 — unexpected errors return a GENERIC message: Prisma driver
+  // text and internal exception details used to reach the browser verbatim.
+  // Everything user-facing is returned by the routes themselves (verified:
+  // no api route relies on thrown Error messages), and the full detail is
+  // logged server-side above.
+  return NextResponse.json({ error: 'Unexpected server error' }, { status: 500 })
 }
 
-export async function readJson<T>(req: Request): Promise<T> {
-  return (await req.json()) as T
+export async function readJson<T>(req: Request, maxBytes = 1_000_000): Promise<T> {
+  // Task 89 — bound the body: settings capped at 256KB already, but every
+  // other route streamed req.json() unbounded (an authenticated client could
+  // buffer megabytes in memory per request). Content-length is checked when
+  // the client sends it; the parse failure path catches the rest.
+  const len = Number(req.headers.get('content-length') || 0)
+  if (Number.isFinite(len) && len > maxBytes) {
+    throw new BadRequestError(`Request body too large (max ${Math.round(maxBytes / 1024)}KB)`)
+  }
+  try {
+    return (await req.json()) as T
+  } catch {
+    throw new BadRequestError('Request body is not valid JSON')
+  }
 }
 
 export async function sendTelegram(token: string, chatId: string, text: string): Promise<boolean> {

@@ -5,6 +5,7 @@ import { requireUser } from '@/lib/auth'
 import { encrypt, decrypt, maskKey } from '@/lib/crypt'
 import { detectAlpacaKeyAccount, migrateLegacyAlpacaKeys, type AlpacaKeyCheck } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
+import { rateLimit } from '@/lib/rate-limit'
 import {
   readJsonSafe,
   settingsBodySchema,
@@ -135,6 +136,12 @@ interface PutBody {
 export async function PUT(req: Request) {
   try {
     const user = await requireUser()
+    // Task 89 — settings PUT stores credentials and probes Alpaca twice per
+    // save (key-account detection); bound it per user.
+    const rl = await rateLimit(`settings:${user.id}`, 10, 60_000)
+    if (!rl.ok) {
+      return NextResponse.json({ error: `Too many settings updates — retry in ${rl.retryAfterSec}s` }, { status: 429 })
+    }
     const raw = await readJsonSafe(req)
     if (raw == null) return NextResponse.json({ error: 'Invalid body' }, { status: 400 })
     if (settingsBodyTooLarge(raw)) {

@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
+import { rateLimit } from '@/lib/rate-limit'
 import {
   BACKUP_APP, BACKUP_VERSION, MAX_ROWS_PER_TABLE, parseBackupEnvelope, restoreBackupData,
 } from '@/lib/backup'
@@ -45,6 +46,12 @@ function backupFilename(username: string): string {
 export async function GET() {
   try {
     const session = await requireUser()
+    // Task 89 — the backup envelope carries the account record (password
+    // hash + encrypted blobs): rate-limited like the sensitive export it is.
+    const rl = await rateLimit(`export:${session.id}`, 5, 60_000)
+    if (!rl.ok) {
+      return NextResponse.json({ error: `Too many export requests — retry in ${rl.retryAfterSec}s` }, { status: 429 })
+    }
     const user = await db.user.findUnique({ where: { id: session.id } })
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 

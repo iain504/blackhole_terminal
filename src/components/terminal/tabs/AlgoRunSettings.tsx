@@ -107,6 +107,11 @@ export default function AlgoRunSettingsDialog({
   // risk sizing requires an SL % bracket — mirror the run setup's Start gate
   const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
   const riskOk = sizingMode === 'fixed' || (riskBudgetOk && slOn && Number(slPct) > 0)
+  // TP/SL gates — an enabled bracket with a 0/negative/junk % is refused by
+  // the server, so block Save (and show a hint) instead of silently
+  // degrading the leg to 'none' while the switch still reads ON
+  const tpInvalid = tpOn && !(Number(tpPct) > 0)
+  const slInvalid = slOn && !(Number(slPct) > 0)
 
   const save = async () => {
     if (!run) return
@@ -125,10 +130,10 @@ export default function AlgoRunSettingsDialog({
           riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
           riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? Number(riskMoney) : null,
           riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? Number(riskPct) : null,
-          tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
-          tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
-          slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
-          slValue: slOn && Number(slPct) > 0 ? Number(slPct) : null,
+          tpMode: tpOn ? 'pct' : 'none',
+          tpValue: tpOn ? Number(tpPct) : null,
+          slMode: slOn ? 'pct' : 'none',
+          slValue: slOn ? Number(slPct) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
           // crypto symbols trade 24/7 — the equity session guards never apply
           rthOnly: !isCryptoRun && rthOnly,
@@ -308,15 +313,37 @@ export default function AlgoRunSettingsDialog({
 
           {/* TP / SL */}
           <div className="grid grid-cols-2 gap-2">
-            <div className="flex items-center gap-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
-              <Switch id="rs-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
-              <Label htmlFor="rs-tp" className="text-[11px] text-zinc-400">TP %</Label>
-              <Input value={tpPct} onChange={(e) => setTpPct(e.target.value)} inputMode="decimal" disabled={!tpOn} className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs" />
+            <div className="flex flex-col gap-1 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+              <div className="flex items-center gap-2">
+                <Switch id="rs-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
+                <Label htmlFor="rs-tp" className="text-[11px] text-zinc-400">TP %</Label>
+                <Input
+                  value={tpPct}
+                  onChange={(e) => setTpPct(e.target.value)}
+                  inputMode="decimal"
+                  disabled={!tpOn}
+                  aria-label="Take profit percent"
+                  aria-invalid={tpInvalid ? true : undefined}
+                  className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs"
+                />
+              </div>
+              {tpInvalid && <p className="text-[10px] leading-snug text-rose-400">TP % required when TP is on</p>}
             </div>
-            <div className="flex items-center gap-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
-              <Switch id="rs-sl" checked={slOn} onCheckedChange={setSlOn} className="scale-90" />
-              <Label htmlFor="rs-sl" className="text-[11px] text-zinc-400">SL %</Label>
-              <Input value={slPct} onChange={(e) => setSlPct(e.target.value)} inputMode="decimal" disabled={!slOn} className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs" />
+            <div className="flex flex-col gap-1 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+              <div className="flex items-center gap-2">
+                <Switch id="rs-sl" checked={slOn} onCheckedChange={setSlOn} className="scale-90" />
+                <Label htmlFor="rs-sl" className="text-[11px] text-zinc-400">SL %</Label>
+                <Input
+                  value={slPct}
+                  onChange={(e) => setSlPct(e.target.value)}
+                  inputMode="decimal"
+                  disabled={!slOn}
+                  aria-label="Stop loss percent"
+                  aria-invalid={slInvalid ? true : undefined}
+                  className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs"
+                />
+              </div>
+              {slInvalid && <p className="text-[10px] leading-snug text-rose-400">SL % required when SL is on</p>}
             </div>
           </div>
 
@@ -425,8 +452,14 @@ export default function AlgoRunSettingsDialog({
           <Button
             size="sm"
             className="h-8 gap-1.5 bg-sky-600 px-3 text-[11px] text-white hover:bg-sky-500"
-            disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
-            title={!riskOk ? 'Risk sizing needs a positive risk $ / % and an SL % bracket' : undefined}
+            disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid}
+            title={!riskOk
+              ? 'Risk sizing needs a positive risk $ / % and an SL % bracket'
+              : tpInvalid
+                ? 'TP % required when TP is on'
+                : slInvalid
+                  ? 'SL % required when SL is on'
+                  : undefined}
             onClick={() => void save()}
           >
             {saving ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Settings2 className="h-3 w-3" />}

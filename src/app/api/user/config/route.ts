@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { requireUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
+import { rateLimit } from '@/lib/rate-limit'
 import { encrypt, decrypt } from '@/lib/crypt'
 import { TIMEFRAMES } from '@/lib/market-types'
 
@@ -61,6 +62,13 @@ const asRecord = (v: unknown): Record<string, unknown> | null =>
 export async function GET() {
   try {
     const user = await requireUser()
+    // Task 89 — this export ships DECRYPTED broker keys + Telegram token, so
+    // it is rate-limited like the sensitive surface it is (the session cookie
+    // alone used to be able to harvest them in a loop).
+    const rl = await rateLimit(`export:${user.id}`, 5, 60_000)
+    if (!rl.ok) {
+      return NextResponse.json({ error: `Too many export requests — retry in ${rl.retryAfterSec}s` }, { status: 429 })
+    }
     const dbUser = await db.user.findUnique({ where: { id: user.id } })
     const s = ((dbUser?.settings as UserSettings | null) || {}) as UserSettings
 

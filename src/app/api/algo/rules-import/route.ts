@@ -24,6 +24,12 @@ export async function POST(req: NextRequest) {
     if (items.length === 0) {
       return NextResponse.json({ error: 'No rules in payload' }, { status: 400 })
     }
+    // Task 89 — cap the payload BEFORE iterating it: the validation loop used
+    // to run over the raw array unbounded (body-size permitting), burning CPU
+    // on the shared process for a request that could never create 50 rules.
+    if (items.length > 100) {
+      return NextResponse.json({ error: 'Too many rules in payload — the limit is 100 per import' }, { status: 400 })
+    }
     const existing = await db.strategyRule.count({ where: { userId: user.id } })
     if (existing >= MAX_RULES) {
       return NextResponse.json({ error: `Strategy limit reached (${MAX_RULES})` }, { status: 400 })
@@ -45,6 +51,8 @@ export async function POST(req: NextRequest) {
         await db.strategyRule.create({
           data: {
             userId: user.id,
+            // Task 89 — imported rules are PINNED paper like every other rule
+            mode: 'paper',
             symbol: norm.symbol,
             kind: norm.kind,
             condition: norm.condition,

@@ -12,7 +12,12 @@ const BARS_TTL_MS = 20000
 const MAX_ENTRIES = 8 // ~400MB worst case; LRU-evicted series simply refetch
 
 export async function barsFor(symbol: string, tf: Timeframe, userId: string) {
-  const key = `${symbol}|${tf}`
+  // Task 89 — the cache key includes the USER dimension: a keyless/demo
+  // user's simulated bars used to be served to a keyed user (and vice versa)
+  // for up to 20s, making the algo engine log "no live bar data" until TTL
+  // expiry. fetchBacktestBars already keys the same way (demo status derives
+  // from the user's keys, so userId is the right partition).
+  const key = `${userId}|${symbol}|${tf}`
   const hit = barsCache.get(key)
   if (hit && Date.now() - hit.at < BARS_TTL_MS) {
     // refresh recency so the Map insertion order stays an LRU order

@@ -157,19 +157,32 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
       // ---- guards FIRST (SL before TP — same order as evaluateGrid);
       // sell-only fires mirrored (short SL above, short TP below). Deferred
       // on non-RTH bars exactly like the gated live engine. ----
+      // Task 89 — GAP-AWARE fills: the guard used to close AT the trigger
+      // price, but the live engine detects the breach on a tick and closes at
+      // MARKET — in a gap (bar opens beyond the trigger, typical on daily
+      // bars and weekend crypto) the real fill is far worse. Fill at
+      // min(open, trigger) for a long SL (mirror everywhere else) so the
+      // auto-start score and optimize rankings are not systematically
+      // optimistic — these numbers gate real deployments.
       const slHit = slTrigger != null && (sellGrid ? bar.high >= slTrigger : bar.low <= slTrigger)
       const tpHit = tpTrigger != null && (sellGrid ? bar.low <= tpTrigger : bar.high >= tpTrigger)
+      // gap-aware fill: breach through a GAPPED open fills at the open —
+      // long SL: min(open, trigger) · short SL: max(open, trigger) ·
+      // long TP: max(open, trigger) · short TP: min(open, trigger)
+      const slFillPx = sellGrid ? Math.max(bar.open, slTrigger ?? bar.open) : Math.min(bar.open, slTrigger ?? bar.open)
+      const tpFillPx = sellGrid ? Math.min(bar.open, tpTrigger ?? bar.open) : Math.max(bar.open, tpTrigger ?? bar.open)
       if (slHit) {
         stopped = true
         stopReason = guardStopText('sl', cfg.slBasis, cfg.maxSL ?? 0, slTrigger)
         if (cfg.closeOnStop) {
-          // the close-all IS the stop close — one fill per lot at the trigger
+          // the close-all IS the stop close — one fill per lot at the
+          // gap-aware fill price
           for (const lot of lots) {
             const pnl = sellGrid
-              ? (lot.entryPrice - slTrigger) * lot.qty
-              : (slTrigger - lot.entryPrice) * lot.qty
+              ? (lot.entryPrice - slFillPx) * lot.qty
+              : (slFillPx - lot.entryPrice) * lot.qty
             realized += pnl
-            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'sl', price: slTrigger, qty: lot.qty, pnl })
+            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'sl', price: slFillPx, qty: lot.qty, pnl })
           }
           lots = []
         } else {
@@ -181,10 +194,10 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
         if (cfg.closeOnStop) {
           for (const lot of lots) {
             const pnl = sellGrid
-              ? (lot.entryPrice - tpTrigger) * lot.qty
-              : (tpTrigger - lot.entryPrice) * lot.qty
+              ? (lot.entryPrice - tpFillPx) * lot.qty
+              : (tpFillPx - lot.entryPrice) * lot.qty
             realized += pnl
-            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'maxtp', price: tpTrigger, qty: lot.qty, pnl })
+            fills.push({ t: iso(bar.time), side: sellGrid ? 'buy' : 'sell', reason: 'maxtp', price: tpFillPx, qty: lot.qty, pnl })
           }
           lots = []
         } else {

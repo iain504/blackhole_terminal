@@ -8,7 +8,7 @@ import { hasAlpacaKeys } from '@/lib/alpaca'
 import { symbolSchema } from '@/lib/validation'
 import {
   startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
-  isGridSpacing, isGridDirection, parseGridState, type GridSpacing,
+  isGridSpacing, isGridDirection, parseGridState, findConflictingGrid, type GridSpacing,
 } from '@/lib/grid-engine'
 
 export const dynamic = 'force-dynamic'
@@ -305,10 +305,17 @@ export async function POST(req: NextRequest) {
     if (mode === 'live') {
       return bad('Refusing to start grid trades in LIVE mode — switch the trade mode to paper')
     }
+    // Task 89 — creation dedup: a second active/paused grid on the same
+    // symbol would double every level crossing's order volume.
+    const conflicting = await findConflictingGrid(user.id, symbol)
+    if (conflicting) {
+      return bad(`An active grid on ${symbol} already exists (id …${conflicting.id.slice(-6)}) — stop or delete it before starting another`)
+    }
 
     const grid = await startGridTrade({
       userId: user.id,
       symbol,
+      mode,
       lowerPrice: lower,
       upperPrice: upper,
       gridCount,

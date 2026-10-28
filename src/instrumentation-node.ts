@@ -54,4 +54,50 @@ export async function bootNode(): Promise<void> {
   } catch (e) {
     console.warn('[instrumentation] alerts supervisor failed to start:', e instanceof Error ? e.message : e)
   }
+
+  try {
+    // 3) Task 89 — resume the GRID engine at boot. Active grids (open lots,
+    //    live Max SL/TP guards) used to stay DORMANT until the first browser
+    //    hit on /api/grid after a restart — the exact "nobody is watching"
+    //    gap closed for algos above, with worse consequences: a 2am restart
+    //    left open positions with no guard evaluation until someone opened
+    //    the terminal.
+    const { ensureGridEngine } = await import('@/lib/grid-engine')
+    ensureGridEngine()
+    console.log('[instrumentation] grid engine resumed at boot')
+  } catch (e) {
+    console.warn('[instrumentation] grid engine boot-resume failed:', e instanceof Error ? e.message : e)
+  }
+
+  try {
+    // 4) Task 89 — resume the remaining watchers at boot:
+    //    a. strategy supervisors for every user with ARMED rules (armed rules
+    //       used to sleep until the Strategies tab was opened);
+    //    b. the crypto OCO supervisor + the Telegram fill notifier for every
+    //       (user, mode) that has traded before — NotifyState rows are the
+    //       exact per-(user,mode) registry (fill notifiers advance cursors
+    //       there). Without this, a filled entry's exit legs only attached
+    //       when a browser polled /api/trading/positions again.
+    const { db: db2 } = await import('@/lib/db')
+    const { ensureStrategySupervisor } = await import('@/lib/strategy')
+    const armedOwners = await db2.strategyRule.findMany({
+      where: { status: 'armed' },
+      distinct: ['userId'],
+      select: { userId: true },
+    })
+    for (const o of armedOwners) ensureStrategySupervisor(o.userId, 'paper') // rules are PINNED paper
+    if (armedOwners.length > 0) console.log(`[instrumentation] strategy supervisors resumed for ${armedOwners.length} user(s)`)
+
+    const { ensureCryptoOcoSupervisor } = await import('@/lib/trading')
+    const { ensureFillNotifier } = await import('@/lib/fill-notifier')
+    const notifyRows = await db2.notifyState.findMany({ select: { userId: true, mode: true } })
+    for (const row of notifyRows) {
+      const mode: 'paper' | 'live' = row.mode === 'live' ? 'live' : 'paper'
+      ensureCryptoOcoSupervisor(row.userId, mode)
+      ensureFillNotifier(row.userId, mode)
+    }
+    if (notifyRows.length > 0) console.log(`[instrumentation] OCO supervisors + fill notifiers resumed for ${notifyRows.length} (user, mode) pair(s)`)
+  } catch (e) {
+    console.warn('[instrumentation] watcher boot-resume failed:', e instanceof Error ? e.message : e)
+  }
 }

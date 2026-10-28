@@ -6,7 +6,7 @@
 // tool; this tab is the mission control (stop / edit-when-flat / inspect /
 // delete / export-import setups / export-import ALL setups as a bundle).
 // Polls every 5s like the Algo tab.
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
   Download, Upload, Copy, Sparkles, Pause, Play,
@@ -112,6 +112,11 @@ export default function GridTab() {
   const { toast } = useToast()
   const [data, setData] = useState<GridData | null>(null)
   const [loading, setLoading] = useState(true)
+  // last poll failure (HTTP status / network) — cleared by the next successful load
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // monotonic poll counter: a response whose seq is no longer current is
+  // dropped (stale) instead of overwriting newer data
+  const loadSeq = useRef(0)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [stopTarget, setStopTarget] = useState<GridRow | null>(null)
   // edit-when-flat (Task 10-b): the grid being reconfigured in-place
@@ -120,6 +125,7 @@ export default function GridTab() {
   const [detailId, setDetailId] = useState<string | null>(null)
   const [detail, setDetail] = useState<{ grid: GridTradeDto; fills: GridFillDto[] } | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
   // setup import (Task 10-f): opens the create dialog with the import panel
   // expanded — the setup JSON fills the form there (paste or file). When the
   // applied setup names its own symbol, the new grid retargets to it
@@ -134,11 +140,21 @@ export default function GridTab() {
   const chartSymbol = useMemo(() => focusedSymbol(activeTab), [activeTab])
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
     try {
       const res = await fetch('/api/grid')
-      if (res.ok) setData((await res.json()) as GridData)
-    } catch { /* offline — keep the last snapshot */ }
-    finally { setLoading(false) }
+      if (seq !== loadSeq.current) return // stale — a newer poll superseded us
+      if (!res.ok) {
+        setLoadError(`HTTP ${res.status}`)
+        return
+      }
+      setData((await res.json()) as GridData)
+      setLoadError(null)
+    } catch {
+      if (seq === loadSeq.current) setLoadError('network error')
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
   }, [])
 
   useEffect(() => {
@@ -150,12 +166,20 @@ export default function GridTab() {
   const openDetails = async (id: string) => {
     setDetailId(id)
     setDetail(null)
+    setDetailError(null)
     setDetailLoading(true)
     try {
       const res = await fetch(`/api/grid/${id}`)
-      if (res.ok) setDetail((await res.json()) as { grid: GridTradeDto; fills: GridFillDto[] })
-    } catch { /* keep skeleton */ }
-    finally { setDetailLoading(false) }
+      if (res.ok) {
+        setDetail((await res.json()) as { grid: GridTradeDto; fills: GridFillDto[] })
+      } else {
+        setDetailError(`HTTP ${res.status}`)
+      }
+    } catch {
+      setDetailError('network error')
+    } finally {
+      setDetailLoading(false)
+    }
   }
 
   const stop = async (grid: GridRow) => {
@@ -332,6 +356,13 @@ export default function GridTab() {
         </Button>
       </div>
 
+      {/* poll error banner — cleared by the next successful load */}
+      {loadError && (
+        <p className="shrink-0 rounded-md border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-400">
+          Failed to load grid trades — {loadError}
+        </p>
+      )}
+
       {/* loading skeleton */}
       {loading && (
         <div className="space-y-2">
@@ -342,7 +373,7 @@ export default function GridTab() {
       )}
 
       {/* empty state */}
-      {!loading && grids.length === 0 && (
+      {!loading && !loadError && grids.length === 0 && (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-md border border-dashed border-zinc-800 bg-zinc-900/40 p-8 text-center">
           <LayoutGrid className="h-8 w-8 text-zinc-600" aria-hidden />
           <p className="max-w-md text-sm text-zinc-400">
@@ -452,7 +483,7 @@ export default function GridTab() {
                       <DropdownMenuTrigger asChild>
                         <Button
                           variant="ghost" size="sm"
-                          className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                          className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                           disabled={busyId === g.id}
                           title="Export this grid's config as a reusable setup (JSON) — no runtime state, just the range/levels/size/guards"
                         >
@@ -470,7 +501,7 @@ export default function GridTab() {
                     </DropdownMenu>
                     {isActive && openLotsG === 0 && (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-emerald-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-emerald-300"
                         disabled={busyId === g.id}
                         onClick={() => setEditTarget(g)}
                         title="Edit this grid's config — only while it holds no open lots"
@@ -480,7 +511,7 @@ export default function GridTab() {
                     )}
                     {isActive && (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-amber-400 hover:text-amber-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-amber-400 hover:text-amber-300"
                         disabled={busyId === g.id}
                         onClick={() => void pauseResume(g, 'pause')}
                         title="Suspend this grid — the engine freezes it (no orders, no guard checks) until you resume"
@@ -490,7 +521,7 @@ export default function GridTab() {
                     )}
                     {isPaused && (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
                         disabled={busyId === g.id}
                         onClick={() => void pauseResume(g, 'resume')}
                         title="Resume this suspended grid — the next engine tick continues with its open lots intact"
@@ -500,7 +531,7 @@ export default function GridTab() {
                     )}
                     {(isActive || isPaused || (g.status === 'error' && openLotsG > 0)) && (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                         disabled={busyId === g.id}
                         onClick={() => setStopTarget(g)}
                         title={g.status === 'error'
@@ -512,7 +543,7 @@ export default function GridTab() {
                     )}
                     {!isActive && !(g.status === 'error' && openLotsG > 0) && (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-500 hover:text-rose-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-zinc-500 hover:text-rose-300"
                         disabled={busyId === g.id}
                         onClick={() => void remove(g)}
                         title="Delete this grid and its fill history"
@@ -521,7 +552,7 @@ export default function GridTab() {
                       </Button>
                     )}
                     <Button
-                      variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                       onClick={() => void openDetails(g.id)}
                       title="Statistics + fill history"
                     >
@@ -612,13 +643,28 @@ export default function GridTab() {
             <DialogDescription className="text-xs text-zinc-400">
               {detail
                 ? `${detail.grid.direction === 'buy' ? 'BUY ONLY · ' : detail.grid.direction === 'sell' ? 'SELL ONLY · ' : ''}${detail.grid.gridCount} levels · ${detail.grid.spacing} · ${fmtPrice(detail.grid.lowerPrice)}–${fmtPrice(detail.grid.upperPrice)} · qty ${detail.grid.qtyPerGrid}/grid`
-                : 'Loading…'}
+                : detailError
+                  ? 'Details unavailable'
+                  : 'Loading…'}
             </DialogDescription>
           </DialogHeader>
 
           {detailLoading && (
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-12 rounded bg-zinc-900" />)}
+            </div>
+          )}
+
+          {!detailLoading && detailError && (
+            <div className="flex flex-col items-start gap-2 rounded border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-400">
+              <span>Failed to load grid details — {detailError}</span>
+              <Button
+                variant="outline" size="sm"
+                className="h-9 sm:h-8 border-rose-500/40 bg-transparent px-3 text-[11px] text-rose-300 hover:bg-rose-500/10 hover:text-rose-200"
+                onClick={() => detailId && void openDetails(detailId)}
+              >
+                Retry
+              </Button>
             </div>
           )}
 

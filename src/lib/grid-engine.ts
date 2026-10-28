@@ -69,14 +69,26 @@
 //      the LAST lot's TP used to 403 on the accumulated fee shortfall.
 import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
-import { getPositionForSymbol, placeOrderWithExits, pollOrderFillPrice, resolveTradeMode, type TradeMode } from '@/lib/trading'
+import { getPositionForSymbol, placeOrderWithExits, pollOrderFillPrice, type TradeMode } from '@/lib/trading'
 import { isRegularSession } from '@/lib/sessions'
+
+/** Task 89 — the PINNED trade mode of a bot row (default for legacy rows:
+ *  'paper' — the only mode every creation path ever allowed). */
+const gridModeOf = (m: string | null | undefined): TradeMode => (m === 'live' ? 'live' : 'paper')
 
 const GRID_CYCLE_MS = 5000
 const MIN_GRID_COUNT = 2
 const MAX_GRID_COUNT = 100
 /** consecutive hard failures before a grid is parked as 'error' */
 const MAX_CONSECUTIVE_FAILURES = 5
+
+// Task 89 — sizing ceilings. The validator previously checked only qty > 0,
+// so qtyPerGrid=1e9 passed every creation path (broker buying power was the
+// only backstop). These are hard server-side caps for a personal terminal:
+// qty per level, and the WORST-CASE deployment (every level filled at the
+// upper price) — the number that actually hits the account in a crash.
+export const MAX_QTY_PER_GRID = 1_000_000
+export const MAX_GRID_NOTIONAL_USD = 10_000_000
 
 export type GridSpacing = 'arithmetic' | 'geometric'
 
@@ -249,6 +261,12 @@ export function validateGridConfig(c: {
   }
   if (!isGridSpacing(c.spacing)) return 'Invalid spacing'
   if (!Number.isFinite(c.qtyPerGrid) || c.qtyPerGrid <= 0) return 'Quantity per grid must be a positive number'
+  if (c.qtyPerGrid > MAX_QTY_PER_GRID) return `Quantity per grid must be at most ${MAX_QTY_PER_GRID}`
+  // Task 89 — worst-case notional: EVERY level filled at the upper price.
+  if (c.qtyPerGrid * c.gridCount * c.upperPrice > MAX_GRID_NOTIONAL_USD) {
+    const worst = Math.round(c.qtyPerGrid * c.gridCount * c.upperPrice)
+    return `Worst-case deployment ($${worst.toLocaleString('en-US')} = qty × ${c.gridCount} levels × ${fmtP(c.upperPrice)}) exceeds the $${(MAX_GRID_NOTIONAL_USD / 1e6).toFixed(0)}M safety cap — reduce the quantity, the level count, or the range`
+  }
   // stocks are floored to whole shares by the broker pipeline (trading.ts) —
   // a fractional stock grid could never fill
   if (!c.isCrypto && c.qtyPerGrid < 1) {
@@ -497,6 +515,8 @@ async function closeAndStop(
     state: unknown
     /** Task 10-g — 'sell' grids hold short lots: the close BUYS them back */
     direction?: string | null
+    /** Task 89 — pinned Alpaca account (legacy rows: 'paper') */
+    mode?: string | null
     /** prior stopReason — an error row acknowledged without lots keeps its history */
     stopReason?: string | null
   },
@@ -520,7 +540,10 @@ async function closeAndStop(
 
   if (st.lots.length > 0) {
     if (grid.closeOnStop && px != null) {
-      const mode = await resolveTradeMode(grid.userId)
+      // Task 89 — the close hits the grid's PINNED account, never the user's
+      // current tradeMode: closing on the wrong broker used to either strand
+      // the real position ("no broker position — lots cleared") or 403.
+      const mode = gridModeOf(grid.mode)
       const short = grid.direction === 'sell'
       const closeSide: 'buy' | 'sell' = short ? 'buy' : 'sell'
       const tracked = st.lots.reduce((acc, l) => acc + l.qty, 0)
@@ -675,6 +698,8 @@ async function evaluateGrid(grid: {
   state: unknown
   /** Task 10-g — absent reads as 'both' */
   direction?: string | null
+  /** Task 89 — pinned Alpaca account (legacy rows: 'paper') */
+  mode?: string | null
   /** Task 18 — planned end: the engine force-stops the grid at this time */
   autoEndAt?: Date | null
 }, price: number): Promise<void> {
@@ -792,7 +817,9 @@ async function evaluateGrid(grid: {
   }
 
   const L = st.lastPrice
-  const mode = await resolveTradeMode(grid.userId)
+  // Task 89 — the grid trades on its PINNED account forever; the user's
+  // current Settings → tradeMode can never migrate a running grid.
+  const mode = gridModeOf(grid.mode)
 
   // ---- SELL signals first (free capacity before adding lots) — per-lot TP:
   // the lot bought at level i pays at level[i+1] ?? upperPrice, on an UPWARD
@@ -1021,6 +1048,9 @@ export interface StartGridInput {
   /** Task 10-g — 'both' | 'buy' | 'sell' (default 'both') */
   direction?: string
   closeOnStop: boolean
+  /** Task 89 — the Alpaca account this grid trades on, pinned for its whole
+   *  life (creation routes refuse live, so this is 'paper' today) */
+  mode?: TradeMode
   /** Task 18 — auto-grid provenance (the watchlist scan's plan snapshot) */
   auto?: boolean
   autoPlan?: unknown
@@ -1036,6 +1066,7 @@ export async function startGridTrade(input: StartGridInput) {
     data: {
       userId: input.userId,
       symbol: input.symbol,
+      mode: input.mode === 'live' ? 'live' : 'paper',
       lowerPrice: input.lowerPrice,
       upperPrice: input.upperPrice,
       gridCount: input.gridCount,
@@ -1056,6 +1087,17 @@ export async function startGridTrade(input: StartGridInput) {
   })
   ensureGridEngine()
   return grid
+}
+
+/** Task 89 — creation dedup: an ACTIVE or PAUSED grid on the same symbol
+ *  already exists → a second one would double every level crossing's order
+ *  volume (double-submit, bundle re-import, repeated auto scans). Creation
+ *  routes surface this as a clean rejection instead of a second grid. */
+export async function findConflictingGrid(userId: string, symbol: string): Promise<{ id: string; symbol: string } | null> {
+  return db.gridTrade.findFirst({
+    where: { userId, symbol, status: { in: ['active', 'paused'] } },
+    select: { id: true, symbol: true },
+  })
 }
 
 /** Delete a grid and its fills (only legal for non-active grids — route enforces). */

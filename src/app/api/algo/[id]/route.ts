@@ -5,7 +5,7 @@ import { handleError, readJson } from '@/lib/api-helpers'
 import { deleteAlgoRun, stopAlgoRun, updateAlgoRunConfig } from '@/lib/algo-engine'
 import { resolveTradeMode } from '@/lib/trading'
 import {
-  isAlgoStrategyId, ALGO_TIMEFRAMES, type AlgoTimeframe,
+  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { toDto } from '../route'
 
@@ -70,7 +70,8 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
     if (!run) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
     const body = await readJson<AlgoPatchBody>(req)
     const symbol = String(body?.symbol ?? '').trim().toUpperCase()
-    if (!symbol || symbol.length > 24) {
+    // Task 89 — charset validation (mirrors POST, same rule as config import)
+    if (!symbol || !SYMBOL_RE.test(symbol)) {
       return NextResponse.json({ error: 'Invalid symbol' }, { status: 400 })
     }
     const tf = String(body?.timeframe ?? '5m')
@@ -107,6 +108,17 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       : null
     if (sizingMode === 'risk' && riskBasis === 'pct' && riskMoneyPct == null) {
       return NextResponse.json({ error: 'Risk % must be a positive number (percent of equity) when sizing mode is risk' }, { status: 400 })
+    }
+    // Task 89 — a % leg with an absent/≤0 value is REJECTED: the engine used
+    // to store tpValue/slValue = null with mode 'pct' and then silently drop
+    // the leg at entry (naked market order). The UI blocks this client-side;
+    // this is the API backstop (imports predate it but the engine's
+    // stored-leg fail-closed gate catches those at runtime).
+    if (body?.tpMode === 'pct' && clampPct(body?.tpValue) == null) {
+      return NextResponse.json({ error: 'TP % must be a positive number when TP mode is pct' }, { status: 400 })
+    }
+    if (body?.slMode === 'pct' && clampPct(body?.slValue) == null) {
+      return NextResponse.json({ error: 'SL % must be a positive number when SL mode is pct' }, { status: 400 })
     }
     if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })

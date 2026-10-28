@@ -490,8 +490,13 @@ export default function GridTradeDialog({
   const qtyN = Number(qty)
   const rangeOk = Number.isFinite(lowerN) && lowerN > 0 && Number.isFinite(upperN) && upperN > lowerN
   const countOk = Number.isInteger(countN) && countN >= 2 && countN <= 100
-  const qtyOk = Number.isFinite(qtyN) && qtyN > 0
+  // Server rule (POST/PUT /api/grid): non-crypto symbols need a WHOLE-number
+  // qtyPerGrid ≥ 1 — crypto may use fractional sizes. Mirror it client-side so
+  // the Start button blocks instead of the server rejecting on submit.
   const isCrypto = symbol.includes('/')
+  const qtyOk = isCrypto
+    ? Number.isFinite(qtyN) && qtyN > 0
+    : Number.isInteger(qtyN) && qtyN >= 1
   const mid = rangeOk ? (lowerN + upperN) / 2 : 0
 
   // SL/TP — price mode keeps the strict ordering rules; percent mode mirrors
@@ -928,6 +933,13 @@ export default function GridTradeDialog({
               className="mt-1 h-8 w-28 border-zinc-800 bg-zinc-950 text-xs tabular-nums"
               aria-invalid={qtyOk ? undefined : true}
             />
+            {!qtyOk && (
+              <p className="mt-1 text-[10px] leading-snug text-rose-400">
+                {isCrypto
+                  ? 'Enter a quantity greater than 0.'
+                  : 'Stocks require a whole-number quantity per grid (min 1) — crypto supports fractional sizes'}
+              </p>
+            )}
           </div>
 
           {/* Max SL — price OR percent below the lower bound */}

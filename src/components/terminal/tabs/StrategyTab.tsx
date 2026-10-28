@@ -313,7 +313,7 @@ export default function StrategyTab() {
                 <span className="ml-auto flex items-center gap-0.5">
                   {(r.status === 'triggered' || r.status === 'failed' || r.status === 'paused') && (
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
                       disabled={busyId === r.id}
                       onClick={() => void patch(r.id, { status: 'armed' }, 'Strategy re-armed')}
                       title="Re-arm — fresh crossing memory, fires on the next genuine crossing"
@@ -323,7 +323,7 @@ export default function StrategyTab() {
                   )}
                   {(r.status === 'armed' || r.status === 'paused') && (
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-zinc-400"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-zinc-400"
                       disabled={busyId === r.id}
                       onClick={() => void patch(r.id, { status: r.status === 'paused' ? 'armed' : 'paused' }, r.status === 'paused' ? 'Strategy resumed' : 'Strategy paused')}
                     >
@@ -331,7 +331,7 @@ export default function StrategyTab() {
                     </Button>
                   )}
                   <Button
-                    variant="ghost" size="sm" className="h-6 px-1.5 text-[10px] text-zinc-400"
+                    variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[10px] text-zinc-400"
                     disabled={busyId === r.id}
                     onClick={() => void patch(r.id, { repeat: !r.repeat }, r.repeat ? 'Switched to one-shot' : 'Switched to repeat')}
                     title={r.repeat ? 'Switch to one-shot' : 'Switch to repeat'}
@@ -339,7 +339,7 @@ export default function StrategyTab() {
                     {r.repeat ? '∞' : '1×'}
                   </Button>
                   <Button
-                    variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                    variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                     onClick={() => setExpanded((e) => ({ ...e, [r.id]: !open }))}
                     aria-expanded={open}
                     title="Show fire history & historical trades"
@@ -348,7 +348,7 @@ export default function StrategyTab() {
                     History
                   </Button>
                   <Button
-                    variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
+                    variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                     disabled={busyId === r.id}
                     onClick={() => void remove(r)}
                     aria-label={`Delete strategy ${r.symbol}`}

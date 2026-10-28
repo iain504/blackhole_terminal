@@ -528,7 +528,10 @@ export interface AlgoImportResult {
   ruleErrors: { index: number; reason: string }[]
 }
 
-const SYMBOL_RE = /^[A-Za-z0-9./-]{1,24}$/
+// Task 89 — exported: the algo create/patch routes validate user symbols
+// with the SAME rule the config importer has always used (charset, not just
+// length), so junk like "A B!" 400s at the door instead of failing downstream.
+export const SYMBOL_RE = /^[A-Za-z0-9./-]{1,24}$/
 
 function clampPct(v: unknown): number | null {
   const n = Number(v)

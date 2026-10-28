@@ -8,6 +8,7 @@ import { useTerminal, Strategy } from '@/store/terminal'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { useToast } from '@/hooks/use-toast'
 import { Bot, Loader2, Zap } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ttLog } from '@/lib/console-log'
@@ -47,11 +48,24 @@ export function statusBadgeCls(status: string): string {
 }
 
 export function StrategyDrawer({ onClose }: { onClose: () => void }) {
+  const { toast } = useToast()
   const strategies = useTerminal((s) => s.strategies)
   const addStrategyLocal = useTerminal((s) => s.addStrategyLocal)
   const patchStrategyLocal = useTerminal((s) => s.patchStrategyLocal)
   const removeStrategyLocal = useTerminal((s) => s.removeStrategyLocal)
   const activeTab = useTerminal((s) => s.tabs.find((t) => t.id === s.activeTabId) ?? s.tabs[0])
+  // rule ids with an in-flight mutation — await-first: local state is only
+  // touched AFTER the server confirms, so a failed PATCH/DELETE leaves the
+  // rule exactly as it was (no optimistic rollback needed)
+  const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set())
+  const setRuleBusy = (id: string, busy: boolean) =>
+    setBusyIds((prev) => {
+      if (prev.has(id) === busy) return prev
+      const next = new Set(prev)
+      if (busy) next.add(id)
+      else next.delete(id)
+      return next
+    })
 
   // ---- creation form state ----
   const [kind, setKind] = useState<'rsi' | 'macd'>('rsi')
@@ -155,18 +169,42 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
   }
 
   const patch = async (id: string, body: Record<string, unknown>) => {
-    const res = await fetch(`/api/strategies/${id}`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    const json = await res.json().catch(() => null)
-    if (res.ok && json?.strategy) patchStrategyLocal(id, json.strategy as Strategy)
+    setRuleBusy(id, true)
+    try {
+      const res = await fetch(`/api/strategies/${id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const json = await res.json().catch(() => null)
+      if (res.ok && json?.strategy) {
+        patchStrategyLocal(id, json.strategy as Strategy)
+      } else {
+        // server refused (e.g. LIVE-mode rule) — leave the local rule untouched
+        toast({ title: 'Strategy update failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Strategy update failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setRuleBusy(id, false)
+    }
   }
 
   const remove = async (id: string) => {
-    removeStrategyLocal(id)
-    await fetch(`/api/strategies/${id}`, { method: 'DELETE' })
+    setRuleBusy(id, true)
+    try {
+      const res = await fetch(`/api/strategies/${id}`, { method: 'DELETE' })
+      const json = await res.json().catch(() => null)
+      if (res.ok) {
+        removeStrategyLocal(id) // server confirmed — only now drop it locally
+      } else {
+        toast({ title: 'Strategy delete failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
+      }
+    } catch {
+      toast({ title: 'Strategy delete failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setRuleBusy(id, false)
+    }
   }
 
   return (
@@ -176,6 +214,15 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 text-sm font-medium">
           <span className="flex items-center gap-2">
             <Bot className="h-4 w-4 text-violet-400" /> Strategy Orders
+            {/* strategy rules fire on the paper account only — make the
+                destination of a fired order visible at a glance */}
+            <Badge
+              variant="outline"
+              className="border-emerald-500/40 text-[10px] text-emerald-400"
+              title="Strategy rules fire on the paper account — fired orders hit paper only"
+            >
+              Paper
+            </Badge>
           </span>
           <Button variant="ghost" size="sm" onClick={onClose} className="h-7 px-2 text-xs">
             Close
@@ -423,23 +470,37 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
                   </span>
                   <span className="flex shrink-0 items-center gap-0.5">
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[10px] text-zinc-400"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[10px] text-zinc-400"
+                      disabled={busyIds.has(r.id)}
                       title={r.repeat ? 'Switch to one-shot' : 'Switch to repeat'}
                       onClick={() => void patch(r.id, { repeat: !r.repeat })}
                     >
                       {r.repeat ? '∞' : '1×'}
                     </Button>
                     {(r.status === 'triggered' || r.status === 'failed' || r.status === 'paused') && (
-                      <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => void patch(r.id, { status: 'armed' })}>
+                      <Button
+                        variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px]"
+                        disabled={busyIds.has(r.id)}
+                        onClick={() => void patch(r.id, { status: 'armed' })}
+                      >
                         Re-arm
                       </Button>
                     )}
                     {r.status !== 'triggered' && r.status !== 'failed' && (
-                      <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[11px]" onClick={() => void patch(r.id, { status: r.status === 'paused' ? 'armed' : 'paused' })}>
+                      <Button
+                        variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px]"
+                        disabled={busyIds.has(r.id)}
+                        onClick={() => void patch(r.id, { status: r.status === 'paused' ? 'armed' : 'paused' })}
+                      >
                         {r.status === 'paused' ? 'Resume' : 'Pause'}
                       </Button>
                     )}
-                    <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-rose-400 hover:text-rose-300" onClick={() => void remove(r.id)}>
+                    <Button
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
+                      disabled={busyIds.has(r.id)}
+                      aria-label="Delete rule"
+                      onClick={() => void remove(r.id)}
+                    >
                       ✕
                     </Button>
                   </span>

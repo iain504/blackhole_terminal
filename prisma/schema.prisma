@@ -89,6 +89,11 @@ model StrategyRule {
   id        String  @id @default(cuid())
   userId    String
   symbol    String
+  // Task 89 — the Alpaca account this rule fires on, PINNED at create time.
+  // Rules are refused in live mode at create (mirrors grid/algo), so every
+  // row is 'paper' — the column exists so a running rule can NEVER silently
+  // follow a later Settings → tradeMode flip onto the other account.
+  mode      String  @default("paper") // 'paper' | 'live'
   // ---- condition: kind 'rsi' | 'macd' ----
   kind      String
   // rsi: 'cross_above'|'cross_below' (level 0-100);
@@ -198,6 +203,11 @@ model AlgoRun {
   id           String    @id @default(cuid())
   userId       String
   symbol       String
+  // Task 89 — the Alpaca account this run trades on, PINNED at start time
+  // (algos refuse to start in live mode, so every row is 'paper'). The engine
+  // orders against THIS mode forever — a later Settings → tradeMode flip
+  // never migrates a running bot to the other account.
+  mode         String    @default("paper") // 'paper' | 'live'
   timeframe    String    @default("5m") // '1m' | '5m' | '15m'
   strategy     String // 'bb-reversion' | 'rsi2-connors' | 'orb15' | 'vwap-fade'
   params       Json
@@ -293,6 +303,13 @@ model GridTrade {
   id          String    @id @default(cuid())
   userId      String
   symbol      String
+  // Task 89 — the Alpaca account this grid trades on, PINNED at start time
+  // (grid start refuses live mode, so every row is 'paper'). Entries, TP
+  // sells and guard closes always hit THIS account — a later Settings →
+  // tradeMode flip never migrates a running grid (the old resolve-at-order-
+  // time behavior could fire a paper grid's orders onto the live account,
+  // or strand its position by closing against the wrong broker).
+  mode        String    @default("paper") // 'paper' | 'live'
   // ---- range ----
   lowerPrice  Float
   upperPrice  Float

@@ -116,8 +116,21 @@ export async function POST(req: Request) {
 
     const action = body.action === 'sell' ? 'sell' : 'buy'
     const qty = Number(body.qty)
-    if (!Number.isFinite(qty) || qty <= 0) {
-      return NextResponse.json({ error: 'qty must be a positive number' }, { status: 400 })
+    if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) {
+      return NextResponse.json({ error: 'qty must be a positive number (max 1,000,000)' }, { status: 400 })
+    }
+    // Task 89 — stocks trade whole shares (the broker pipeline floors), so a
+    // fractional stock qty would silently trade a different size than shown
+    if (!symbol.includes('/') && !Number.isInteger(qty)) {
+      return NextResponse.json({ error: 'Stocks require a whole-number quantity — crypto supports fractional sizes' }, { status: 400 })
+    }
+
+    // Task 89 — rules are PINNED to paper: refuse live outright (mirrors
+    // grid + algo) instead of silently firing real-money orders in whatever
+    // mode the settings happen to have. Checked BEFORE the create.
+    const mode = await resolveTradeMode(user.id)
+    if (mode === 'live') {
+      return NextResponse.json({ error: 'Refusing to arm strategy rules in LIVE mode — switch the trade mode to paper' }, { status: 400 })
     }
 
     const tpMode = ['none', 'price', 'pct'].includes(body.tpMode || '') ? body.tpMode! : 'none'
@@ -155,6 +168,9 @@ export async function POST(req: Request) {
     const r = await db.strategyRule.create({
       data: {
         userId: user.id, symbol, kind, condition, level,
+        // Task 89 — PINNED account: rules are refused in live mode below, so
+        // every rule fires on paper forever, immune to tradeMode flips
+        mode: 'paper',
         timeframe: validTf(body.timeframe), params,
         action, qty,
         tpMode, tpValue: tpValue != null && Number.isFinite(tpValue) ? clampPctOrKeep(tpMode, tpValue) : null,
@@ -165,8 +181,8 @@ export async function POST(req: Request) {
       },
     })
     // warm the supervisor so this rule fires even with no terminal tab open
-    const mode = await resolveTradeMode(user.id)
-    ensureStrategySupervisor(user.id, mode)
+    // (the rule is pinned paper — see the live refusal above)
+    ensureStrategySupervisor(user.id, 'paper')
     return NextResponse.json({ strategy: toDto(r) })
   } catch (e) {
     return handleError(e)

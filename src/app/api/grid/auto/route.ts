@@ -8,13 +8,16 @@ import { hasAlpacaKeys } from '@/lib/alpaca'
 import { getAccount, resolveTradeMode } from '@/lib/trading'
 import { ALGO_MAX_DAYS } from '@/lib/algo-strategies'
 import { fetchBacktestBars } from '@/lib/backtest-history'
-import { validateGridConfig, startGridTrade } from '@/lib/grid-engine'
+import { validateGridConfig, startGridTrade, findConflictingGrid } from '@/lib/grid-engine'
 import {
   analyzeGridForSymbol, isGridAutoPreset, AUTO_PRESETS,
   type GridAutoDecision, type GridAutoPreset, type GridAutoSizing,
 } from '@/lib/grid-auto'
 
 export const dynamic = 'force-dynamic'
+
+// Task 89 — throttle for the GridAutoRun retention pruner (see POST below)
+let lastAutoRunPruneAt = 0
 
 // ---------------------------------------------------------------------------
 // POST /api/grid/auto (Task 18) — the Auto Grid watchlist scanner.
@@ -96,6 +99,11 @@ export async function POST(req: NextRequest) {
       watchlistName = wl.name
       symbols = Array.isArray(wl.items) ? (wl.items as string[]) : []
     } else if (Array.isArray(body?.symbols)) {
+      // Task 89 — cap BEFORE mapping: a megabyte array used to be fully
+      // mapped/set-deduped before the MAX_SYMBOLS slice
+      if (body.symbols.length > 500) {
+        return bad('Too many symbols — the limit is 500 per request')
+      }
       symbols = body.symbols.map((s) => String(s).trim().toUpperCase()).filter(Boolean)
     }
     symbols = [...new Set(symbols)]
@@ -155,6 +163,10 @@ export async function POST(req: NextRequest) {
     const results: (GridAutoDecision & { gridId?: string; error?: string })[] = []
     for (const symbol of symbols) {
       try {
+        // Task 89 — yield between symbols: each analyzeGridForSymbol is a
+        // bounded CPU sweep; without the yield a 25-symbol START scan stalls
+        // the live engine cycles for its whole duration
+        await new Promise((r) => setImmediate(r))
         const hist = await fetchBacktestBars(symbol, timeframe, user.id, days)
         if (!hist.ok) {
           results.push({ symbol, decision: 'skip', reason: hist.error ?? 'History unavailable', details: [], plan: null })
@@ -187,17 +199,36 @@ export async function POST(req: NextRequest) {
     // across the started batch never exceeds the account equity — a 25-symbol
     // watchlist at 5% each would otherwise silently try to deploy 125%. Tail
     // symbols are skipped with an honest reason (the plan stays for review).
+    // Task 89 — the budget now SEEDS from the grids that already exist: the
+    // old per-request counter let two consecutive START runs deploy 200%+ of
+    // equity combined. Active auto+manual grids count at their worst-case
+    // (qty × level count × range mid) exactly like moneyBehindOf().
     let deployed = 0
     if (mode === 'start') {
+      const existingActive = await db.gridTrade.findMany({
+        where: { userId: user.id, status: { in: ['active', 'paused'] } },
+        select: { qtyPerGrid: true, gridCount: true, lowerPrice: true, upperPrice: true },
+      })
+      deployed = existingActive.reduce(
+        (acc, g) => acc + g.qtyPerGrid * g.gridCount * ((g.lowerPrice + g.upperPrice) / 2),
+        0,
+      )
       const selected = Array.isArray(body?.selected) ? new Set(body.selected.map((s) => String(s).toUpperCase())) : null
       for (const r of results) {
         if (r.decision !== 'start' || !r.plan) continue
         if (selected && !selected.has(r.symbol)) continue
+        // Task 89 — dedup: an active/paused grid on this symbol already runs
+        const conflicting = await findConflictingGrid(user.id, r.symbol)
+        if (conflicting) {
+          r.decision = 'skip'
+          r.reason = 'An active grid on this symbol already exists — skipped (duplicate)'
+          continue
+        }
         const behind = r.plan.moneyBehind ?? 0
         if (sizing.mode === 'equityPct' && behind > 0 && deployed + behind > sizing.equity) {
           r.decision = 'skip'
           r.reason =
-            `Risk budget exhausted — $${Math.round(deployed)} of $${Math.round(sizing.equity)} equity already planned this batch; ` +
+            `Risk budget exhausted — $${Math.round(deployed)} of $${Math.round(sizing.equity)} equity already deployed by running grids + this batch; ` +
             `this grid needs $${Math.round(behind)} more. Raise the per-grid %, start fewer symbols, or accept the risk manually.`
           continue
         }
@@ -226,6 +257,7 @@ export async function POST(req: NextRequest) {
           const grid = await startGridTrade({
             userId: user.id,
             symbol: r.symbol,
+            mode: tradeMode ?? 'paper',
             lowerPrice: p.lowerPrice,
             upperPrice: p.upperPrice,
             gridCount: p.gridCount,
@@ -258,14 +290,25 @@ export async function POST(req: NextRequest) {
       : results.filter((r) => r.decision === 'start').length
     const skippedCount = results.filter((r) => r.decision === 'skip').length
     // planned deployment across everything this run accepted (info in scan
-    // mode; in start mode the survivors after the risk-budget cap)
+    // mode; in start mode the survivors after the risk-budget cap). Task 89:
+    // only rows that ACTUALLY have a grid count toward the deployed number —
+    // deselected symbols keep decision 'start' but gridId null, and counting
+    // them overstated the % of equity reported.
     const plannedDeployment = round2(
       results
-        .filter((r) => r.decision === 'start' || r.gridId != null)
+        .filter((r) => (mode === 'start' ? r.gridId != null : r.decision === 'start'))
         .reduce((acc, r) => acc + (r.plan?.moneyBehind ?? 0), 0),
     )
 
     // ---- persist the run so the "why" survives reloads ----
+    // Task 89 — lazy pruner: every scan/start persisted a full JSON report
+    // forever with no reader for old rows; keep 14 days, throttled to 10 min.
+    if (Date.now() - lastAutoRunPruneAt > 10 * 60_000) {
+      lastAutoRunPruneAt = Date.now()
+      db.gridAutoRun
+        .deleteMany({ where: { createdAt: { lt: new Date(Date.now() - 14 * 86_400_000) } } })
+        .catch(() => { /* the pruner must never surface */ })
+    }
     const run = await db.gridAutoRun.create({
       data: {
         userId: user.id,

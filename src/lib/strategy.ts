@@ -27,6 +27,9 @@ interface UserSettings {
 export interface StrategyRow {
   id: string
   symbol: string
+  /** Task 89 — the Alpaca account this rule fires on, PINNED at create time
+   *  (legacy rows read as 'paper' — create always refused live) */
+  mode?: string | null
   kind: string
   condition: string
   level: number
@@ -216,6 +219,9 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
 
       const action = r.action === 'sell' ? 'sell' : 'buy'
       const qty = r.qty
+      // Task 89 — the rule fires on its PINNED account (always 'paper' since
+      // create refuses live); the caller's mode arg is legacy fallback only.
+      const fireMode: TradeMode = r.mode === 'live' ? 'live' : 'paper'
       let failNote: string | null = null
       let orderNote = ''
       let orderId: string | undefined
@@ -235,12 +241,19 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
         const tp = failNote ? undefined : resolveExit(r.tpMode, r.tpValue, action, ref, 'tp')
         const sl = failNote ? undefined : resolveExit(r.slMode, r.slValue, action, ref, 'sl')
         if (!failNote && (tp === null || sl === null)) failNote = 'Resolved TP/SL price is invalid'
+        // Task 89 — FAIL LOUD on a stored-but-invalid exit: resolveExit
+        // returns undefined for tpValue/slValue ≤ 0 (a corrupted PATCH used
+        // to store those), and undefined slipped past the null check → the
+        // order went out NAKED while the UI showed the leg armed. An armed
+        // rule with a configured-but-invalid leg must fail visibly instead.
+        if (!failNote && r.tpMode !== 'none' && tp === undefined) failNote = 'Stored TP value is invalid (≤ 0) — edit the rule; firing without it is not allowed'
+        if (!failNote && r.slMode !== 'none' && sl === undefined) failNote = 'Stored SL value is invalid (≤ 0) — edit the rule; firing without it is not allowed'
         if (!failNote && !(qty > 0)) failNote = 'Rule has an invalid qty'
 
         if (!failNote) {
           // keep the crypto OCO supervisor alive so % entries get exits on fill
-          ensureCryptoOcoSupervisor(userId, mode)
-          const r2 = await placeOrderWithExits(userId, mode, {
+          ensureCryptoOcoSupervisor(userId, fireMode)
+          const r2 = await placeOrderWithExits(userId, fireMode, {
             symbol,
             side: action as 'buy' | 'sell',
             qty,
@@ -320,15 +333,52 @@ export async function evaluateStrategies(userId: string, mode: TradeMode): Promi
 
 type GlobalWithStrategies = typeof globalThis & {
   __ttStrategySupervised?: Map<string, ReturnType<typeof setInterval>>
+  __ttStrategyIdle?: Map<string, number>
+}
+
+// Task 89 — lazy pruning: StrategyFireLog rows (success AND failure, by
+// design) accumulated forever with no reader for old rows. Every supervisor
+// tick may run this (throttled to 10 min) — keep 30 days of history.
+let lastFireLogPruneAt = 0
+function maybePruneFireLogs(): void {
+  const now = Date.now()
+  if (now - lastFireLogPruneAt < 10 * 60_000) return
+  lastFireLogPruneAt = now
+  db.strategyFireLog
+    .deleteMany({ where: { createdAt: { lt: new Date(now - 30 * 86_400_000) } } })
+    .catch(() => { /* the pruner must never surface */ })
 }
 
 /** Start (once per user+mode) a 20s server-side evaluation cycle. */
 export function ensureStrategySupervisor(userId: string, mode: TradeMode): void {
   const g = globalThis as GlobalWithStrategies
   if (!g.__ttStrategySupervised) g.__ttStrategySupervised = new Map()
+  if (!g.__ttStrategyIdle) g.__ttStrategyIdle = new Map()
   const key = `${userId}|${mode}`
   if (g.__ttStrategySupervised.has(key)) return
+  const idle = g.__ttStrategyIdle!
   const timer = setInterval(() => {
+    // Task 89 — teardown: a warmed supervisor used to tick for the LIFE of
+    // the process even after every rule was deleted/paused. When the user
+    // has no armed rules for 3 consecutive cycles (60s), stop the timer and
+    // drop the entry — the next GET/POST warms it again if rules return.
+    void db.strategyRule.count({ where: { userId, status: 'armed' } })
+      .then((armed) => {
+        if (armed > 0) {
+          idle.set(key, 0)
+          return
+        }
+        const n = (idle.get(key) ?? 0) + 1
+        idle.set(key, n)
+        if (n >= 3) {
+          clearInterval(timer)
+          g.__ttStrategySupervised!.delete(key)
+          idle.delete(key)
+          console.log(`[strategy] supervisor stopped for ${key} (no armed rules)`)
+        }
+      })
+      .catch(() => { /* DB hiccup — keep ticking; the eval call below re-checks */ })
+    maybePruneFireLogs()
     void evaluateStrategies(userId, mode).catch((e) =>
       console.warn('[strategy] supervisor cycle failed:', e instanceof Error ? e.message : e),
     )

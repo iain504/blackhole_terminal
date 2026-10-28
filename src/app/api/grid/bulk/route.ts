@@ -8,7 +8,7 @@ import { symbolSchema } from '@/lib/validation'
 import { GRID_BUNDLE_MAX } from '@/lib/grid-setup'
 import {
   startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
-  isGridSpacing, isGridDirection, type GridSpacing,
+  isGridSpacing, isGridDirection, findConflictingGrid, type GridSpacing,
 } from '@/lib/grid-engine'
 import { parseGuardBasis, round2, toDto } from '../route'
 
@@ -148,9 +148,18 @@ export async function POST(req: NextRequest) {
           continue
         }
 
+        // Task 89 — creation dedup: skip duplicates inside the bundle AND
+        // against already-running grids (same user+symbol)
+        const conflicting = await findConflictingGrid(user.id, symbol)
+        if (conflicting) {
+          results.push({ index: i, symbol, ok: false, error: 'An active grid on this symbol already exists — skipped (duplicate)' })
+          continue
+        }
+
         const grid = await startGridTrade({
           userId: user.id,
           symbol,
+          mode,
           lowerPrice: lower,
           upperPrice: upper,
           gridCount,

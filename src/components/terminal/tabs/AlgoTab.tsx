@@ -27,6 +27,7 @@ import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Skeleton } from '@/components/ui/skeleton'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import {
@@ -58,7 +59,14 @@ interface AlgoData { runs: AlgoRunDto[]; rules?: AlgoRuleLike[]; mode: string; c
 export default function AlgoTab() {
   const { toast } = useToast()
   const [data, setData] = useState<AlgoData | null>(null)
-  const [loading, setLoading] = useState(false)
+  // starts true so the skeleton renders until the first snapshot lands and the
+  // "No algo runs yet" empty state never flashes before the first fetch
+  const [loading, setLoading] = useState(true)
+  // last poll failure (HTTP status / network) — cleared by the next successful load
+  const [loadError, setLoadError] = useState<string | null>(null)
+  // monotonic poll counter: a response whose seq is no longer current is
+  // dropped (stale) instead of overwriting newer data
+  const loadSeq = useRef(0)
   const [starting, setStarting] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
@@ -114,10 +122,22 @@ export default function AlgoTab() {
   const isCryptoSym = symbol.trim().toUpperCase().includes('/')
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
+    setLoading(true)
     try {
       const res = await fetch('/api/algo')
-      if (res.ok) setData((await res.json()) as AlgoData)
-    } catch { /* offline */ }
+      if (seq !== loadSeq.current) return // stale — a newer poll superseded us
+      if (!res.ok) {
+        setLoadError(`HTTP ${res.status}`)
+        return
+      }
+      setData((await res.json()) as AlgoData)
+      setLoadError(null)
+    } catch {
+      if (seq === loadSeq.current) setLoadError('network error')
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
   }, [])
 
   useEffect(() => {
@@ -165,10 +185,10 @@ export default function AlgoTab() {
           riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
           riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? Number(riskMoney) : null,
           riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? Number(riskPct) : null,
-          tpMode: tpOn && Number(tpPct) > 0 ? 'pct' : 'none',
-          tpValue: tpOn && Number(tpPct) > 0 ? Number(tpPct) : null,
-          slMode: slOn && Number(slPct) > 0 ? 'pct' : 'none',
-          slValue: slOn && Number(slPct) > 0 ? Number(slPct) : null,
+          tpMode: tpOn ? 'pct' : 'none',
+          tpValue: tpOn ? Number(tpPct) : null,
+          slMode: slOn ? 'pct' : 'none',
+          slValue: slOn ? Number(slPct) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
           // crypto symbols trade 24/7 — the equity session guards never apply
           rthOnly: !sym.includes('/') && rthOnly,
@@ -240,6 +260,11 @@ export default function AlgoTab() {
   // the risk unit) — Start/backtest stay disabled until the config is coherent
   const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
   const riskOk = sizingMode === 'fixed' || (riskBudgetOk && slOn && Number(slPct) > 0)
+  // TP/SL gates — an enabled bracket with a 0/negative/junk % is refused by
+  // the server, so block Start (and show a hint) instead of silently
+  // degrading the leg to 'none' while the switch still reads ON
+  const tpInvalid = tpOn && !(Number(tpPct) > 0)
+  const slInvalid = slOn && !(Number(slPct) > 0)
   const sizingHint = sizingMode === 'risk'
     ? (riskBasis === 'pct'
         ? `% of account equity at risk per trade — qty = equity×% ÷ (entry × SL%)${slOn && Number(slPct) > 0 ? '' : ' · turn SL % ON'}`
@@ -377,6 +402,11 @@ export default function AlgoTab() {
         </Button>
       </div>
 
+      {loadError && (
+        <p className="shrink-0 rounded-md border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-400">
+          Failed to load algo runs — {loadError}
+        </p>
+      )}
       {data && !data.configured && (
         <p className="shrink-0 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
           No Alpaca keys — add them in Settings before starting a run (algo runs place real paper orders).
@@ -507,15 +537,37 @@ export default function AlgoTab() {
                 <Label htmlFor="algo-cap" className="text-[11px] text-zinc-300">Max trades / day</Label>
                 <Input id="algo-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
               </div>
-              <div className="col-span-1 flex items-center gap-2">
-                <Switch id="algo-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
-                <Label htmlFor="algo-tp" className="text-[11px] text-zinc-400">Take profit %</Label>
-                <Input value={tpPct} onChange={(e) => setTpPct(e.target.value)} inputMode="decimal" disabled={!tpOn} className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
+              <div className="col-span-1">
+                <div className="flex items-center gap-2">
+                  <Switch id="algo-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
+                  <Label htmlFor="algo-tp" className="text-[11px] text-zinc-400">Take profit %</Label>
+                  <Input
+                    value={tpPct}
+                    onChange={(e) => setTpPct(e.target.value)}
+                    inputMode="decimal"
+                    disabled={!tpOn}
+                    aria-label="Take profit percent"
+                    aria-invalid={tpInvalid ? true : undefined}
+                    className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs"
+                  />
+                </div>
+                {tpInvalid && <p className="mt-0.5 text-[10px] leading-snug text-rose-400">TP % required when TP is on</p>}
               </div>
-              <div className="col-span-1 flex items-center gap-2">
-                <Switch id="algo-sl" checked={slOn} onCheckedChange={setSlOn} className="scale-90" />
-                <Label htmlFor="algo-sl" className="text-[11px] text-zinc-400">Stop loss %</Label>
-                <Input value={slPct} onChange={(e) => setSlPct(e.target.value)} inputMode="decimal" disabled={!slOn} className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
+              <div className="col-span-1">
+                <div className="flex items-center gap-2">
+                  <Switch id="algo-sl" checked={slOn} onCheckedChange={setSlOn} className="scale-90" />
+                  <Label htmlFor="algo-sl" className="text-[11px] text-zinc-400">Stop loss %</Label>
+                  <Input
+                    value={slPct}
+                    onChange={(e) => setSlPct(e.target.value)}
+                    inputMode="decimal"
+                    disabled={!slOn}
+                    aria-label="Stop loss percent"
+                    aria-invalid={slInvalid ? true : undefined}
+                    className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs"
+                  />
+                </div>
+                {slInvalid && <p className="mt-0.5 text-[10px] leading-snug text-rose-400">SL % required when SL is on</p>}
               </div>
               <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <div>
@@ -608,8 +660,14 @@ export default function AlgoTab() {
 
             <Button
               className="mt-3 h-9 w-full gap-2 bg-sky-600 text-xs text-white hover:bg-sky-500"
-              disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk}
-              title={!riskOk ? 'Risk sizing needs a positive risk $ / % and an SL % bracket' : undefined}
+              disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid}
+              title={!riskOk
+                ? 'Risk sizing needs a positive risk $ / % and an SL % bracket'
+                : tpInvalid
+                  ? 'TP % required when TP is on'
+                  : slInvalid
+                    ? 'SL % required when SL is on'
+                    : undefined}
               onClick={() => void start()}
             >
               {starting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -684,7 +742,16 @@ export default function AlgoTab() {
               }}
             />
           )}
-          {view === 'runs' && runs.length === 0 && (
+          {/* first-load skeleton — until the initial snapshot arrives (the
+              "No algo runs yet" empty state must not flash before that) */}
+          {view === 'runs' && loading && data == null && (
+            <div className="space-y-2">
+              {[0, 1, 2].map((i) => (
+                <Skeleton key={i} className="h-14 w-full rounded-md bg-zinc-900" />
+              ))}
+            </div>
+          )}
+          {view === 'runs' && data != null && !loadError && runs.length === 0 && (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-md border border-dashed border-zinc-800 bg-zinc-900/40 p-8 text-center">
               <Rocket className="h-8 w-8 text-zinc-600" aria-hidden />
               <p className="max-w-md text-sm text-zinc-400">
@@ -749,7 +816,7 @@ export default function AlgoTab() {
                     {isRunning ? (
                       <>
                         <Button
-                          variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
+                          variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                           disabled={busyId === r.id}
                           onClick={() => void act(r.id, 'stop', false, 'Run stopped')}
                           title="Stop the engine (keep any open position)"
@@ -757,7 +824,7 @@ export default function AlgoTab() {
                           <Square className="h-3 w-3" /> Stop
                         </Button>
                         <Button
-                          variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-rose-300 hover:text-rose-200"
+                          variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-rose-300 hover:text-rose-200"
                           disabled={busyId === r.id}
                           onClick={() => void act(r.id, 'stop', true, 'Run stopped + position flattened')}
                           title="Stop the engine AND market-close the run's position"
@@ -767,7 +834,7 @@ export default function AlgoTab() {
                       </>
                     ) : (
                       <Button
-                        variant="ghost" size="sm" className="h-6 gap-1 px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
+                        variant="ghost" size="sm" className="h-9 sm:h-6 gap-1 px-2 sm:px-1.5 text-[11px] text-emerald-400 hover:text-emerald-300"
                         disabled={busyId === r.id}
                         onClick={() => void act(r.id, 'start', false, 'Run restarted')}
                         title="Restart this run with the same config"
@@ -776,7 +843,7 @@ export default function AlgoTab() {
                       </Button>
                     )}
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                       disabled={busyId === r.id}
                       onClick={() => setExpanded((e) => ({ ...e, [r.id]: !open }))}
                       aria-expanded={open}
@@ -785,7 +852,7 @@ export default function AlgoTab() {
                       {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />} Log
                     </Button>
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                       onClick={() => setSettingsRun(r)}
                       aria-label={`Edit settings of algo run ${r.symbol}`}
                       title="Show & edit this run's settings (applies on the next engine cycle)"
@@ -793,7 +860,7 @@ export default function AlgoTab() {
                       <Settings2 className="h-3 w-3" />
                     </Button>
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-zinc-400 hover:text-zinc-200"
                       onClick={() => exportRun(r)}
                       aria-label={`Export config of algo run ${r.symbol}`}
                       title="Export this run's config (JSON)"
@@ -801,7 +868,7 @@ export default function AlgoTab() {
                       <Download className="h-3 w-3" />
                     </Button>
                     <Button
-                      variant="ghost" size="sm" className="h-6 px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
+                      variant="ghost" size="sm" className="h-9 sm:h-6 px-2 sm:px-1.5 text-[11px] text-rose-400 hover:text-rose-300"
                       disabled={busyId === r.id}
                       onClick={() => void act(r.id, 'delete', false, 'Run deleted')}
                       aria-label={`Delete algo run ${r.symbol}`}

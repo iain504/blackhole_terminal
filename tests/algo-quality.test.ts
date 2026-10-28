@@ -317,9 +317,9 @@ describe('atrPctSeries', () => {
 // Optimizer sensitivity / plateau
 // ---------------------------------------------------------------------------
 describe('optimizeBacktest — neighbor sensitivity (plateau probe)', () => {
-  test('reports ±1-step neighbor scores and a plateau verdict', () => {
+  test('reports ±1-step neighbor scores and a plateau verdict', async () => {
     const series = prepareSeries(barsFrom(spikes()))
-    const opt = optimizeBacktest(
+    const opt = await optimizeBacktest(
       series,
       baseCfg(bbParams()),
       [{ key: 'bbStd', min: 1, max: 4, step: 0.5 }],
@@ -342,8 +342,8 @@ describe('walkForward — rolling folds + pure hold-out', () => {
   const series = prepareSeries(barsFrom(spikes(218))) // 2398 bars
   const ranges = [{ key: 'bbStd', min: 1, max: 4, step: 0.5 }]
 
-  test('runs the requested folds and carves the hold-out off FIRST', () => {
-    const wf = walkForward(series, baseCfg(bbParams()), { ranges, folds: 2, isFraction: 0.7, holdoutFraction: 0.2, minTrades: 1 })
+  test('runs the requested folds and carves the hold-out off FIRST', async () => {
+    const wf = await walkForward(series, baseCfg(bbParams()), { ranges, folds: 2, isFraction: 0.7, holdoutFraction: 0.2, minTrades: 1 })
     expect(wf.mode).toBe('rolling')
     // 2398 bars → hold-out 479, wf span 1919 → 2 spans (IS 70% / OOS 30%)
     expect(wf.folds.length).toBe(2)
@@ -354,8 +354,8 @@ describe('walkForward — rolling folds + pure hold-out', () => {
     expect(wf.aggregate.foldsTotal).toBe(2)
   })
 
-  test('anchored mode expands the IS window back to bar 0', () => {
-    const wf = walkForward(series, baseCfg(bbParams()), { ranges, folds: 2, isFraction: 0.7, holdoutFraction: 0, anchored: true, minTrades: 1 })
+  test('anchored mode expands the IS window back to bar 0', async () => {
+    const wf = await walkForward(series, baseCfg(bbParams()), { ranges, folds: 2, isFraction: 0.7, holdoutFraction: 0, anchored: true, minTrades: 1 })
     expect(wf.mode).toBe('anchored')
     expect(wf.folds.length).toBe(2)
     // anchored folds tune on everything from the very first bar
@@ -363,9 +363,9 @@ describe('walkForward — rolling folds + pure hold-out', () => {
     expect(wf.folds[1].isFrom).toBe(series.bars[0].time)
   })
 
-  test('a tiny dataset degrades honestly (empty folds + reason)', () => {
+  test('a tiny dataset degrades honestly (empty folds + reason)', async () => {
     const tiny = prepareSeries(barsFrom(spikes(10))) // 110 bars
-    const wf = walkForward(tiny, baseCfg(bbParams()), { ranges, folds: 3, isFraction: 0.7, holdoutFraction: 0, minTrades: 1 })
+    const wf = await walkForward(tiny, baseCfg(bbParams()), { ranges, folds: 3, isFraction: 0.7, holdoutFraction: 0, minTrades: 1 })
     expect(wf.folds.length).toBe(0)
     expect(wf.holdoutDisabled).toBeTruthy()
   })

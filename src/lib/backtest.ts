@@ -668,6 +668,15 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
           tpPx: cfg.tpMode === 'pct' ? pctPx(cfg.tpValue, true) : null,
           slPx,
         }
+        // Task 89 — parity: counted when the fill SURVIVES the dust check
+        // (see the signal-time comment above) — tradesToday AND orb15's
+        // one-per-side memory both match the live engine's fill-success
+        // semantics now
+        tradesToday++
+        if (strategy === 'orb15') {
+          if (dir === 1) firedLong = true
+          else firedShort = true
+        }
       }
       pending = null
     }
@@ -745,11 +754,14 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         else if (tradesToday >= cfg.maxTradesDay) suppressed++
         else {
           pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
-          tradesToday++
-          if (strategy === 'orb15') {
-            if (dec.entry.side === 'buy') firedLong = true
-            else firedShort = true
-          }
+          // Task 89 — tradesToday parity: the LIVE engine increments on FILL
+          // success, the backtest used to increment at signal time — a
+          // dust-cancelled pending consumed a daily slot the live engine
+          // wouldn't. The increment (and orb15's one-per-side memory, same
+          // fill-success semantics as the live engine) moved to the
+          // successful-fill branch below; the gate itself still checks at
+          // signal time against COMPLETED trades (same as live), and the
+          // single-pending rule bounds in-flight signals to one.
         }
       }
     }
@@ -985,12 +997,18 @@ function heapAbortCheck(context: string): void {
   }
 }
 
-export function optimizeBacktest(
+// Task 89 — ASYNC with event-loop yields: this grid search is a pure CPU
+// loop (up to 800 combos × O(n·240) sims) that used to run synchronously on
+// the main thread — every live algo cycle, API route and heartbeat stalled
+// behind it for the whole run. Yielding every few combos costs ~nothing
+// (the per-combo heap probe already exists) and keeps the 15s trading cycles
+// responsive during multi-minute optimize/sweep/walk-forward runs.
+export async function optimizeBacktest(
   series: BacktestSeries,
   base: BacktestConfig,
   ranges: OptimizeRange[],
   opts?: { minTrades?: number; maxCombos?: number; onProgress?: BacktestProgress },
-): OptimizeResult {
+): Promise<OptimizeResult> {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const onProgress = opts?.onProgress
@@ -1060,6 +1078,7 @@ export function optimizeBacktest(
       }
       const res = runBacktest(series, { ...comboCfg, collectEquity: false })
       evaluated++
+      if (evaluated % 3 === 0) await new Promise((r) => setImmediate(r))
       results.push({
         params: override,
         score: backtestScore(res.metrics, minTrades),
@@ -1239,11 +1258,13 @@ function sweepSig(strategy: AlgoStrategyId, params: Record<string, number>): str
  *   • every row carries `boundary` — true when any tuned param equals its
  *     grid min/max (the winner sits on the edge of the searched grid).
  */
-export function sweepStrategies(
+// Task 89 — async (see optimizeBacktest): yields between strategies so live
+// cycles interleave with the sweep.
+export async function sweepStrategies(
   series: BacktestSeries,
   base: BacktestConfig,
   opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number; onProgress?: BacktestProgress },
-): SweepResult {
+): Promise<SweepResult> {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const topX = Math.min(20, Math.max(1, Math.round(opts?.topX ?? 8)))
@@ -1269,6 +1290,7 @@ export function sweepStrategies(
     // optimizer back-to-back; catch the hot heap BETWEEN strategies (see
     // heapAbortCheck)
     heapAbortCheck('Strategy sweep')
+    await new Promise((r) => setImmediate(r))
     const def = ALGO_STRATEGIES[sid]
     // Task 15 — per-strategy progress (the optimizer's inner frac is mapped
     // into this strategy's slice of the whole sweep)
@@ -1300,7 +1322,7 @@ export function sweepStrategies(
     let scorable = baseScore > -Infinity ? 1 : 0
     let bestScore = baseScore > -Infinity ? baseScore : null
     // (2) auto grid search over the strategy's numeric params
-    const opt = optimizeBacktest(isSeries, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy, onProgress: innerProgress })
+    const opt = await optimizeBacktest(isSeries, cfg, autoOptimizeRanges(sid), { minTrades, maxCombos: opts?.maxCombosPerStrategy, onProgress: innerProgress })
     evaluated += opt.evaluated
     skipped += opt.skipped
     for (const row of opt.results) {
@@ -1458,11 +1480,11 @@ const wfSig = (p: Record<string, number>): string =>
     .sort()
     .join(',')
 
-export function walkForward(
+export async function walkForward(
   series: BacktestSeries,
   base: BacktestConfig,
   opts: WalkForwardOpts,
-): WalkForwardResult {
+): Promise<WalkForwardResult> {
   const t0 = Date.now()
   let folds = Math.min(6, Math.max(2, Math.round(opts.folds ?? 3)))
   const isFraction = Math.min(0.9, Math.max(0.5, Number(opts.isFraction) || 0.7))
@@ -1556,7 +1578,7 @@ export function walkForward(
     // per-fold compute budget — the whole harness must stay inside the same
     // COMBO_BAR_BUDGET envelope a single optimize run gets
     const budget = Math.max(30, Math.min(400, Math.floor(COMBO_BAR_BUDGET / Math.max(1, isSeries.n) / folds)))
-    const opt = optimizeBacktest(isSeries, { ...base, collectEquity: false }, opts.ranges, { minTrades, maxCombos: budget, onProgress: opts.onProgress ? (innerFrac) => opts.onProgress!((k + innerFrac) / folds, foldStage) : undefined })
+    const opt = await optimizeBacktest(isSeries, { ...base, collectEquity: false }, opts.ranges, { minTrades, maxCombos: budget, onProgress: opts.onProgress ? (innerFrac) => opts.onProgress!((k + innerFrac) / folds, foldStage) : undefined })
     evaluated += opt.evaluated
     const best = opt.best
     if (!best) {

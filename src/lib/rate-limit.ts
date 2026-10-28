@@ -38,7 +38,7 @@ interface Bucket {
   resetAt: number
 }
 
-const g = globalThis as unknown as { __rateLimitBuckets?: Map<string, Bucket> }
+const g = globalThis as unknown as { __rateLimitBuckets?: Map<string, Bucket>; __rateLimitFallbackWarnedAt?: number }
 const memoryBuckets: Map<string, Bucket> = (g.__rateLimitBuckets ??= new Map())
 
 let lastFallbackAt = 0

@@ -360,7 +360,7 @@ export async function runRecoSweepMatrix(
           const series = prepareSeries(bars)
           // Task 3-d — 70/30 IS/OOS walk-forward: tune on the first 70% of
           // bars, re-run the winners untouched on the last 30%
-          const sweep = sweepStrategies(series, cfg, {
+          const sweep = await sweepStrategies(series, cfg, {
             minTrades: RECO_MIN_TRADES,
             topX: RECO_TOPX,
             oosFraction: RECO_OOS_FRACTION,
