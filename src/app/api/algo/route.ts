@@ -31,6 +31,9 @@ export interface AlgoRunDto {
   slValue: number | null
   tpTf?: string | null
   slTf?: string | null
+  trailMode: string
+  trailArmPct: number | null
+  trailGivePct: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -49,6 +52,7 @@ export function toDto(r: {
   riskMoney?: number | null; riskMoneyPct?: number | null
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
   tpTf?: string | null; slTf?: string | null
+  trailMode?: string; trailArmPct?: number | null; trailGivePct?: number | null
   maxTradesDay: number; rthOnly: boolean; flattenEod: boolean
   cooldownMin?: number; requireNewSignal?: boolean
   status: string
@@ -65,6 +69,9 @@ export function toDto(r: {
     riskMoneyPct: r.sizingMode === 'risk' && r.riskBasis === 'pct' ? (r.riskMoneyPct ?? null) : null,
     tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
     tpTf: r.tpTf ?? null, slTf: r.slTf ?? null,
+    trailMode: r.trailMode === 'pct' ? 'pct' : 'off',
+    trailArmPct: r.trailMode === 'pct' ? (r.trailArmPct ?? null) : null,
+    trailGivePct: r.trailMode === 'pct' ? (r.trailGivePct ?? null) : null,
     maxTradesDay: r.maxTradesDay, rthOnly: r.rthOnly, flattenEod: r.flattenEod,
     cooldownMin: r.cooldownMin ?? 0, requireNewSignal: r.requireNewSignal === true,
     status: r.status, tradesToday: st.tradesToday ?? 0,
@@ -132,6 +139,9 @@ interface AlgoStartBody {
   slValue?: number
   tpTf?: string | null
   slTf?: string | null
+  trailMode?: string
+  trailArmPct?: number
+  trailGivePct?: number
   maxTradesDay?: number
   rthOnly?: boolean
   flattenEod?: boolean
@@ -231,6 +241,19 @@ export async function POST(req: NextRequest) {
     if (typeof tpLeg === 'string') return NextResponse.json({ error: tpLeg }, { status: 400 })
     const slLeg = parseExitLeg(body?.slMode, body?.slValue, body?.slTf, 'SL')
     if (typeof slLeg === 'string') return NextResponse.json({ error: slLeg }, { status: 400 })
+    // v1.97.0 — trailing exit: mode 'pct' requires BOTH a positive arm %
+    // (profit needed to arm) and a positive give-back % (trail distance); any
+    // other mode reads as 'off'. Clamps mirror the % legs (0.01–100).
+    const trailMode = body?.trailMode === 'pct' ? 'pct' : 'off'
+    let trailArmPct: number | null = null
+    let trailGivePct: number | null = null
+    if (trailMode === 'pct') {
+      trailArmPct = clampPct(body?.trailArmPct)
+      trailGivePct = clampPct(body?.trailGivePct)
+      if (trailArmPct == null || trailGivePct == null) {
+        return NextResponse.json({ error: 'Trailing exit needs a positive arm % and a positive give-back % when trail mode is pct' }, { status: 400 })
+      }
+    }
     if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
@@ -252,6 +275,9 @@ export async function POST(req: NextRequest) {
       slMode: slLeg.mode,
       slValue: slLeg.value,
       slTf: slLeg.tf,
+      trailMode,
+      trailArmPct,
+      trailGivePct,
       maxTradesDay: Math.min(50, Math.max(1, Math.round(Number(body?.maxTradesDay) || 3))),
       rthOnly: body?.rthOnly !== false,
       flattenEod: body?.flattenEod !== false,

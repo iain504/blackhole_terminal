@@ -78,6 +78,10 @@ export interface AlgoSetupCfg {
   /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
   tpTf?: string | null
   slTf?: string | null
+  // v1.97.0 — trailing exit (mirrors the live run config)
+  trailMode?: 'off' | 'pct'
+  trailArmPct?: number | null
+  trailGivePct?: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -366,6 +370,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     slMode: cfg.slMode,
     slValue: cfg.slValue,
     slTf: cfg.slMode === 'atr' ? (cfg.slTf ?? null) : null,
+    trailMode: cfg.trailMode === 'pct' ? 'pct' : 'off',
+    trailArmPct: cfg.trailMode === 'pct' ? (cfg.trailArmPct ?? null) : null,
+    trailGivePct: cfg.trailMode === 'pct' ? (cfg.trailGivePct ?? null) : null,
     maxTradesDay: cfg.maxTradesDay,
     rthOnly: cfg.rthOnly,
     flattenEod: cfg.flattenEod,

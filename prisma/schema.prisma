@@ -248,6 +248,15 @@ model AlgoRun {
   // ATR timeframe for mode 'atr' (a Timeframe key: '1m'..'1M'); null = N/A
   tpTf         String?
   slTf         String?
+  // v1.97.0 — trailing exit (engine-managed, not a broker order): arms once
+  // the position's unrealized profit ≥ trailArmPct % (measured from the
+  // broker position's avg entry price), then tracks the best price since
+  // arming and market-closes when price gives back trailGivePct % from that
+  // peak. 'off' | 'pct' — only protects while the run is running; the
+  // broker-side SL/TP bracket above stays as the catastrophic stop.
+  trailMode    String    @default("off")
+  trailArmPct  Float?
+  trailGivePct Float?
   maxTradesDay Int       @default(3)
   rthOnly      Boolean   @default(true)
   flattenEod   Boolean   @default(true)

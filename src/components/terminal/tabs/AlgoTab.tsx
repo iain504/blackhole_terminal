@@ -97,6 +97,11 @@ export default function AlgoTab() {
   const [tpAtrTf, setTpAtrTf] = useState('1h')
   const [slUnit, setSlUnit] = useState<'pct' | 'atr'>('pct')
   const [slAtrTf, setSlAtrTf] = useState('1h')
+  // v1.97.0 — trailing exit: arms once in profit ≥ arm %, closes on a give-back
+  // ≥ trail % from the best price since (engine-managed every 15s cycle)
+  const [trailOn, setTrailOn] = useState(false)
+  const [trailArm, setTrailArm] = useState('0.5')
+  const [trailGive, setTrailGive] = useState('0.3')
   const [maxTradesDay, setMaxTradesDay] = useState('3')
   const [rthOnly, setRthOnly] = useState(true)
   const [flattenEod, setFlattenEod] = useState(true)
@@ -198,6 +203,9 @@ export default function AlgoTab() {
           slMode: slOn ? (slUnit === 'atr' ? 'atr' : 'pct') : 'none',
           slValue: slOn ? Number(slPct) : null,
           slTf: slOn && slUnit === 'atr' ? slAtrTf : null,
+          trailMode: trailOn ? 'pct' : 'off',
+          trailArmPct: trailOn ? Number(trailArm) : null,
+          trailGivePct: trailOn ? Number(trailGive) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
           // crypto symbols trade 24/7 — the equity session guards never apply
           rthOnly: !sym.includes('/') && rthOnly,
@@ -279,6 +287,9 @@ export default function AlgoTab() {
   const slInvalid = slOn && (slUnit === 'atr' ? !slMultOk : !(Number(slPct) > 0))
   const tpInvalidMsg = tpUnit === 'atr' ? 'TP ATR multiplier must be between 0.1 and 20' : 'TP % required when TP is on'
   const slInvalidMsg = slUnit === 'atr' ? 'SL ATR multiplier must be between 0.1 and 20' : 'SL % required when SL is on'
+  // v1.97.0 — trailing exit needs BOTH percents when on (the API 400s otherwise)
+  const trailInvalid = trailOn && (!(Number(trailArm) > 0) || !(Number(trailGive) > 0))
+  const trailInvalidMsg = 'Trailing exit needs a positive arm % and a positive give-back %'
   const sizingHint = sizingMode === 'risk'
     ? (riskBasis === 'pct'
         ? `% of account equity at risk per trade — qty = equity×% ÷ (entry × SL distance)${slOn && Number(slPct) > 0 ? '' : ' · turn SL ON'}`
@@ -302,12 +313,15 @@ export default function AlgoTab() {
     slMode: slOn && Number(slPct) > 0 ? (slUnit === 'atr' ? 'atr' : 'pct') : 'none',
     slValue: slOn && Number(slPct) > 0 ? Number(slPct) : null,
     slTf: slOn && slUnit === 'atr' && Number(slPct) > 0 ? slAtrTf : null,
+    trailMode: trailOn && Number(trailArm) > 0 && Number(trailGive) > 0 ? 'pct' : 'off',
+    trailArmPct: trailOn && Number(trailArm) > 0 && Number(trailGive) > 0 ? Number(trailArm) : null,
+    trailGivePct: trailOn && Number(trailArm) > 0 && Number(trailGive) > 0 ? Number(trailGive) : null,
     maxTradesDay: Number(maxTradesDay) || 3,
     rthOnly,
     flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
     requireNewSignal,
-  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, tpUnit, tpAtrTf, slOn, slPct, slUnit, slAtrTf, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
+  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, tpUnit, tpAtrTf, slOn, slPct, slUnit, slAtrTf, trailOn, trailArm, trailGive, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal])
 
   // ---- config import / export (Task 66) ----
   // Task 9-n — exports open the export DIALOG (JSON preview + copy + download):
@@ -367,6 +381,9 @@ export default function AlgoTab() {
     setSlUnit(cfg.slMode === 'atr' ? 'atr' : 'pct')
     setSlPct(cfg.slValue != null ? String(cfg.slValue) : '1')
     setSlAtrTf(cfg.slMode === 'atr' ? (cfg.slTf ?? '1h') : '1h')
+    setTrailOn(cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null)
+    setTrailArm(cfg.trailArmPct != null ? String(cfg.trailArmPct) : '0.5')
+    setTrailGive(cfg.trailGivePct != null ? String(cfg.trailGivePct) : '0.3')
     setMaxTradesDay(String(cfg.maxTradesDay))
     setRthOnly(cfg.rthOnly)
     setFlattenEod(cfg.flattenEod)
@@ -647,6 +664,47 @@ export default function AlgoTab() {
                 </div>
                 {slInvalid && <p className="mt-0.5 text-[10px] leading-snug text-rose-400">{slInvalidMsg}</p>}
               </div>
+              {/* v1.97.0 — trailing exit (engine-managed; arms once in profit) */}
+              <div className="col-span-2 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="text-[11px] text-zinc-300">Trailing exit</p>
+                    <p className="text-[10px] leading-snug text-zinc-500">arms once in profit ≥ arm % · closes on a {trailGive || '0.3'}% give-back from the best price since (checked every 15s while running; the SL/TP bracket stays as the catastrophic stop)</p>
+                  </div>
+                  <Switch checked={trailOn} onCheckedChange={setTrailOn} className="scale-90 shrink-0" aria-label="Trailing exit" />
+                </div>
+                {trailOn && (
+                  <div className="mt-1.5 grid grid-cols-2 gap-2">
+                    <div>
+                      <Label htmlFor="algo-trail-arm" className="text-[10px] text-zinc-500">Arm after profit (%)</Label>
+                      <Input
+                        id="algo-trail-arm"
+                        value={trailArm}
+                        onChange={(e) => setTrailArm(e.target.value)}
+                        onBlur={() => setTrailArm(String(Math.min(100, Math.max(0.01, Number(trailArm) || 0))))}
+                        inputMode="decimal"
+                        aria-label="Trailing arm threshold — percent profit needed before the trail engages"
+                        aria-invalid={trailOn && !(Number(trailArm) > 0) ? true : undefined}
+                        className="mt-1 h-7 border-zinc-800 bg-zinc-950 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <Label htmlFor="algo-trail-give" className="text-[10px] text-zinc-500">Give-back trail (%)</Label>
+                      <Input
+                        id="algo-trail-give"
+                        value={trailGive}
+                        onChange={(e) => setTrailGive(e.target.value)}
+                        onBlur={() => setTrailGive(String(Math.min(100, Math.max(0.01, Number(trailGive) || 0))))}
+                        inputMode="decimal"
+                        aria-label="Trailing give-back — percent retrace from the best price that closes the position"
+                        aria-invalid={trailOn && !(Number(trailGive) > 0) ? true : undefined}
+                        className="mt-1 h-7 border-zinc-800 bg-zinc-950 text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+                {trailInvalid && <p className="mt-0.5 text-[10px] leading-snug text-rose-400">{trailInvalidMsg}</p>}
+              </div>
               <div className="col-span-2 flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
                 <div>
                   <p className="text-[11px] text-zinc-300">Regular hours only</p>
@@ -738,14 +796,16 @@ export default function AlgoTab() {
 
             <Button
               className="mt-3 h-9 w-full gap-2 bg-sky-600 text-xs text-white hover:bg-sky-500"
-              disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid}
+              disabled={starting || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid || trailInvalid}
               title={!riskOk
                 ? 'Risk sizing needs a positive risk $ / % and an SL bracket (any mode)'
                 : tpInvalid
                   ? tpInvalidMsg
                   : slInvalid
                     ? slInvalidMsg
-                    : undefined}
+                    : trailInvalid
+                      ? trailInvalidMsg
+                      : undefined}
               onClick={() => void start()}
             >
               {starting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
@@ -875,6 +935,11 @@ export default function AlgoTab() {
                       {(r.tpMode === 'pct' || r.tpMode === 'atr') && (r.slMode === 'pct' || r.slMode === 'atr') ? ' · ' : ''}
                       {r.slMode === 'pct' && <span className="text-rose-400/80">SL {r.slValue}%</span>}
                       {r.slMode === 'atr' && <span className="text-rose-400/80">SL {fmtAtrExit(r.slValue, r.slTf)}</span>}
+                    </span>
+                  )}
+                  {r.trailMode === 'pct' && (
+                    <span className="text-cyan-400/90" title={`Trailing exit — arms once the position is in profit ≥ ${r.trailArmPct}%, then closes when price gives back ${r.trailGivePct}% from the best price since arming (engine-managed while the run is running)`}>
+                      trail +{r.trailArmPct}%→−{r.trailGivePct}%
                     </span>
                   )}
                   {!r.symbol.includes('/') && r.rthOnly && <Badge variant="outline" className="text-[10px] text-zinc-500" title="Entries only during regular hours">RTH</Badge>}

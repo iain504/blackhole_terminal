@@ -144,6 +144,9 @@ interface BacktestBody {
   tpValue?: number | null
   slMode?: string
   slValue?: number | null
+  trailMode?: string
+  trailArmPct?: number | null
+  trailGivePct?: number | null
   maxTradesDay?: number
   rthOnly?: boolean
   flattenEod?: boolean
@@ -370,6 +373,14 @@ async function computeBacktest(
       : body.slMode === 'atr' && Number(body.slValue) > 0
         ? Math.min(20, Math.max(0.1, Number(body.slValue)))
         : null,
+    // v1.97.0 — trailing exit mirror (clamps mirror the live routes)
+    trailMode: body.trailMode === 'pct' ? 'pct' : 'off',
+    trailArmPct: body.trailMode === 'pct' && Number(body.trailArmPct) > 0
+      ? Math.min(100, Math.max(0.01, Number(body.trailArmPct)))
+      : null,
+    trailGivePct: body.trailMode === 'pct' && Number(body.trailGivePct) > 0
+      ? Math.min(100, Math.max(0.01, Number(body.trailGivePct)))
+      : null,
     maxTradesDay,
     rthOnly: body.rthOnly !== false,
     flattenEod: body.flattenEod !== false,

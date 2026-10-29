@@ -76,6 +76,10 @@ interface AlgoRunRow {
   /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
   tpTf: string | null
   slTf: string | null
+  // v1.97.0 — trailing exit ('off' | 'pct'): arm/give % pairs (null when off)
+  trailMode: string
+  trailArmPct: number | null
+  trailGivePct: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -113,6 +117,9 @@ interface AlgoState {
   prevLongSignal?: boolean // raw entry signal on the previously processed bar
   prevShortSignal?: boolean
   freshGateSide?: 'buy' | 'sell' // side currently edge-suppressed (log once per episode)
+  // v1.97.0 — trailing exit memory (persisted so restarts keep the trail)
+  trailArmed?: boolean // profit threshold crossed — tracking the best price
+  trailPeak?: number // best price since arming (max for long, min for short)
 }
 
 interface BarRow { time: number; open: number; high: number; low: number; close: number; volume: number }
@@ -439,6 +446,8 @@ async function cycle(runId: string) {
       st.prevShortSignal = false
       st.freshGateSide = undefined
       st.lastGate = undefined
+      st.trailArmed = false
+      st.trailPeak = undefined
       await log(runId, run.userId, 'info', `Instrument/strategy changed (${st.identity} → ${identity}) — session memory wiped`)
     }
     st.identity = identity
@@ -542,6 +551,11 @@ async function cycle(runId: string) {
     // posUnknown now suppresses entries for the cycle and keeps the bar
     // UNCONSUMED (the exit re-evaluates on the next cycle, like the backtest).
     let pos: { side: 'long' | 'short'; qty: number } | null = null
+    // v1.97.0 — the trailing exit prices off the broker position snapshot
+    // itself (avg entry + current mark) — zero extra API calls, and the same
+    // numbers the Positions tab shows
+    let posEntry: number | null = null
+    let posCur: number | null = null
     let posUnknown = false
     try {
       const posRes = await getPositions(run.userId, mode)
@@ -549,7 +563,13 @@ async function cycle(runId: string) {
       if (!Array.isArray(posRes.data) && posRes.error) throw new Error(posRes.error)
       const mine = positions.find((p) => p.symbol === tradeSymbol(run.symbol) || p.symbol === run.symbol)
       const q = mine ? Number(mine.qty) : 0
-      if (mine && Math.abs(q) > 1e-9) pos = { side: mine.side === 'short' ? 'short' : 'long', qty: Math.abs(q) }
+      if (mine && Math.abs(q) > 1e-9) {
+        pos = { side: mine.side === 'short' ? 'short' : 'long', qty: Math.abs(q) }
+        const e = Number(mine.avg_entry_price)
+        const c = Number(mine.current_price)
+        posEntry = Number.isFinite(e) && e > 0 ? e : null
+        posCur = Number.isFinite(c) && c > 0 ? c : null
+      }
       posUnknown = false
     } catch {
       posUnknown = true
@@ -568,6 +588,81 @@ async function cycle(runId: string) {
         pos = null
       } else {
         await log(runId, run.userId, 'error', `EOD flatten failed: ${f.note}`)
+      }
+    }
+
+    // ---- v1.97.0 — trailing exit (engine-managed, every 15s cycle) ----
+    // Arms once the position is IN PROFIT ≥ trailArmPct % (from the broker
+    // position's avg entry price — "price in favor and in profit"), then
+    // tracks the best price since arming and market-closes when price gives
+    // back trailGivePct % from that peak. The trail memory lives in run.state
+    // (restart-safe), resets when flat / disabled / reconfigured. It is an
+    // ADDITIONAL exit: the broker-side SL/TP bracket stays working as the
+    // catastrophic stop, and a trail close (like every engine exit) cancels
+    // the working legs with the position.
+    {
+      const trailOn = run.trailMode === 'pct'
+        && run.trailArmPct != null && run.trailArmPct > 0
+        && run.trailGivePct != null && run.trailGivePct > 0
+      if (!trailOn) {
+        // disabled or misconfigured → the trail is simply not managed (the
+        // broker bracket remains); forget any stale arm so a later re-enable
+        // starts fresh
+        if (st.trailArmed != null && st.trailArmed) st.trailArmed = false
+        st.trailPeak = undefined
+      } else if (!posUnknown) {
+        if (!pos) {
+          // flat book — any leftover trail memory from a closed position resets
+          if (st.trailArmed) st.trailArmed = false
+          st.trailPeak = undefined
+        } else if (posEntry != null) {
+          // Prefer a LIVE quote for the mark: the broker position snapshot's
+          // current_price can LAG badly on paper crypto (observed minutes
+          // stale while the market moved ~0.1%) — a trailing stop must track
+          // the market. Quote failure falls back to the position mark; no
+          // mark at all → the trail simply waits a cycle (fail-safe: the
+          // broker SL bracket remains).
+          let cur = posCur
+          try {
+            const { quotes } = await getQuotes([run.symbol], run.userId, { trading: true })
+            const q = quotes.find((x) => x.symbol === run.symbol)
+            const qp = q?.price
+            if (qp != null && Number.isFinite(qp) && qp > 0) cur = qp
+          } catch { /* keep the position mark */ }
+          if (cur != null) {
+            const dirLong = pos.side === 'long'
+            const profitPct = ((dirLong ? cur - posEntry : posEntry - cur) / posEntry) * 100
+            if (!st.trailArmed) {
+              if (profitPct >= (run.trailArmPct as number)) {
+                st.trailArmed = true
+                st.trailPeak = cur
+                await log(runId, run.userId, 'signal', `Trail armed — ${pos.side} ${run.symbol} ${pos.qty} +${profitPct.toFixed(2)}% ≥ arm +${run.trailArmPct}% · now trailing ${run.trailGivePct}% behind the best price`)
+              }
+            } else {
+              // one price sample per cycle: extend the peak, then judge the
+              // give-back against it (a fresh sample can't both extend and breach)
+              const prevPeak = st.trailPeak
+              st.trailPeak = dirLong
+                ? Math.max(prevPeak ?? cur, cur)
+                : Math.min(prevPeak ?? cur, cur)
+              const stopPx = dirLong
+                ? (st.trailPeak as number) * (1 - (run.trailGivePct as number) / 100)
+                : (st.trailPeak as number) * (1 + (run.trailGivePct as number) / 100)
+              const breached = dirLong ? cur <= stopPx : cur >= stopPx
+              if (breached) {
+                const f = await flattenPosition(run.userId, mode, run.symbol)
+                if (f.ok) {
+                  await log(runId, run.userId, 'trade', `EXIT ${pos.side} ${pos.qty} ${run.symbol} — trail stop: gave back ${run.trailGivePct}% from best ${fmtP(st.trailPeak as number)} (entry ${fmtP(posEntry)} → closed ${profitPct >= 0 ? '+' : ''}${profitPct.toFixed(2)}%)${f.note}`)
+                  pos = null
+                  st.trailArmed = false
+                  st.trailPeak = undefined
+                } else {
+                  await log(runId, run.userId, 'error', `Trail stop close failed: ${f.note}`)
+                }
+              }
+            }
+          }
+        }
       }
     }
 
@@ -949,6 +1044,10 @@ export async function startAlgoRun(cfg: {
   /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
   tpTf: string | null
   slTf: string | null
+  // v1.97.0 — trailing exit config ('off' | 'pct' + arm/give %)
+  trailMode: string
+  trailArmPct: number | null
+  trailGivePct: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -976,6 +1075,11 @@ export async function startAlgoRun(cfg: {
       // v1.96.0 — ATR timeframes (null unless the mode is 'atr')
       tpTf: cfg.tpMode === 'atr' ? (cfg.tpTf ?? null) : null,
       slTf: cfg.slMode === 'atr' ? (cfg.slTf ?? null) : null,
+      // v1.97.0 — trailing exit (values only stored when the mode is 'pct';
+      // the engine treats a 'pct' mode with missing/≤0 values as off)
+      trailMode: cfg.trailMode === 'pct' ? 'pct' : 'off',
+      trailArmPct: cfg.trailMode === 'pct' ? cfg.trailArmPct : null,
+      trailGivePct: cfg.trailMode === 'pct' ? cfg.trailGivePct : null,
       maxTradesDay: cfg.maxTradesDay,
       rthOnly: cfg.rthOnly,
       flattenEod: cfg.flattenEod,
@@ -990,8 +1094,8 @@ export async function startAlgoRun(cfg: {
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', autostart
-    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}`
-    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''} — press Start to begin trading`)
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
+    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
   if (autostart) startEngine(run.id)
   return run
 }
@@ -1021,6 +1125,10 @@ export interface AlgoRunConfigPatch {
   /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
   tpTf: string | null
   slTf: string | null
+  // v1.97.0 — trailing exit config ('off' | 'pct' + arm/give %)
+  trailMode: string
+  trailArmPct: number | null
+  trailGivePct: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -1036,6 +1144,15 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   const identityChanged = run.symbol !== patch.symbol || run.timeframe !== patch.timeframe || run.strategy !== patch.strategy
 
   const st = (run.state && typeof run.state === 'object' ? run.state : {}) as AlgoState
+  const trailCfgChanged = run.trailMode !== patch.trailMode
+    || run.trailArmPct !== patch.trailArmPct
+    || run.trailGivePct !== patch.trailGivePct
+  if (trailCfgChanged) {
+    // a changed trail re-arms from scratch — a stale peak from the old
+    // give-back would judge the NEW trail against the OLD memory
+    st.trailArmed = false
+    st.trailPeak = undefined
+  }
   if (identityChanged) {
     // instrument/strategy switch → forget session memory + signal edges so
     // the next cycle starts clean on the new instrument/strategy (Task 89:
@@ -1054,6 +1171,8 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
     st.prevShortSignal = false
     st.freshGateSide = undefined
     st.lastGate = undefined
+    st.trailArmed = false
+    st.trailPeak = undefined
   }
 
   // one journal line describing the edit (old → new per changed field)
@@ -1084,6 +1203,12 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.slMode !== patch.slMode || run.slValue !== patch.slValue || run.slTf !== patch.slTf) {
     diffs.push(`SL ${exitDiffLabel(run.slMode, run.slValue, run.slTf)} → ${exitDiffLabel(patch.slMode, patch.slValue, patch.slTf)}`)
   }
+  // v1.97.0 — trailing exit diff
+  const trailDiffLabel = (m: string, arm: number | null, give: number | null) =>
+    m === 'pct' && arm != null && give != null ? `arm +${arm}% · give back ${give}%` : 'off'
+  if (trailCfgChanged) {
+    diffs.push(`trail ${trailDiffLabel(run.trailMode, run.trailArmPct, run.trailGivePct)} → ${trailDiffLabel(patch.trailMode, patch.trailArmPct, patch.trailGivePct)}`)
+  }
   if (run.maxTradesDay !== patch.maxTradesDay) diffs.push(`max trades/day ${run.maxTradesDay} → ${patch.maxTradesDay}`)
   if (run.rthOnly !== patch.rthOnly) diffs.push(`RTH only ${run.rthOnly ? 'ON' : 'OFF'} → ${patch.rthOnly ? 'ON' : 'OFF'}`)
   if (run.flattenEod !== patch.flattenEod) diffs.push(`EOD flatten ${run.flattenEod ? 'ON' : 'OFF'} → ${patch.flattenEod ? 'ON' : 'OFF'}`)
@@ -1112,6 +1237,10 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       // v1.96.0 — ATR timeframes follow their mode (null when not 'atr')
       tpTf: patch.tpMode === 'atr' ? (patch.tpTf ?? null) : null,
       slTf: patch.slMode === 'atr' ? (patch.slTf ?? null) : null,
+      // v1.97.0 — trailing exit follows its mode (values null when not 'pct')
+      trailMode: patch.trailMode === 'pct' && patch.trailArmPct != null && patch.trailGivePct != null ? 'pct' : 'off',
+      trailArmPct: patch.trailMode === 'pct' ? patch.trailArmPct : null,
+      trailGivePct: patch.trailMode === 'pct' ? patch.trailGivePct : null,
       maxTradesDay: patch.maxTradesDay,
       rthOnly: patch.rthOnly,
       flattenEod: patch.flattenEod,

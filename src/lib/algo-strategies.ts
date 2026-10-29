@@ -362,6 +362,11 @@ export interface AlpoRunConfig {
   /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
   tpTf?: string | null
   slTf?: string | null
+  // v1.97.0 — trailing exit ('off' | 'pct'): arm = profit % needed to arm,
+  // give = give-back % from the best price since arming (null when off)
+  trailMode: 'off' | 'pct'
+  trailArmPct: number | null
+  trailGivePct: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -441,6 +446,10 @@ export interface AlgoRunLike {
   // v1.96.0 — ATR(14) timeframes when the mode is 'atr' (optional: legacy rows)
   tpTf?: string | null
   slTf?: string | null
+  // v1.97.0 — trailing exit (optional: legacy rows/DTOs pre-trailing)
+  trailMode?: string
+  trailArmPct?: number | null
+  trailGivePct?: number | null
 }
 
 /** Human label used as the default entry name ("BB + RSI Mean Reversion · TSLA 5m").
@@ -493,6 +502,11 @@ export function runToAlgoConfig(run: AlgoRunLike): AlpoRunConfig {
     slMode: run.slMode === 'pct' ? 'pct' : run.slMode === 'atr' ? 'atr' : 'none',
     slValue: run.slMode === 'pct' || run.slMode === 'atr' ? run.slValue : null,
     slTf: run.slMode === 'atr' ? (run.slTf ?? null) : null,
+    trailMode: run.trailMode === 'pct'
+      && run.trailArmPct != null && run.trailArmPct > 0
+      && run.trailGivePct != null && run.trailGivePct > 0 ? 'pct' : 'off',
+    trailArmPct: run.trailMode === 'pct' ? (run.trailArmPct ?? null) : null,
+    trailGivePct: run.trailMode === 'pct' ? (run.trailGivePct ?? null) : null,
     maxTradesDay: run.maxTradesDay,
     rthOnly: run.rthOnly,
     flattenEod: run.flattenEod,
@@ -604,6 +618,13 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
     slValue: r.slMode === 'pct' ? slRaw : r.slMode === 'atr' ? slMult : null,
     slTf: r.slMode === 'atr' && slMult != null
       ? (typeof r.slTf === 'string' && r.slTf in TIMEFRAMES ? r.slTf : '1h') : null,
+    // v1.97.0 — trailing exit: liberal like the brackets — 'pct' only sticks
+    // when BOTH values clamp clean, anything else degrades to 'off' (the
+    // engine then simply doesn't trail; the broker bracket remains)
+    trailMode: r.trailMode === 'pct' && clampPct(r.trailArmPct) != null && clampPct(r.trailGivePct) != null
+      ? 'pct' : 'off',
+    trailArmPct: r.trailMode === 'pct' ? clampPct(r.trailArmPct) : null,
+    trailGivePct: r.trailMode === 'pct' ? clampPct(r.trailGivePct) : null,
     maxTradesDay: Math.min(50, Math.max(1, Math.round(Number(r.maxTradesDay) || 3))),
     rthOnly: r.rthOnly !== false,
     flattenEod: r.flattenEod !== false,

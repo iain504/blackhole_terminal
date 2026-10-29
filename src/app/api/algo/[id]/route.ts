@@ -55,6 +55,9 @@ interface AlgoPatchBody {
   slValue?: number
   tpTf?: string | null
   slTf?: string | null
+  trailMode?: string
+  trailArmPct?: number
+  trailGivePct?: number
   maxTradesDay?: number
   rthOnly?: boolean
   flattenEod?: boolean
@@ -142,6 +145,17 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
     if (typeof tpLeg === 'string') return NextResponse.json({ error: tpLeg }, { status: 400 })
     const slLeg = parseExitLeg(body?.slMode, body?.slValue, body?.slTf, 'SL')
     if (typeof slLeg === 'string') return NextResponse.json({ error: slLeg }, { status: 400 })
+    // v1.97.0 — trailing exit validation mirrors POST /api/algo exactly
+    const trailMode = body?.trailMode === 'pct' ? 'pct' : 'off'
+    let trailArmPct: number | null = null
+    let trailGivePct: number | null = null
+    if (trailMode === 'pct') {
+      trailArmPct = clampPct(body?.trailArmPct)
+      trailGivePct = clampPct(body?.trailGivePct)
+      if (trailArmPct == null || trailGivePct == null) {
+        return NextResponse.json({ error: 'Trailing exit needs a positive arm % and a positive give-back % when trail mode is pct' }, { status: 400 })
+      }
+    }
     if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
@@ -161,6 +175,9 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       slMode: slLeg.mode,
       slValue: slLeg.value,
       slTf: slLeg.tf,
+      trailMode,
+      trailArmPct,
+      trailGivePct,
       maxTradesDay: Math.min(50, Math.max(1, Math.round(Number(body?.maxTradesDay) || 3))),
       rthOnly: body?.rthOnly !== false,
       flattenEod: body?.flattenEod !== false,

@@ -62,6 +62,10 @@ export default function AlgoRunSettingsDialog({
   const [tpAtrTf, setTpAtrTf] = useState('1h')
   const [slUnit, setSlUnit] = useState<'pct' | 'atr'>('pct')
   const [slAtrTf, setSlAtrTf] = useState('1h')
+  // v1.97.0 — trailing exit (mirrors the run setup form)
+  const [trailOn, setTrailOn] = useState(false)
+  const [trailArm, setTrailArm] = useState('0.5')
+  const [trailGive, setTrailGive] = useState('0.3')
   const [maxTradesDay, setMaxTradesDay] = useState('3')
   const [rthOnly, setRthOnly] = useState(true)
   const [flattenEod, setFlattenEod] = useState(true)
@@ -93,6 +97,9 @@ export default function AlgoRunSettingsDialog({
     setSlUnit(run.slMode === 'atr' ? 'atr' : 'pct')
     setSlPct(run.slValue != null ? String(run.slValue) : '1')
     setSlAtrTf(run.slMode === 'atr' ? (run.slTf ?? '1h') : '1h')
+    setTrailOn(run.trailMode === 'pct' && run.trailArmPct != null && run.trailGivePct != null)
+    setTrailArm(run.trailArmPct != null ? String(run.trailArmPct) : '0.5')
+    setTrailGive(run.trailGivePct != null ? String(run.trailGivePct) : '0.3')
     setMaxTradesDay(String(run.maxTradesDay))
     setRthOnly(run.rthOnly)
     setFlattenEod(run.flattenEod)
@@ -129,6 +136,9 @@ export default function AlgoRunSettingsDialog({
   const slInvalid = slOn && (slUnit === 'atr' ? !slMultOk : !(Number(slPct) > 0))
   const tpInvalidMsg = tpUnit === 'atr' ? 'TP ATR multiplier must be between 0.1 and 20' : 'TP % required when TP is on'
   const slInvalidMsg = slUnit === 'atr' ? 'SL ATR multiplier must be between 0.1 and 20' : 'SL % required when SL is on'
+  // v1.97.0 — trailing exit needs BOTH percents when on (the API 400s otherwise)
+  const trailInvalid = trailOn && (!(Number(trailArm) > 0) || !(Number(trailGive) > 0))
+  const trailInvalidMsg = 'Trailing exit needs a positive arm % and a positive give-back %'
 
   const save = async () => {
     if (!run) return
@@ -153,6 +163,9 @@ export default function AlgoRunSettingsDialog({
           slMode: slOn ? (slUnit === 'atr' ? 'atr' : 'pct') : 'none',
           slValue: slOn ? Number(slPct) : null,
           slTf: slOn && slUnit === 'atr' ? slAtrTf : null,
+          trailMode: trailOn ? 'pct' : 'off',
+          trailArmPct: trailOn ? Number(trailArm) : null,
+          trailGivePct: trailOn ? Number(trailGive) : null,
           maxTradesDay: Number(maxTradesDay) || 3,
           // crypto symbols trade 24/7 — the equity session guards never apply
           rthOnly: !isCryptoRun && rthOnly,
@@ -423,6 +436,48 @@ export default function AlgoRunSettingsDialog({
             </div>
           </div>
 
+          {/* v1.97.0 — trailing exit (engine-managed; arms once in profit) */}
+          <div className="rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[11px] text-zinc-300">Trailing exit</p>
+                <p className="text-[10px] leading-snug text-zinc-500">arms once in profit ≥ arm % · closes on a give-back from the best price since — checked every 15s while the run is running (applies to the OPEN position too; the SL/TP bracket stays as the catastrophic stop)</p>
+              </div>
+              <Switch checked={trailOn} onCheckedChange={setTrailOn} className="scale-90 shrink-0" aria-label="Trailing exit" />
+            </div>
+            {trailOn && (
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                <div>
+                  <Label htmlFor="rs-trail-arm" className="text-[10px] text-zinc-500">Arm after profit (%)</Label>
+                  <Input
+                    id="rs-trail-arm"
+                    value={trailArm}
+                    onChange={(e) => setTrailArm(e.target.value)}
+                    onBlur={() => setTrailArm(String(Math.min(100, Math.max(0.01, Number(trailArm) || 0))))}
+                    inputMode="decimal"
+                    aria-label="Trailing arm threshold — percent profit needed before the trail engages"
+                    aria-invalid={trailOn && !(Number(trailArm) > 0) ? true : undefined}
+                    className="mt-1 h-7 border-zinc-800 bg-zinc-950 text-xs"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="rs-trail-give" className="text-[10px] text-zinc-500">Give-back trail (%)</Label>
+                  <Input
+                    id="rs-trail-give"
+                    value={trailGive}
+                    onChange={(e) => setTrailGive(e.target.value)}
+                    onBlur={() => setTrailGive(String(Math.min(100, Math.max(0.01, Number(trailGive) || 0))))}
+                    inputMode="decimal"
+                    aria-label="Trailing give-back — percent retrace from the best price that closes the position"
+                    aria-invalid={trailOn && !(Number(trailGive) > 0) ? true : undefined}
+                    className="mt-1 h-7 border-zinc-800 bg-zinc-950 text-xs"
+                  />
+                </div>
+              </div>
+            )}
+            {trailInvalid && <p className="mt-0.5 text-[10px] leading-snug text-rose-400">{trailInvalidMsg}</p>}
+          </div>
+
           {/* session guards — equity concepts; crypto runs 24/7 and shows them disabled */}
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
@@ -528,7 +583,7 @@ export default function AlgoRunSettingsDialog({
           <Button
             size="sm"
             className="h-8 gap-1.5 bg-sky-600 px-3 text-[11px] text-white hover:bg-sky-500"
-            disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid}
+            disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid || trailInvalid}
             title={!riskOk
               ? 'Risk sizing needs a positive risk $ / % and an SL bracket (any mode)'
               : tpInvalid

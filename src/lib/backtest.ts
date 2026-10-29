@@ -94,6 +94,13 @@ export interface BacktestConfig {
   tpValue: number | null
   slMode: 'none' | 'pct' | 'atr'
   slValue: number | null
+  // v1.97.0 — trailing exit (mirrors the live engine): arms once a bar CLOSE
+  // is in profit ≥ trailArmPct % from the fill, then tracks the best price
+  // with bar high/low and exits when price gives back trailGivePct % from
+  // that peak (stop-market at the stop level). Optional for old probes.
+  trailMode?: 'off' | 'pct'
+  trailArmPct?: number | null
+  trailGivePct?: number | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -489,6 +496,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     entryTime: number
     tpPx: number | null
     slPx: number | null
+    // v1.97.0 — trailing exit memory (mirrors run.state.trailArmed/trailPeak)
+    trailArmed: boolean
+    trailPeak: number | null
   }
   interface Pending {
     side: 1 | -1
@@ -691,6 +701,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
               ? atrPx(cfg.tpValue, true)
               : null,
           slPx,
+          trailArmed: false,
+          trailPeak: null,
         }
         // Task 89 — parity: counted when the fill SURVIVES the dust check
         // (see the signal-time comment above) — tradesToday AND orb15's
@@ -723,23 +735,64 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // ---- 3) resting TP/SL intrabar (stop assumed first — worst case) —
     //         skipped on the EOD gate bar, the position is already flat
     if (pos && !eodGate) {
+      // v1.97.0 — trailing exit bookkeeping (mirrors the live engine's cycle
+      // trail, discretized to bars). Arm on a bar CLOSE in profit ≥ arm%
+      // (conservative — no intrabar arming), peak from the ARM bar's close,
+      // then judge the give-back against the PREVIOUS peak with this bar's
+      // low/high BEFORE extending it with the bar's high/low (worst-case
+      // ordering: the unknown intrabar path can't flatter the model).
+      const trailOn = cfg.trailMode === 'pct' && (cfg.trailArmPct ?? 0) > 0 && (cfg.trailGivePct ?? 0) > 0
+      let trailStopPx: number | null = null
+      if (trailOn) {
+        const arm = (cfg.trailArmPct as number) / 100
+        const give = (cfg.trailGivePct as number) / 100
+        if (pos.side === 1) {
+          if (!pos.trailArmed && bar.close >= pos.entryPx * (1 + arm)) {
+            pos.trailArmed = true
+            pos.trailPeak = bar.close
+          } else if (pos.trailArmed && pos.trailPeak != null) {
+            trailStopPx = pos.trailPeak * (1 - give)
+          }
+        } else {
+          if (!pos.trailArmed && bar.close <= pos.entryPx * (1 - arm)) {
+            pos.trailArmed = true
+            pos.trailPeak = bar.close
+          } else if (pos.trailArmed && pos.trailPeak != null) {
+            trailStopPx = pos.trailPeak * (1 + give)
+          }
+        }
+      }
       let exitPx: number | null = null
       let reason = ''
       if (pos.side === 1) {
-        if (pos.slPx != null && bar.low <= pos.slPx) {
+        // among simultaneous stop breaches the HIGHER stop is the one a
+        // falling price hits first (fixed SL vs the trailing stop)
+        let stopPx: number | null = null
+        let stopReason = ''
+        if (pos.slPx != null && bar.low <= pos.slPx) { stopPx = pos.slPx; stopReason = 'stop loss' }
+        if (trailStopPx != null && bar.low <= trailStopPx && (stopPx == null || trailStopPx > stopPx)) {
+          stopPx = trailStopPx; stopReason = 'trailing stop'
+        }
+        if (stopPx != null) {
           recordFill(i, false) // stop-market sell — pays the full market cost
-          exitPx = slipPx(i, pos.slPx, -1) // stop-market sell — adverse drift
-          reason = 'stop loss'
+          exitPx = slipPx(i, stopPx, -1) // stop-market sell — adverse drift
+          reason = stopReason
         } else if (pos.tpPx != null && bar.high >= pos.tpPx) {
           recordFill(i, true) // resting LIMIT — fills at its price (fee only)
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
           reason = 'take profit'
         }
       } else {
-        if (pos.slPx != null && bar.high >= pos.slPx) {
+        let stopPx: number | null = null
+        let stopReason = ''
+        if (pos.slPx != null && bar.high >= pos.slPx) { stopPx = pos.slPx; stopReason = 'stop loss' }
+        if (trailStopPx != null && bar.high >= trailStopPx && (stopPx == null || trailStopPx < stopPx)) {
+          stopPx = trailStopPx; stopReason = 'trailing stop'
+        }
+        if (stopPx != null) {
           recordFill(i, false) // stop-market buy-back — pays the full market cost
-          exitPx = slipPx(i, pos.slPx, 1) // stop-market buy-back — adverse drift
-          reason = 'stop loss'
+          exitPx = slipPx(i, stopPx, 1) // stop-market buy-back — adverse drift
+          reason = stopReason
         } else if (pos.tpPx != null && bar.low <= pos.tpPx) {
           recordFill(i, true) // resting LIMIT — fills at its price (fee only)
           exitPx = pos.tpPx // resting LIMIT — fills at its price, no drift
@@ -749,6 +802,11 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       if (exitPx != null) {
         closeTrade(pos, exitPx, bar.time, reason)
         pos = null
+      } else if (pos.trailArmed && pos.trailPeak != null) {
+        // position survived the bar → the peak extends with the bar's extreme
+        pos.trailPeak = pos.side === 1
+          ? Math.max(pos.trailPeak, bar.high)
+          : Math.min(pos.trailPeak, bar.low)
       }
     }
 
