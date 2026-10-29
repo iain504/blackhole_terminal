@@ -26,7 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import {
-  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices, ShieldCheck,
+  FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, TrendingDown, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices, ShieldCheck,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -46,7 +46,7 @@ import {
   type AlgoRegimePresetId,
   type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
-import type { BacktestResult, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
+import type { BacktestResult, BacktestMetrics, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
 import type { MonteCarloResult, RegimeGateStats } from '@/lib/algo-regime'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
@@ -238,6 +238,11 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   // gate forced off so the gated run can be quantified against its raw baseline
   const [abRes, setAbRes] = useState<{ netPct: number; trades: number; profitFactor: number; winRate: number } | null>(null)
   const [abBusy, setAbBusy] = useState(false)
+  // v1.98.0 — trailing PROOF A/B: re-runs the SAME config with the trail forced
+  // off (the pre-1.97 exit behavior) so the trail's impact on THIS window is
+  // measured, not guessed. Only meaningful when the run setup has the trail on.
+  const [trailAbRes, setTrailAbRes] = useState<BacktestMetrics | null>(null)
+  const [trailAbBusy, setTrailAbBusy] = useState(false)
   // win/loss breakdown granularity (Task 71-2)
   const [wlGran, setWlGran] = useState<BtGran>('hour')
 
@@ -473,6 +478,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setMcRes(j.mc ?? null)
       setOptRes(null)
       setAbRes(null) // a fresh baseline invalidates the gates-off A/B
+      setTrailAbRes(null) // a fresh run invalidates the trail-proof A/B
     } else if (mode === 'optimize') {
       setOptRes(j.optimize ?? null)
       setRunRes(null)
@@ -652,6 +658,33 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       toast({ title: 'A/B run failed', description: 'Network error', variant: 'destructive' })
     } finally {
       setAbBusy(false)
+    }
+  }
+
+  // v1.98.0 — trailing PROOF A/B ("prove the performance before and after
+  // trailing applied"): replays the EXACT same window/config with trailMode
+  // forced off — the pre-trailing engine — and keeps its metrics so the card
+  // below can render BEFORE vs AFTER side by side. Same inline-request pattern
+  // as the gates A/B: one fast sim on the 2-min-cached bars.
+  const runTrailAb = async () => {
+    setTrailAbBusy(true)
+    try {
+      const res = await fetch('/api/algo/backtest', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...payload, mode: 'run', trailMode: 'off', trailArmPct: null, trailGivePct: null }),
+      })
+      const json = await res.json().catch(() => null)
+      const mm = (json as { result?: { metrics?: BacktestMetrics } } | null)?.result?.metrics
+      if (!res.ok || !mm) {
+        toast({ title: 'Trail A/B run failed', description: (json as { error?: string } | null)?.error || `HTTP ${res.status}`, variant: 'destructive' })
+        return
+      }
+      setTrailAbRes(mm)
+    } catch {
+      toast({ title: 'Trail A/B run failed', description: 'Network error', variant: 'destructive' })
+    } finally {
+      setTrailAbBusy(false)
     }
   }
 
@@ -1281,6 +1314,85 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </div>
             )
           })()}
+
+          {/* v1.98.0 — trailing exit PROOF ("prove the performance before and
+              after trailing applied"): BEFORE = the same window replayed with
+              the trail off (the pre-1.97 engine); AFTER = this run's trail-on
+              result. Same bars, same strategy, same SL — the ONLY difference
+              is the trailing exit, so the delta IS the trail's effect. */}
+          {cfg.trailMode === 'pct' && (cfg.trailArmPct ?? 0) > 0 && (cfg.trailGivePct ?? 0) > 0 && (
+            <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <TrendingDown className="h-3.5 w-3.5 text-cyan-400" aria-hidden />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Trailing exit proof</span>
+                <Badge
+                  variant="outline"
+                  className="text-[10px] text-cyan-300/90"
+                  title="Arms once a close is in profit ≥ arm% from entry, then market-closes on a give-back % from the best price since (engine-managed every 15s)"
+                >
+                  arm {cfg.trailArmPct}% · give {cfg.trailGivePct}%
+                </Badge>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="ml-auto h-6 gap-1 border-zinc-700 px-2 text-[10px] text-zinc-300 hover:bg-zinc-800"
+                  disabled={trailAbBusy || busy !== null}
+                  title="Replay the EXACT same window with the trailing exit forced off — the honest 'before' that quantifies what the trail changed"
+                  onClick={() => void runTrailAb()}
+                >
+                  {trailAbBusy ? <RefreshCw className="h-3 w-3 animate-spin" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
+                  A/B: trail off
+                </Button>
+              </div>
+              {trailAbRes && m && (() => {
+                const trailTrades = (runRes?.trades ?? []).filter((t) => t.exitReason === 'trailing stop')
+                const trailAvg = trailTrades.length ? trailTrades.reduce((s, t) => s + t.pnlPct, 0) / trailTrades.length : 0
+                const b = trailAbRes
+                const row = (label: string, offV: string, onV: string, d: number | null, fmt: (v: number) => string, better: 'up' | 'down' | 'none') => (
+                  <div key={label} className="contents">
+                    <span className="text-zinc-500">{label}</span>
+                    <span className="tabular-nums text-zinc-300">{offV}</span>
+                    <span className="font-medium tabular-nums text-zinc-100">{onV}</span>
+                    <span className={cn('tabular-nums', d == null || d === 0 ? 'text-zinc-500' : better === 'up' ? (d > 0 ? 'text-emerald-400' : 'text-rose-400') : better === 'down' ? (d < 0 ? 'text-emerald-400' : 'text-rose-400') : 'text-zinc-500')}>
+                      {d == null ? '—' : fmt(d)}
+                    </span>
+                  </div>
+                )
+                const holdF = (min: number) => (min < 90 ? `${Math.round(min)}m` : `${(min / 60).toFixed(1)}h`)
+                return (
+                  <>
+                    <div className="mt-2 grid grid-cols-[minmax(5rem,auto)_1fr_1fr_1fr] gap-x-3 gap-y-1 text-[11px]">
+                      <span />
+                      <span className="text-[10px] uppercase tracking-wider text-zinc-500">before · trail off</span>
+                      <span className="text-[10px] uppercase tracking-wider text-cyan-300/90">after · trail on</span>
+                      <span className="text-[10px] uppercase tracking-wider text-zinc-500">Δ</span>
+                      {row('Net P&L', fmtPct(b.netPct), fmtPct(m.netPct), m.netPct - b.netPct, fmtPct, 'up')}
+                      {row('Trades', String(b.trades), String(m.trades), m.trades - b.trades, (v) => (v > 0 ? `+${v}` : String(v)), 'none')}
+                      {row('Win rate', `${b.winRate.toFixed(0)}%`, `${m.winRate.toFixed(0)}%`, m.winRate - b.winRate, (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}pp`, 'up')}
+                      {row('Profit factor', b.profitFactor >= 999 ? '∞' : b.profitFactor.toFixed(2), m.profitFactor >= 999 ? '∞' : m.profitFactor.toFixed(2), m.profitFactor - b.profitFactor, (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`, 'up')}
+                      {row('Max drawdown', fmtPct(-b.maxDrawdownPct), fmtPct(-m.maxDrawdownPct), m.maxDrawdownPct - b.maxDrawdownPct, (v) => `${v > 0 ? '+' : ''}${v.toFixed(2)}pp`, 'down')}
+                      {row('Expectancy', fmtUsd(b.expectancy), fmtUsd(m.expectancy), m.expectancy - b.expectancy, (v) => `${v >= 0 ? '+' : ''}$${Math.abs(v).toFixed(2)}`, 'up')}
+                      {row('Avg hold', holdF(b.avgHoldMin), holdF(m.avgHoldMin), null, () => '', 'none')}
+                    </div>
+                    <p className="mt-1.5 text-[10px] leading-snug text-zinc-400">
+                      {trailTrades.length === 0
+                        ? 'The trail never armed on this window — the strategy\'s own exits resolved before the arm threshold, so before/after are identical by construction. Tighten the arm % if you want the trail to take over.'
+                        : `${trailTrades.length} trade${trailTrades.length === 1 ? '' : 's'} closed by the trail (avg ${fmtPct(trailAvg)} each). ${
+                            m.trades > b.trades + 2
+                              ? 'Banking winners sooner frees the slot for fresh entries — the trade count rose, so on a weak-edge window net P&L can fall even while every per-trade metric improves; judge the trail by expectancy and drawdown.'
+                              : 'Winners are banked on the way down instead of handed back to the market.'
+                          }`}
+                    </p>
+                  </>
+                )
+              })()}
+              {!trailAbRes && (
+                <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+                  Click to replay this exact window with the trail off — the "before" baseline. Same bars, same strategy, same SL bracket: the ONLY difference is the trailing exit, so every delta in the table is the trail's doing.
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Task 12 — Monte Carlo bootstrap (improvement plan P2): resample the
               realized trade sequence to estimate how much of the edge is luck */}
