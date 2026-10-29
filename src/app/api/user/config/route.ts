@@ -158,6 +158,8 @@ interface SanitizedStrategy {
   symbol: string; kind: string; condition: string; level: number
   timeframe: string; params: Prisma.InputJsonValue; action: string; qty: number
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null; slTf: string | null
   repeat: boolean
   status: string
 }
@@ -216,12 +218,15 @@ function sanitizeStrategy(raw: unknown): SanitizedStrategy | null {
   const action = r.action === 'sell' ? 'sell' : 'buy'
   const qty = num(r.qty)
   if (!Number.isFinite(qty) || qty <= 0) return null
-  const tpMode = ['none', 'price', 'pct'].includes(str(r.tpMode)) ? str(r.tpMode) : 'none'
-  const slMode = ['none', 'price', 'pct'].includes(str(r.slMode)) ? str(r.slMode) : 'none'
+  const tpMode = ['none', 'price', 'pct', 'atr'].includes(str(r.tpMode)) ? str(r.tpMode) : 'none'
+  const slMode = ['none', 'price', 'pct', 'atr'].includes(str(r.slMode)) ? str(r.slMode) : 'none'
   const tpValue = tpMode === 'none' ? null : num(r.tpValue)
   const slValue = slMode === 'none' ? null : num(r.slValue)
-  if (tpMode !== 'none' && (!tpValue || tpValue <= 0 || (tpMode === 'pct' && tpValue > 100))) return null
-  if (slMode !== 'none' && (!slValue || slValue <= 0 || (slMode === 'pct' && slValue > 100))) return null
+  if (tpMode !== 'none' && (!tpValue || tpValue <= 0 || (tpMode === 'pct' && tpValue > 100) || (tpMode === 'atr' && (tpValue < 0.1 || tpValue > 20)))) return null
+  if (slMode !== 'none' && (!slValue || slValue <= 0 || (slMode === 'pct' && slValue > 100) || (slMode === 'atr' && (slValue < 0.1 || slValue > 20)))) return null
+  // v1.96.0 — ATR(14) timeframes (validated chart timeframes, default '1h')
+  const atrTfValid = (tf: unknown): string | null =>
+    typeof tf === 'string' && tf in TIMEFRAMES ? tf : null
   let condition: string
   let level = num(r.level)
   if (!Number.isFinite(level)) level = 0
@@ -248,6 +253,8 @@ function sanitizeStrategy(raw: unknown): SanitizedStrategy | null {
     symbol, kind, condition, level: Math.round(level * 100) / 100,
     timeframe: validTf(r.timeframe), params, action, qty: Math.round(qty * 1e8) / 1e8,
     tpMode, tpValue, slMode, slValue,
+    tpTf: tpMode === 'atr' ? (atrTfValid(r.tpTf) ?? '1h') : null,
+    slTf: slMode === 'atr' ? (atrTfValid(r.slTf) ?? '1h') : null,
     repeat: Boolean(r.repeat),
     status,
   }

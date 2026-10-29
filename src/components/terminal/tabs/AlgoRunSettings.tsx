@@ -29,6 +29,7 @@ import {
   normalizeAlgoParams, type AlgoRiskBasis, type AlgoSizingMode, type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { Segmented } from '@/components/terminal/tabs/Segmented'
+import { ATR_TF_OPTIONS } from '@/lib/atr-client'
 import type { AlgoRunDto } from '@/app/api/algo/route'
 
 export default function AlgoRunSettingsDialog({
@@ -55,6 +56,12 @@ export default function AlgoRunSettingsDialog({
   const [tpPct, setTpPct] = useState('1.5')
   const [slOn, setSlOn] = useState(true)
   const [slPct, setSlPct] = useState('1')
+  // v1.96.0 — per-leg exit unit: 'pct' = % offset · 'atr' = multiplier of
+  // Wilder ATR(14) on the chosen timeframe (tpAtrTf/slAtrTf, default '1h')
+  const [tpUnit, setTpUnit] = useState<'pct' | 'atr'>('pct')
+  const [tpAtrTf, setTpAtrTf] = useState('1h')
+  const [slUnit, setSlUnit] = useState<'pct' | 'atr'>('pct')
+  const [slAtrTf, setSlAtrTf] = useState('1h')
   const [maxTradesDay, setMaxTradesDay] = useState('3')
   const [rthOnly, setRthOnly] = useState(true)
   const [flattenEod, setFlattenEod] = useState(true)
@@ -78,10 +85,14 @@ export default function AlgoRunSettingsDialog({
     setRiskBasis(run.riskBasis === 'pct' ? 'pct' : 'usd')
     setRiskMoney(run.riskMoney != null ? String(run.riskMoney) : '200')
     setRiskPct(run.riskMoneyPct != null ? String(run.riskMoneyPct) : '1')
-    setTpOn(run.tpMode === 'pct' && run.tpValue != null)
+    setTpOn((run.tpMode === 'pct' || run.tpMode === 'atr') && run.tpValue != null)
+    setTpUnit(run.tpMode === 'atr' ? 'atr' : 'pct')
     setTpPct(run.tpValue != null ? String(run.tpValue) : '1.5')
-    setSlOn(run.slMode === 'pct' && run.slValue != null)
+    setTpAtrTf(run.tpMode === 'atr' ? (run.tpTf ?? '1h') : '1h')
+    setSlOn((run.slMode === 'pct' || run.slMode === 'atr') && run.slValue != null)
+    setSlUnit(run.slMode === 'atr' ? 'atr' : 'pct')
     setSlPct(run.slValue != null ? String(run.slValue) : '1')
+    setSlAtrTf(run.slMode === 'atr' ? (run.slTf ?? '1h') : '1h')
     setMaxTradesDay(String(run.maxTradesDay))
     setRthOnly(run.rthOnly)
     setFlattenEod(run.flattenEod)
@@ -104,14 +115,20 @@ export default function AlgoRunSettingsDialog({
   // crypto symbols trade 24/7 — equity session guards are forced off + disabled
   const isCryptoRun = (run?.symbol ?? '').includes('/')
   const identityChanged = !!run && (symbol.trim().toUpperCase() !== run.symbol || timeframe !== run.timeframe || strategy !== run.strategy)
-  // risk sizing requires an SL % bracket — mirror the run setup's Start gate
+  // risk sizing requires an SL bracket (any mode — % or ×ATR; the engine
+  // resolves the stop distance at entry) — mirror the run setup's Start gate
   const riskBudgetOk = riskBasis === 'pct' ? Number(riskPct) > 0 : Number(riskMoney) > 0
   const riskOk = sizingMode === 'fixed' || (riskBudgetOk && slOn && Number(slPct) > 0)
-  // TP/SL gates — an enabled bracket with a 0/negative/junk % is refused by
-  // the server, so block Save (and show a hint) instead of silently
-  // degrading the leg to 'none' while the switch still reads ON
-  const tpInvalid = tpOn && !(Number(tpPct) > 0)
-  const slInvalid = slOn && !(Number(slPct) > 0)
+  // TP/SL gates — an enabled bracket with a 0/negative/junk value is refused
+  // by the server, so block Save (and show a hint) instead of silently
+  // degrading the leg to 'none' while the switch still reads ON.
+  // v1.96.0 — ATR legs must be a 0.1–20 multiplier (the API's bounds).
+  const tpMultOk = Number(tpPct) >= 0.1 && Number(tpPct) <= 20
+  const slMultOk = Number(slPct) >= 0.1 && Number(slPct) <= 20
+  const tpInvalid = tpOn && (tpUnit === 'atr' ? !tpMultOk : !(Number(tpPct) > 0))
+  const slInvalid = slOn && (slUnit === 'atr' ? !slMultOk : !(Number(slPct) > 0))
+  const tpInvalidMsg = tpUnit === 'atr' ? 'TP ATR multiplier must be between 0.1 and 20' : 'TP % required when TP is on'
+  const slInvalidMsg = slUnit === 'atr' ? 'SL ATR multiplier must be between 0.1 and 20' : 'SL % required when SL is on'
 
   const save = async () => {
     if (!run) return
@@ -130,10 +147,12 @@ export default function AlgoRunSettingsDialog({
           riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
           riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? Number(riskMoney) : null,
           riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? Number(riskPct) : null,
-          tpMode: tpOn ? 'pct' : 'none',
+          tpMode: tpOn ? (tpUnit === 'atr' ? 'atr' : 'pct') : 'none',
           tpValue: tpOn ? Number(tpPct) : null,
-          slMode: slOn ? 'pct' : 'none',
+          tpTf: tpOn && tpUnit === 'atr' ? tpAtrTf : null,
+          slMode: slOn ? (slUnit === 'atr' ? 'atr' : 'pct') : 'none',
           slValue: slOn ? Number(slPct) : null,
+          slTf: slOn && slUnit === 'atr' ? slAtrTf : null,
           maxTradesDay: Number(maxTradesDay) || 3,
           // crypto symbols trade 24/7 — the equity session guards never apply
           rthOnly: !isCryptoRun && rthOnly,
@@ -186,7 +205,7 @@ export default function AlgoRunSettingsDialog({
           </p>
         )}
         <p className="rounded border border-zinc-800 bg-zinc-950/60 px-2.5 py-1.5 text-[11px] leading-snug text-zinc-400">
-          % TP/SL applies to <span className="text-zinc-200">new entries</span> — a position opened earlier keeps the bracket it was entered with.
+          TP/SL applies to <span className="text-zinc-200">new entries</span> — a position opened earlier keeps the bracket it was entered with.
         </p>
 
         <div className="flex flex-col gap-2.5">
@@ -272,7 +291,7 @@ export default function AlgoRunSettingsDialog({
                   <p className={cn('text-[10px] leading-snug', slOn && Number(slPct) > 0 ? 'text-zinc-500' : 'text-amber-400')}>
                     {riskBasis === 'pct'
                       ? `% of account equity at risk per trade — resolved at each entry`
-                      : `$ at risk per trade — qty = risk ÷ (entry × SL%)`}
+                      : `$ at risk per trade — qty = risk ÷ (entry × SL distance)`}
                     {' '}· applies to new entries
                   </p>
                 </div>
@@ -311,39 +330,96 @@ export default function AlgoRunSettingsDialog({
             <Input id="rs-cap" value={maxTradesDay} onChange={(e) => setMaxTradesDay(e.target.value)} inputMode="numeric" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
           </div>
 
-          {/* TP / SL */}
+          {/* TP / SL — per-leg unit: % offset or ×ATR(14) multiplier */}
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
               <div className="flex items-center gap-2">
                 <Switch id="rs-tp" checked={tpOn} onCheckedChange={setTpOn} className="scale-90" />
-                <Label htmlFor="rs-tp" className="text-[11px] text-zinc-400">TP %</Label>
+                <Label htmlFor="rs-tp" className="text-[11px] text-zinc-400">{tpUnit === 'atr' ? 'TP ×ATR' : 'TP %'}</Label>
                 <Input
                   value={tpPct}
                   onChange={(e) => setTpPct(e.target.value)}
                   inputMode="decimal"
                   disabled={!tpOn}
-                  aria-label="Take profit percent"
+                  aria-label={tpUnit === 'atr' ? 'Take profit ATR multiplier (0.1–20)' : 'Take profit percent'}
                   aria-invalid={tpInvalid ? true : undefined}
                   className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs"
                 />
               </div>
-              {tpInvalid && <p className="text-[10px] leading-snug text-rose-400">TP % required when TP is on</p>}
+              <div className="flex items-center gap-1.5">
+                <Segmented
+                  ariaLabel="Take profit unit — percent or ATR multiplier"
+                  size="sm"
+                  value={tpUnit}
+                  onChange={(u) => {
+                    setTpUnit(u)
+                    // seed a sane default when the value does not fit the new unit
+                    if (u === 'atr' && !tpMultOk) setTpPct('1.5')
+                    if (u === 'pct' && !(Number(tpPct) > 0)) setTpPct('1.5')
+                  }}
+                  options={[
+                    { value: 'pct', label: '%', title: 'Percent offset from the entry price' },
+                    { value: 'atr', label: 'ATR', title: 'Multiplier of Wilder ATR(14) on the chosen timeframe' },
+                  ]}
+                />
+                {tpUnit === 'atr' && (
+                  <select
+                    value={tpAtrTf}
+                    onChange={(e) => setTpAtrTf(e.target.value)}
+                    aria-label="Take profit ATR timeframe"
+                    title="ATR(14) timeframe"
+                    disabled={!tpOn}
+                    className="h-6 rounded border border-zinc-800 bg-zinc-950 px-1 text-[10px] text-zinc-300 disabled:opacity-40"
+                  >
+                    {ATR_TF_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                )}
+              </div>
+              {tpInvalid && <p className="text-[10px] leading-snug text-rose-400">{tpInvalidMsg}</p>}
             </div>
             <div className="flex flex-col gap-1 rounded border border-zinc-800/70 bg-zinc-950/60 px-2 py-1.5">
               <div className="flex items-center gap-2">
                 <Switch id="rs-sl" checked={slOn} onCheckedChange={setSlOn} className="scale-90" />
-                <Label htmlFor="rs-sl" className="text-[11px] text-zinc-400">SL %</Label>
+                <Label htmlFor="rs-sl" className="text-[11px] text-zinc-400">{slUnit === 'atr' ? 'SL ×ATR' : 'SL %'}</Label>
                 <Input
                   value={slPct}
                   onChange={(e) => setSlPct(e.target.value)}
                   inputMode="decimal"
                   disabled={!slOn}
-                  aria-label="Stop loss percent"
+                  aria-label={slUnit === 'atr' ? 'Stop loss ATR multiplier (0.1–20)' : 'Stop loss percent'}
                   aria-invalid={slInvalid ? true : undefined}
                   className="h-7 w-14 border-zinc-800 bg-zinc-950 text-xs"
                 />
               </div>
-              {slInvalid && <p className="text-[10px] leading-snug text-rose-400">SL % required when SL is on</p>}
+              <div className="flex items-center gap-1.5">
+                <Segmented
+                  ariaLabel="Stop loss unit — percent or ATR multiplier"
+                  size="sm"
+                  value={slUnit}
+                  onChange={(u) => {
+                    setSlUnit(u)
+                    if (u === 'atr' && !slMultOk) setSlPct('1.5')
+                    if (u === 'pct' && !(Number(slPct) > 0)) setSlPct('1')
+                  }}
+                  options={[
+                    { value: 'pct', label: '%', title: 'Percent offset from the entry price' },
+                    { value: 'atr', label: 'ATR', title: 'Multiplier of Wilder ATR(14) on the chosen timeframe' },
+                  ]}
+                />
+                {slUnit === 'atr' && (
+                  <select
+                    value={slAtrTf}
+                    onChange={(e) => setSlAtrTf(e.target.value)}
+                    aria-label="Stop loss ATR timeframe"
+                    title="ATR(14) timeframe"
+                    disabled={!slOn}
+                    className="h-6 rounded border border-zinc-800 bg-zinc-950 px-1 text-[10px] text-zinc-300 disabled:opacity-40"
+                  >
+                    {ATR_TF_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                )}
+              </div>
+              {slInvalid && <p className="text-[10px] leading-snug text-rose-400">{slInvalidMsg}</p>}
             </div>
           </div>
 
@@ -454,11 +530,11 @@ export default function AlgoRunSettingsDialog({
             className="h-8 gap-1.5 bg-sky-600 px-3 text-[11px] text-white hover:bg-sky-500"
             disabled={saving || !symbol.trim() || !(Number(qty) > 0) || !riskOk || tpInvalid || slInvalid}
             title={!riskOk
-              ? 'Risk sizing needs a positive risk $ / % and an SL % bracket'
+              ? 'Risk sizing needs a positive risk $ / % and an SL bracket (any mode)'
               : tpInvalid
-                ? 'TP % required when TP is on'
+                ? tpInvalidMsg
                 : slInvalid
-                  ? 'SL % required when SL is on'
+                  ? slInvalidMsg
                   : undefined}
             onClick={() => void save()}
           >

@@ -358,10 +358,18 @@ async function computeBacktest(
     riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
     riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
     isCrypto: symbol.includes('/'),
-    tpMode: body.tpMode === 'pct' ? 'pct' : 'none',
-    tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0 ? Number(body.tpValue) : null,
-    slMode: body.slMode === 'pct' ? 'pct' : 'none',
-    slValue: body.slMode === 'pct' && Number(body.slValue) > 0 ? Number(body.slValue) : null,
+    tpMode: body.tpMode === 'pct' ? 'pct' : body.tpMode === 'atr' ? 'atr' : 'none',
+    tpValue: body.tpMode === 'pct' && Number(body.tpValue) > 0
+      ? Number(body.tpValue)
+      : body.tpMode === 'atr' && Number(body.tpValue) > 0
+        ? Math.min(20, Math.max(0.1, Number(body.tpValue)))
+        : null,
+    slMode: body.slMode === 'pct' ? 'pct' : body.slMode === 'atr' ? 'atr' : 'none',
+    slValue: body.slMode === 'pct' && Number(body.slValue) > 0
+      ? Number(body.slValue)
+      : body.slMode === 'atr' && Number(body.slValue) > 0
+        ? Math.min(20, Math.max(0.1, Number(body.slValue)))
+        : null,
     maxTradesDay,
     rthOnly: body.rthOnly !== false,
     flattenEod: body.flattenEod !== false,

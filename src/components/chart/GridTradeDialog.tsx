@@ -7,9 +7,11 @@
 // "Import setup" action (openWithImport → empty form + the import panel
 // expanded so a saved setup JSON can be pasted/uploaded).
 // Everything is editable before the grid starts: level count, spacing model,
-// per-grid size, optional whole-grid SL/TP circuit breakers (absolute price OR
-// percent of the range bounds — resolved exactly like the server:
-// SL trigger = lower × (1 − pct/100), TP trigger = upper × (1 + pct/100)) and
+// per-grid size, optional whole-grid SL/TP circuit breakers (absolute price,
+// percent of the range bounds, or a ×ATR(14) multiplier — resolved exactly
+// like the server:
+// SL trigger = lower × (1 − pct/100) / lower − mult×ATR(slTf), TP trigger =
+// upper × (1 + pct/100) / upper + mult×ATR(tpTf); sell grids mirror) and
 // whether a stop market-closes the open lots. A live preview line shows the
 // resulting step/ratio + capital commitment so mistakes are visible BEFORE
 // real orders. An in-dialog backtester (POST /api/grid/backtest) simulates the
@@ -38,13 +40,15 @@ import { useToast } from '@/hooks/use-toast'
 // pushed the header above the viewport on short screens.
 import { cn } from '@/lib/utils'
 import { fmtPrice } from '@/lib/market-types'
+import { fetchAtr, ATR_TF_OPTIONS, type AtrInfo } from '@/lib/atr-client'
 import { parseGridSetup, type GridSetup, type GridSetupDirection } from '@/lib/grid-setup'
 
 export type DialogDirection = GridSetupDirection
 
 /** Full config of a grid being edited (edit-when-flat, Task 10-b).
- * slBasis/tpBasis are optional API strings ('price' | 'percent') — rows created
- * before Task 10-a landed simply lack them (treated as 'price'). direction —
+ * slBasis/tpBasis are optional API strings ('price' | 'percent' | 'atr') — rows
+ * created before Task 10-a landed simply lack them (treated as 'price').
+ * slTf/tpTf (v1.96.0) ride along when the basis is 'atr'. direction —
  * pre-10-g rows lack it (treated as 'both'). */
 export interface GridEditTarget {
   id: string
@@ -58,6 +62,8 @@ export interface GridEditTarget {
   maxTP: number | null
   slBasis?: string | null
   tpBasis?: string | null
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string | null
   closeOnStop: boolean
 }
@@ -84,7 +90,14 @@ export interface GridTradeDialogProps {
   onApplySymbol?: (symbol: string) => void
 }
 
-type Basis = 'price' | 'percent'
+type Basis = 'price' | 'percent' | 'atr'
+
+const BASIS_LABEL: Record<Basis, string> = { price: 'Price', percent: '%', atr: 'ATR' }
+const BASIS_TITLE: Record<Basis, string> = {
+  price: 'Absolute price',
+  percent: 'Percent of the range bound',
+  atr: 'Multiplier of Wilder ATR(14) on the chosen timeframe',
+}
 
 // ---- backtest response (contract guaranteed by the backend, Task 10-a) ----
 interface BacktestStats {
@@ -131,17 +144,23 @@ type FormSetters = {
   setSlBasis: (v: Basis) => void
   setSlPrice: (v: string) => void
   setSlPct: (v: string) => void
+  setSlMult: (v: string) => void
+  setSlTf: (v: string) => void
   setTpOn: (v: boolean) => void
   setTpBasis: (v: Basis) => void
   setTpPrice: (v: string) => void
   setTpPct: (v: string) => void
+  setTpMult: (v: string) => void
+  setTpTf: (v: string) => void
   setCloseOnStop: (v: boolean) => void
 }
 
 /** Fill every form field from a parsed grid setup (Task 10-f import path). */
 function applySetupToForm(s: GridSetup, st: FormSetters) {
   const slIsPct = s.slBasis === 'percent'
+  const slIsAtr = s.slBasis === 'atr'
   const tpIsPct = s.tpBasis === 'percent'
+  const tpIsAtr = s.tpBasis === 'atr'
   st.setLower(String(s.lowerPrice))
   st.setUpper(String(s.upperPrice))
   st.setGridCount(String(s.gridCount))
@@ -149,13 +168,17 @@ function applySetupToForm(s: GridSetup, st: FormSetters) {
   st.setQty(String(s.qtyPerGrid))
   st.setDirection(s.direction)
   st.setSlOn(s.maxSL != null)
-  st.setSlBasis(slIsPct ? 'percent' : 'price')
-  st.setSlPrice(s.maxSL != null && !slIsPct ? String(s.maxSL) : '')
+  st.setSlBasis(slIsPct ? 'percent' : slIsAtr ? 'atr' : 'price')
+  st.setSlPrice(s.maxSL != null && !slIsPct && !slIsAtr ? String(s.maxSL) : '')
   st.setSlPct(s.maxSL != null && slIsPct ? String(s.maxSL) : '')
+  st.setSlMult(s.maxSL != null && slIsAtr ? String(s.maxSL) : '1.5')
+  st.setSlTf(s.slTf ?? '1h')
   st.setTpOn(s.maxTP != null)
-  st.setTpBasis(tpIsPct ? 'percent' : 'price')
-  st.setTpPrice(s.maxTP != null && !tpIsPct ? String(s.maxTP) : '')
+  st.setTpBasis(tpIsPct ? 'percent' : tpIsAtr ? 'atr' : 'price')
+  st.setTpPrice(s.maxTP != null && !tpIsPct && !tpIsAtr ? String(s.maxTP) : '')
   st.setTpPct(s.maxTP != null && tpIsPct ? String(s.maxTP) : '')
+  st.setTpMult(s.maxTP != null && tpIsAtr ? String(s.maxTP) : '1.5')
+  st.setTpTf(s.tpTf ?? '1h')
   st.setCloseOnStop(s.closeOnStop)
 }
 
@@ -262,7 +285,7 @@ const pnlCls = (v: number | null | undefined) =>
 const signed = (v: number | null | undefined, digits = 2) =>
   v == null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`
 
-/** Basis segmented toggle (Price | %) for the SL/TP rows — module-level so it
+/** Basis segmented toggle (Price | % | ATR) for the SL/TP rows — module-level so it
  * never remounts (a component defined inside the dialog body would get a new
  * identity on every keystroke). */
 function BasisToggle({ which, value, onChange, disabled }: {
@@ -273,20 +296,20 @@ function BasisToggle({ which, value, onChange, disabled }: {
 }) {
   return (
     <div role="group" aria-label={`${which === 'sl' ? 'Stop loss' : 'Take profit'} basis`} className="flex shrink-0 overflow-hidden rounded border border-zinc-800">
-      {(['price', 'percent'] as const).map((b) => (
+      {(['price', 'percent', 'atr'] as const).map((b) => (
         <button
           key={b}
           type="button"
           aria-pressed={value === b}
           disabled={disabled}
           onClick={() => onChange(b)}
-          title={b === 'price' ? 'Absolute price' : 'Percent of the range bound'}
+          title={BASIS_TITLE[b]}
           className={cn(
             'h-6 px-1.5 text-[10px] leading-none transition-colors disabled:opacity-40',
             value === b ? 'bg-emerald-500/20 text-emerald-400' : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300',
           )}
         >
-          {b === 'price' ? 'Price' : '%'}
+          {BASIS_LABEL[b]}
         </button>
       ))}
     </div>
@@ -308,12 +331,24 @@ export default function GridTradeDialog({
   const [slBasis, setSlBasis] = useState<Basis>('price')
   const [slPrice, setSlPrice] = useState('')
   const [slPct, setSlPct] = useState('')
+  // v1.96.0 — ATR basis: the value is a multiplier of Wilder ATR(14) (0.1–20)
+  // on slTf/tpTf (kept per-leg so switching basis never loses the other input)
+  const [slMult, setSlMult] = useState('1.5')
+  const [slTf, setSlTf] = useState('1h')
   const [tpOn, setTpOn] = useState(false)
   const [tpBasis, setTpBasis] = useState<Basis>('price')
   const [tpPrice, setTpPrice] = useState('')
   const [tpPct, setTpPct] = useState('')
+  const [tpMult, setTpMult] = useState('1.5')
+  const [tpTf, setTpTf] = useState('1h')
   const [closeOnStop, setCloseOnStop] = useState(true)
   const [submitting, setSubmitting] = useState(false)
+
+  // v1.96.0 — live ATR(14) info for the ≈ trigger preview while a leg's basis
+  // is 'atr' (re-fetched on activation / symbol / tf / multiplier change and
+  // every 30s while active — the route server-caches for 60s)
+  const [slAtr, setSlAtr] = useState<AtrInfo | null>(null)
+  const [tpAtr, setTpAtr] = useState<AtrInfo | null>(null)
 
   // ---- setup import (Task 10-f) ----
   const [importOpen, setImportOpen] = useState(false)
@@ -433,15 +468,21 @@ export default function GridTradeDialog({
       setQty(String(eg.qtyPerGrid))
       setDirection(eg.direction === 'buy' || eg.direction === 'sell' ? eg.direction : 'both')
       const slIsPct = eg.slBasis === 'percent'
+      const slIsAtr = eg.slBasis === 'atr'
       setSlOn(eg.maxSL != null)
-      setSlBasis(slIsPct ? 'percent' : 'price')
-      setSlPrice(eg.maxSL != null && !slIsPct ? String(eg.maxSL) : '')
+      setSlBasis(slIsAtr ? 'atr' : slIsPct ? 'percent' : 'price')
+      setSlPrice(eg.maxSL != null && !slIsPct && !slIsAtr ? String(eg.maxSL) : '')
       setSlPct(eg.maxSL != null && slIsPct ? String(eg.maxSL) : '')
+      setSlMult(eg.maxSL != null && slIsAtr ? String(eg.maxSL) : '1.5')
+      setSlTf(eg.slTf ?? '1h')
       const tpIsPct = eg.tpBasis === 'percent'
+      const tpIsAtr = eg.tpBasis === 'atr'
       setTpOn(eg.maxTP != null)
-      setTpBasis(tpIsPct ? 'percent' : 'price')
-      setTpPrice(eg.maxTP != null && !tpIsPct ? String(eg.maxTP) : '')
+      setTpBasis(tpIsAtr ? 'atr' : tpIsPct ? 'percent' : 'price')
+      setTpPrice(eg.maxTP != null && !tpIsPct && !tpIsAtr ? String(eg.maxTP) : '')
       setTpPct(eg.maxTP != null && tpIsPct ? String(eg.maxTP) : '')
+      setTpMult(eg.maxTP != null && tpIsAtr ? String(eg.maxTP) : '1.5')
+      setTpTf(eg.tpTf ?? '1h')
       setCloseOnStop(eg.closeOnStop)
     } else if (lowerPrice > 0 && upperPrice > 0) {
       setLower(String(Number(lowerPrice.toFixed(6))))
@@ -454,10 +495,14 @@ export default function GridTradeDialog({
       setSlBasis('price')
       setSlPrice('')
       setSlPct('')
+      setSlMult('1.5')
+      setSlTf('1h')
       setTpOn(false)
       setTpBasis('price')
       setTpPrice('')
       setTpPct('')
+      setTpMult('1.5')
+      setTpTf('1h')
       setCloseOnStop(true)
     } else {
       // import-first flow (Grid tab "Import setup"): no picked range — start
@@ -473,13 +518,38 @@ export default function GridTradeDialog({
       setSlBasis('price')
       setSlPrice('')
       setSlPct('')
+      setSlMult('1.5')
+      setSlTf('1h')
       setTpOn(false)
       setTpBasis('price')
       setTpPrice('')
       setTpPct('')
+      setTpMult('1.5')
+      setTpTf('1h')
       setCloseOnStop(true)
     }
   }, [open, editId, lowerPrice, upperPrice])
+
+  // v1.96.0 — pull the live ATR(14) while a leg's basis is 'atr': on
+  // activation, when the symbol/tf/multiplier changes, and every 30s
+  const slAtrActive = open && slOn && slBasis === 'atr'
+  useEffect(() => {
+    if (!slAtrActive) return
+    let alive = true
+    const pull = () => { void fetchAtr(symbol, slTf).then((a) => { if (alive) setSlAtr(a) }) }
+    pull()
+    const t = setInterval(pull, 30_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [slAtrActive, symbol, slTf, slMult])
+  const tpAtrActive = open && tpOn && tpBasis === 'atr'
+  useEffect(() => {
+    if (!tpAtrActive) return
+    let alive = true
+    const pull = () => { void fetchAtr(symbol, tpTf).then((a) => { if (alive) setTpAtr(a) }) }
+    pull()
+    const t = setInterval(pull, 30_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [tpAtrActive, symbol, tpTf, tpMult])
 
   // prices normalized to 2 decimal places (both here and defensively on submit)
   const lowerRaw = Number(lower)
@@ -505,25 +575,40 @@ export default function GridTradeDialog({
   // the engine uses: lower × (1 − pct/100) / upper × (1 + pct/100).
   // Task 10-g: sell-only grids MIRROR — SL% sits ABOVE the upper bound,
   // TP% BELOW the lower bound (short-side circuit breakers).
+  // v1.96.0 — ATR mode: the value is a 0.1–20 multiplier of Wilder ATR(14) on
+  // the leg's tf; the ≈ trigger preview resolves it with live ATR below.
   const sellGrid = direction === 'sell'
   const slN = Number(slPrice)
   const slPctN = Number(slPct)
   const tpN = Number(tpPrice)
   const tpPctN = Number(tpPct)
+  const slMultN = Number(slMult)
+  const tpMultN = Number(tpMult)
   const slPctValid = Number.isFinite(slPctN) && slPctN > 0 && slPctN <= 90
   const tpPctValid = Number.isFinite(tpPctN) && tpPctN > 0 && tpPctN <= 1000
+  const slMultValid = Number.isFinite(slMultN) && slMultN >= 0.1 && slMultN <= 20
+  const tpMultValid = Number.isFinite(tpMultN) && tpMultN >= 0.1 && tpMultN <= 20
   const slResolved = slBasis === 'percent' && rangeOk && slPctValid
     ? round2(sellGrid ? upperN * (1 + slPctN / 100) : lowerN * (1 - slPctN / 100))
     : slN
   const tpResolved = tpBasis === 'percent' && rangeOk && tpPctValid
     ? round2(sellGrid ? lowerN * (1 - tpPctN / 100) : upperN * (1 + tpPctN / 100))
     : tpN
+  // ≈ trigger for ATR legs — the same math the grid engine applies at run time
+  // (SL = lower − mult×ATR · TP = upper + mult×ATR · sell grids mirror);
+  // null while the ATR fetch is in flight/failed → the UI shows the message.
+  const slAtrTrigger = slAtrActive && rangeOk && slMultValid && slAtr?.atr != null
+    ? round2(sellGrid ? upperN + slMultN * slAtr.atr : lowerN - slMultN * slAtr.atr)
+    : null
+  const tpAtrTrigger = tpAtrActive && rangeOk && tpMultValid && tpAtr?.atr != null
+    ? round2(sellGrid ? lowerN - tpMultN * tpAtr.atr : upperN + tpMultN * tpAtr.atr)
+    : null
   const slInvalid = slOn && (slBasis === 'price'
     ? (!Number.isFinite(slN) || slN <= 0 || (rangeOk && (sellGrid ? slN <= upperN : slN >= lowerN)))
-    : !slPctValid)
+    : slBasis === 'atr' ? !slMultValid : !slPctValid)
   const tpInvalid = tpOn && (tpBasis === 'price'
     ? (!Number.isFinite(tpN) || tpN <= 0 || (rangeOk && (sellGrid ? tpN >= lowerN : tpN <= upperN)))
-    : !tpPctValid)
+    : tpBasis === 'atr' ? !tpMultValid : !tpPctValid)
 
   const preview = useMemo(() => {
     if (!rangeOk || !countOk) return null
@@ -541,6 +626,7 @@ export default function GridTradeDialog({
 
   // identical body shape for create (POST) and edit (PUT) — the server fills
   // whatever is unspecified; basis flags tell it how to read maxSL/maxTP
+  // (v1.96.0: 'atr' → maxSL/maxTP is a ×ATR multiplier + slTf/tpTf)
   const buildBody = () => ({
     symbol,
     lowerPrice: round2(lowerN),
@@ -549,17 +635,19 @@ export default function GridTradeDialog({
     spacing,
     qtyPerGrid: qtyN,
     direction,
-    maxSL: slOn ? (slBasis === 'percent' ? round2(slPctN) : slN) : null,
+    maxSL: slOn ? (slBasis === 'atr' ? slMultN : slBasis === 'percent' ? round2(slPctN) : slN) : null,
     slBasis: slOn ? slBasis : 'price',
-    maxTP: tpOn ? (tpBasis === 'percent' ? round2(tpPctN) : tpN) : null,
+    slTf: slOn && slBasis === 'atr' ? slTf : null,
+    maxTP: tpOn ? (tpBasis === 'atr' ? tpMultN : tpBasis === 'percent' ? round2(tpPctN) : tpN) : null,
     tpBasis: tpOn ? tpBasis : 'price',
+    tpTf: tpOn && tpBasis === 'atr' ? tpTf : null,
     closeOnStop,
   })
 
   // snapshot of everything that affects the outcome — a backtest result is
   // only "fresh" while this string is unchanged
   const configSnapshot = () =>
-    JSON.stringify([lowerN, upperN, countN, spacing, qtyN, direction, slOn, slBasis, slPrice, slPct, tpOn, tpBasis, tpPrice, tpPct, closeOnStop])
+    JSON.stringify([lowerN, upperN, countN, spacing, qtyN, direction, slOn, slBasis, slPrice, slPct, slMult, slTf, tpOn, tpBasis, tpPrice, tpPct, tpMult, tpTf, closeOnStop])
   const btStale = bt != null && btRanConfig != null && btRanConfig !== configSnapshot()
 
   const runBacktest = async () => {
@@ -670,8 +758,8 @@ export default function GridTradeDialog({
     }
     applySetupToForm(r.setup, {
       setLower, setUpper, setGridCount, setSpacing, setQty, setDirection,
-      setSlOn, setSlBasis, setSlPrice, setSlPct,
-      setTpOn, setTpBasis, setTpPrice, setTpPct, setCloseOnStop,
+      setSlOn, setSlBasis, setSlPrice, setSlPct, setSlMult, setSlTf,
+      setTpOn, setTpBasis, setTpPrice, setTpPct, setTpMult, setTpTf, setCloseOnStop,
     })
     setImportError(null)
     setBt(null)
@@ -942,7 +1030,7 @@ export default function GridTradeDialog({
             )}
           </div>
 
-          {/* Max SL — price OR percent below the lower bound */}
+          {/* Max SL — price, percent below the lower bound, or ×ATR(14) */}
           <div className={cn('col-span-2 rounded border px-2 py-1.5', slInvalid ? 'border-amber-500/40 bg-amber-500/5' : 'border-zinc-800/70 bg-zinc-950/60')}>
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -950,22 +1038,39 @@ export default function GridTradeDialog({
                 <Label htmlFor="grid-sl" className="text-[11px] text-zinc-300">Max stop loss</Label>
               </div>
               <div className="flex items-center gap-1.5">
-                <BasisToggle which="sl" value={slBasis} onChange={setSlBasis} disabled={!slOn} />
+                <BasisToggle
+                  which="sl"
+                  value={slBasis}
+                  onChange={(b) => { setSlBasis(b); if (b === 'atr' && !slMultValid) setSlMult('1.5') }}
+                  disabled={!slOn}
+                />
                 <Input
-                  value={slBasis === 'percent' ? slPct : slPrice}
-                  onChange={(e) => { if (slBasis === 'percent') setSlPct(e.target.value); else setSlPrice(e.target.value) }}
+                  value={slBasis === 'percent' ? slPct : slBasis === 'atr' ? slMult : slPrice}
+                  onChange={(e) => { if (slBasis === 'percent') setSlPct(e.target.value); else if (slBasis === 'atr') setSlMult(e.target.value); else setSlPrice(e.target.value) }}
                   inputMode="decimal"
                   disabled={!slOn}
-                  placeholder={slBasis === 'percent' ? '5' : 'price'}
+                  placeholder={slBasis === 'percent' ? '5' : slBasis === 'atr' ? '1.5' : 'price'}
                   aria-label={slBasis === 'percent'
                     ? (sellGrid
                         ? 'Max stop loss percent (0–90) above the upper price'
                         : 'Max stop loss percent (0–90) below the lower price')
-                    : (sellGrid
-                        ? 'Max stop loss price — whole-grid hard ceiling above the upper price'
-                        : 'Max stop loss price — whole-grid hard floor below the lower price')}
+                    : slBasis === 'atr'
+                      ? 'Max stop loss ATR multiplier (0.1–20)'
+                      : (sellGrid
+                          ? 'Max stop loss price — whole-grid hard ceiling above the upper price'
+                          : 'Max stop loss price — whole-grid hard floor below the lower price')}
                   className="h-7 w-20 border-zinc-800 bg-zinc-950 text-right text-xs tabular-nums"
                 />
+                {slBasis === 'atr' && (
+                  <Select value={slTf} onValueChange={setSlTf} disabled={!slOn}>
+                    <SelectTrigger aria-label="Stop loss ATR timeframe" title="ATR(14) timeframe" className="h-7 w-[74px] shrink-0 border-zinc-800 bg-zinc-950 text-[10px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="border-zinc-800 bg-zinc-900 text-xs">
+                      {ATR_TF_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                )}
               </div>
             </div>
             {slOn && slBasis === 'percent' && rangeOk && slPctValid && (
@@ -974,9 +1079,17 @@ export default function GridTradeDialog({
                 <span className="text-zinc-600">{sellGrid ? <>above upper {fmtPrice(upperN)}</> : <>below lower {fmtPrice(lowerN)}</>}</span>
               </p>
             )}
+            {slOn && slBasis === 'atr' && (
+              <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-500">
+                {slAtrTrigger != null
+                  ? <>≈ trigger {fmtPrice(slAtrTrigger)}{' '}</>
+                  : <><span className="text-amber-400/90">≈ trigger {slAtr == null ? 'fetching ATR…' : `ATR unavailable${slAtr.error ? ` — ${slAtr.error}` : ''}`}</span>{' '}</>}
+                <span className="text-zinc-600">{sellGrid ? <>above upper {fmtPrice(upperN)}</> : <>below lower {fmtPrice(lowerN)}</>}</span>
+              </p>
+            )}
           </div>
 
-          {/* Max TP — price OR percent above the upper bound */}
+          {/* Max TP — price, percent above the upper bound, or ×ATR(14) */}
           <div className={cn('col-span-2 rounded border px-2 py-1.5', tpInvalid ? 'border-amber-500/40 bg-amber-500/5' : 'border-zinc-800/70 bg-zinc-950/60')}>
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -984,27 +1097,52 @@ export default function GridTradeDialog({
                 <Label htmlFor="grid-tp" className="text-[11px] text-zinc-300">Max take profit</Label>
               </div>
               <div className="flex items-center gap-1.5">
-                <BasisToggle which="tp" value={tpBasis} onChange={setTpBasis} disabled={!tpOn} />
+                <BasisToggle
+                  which="tp"
+                  value={tpBasis}
+                  onChange={(b) => { setTpBasis(b); if (b === 'atr' && !tpMultValid) setTpMult('1.5') }}
+                  disabled={!tpOn}
+                />
                 <Input
-                  value={tpBasis === 'percent' ? tpPct : tpPrice}
-                  onChange={(e) => { if (tpBasis === 'percent') setTpPct(e.target.value); else setTpPrice(e.target.value) }}
+                  value={tpBasis === 'percent' ? tpPct : tpBasis === 'atr' ? tpMult : tpPrice}
+                  onChange={(e) => { if (tpBasis === 'percent') setTpPct(e.target.value); else if (tpBasis === 'atr') setTpMult(e.target.value); else setTpPrice(e.target.value) }}
                   inputMode="decimal"
                   disabled={!tpOn}
-                  placeholder={tpBasis === 'percent' ? '5' : 'price'}
+                  placeholder={tpBasis === 'percent' ? '5' : tpBasis === 'atr' ? '1.5' : 'price'}
                   aria-label={tpBasis === 'percent'
                     ? (sellGrid
                         ? 'Max take profit percent (0–1000) below the lower price'
                         : 'Max take profit percent (0–1000) above the upper price')
-                    : (sellGrid
-                        ? 'Max take profit price — whole-grid profit floor below the lower price'
-                        : 'Max take profit price — whole-grid profit ceiling above the upper price')}
+                    : tpBasis === 'atr'
+                      ? 'Max take profit ATR multiplier (0.1–20)'
+                      : (sellGrid
+                          ? 'Max take profit price — whole-grid profit floor below the lower price'
+                          : 'Max take profit price — whole-grid profit ceiling above the upper price')}
                   className="h-7 w-20 border-zinc-800 bg-zinc-950 text-right text-xs tabular-nums"
                 />
+                {tpBasis === 'atr' && (
+                  <Select value={tpTf} onValueChange={setTpTf} disabled={!tpOn}>
+                    <SelectTrigger aria-label="Take profit ATR timeframe" title="ATR(14) timeframe" className="h-7 w-[74px] shrink-0 border-zinc-800 bg-zinc-950 text-[10px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="border-zinc-800 bg-zinc-900 text-xs">
+                      {ATR_TF_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                )}
               </div>
             </div>
             {tpOn && tpBasis === 'percent' && rangeOk && tpPctValid && (
               <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-500">
                 ≈ trigger {fmtPrice(tpResolved)}{' '}
+                <span className="text-zinc-600">{sellGrid ? <>below lower {fmtPrice(lowerN)}</> : <>above upper {fmtPrice(upperN)}</>}</span>
+              </p>
+            )}
+            {tpOn && tpBasis === 'atr' && (
+              <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-500">
+                {tpAtrTrigger != null
+                  ? <>≈ trigger {fmtPrice(tpAtrTrigger)}{' '}</>
+                  : <><span className="text-amber-400/90">≈ trigger {tpAtr == null ? 'fetching ATR…' : `ATR unavailable${tpAtr.error ? ` — ${tpAtr.error}` : ''}`}</span>{' '}</>}
                 <span className="text-zinc-600">{sellGrid ? <>below lower {fmtPrice(lowerN)}</> : <>above upper {fmtPrice(upperN)}</>}</span>
               </p>
             )}
@@ -1046,16 +1184,24 @@ export default function GridTradeDialog({
                 ? (rangeOk && slPctValid
                     ? <div>Max SL {trimNum(slPctN)}% → <span className="font-semibold text-rose-300">{fmtPrice(slResolved)}</span></div>
                     : null)
-                : (Number.isFinite(slN) && slN > 0
-                    ? <div>Max SL <span className="font-semibold text-rose-300">{fmtPrice(slN)}</span></div>
-                    : null))}
+                : slBasis === 'atr'
+                  ? (slMultValid
+                      ? <div>Max SL {trimNum(slMultN)}×ATR({slTf}){slAtrTrigger != null ? <> → <span className="font-semibold text-rose-300">{fmtPrice(slAtrTrigger)}</span></> : <span className="text-amber-400/90"> — ATR unavailable</span>}</div>
+                      : null)
+                  : (Number.isFinite(slN) && slN > 0
+                      ? <div>Max SL <span className="font-semibold text-rose-300">{fmtPrice(slN)}</span></div>
+                      : null))}
               {tpOn && (tpBasis === 'percent'
                 ? (rangeOk && tpPctValid
                     ? <div>Max TP {trimNum(tpPctN)}% → <span className="font-semibold text-emerald-300">{fmtPrice(tpResolved)}</span></div>
                     : null)
-                : (Number.isFinite(tpN) && tpN > 0
-                    ? <div>Max TP <span className="font-semibold text-emerald-300">{fmtPrice(tpN)}</span></div>
-                    : null))}
+                : tpBasis === 'atr'
+                  ? (tpMultValid
+                      ? <div>Max TP {trimNum(tpMultN)}×ATR({tpTf}){tpAtrTrigger != null ? <> → <span className="font-semibold text-emerald-300">{fmtPrice(tpAtrTrigger)}</span></> : <span className="text-amber-400/90"> — ATR unavailable</span>}</div>
+                      : null)
+                  : (Number.isFinite(tpN) && tpN > 0
+                      ? <div>Max TP <span className="font-semibold text-emerald-300">{fmtPrice(tpN)}</span></div>
+                      : null))}
             </div>
           ) : (
             <span className="text-zinc-600">Enter a valid range (upper &gt; lower &gt; 0) and level count to see the preview</span>
@@ -1066,10 +1212,14 @@ export default function GridTradeDialog({
               {slInvalid
                 ? (slBasis === 'percent'
                     ? (sellGrid ? 'Max SL % must be within 0–90 (it sits above the upper price).' : 'Max SL % must be within 0–90 (it sits below the lower price).')
-                    : (sellGrid ? 'Max SL must be a positive price ABOVE the upper price (short-grid hard ceiling).' : 'Max SL must be a positive price BELOW the lower price.'))
+                    : slBasis === 'atr'
+                      ? 'Max SL ATR multiplier must be between 0.1 and 20.'
+                      : (sellGrid ? 'Max SL must be a positive price ABOVE the upper price (short-grid hard ceiling).' : 'Max SL must be a positive price BELOW the lower price.'))
                 : (tpBasis === 'percent'
                     ? (sellGrid ? 'Max TP % must be within 0–1000 (it sits below the lower price).' : 'Max TP % must be within 0–1000 (it sits above the upper price).')
-                    : (sellGrid ? 'Max TP must be a positive price BELOW the lower price (short-grid profit floor).' : 'Max TP must be a positive price ABOVE the upper price.'))}
+                    : tpBasis === 'atr'
+                      ? 'Max TP ATR multiplier must be between 0.1 and 20.'
+                      : (sellGrid ? 'Max TP must be a positive price BELOW the lower price (short-grid profit floor).' : 'Max TP must be a positive price ABOVE the upper price.'))}
             </p>
           )}
         </div>

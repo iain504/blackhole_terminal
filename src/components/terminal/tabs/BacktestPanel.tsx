@@ -71,10 +71,13 @@ export interface AlgoSetupCfg {
   riskBasis: AlgoRiskBasis
   riskMoney: number | null
   riskMoneyPct: number | null
-  tpMode: 'none' | 'pct'
+  tpMode: 'none' | 'pct' | 'atr'
   tpValue: number | null
-  slMode: 'none' | 'pct'
+  slMode: 'none' | 'pct' | 'atr'
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf?: string | null
+  slTf?: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -359,8 +362,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     riskMoneyPct: cfg.sizingMode === 'risk' && cfg.riskBasis === 'pct' ? cfg.riskMoneyPct : null,
     tpMode: cfg.tpMode,
     tpValue: cfg.tpValue,
+    tpTf: cfg.tpMode === 'atr' ? (cfg.tpTf ?? null) : null,
     slMode: cfg.slMode,
     slValue: cfg.slValue,
+    slTf: cfg.slMode === 'atr' ? (cfg.slTf ?? null) : null,
     maxTradesDay: cfg.maxTradesDay,
     rthOnly: cfg.rthOnly,
     flattenEod: cfg.flattenEod,
@@ -1077,8 +1082,8 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                   Sweeping one with the setup bracket OFF turns it ON for every
                   combo; the engine clamps to a 0.1–50% sane span. */}
               {([
-                { key: 'tpValue', label: 'Take profit %', dMin: '0.5', dMax: '4', dStep: '0.5', setup: cfg.tpMode === 'pct' && cfg.tpValue != null ? String(cfg.tpValue) : 'off' },
-                { key: 'slValue', label: 'Stop loss %', dMin: '0.25', dMax: '3', dStep: '0.25', setup: cfg.slMode === 'pct' && cfg.slValue != null ? String(cfg.slValue) : 'off' },
+                { key: 'tpValue', label: cfg.tpMode === 'atr' ? 'Take profit ×ATR' : 'Take profit %', dMin: '0.5', dMax: '4', dStep: '0.5', setup: cfg.tpMode !== 'none' && cfg.tpValue != null ? String(cfg.tpValue) : 'off' },
+                { key: 'slValue', label: cfg.slMode === 'atr' ? 'Stop loss ×ATR' : 'Stop loss %', dMin: '0.25', dMax: '3', dStep: '0.25', setup: cfg.slMode !== 'none' && cfg.slValue != null ? String(cfg.slValue) : 'off' },
               ]).map((p) => {
                 const r = ranges[p.key] ?? { on: false, min: p.dMin, max: p.dMax, step: p.dStep }
                 const toggle = (on: boolean) =>

@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { useToast } from '@/hooks/use-toast'
+import { fetchAtr, atrExitPrice, fmtAtrExit, ATR_TF_OPTIONS, type AtrInfo } from '@/lib/atr-client'
 import { fmtPrice } from '@/lib/market-types'
 import { isCryptoTradeSymbol } from './trading-types'
 import { useTerminal } from '@/store/terminal'
@@ -25,6 +26,12 @@ export interface TicketPrefill {
 }
 
 const fmtP = (v: number) => String(v >= 1 ? +v.toFixed(2) : +v.toFixed(6))
+
+/** v1.96.0 — clamp an ATR multiplier input to the valid 0.1–20 range; 0 = unusable. */
+const clampAtrMult = (s: string): number => {
+  const n = parseFloat(s)
+  return Number.isFinite(n) ? Math.min(20, Math.max(0.1, n)) : 0
+}
 
 export function TradeTicket({
   symbol,
@@ -108,6 +115,18 @@ export function TradeTicket({
   const [slPct, setSlPct] = useState('5')
   const [tpPct, setTpPct] = useState('5')
   const [trailPct, setTrailPct] = useState('')
+  // ---- v1.96.0: per-leg ATR mode — a leg's value is a MULTIPLIER of Wilder
+  // ATR(14) on the chosen timeframe; resolved client-side into the SAME
+  // absolute price inputs the % path fills, so the submitted payload
+  // (stop_loss / take_profit) stays byte-compatible ----
+  const [slUnit, setSlUnit] = useState<'pct' | 'atr'>('pct')
+  const [tpUnit, setTpUnit] = useState<'pct' | 'atr'>('pct')
+  const [slAtrMult, setSlAtrMult] = useState('1.5')
+  const [tpAtrMult, setTpAtrMult] = useState('1.5')
+  const [slAtrTf, setSlAtrTf] = useState('1h')
+  const [tpAtrTf, setTpAtrTf] = useState('1h')
+  const [slAtrInfo, setSlAtrInfo] = useState<AtrInfo | null>(null)
+  const [tpAtrInfo, setTpAtrInfo] = useState<AtrInfo | null>(null)
   // once the user edits SL/TP by hand the auto-fill stops overwriting them
   const [slTouched, setSlTouched] = useState(false)
   const [tpTouched, setTpTouched] = useState(false)
@@ -354,9 +373,58 @@ export function TradeTicket({
     const tpP = parseFloat(tpPct)
     if (!isFinite(slP) || slP <= 0 || !isFinite(tpP) || tpP <= 0) return
     const dir = side === 'buy' ? 1 : -1
-    if (!slTouched) setSlPrice(fmtP(basis * (1 - (dir * slP) / 100)))
-    if (!tpTouched) setTpPrice(fmtP(basis * (1 + (dir * tpP) / 100)))
-  }, [basis, side, slPct, tpPct, slTouched, tpTouched])
+    if (!slTouched && slUnit !== 'atr') setSlPrice(fmtP(basis * (1 - (dir * slP) / 100)))
+    if (!tpTouched && tpUnit !== 'atr') setTpPrice(fmtP(basis * (1 + (dir * tpP) / 100)))
+  }, [basis, side, slPct, tpPct, slTouched, tpTouched, slUnit, tpUnit])
+
+  // ---- v1.96.0: ATR legs — poll GET /api/market/atr every 30s while any leg
+  // is in ATR mode (per-leg timeframe; the server caches for 60s). A per-cycle
+  // AbortController + alive flag drops stale responses so a slow reply can
+  // never overwrite a newer one. ----
+  const atrAbortRef = useRef<AbortController | null>(null)
+  const atrLegsActive = !trailActive && (slUnit === 'atr' || tpUnit === 'atr')
+  useEffect(() => {
+    if (!atrLegsActive) return
+    let alive = true
+    const ac = new AbortController()
+    atrAbortRef.current = ac
+    const load = () => {
+      if (slUnit === 'atr') {
+        void fetchAtr(symbol, slAtrTf).then((info) => { if (alive && !ac.signal.aborted) setSlAtrInfo(info) }).catch(() => {})
+      }
+      if (tpUnit === 'atr') {
+        void fetchAtr(symbol, tpAtrTf).then((info) => { if (alive && !ac.signal.aborted) setTpAtrInfo(info) }).catch(() => {})
+      }
+    }
+    load()
+    const iv = window.setInterval(load, 30000)
+    return () => {
+      alive = false
+      ac.abort()
+      if (atrAbortRef.current === ac) atrAbortRef.current = null
+      window.clearInterval(iv)
+    }
+  }, [atrLegsActive, slUnit, tpUnit, symbol, slAtrTf, tpAtrTf])
+
+  // resolve each ATR leg into the existing absolute price input whenever the
+  // ATR response arrives or symbol / timeframe / multiplier / side / basis
+  // changes — same fmtP formatting as the % path keeps payloads identical.
+  // Never writes when atr is null (insufficient data / error) or the leg is
+  // in % mode, so the % behavior stays byte-identical. ----
+  const slAtrM = clampAtrMult(slAtrMult)
+  const tpAtrM = clampAtrMult(tpAtrMult)
+  const slAtrPx =
+    slUnit === 'atr' && slAtrM > 0 && basis > 0 && slAtrInfo?.atr != null
+      ? atrExitPrice(side, basis, slAtrM, slAtrInfo.atr, 'sl')
+      : null
+  const tpAtrPx =
+    tpUnit === 'atr' && tpAtrM > 0 && basis > 0 && tpAtrInfo?.atr != null
+      ? atrExitPrice(side, basis, tpAtrM, tpAtrInfo.atr, 'tp')
+      : null
+  useEffect(() => {
+    if (slAtrPx != null) setSlPrice(fmtP(slAtrPx))
+    if (tpAtrPx != null) setTpPrice(fmtP(tpAtrPx))
+  }, [slAtrPx, tpAtrPx])
 
   return (
     <div
@@ -536,28 +604,67 @@ export function TradeTicket({
         <div className="col-span-1">
           <div className="flex items-center justify-between">
             <Label htmlFor="tt-sl" className={cn('text-[10px]', trailActive ? 'text-zinc-600' : 'text-zinc-400')}>Stop loss{trailActive ? ' (off)' : ''}</Label>
-            <div className="flex items-center gap-0.5">
+            {!trailActive && (
+              <div className="flex items-center gap-0.5">
+                {/* v1.96.0 — leg unit: % of basis | ×ATR(14) */}
+                <div className="flex items-center rounded border border-zinc-800 bg-zinc-950 p-px" role="group" aria-label="Stop loss unit">
+                  <button type="button" onClick={() => setSlUnit('pct')} aria-pressed={slUnit === 'pct'} title="Stop loss as % of the entry basis" className={cn('rounded px-1 text-[9px] font-semibold leading-[13px] transition-colors', slUnit === 'pct' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>%</button>
+                  <button type="button" onClick={() => setSlUnit('atr')} aria-pressed={slUnit === 'atr'} title="Stop loss as a multiple of ATR(14)" className={cn('rounded px-1 text-[9px] font-semibold leading-[13px] transition-colors', slUnit === 'atr' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>ATR</button>
+                </div>
+                {slUnit === 'pct' && (
+                  <>
+                    <input
+                      aria-label="Stop loss percent"
+                      type="number"
+                      min="0.1"
+                      step="0.5"
+                      value={slPct}
+                      onChange={(e) => {
+                        const p = e.target.value
+                        setSlPct(p)
+                        const pv = parseFloat(p)
+                        if (isFinite(pv) && pv > 0 && basis > 0) {
+                          const dir = side === 'buy' ? 1 : -1
+                          setSlPrice(fmtP(basis * (1 - (dir * pv) / 100)))
+                        }
+                        setSlTouched(true)
+                      }}
+                      className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+                    />
+                    <span className="text-[9px] text-zinc-600">%</span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          {slUnit === 'atr' && !trailActive && (
+            <div className="mt-0.5 flex items-center gap-1">
               <input
-                aria-label="Stop loss percent"
+                aria-label="Stop loss ATR multiplier"
+                title="ATR multiplier (0.1–20)"
                 type="number"
                 min="0.1"
-                step="0.5"
-                value={slPct}
-                onChange={(e) => {
-                  const p = e.target.value
-                  setSlPct(p)
-                  const pv = parseFloat(p)
-                  if (isFinite(pv) && pv > 0 && basis > 0) {
-                    const dir = side === 'buy' ? 1 : -1
-                    setSlPrice(fmtP(basis * (1 - (dir * pv) / 100)))
-                  }
-                  setSlTouched(true)
-                }}
-                className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+                max="20"
+                step="0.1"
+                value={slAtrMult}
+                onChange={(e) => setSlAtrMult(e.target.value)}
+                placeholder="1.5"
+                className="h-4 w-10 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
               />
-              <span className="text-[9px] text-zinc-600">%</span>
+              <span className="text-[9px] text-zinc-600">×ATR</span>
+              <select
+                aria-label="Stop loss ATR timeframe"
+                title="ATR timeframe"
+                value={slAtrTf}
+                onChange={(e) => setSlAtrTf(e.target.value)}
+                className="h-4 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-[9px] text-zinc-400"
+              >
+                {ATR_TF_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.value}</option>
+                ))}
+              </select>
             </div>
-          </div>
+          )}
           <Input
             id="tt-sl"
             type="number"
@@ -572,32 +679,84 @@ export function TradeTicket({
             placeholder={trailActive ? 'trailing stop active' : 'none'}
             className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs disabled:opacity-50"
           />
+          {!trailActive && slUnit === 'atr' && (slAtrPx != null ? (
+            <p className="mt-0.5 text-[9px] leading-snug text-zinc-500">{fmtAtrExit(slAtrM, slAtrTf)} ≈ {fmtPrice(slAtrPx)}</p>
+          ) : (
+            <p className="mt-0.5 text-[9px] leading-snug text-amber-400/80">
+              {basis <= 0
+                ? 'Waiting for a basis price…'
+                : slAtrInfo == null
+                  ? 'Loading ATR…'
+                  : slAtrInfo.atr == null
+                    ? (slAtrInfo.message || slAtrInfo.error || 'ATR unavailable')
+                    : 'No valid price — check the multiplier'}
+            </p>
+          ))}
         </div>
         <div className="col-span-1">
           <div className="flex items-center justify-between">
             <Label htmlFor="tt-tp" className={cn('text-[10px]', trailActive ? 'text-zinc-600' : 'text-zinc-400')}>Take profit{trailActive ? ' (off)' : ''}</Label>
-            <div className="flex items-center gap-0.5">
+            {!trailActive && (
+              <div className="flex items-center gap-0.5">
+                {/* v1.96.0 — leg unit: % of basis | ×ATR(14) */}
+                <div className="flex items-center rounded border border-zinc-800 bg-zinc-950 p-px" role="group" aria-label="Take profit unit">
+                  <button type="button" onClick={() => setTpUnit('pct')} aria-pressed={tpUnit === 'pct'} title="Take profit as % of the entry basis" className={cn('rounded px-1 text-[9px] font-semibold leading-[13px] transition-colors', tpUnit === 'pct' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>%</button>
+                  <button type="button" onClick={() => setTpUnit('atr')} aria-pressed={tpUnit === 'atr'} title="Take profit as a multiple of ATR(14)" className={cn('rounded px-1 text-[9px] font-semibold leading-[13px] transition-colors', tpUnit === 'atr' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>ATR</button>
+                </div>
+                {tpUnit === 'pct' && (
+                  <>
+                    <input
+                      aria-label="Take profit percent"
+                      type="number"
+                      min="0.1"
+                      step="0.5"
+                      value={tpPct}
+                      onChange={(e) => {
+                        const p = e.target.value
+                        setTpPct(p)
+                        const pv = parseFloat(p)
+                        if (isFinite(pv) && pv > 0 && basis > 0) {
+                          const dir = side === 'buy' ? 1 : -1
+                          setTpPrice(fmtP(basis * (1 + (dir * pv) / 100)))
+                        }
+                        setTpTouched(true)
+                      }}
+                      className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+                    />
+                    <span className="text-[9px] text-zinc-600">%</span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          {tpUnit === 'atr' && !trailActive && (
+            <div className="mt-0.5 flex items-center gap-1">
               <input
-                aria-label="Take profit percent"
+                aria-label="Take profit ATR multiplier"
+                title="ATR multiplier (0.1–20)"
                 type="number"
                 min="0.1"
-                step="0.5"
-                value={tpPct}
-                onChange={(e) => {
-                  const p = e.target.value
-                  setTpPct(p)
-                  const pv = parseFloat(p)
-                  if (isFinite(pv) && pv > 0 && basis > 0) {
-                    const dir = side === 'buy' ? 1 : -1
-                    setTpPrice(fmtP(basis * (1 + (dir * pv) / 100)))
-                  }
-                  setTpTouched(true)
-                }}
-                className="h-4 w-9 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
+                max="20"
+                step="0.1"
+                value={tpAtrMult}
+                onChange={(e) => setTpAtrMult(e.target.value)}
+                placeholder="1.5"
+                className="h-4 w-10 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-right text-[9px] text-zinc-400"
               />
-              <span className="text-[9px] text-zinc-600">%</span>
+              <span className="text-[9px] text-zinc-600">×ATR</span>
+              <select
+                aria-label="Take profit ATR timeframe"
+                title="ATR timeframe"
+                value={tpAtrTf}
+                onChange={(e) => setTpAtrTf(e.target.value)}
+                className="h-4 rounded border border-zinc-800 bg-zinc-950 px-0.5 text-[9px] text-zinc-400"
+              >
+                {ATR_TF_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.value}</option>
+                ))}
+              </select>
             </div>
-          </div>
+          )}
           <Input
             id="tt-tp"
             type="number"
@@ -612,6 +771,19 @@ export function TradeTicket({
             placeholder={trailActive ? 'trailing stop active' : 'none'}
             className="mt-0.5 h-7 border-zinc-800 bg-zinc-950 text-xs disabled:opacity-50"
           />
+          {!trailActive && tpUnit === 'atr' && (tpAtrPx != null ? (
+            <p className="mt-0.5 text-[9px] leading-snug text-zinc-500">{fmtAtrExit(tpAtrM, tpAtrTf)} ≈ {fmtPrice(tpAtrPx)}</p>
+          ) : (
+            <p className="mt-0.5 text-[9px] leading-snug text-amber-400/80">
+              {basis <= 0
+                ? 'Waiting for a basis price…'
+                : tpAtrInfo == null
+                  ? 'Loading ATR…'
+                  : tpAtrInfo.atr == null
+                    ? (tpAtrInfo.message || tpAtrInfo.error || 'ATR unavailable')
+                    : 'No valid price — check the multiplier'}
+            </p>
+          ))}
         </div>
         {!isCrypto && (
           <div className="col-span-2">

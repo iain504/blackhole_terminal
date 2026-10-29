@@ -7,6 +7,7 @@ import {
   isGridDirection,
 } from '@/lib/grid-engine'
 import { toDto, round2, type GridFillDto } from '../route'
+import { TIMEFRAMES } from '@/lib/market-types'
 
 export const dynamic = 'force-dynamic'
 
@@ -75,6 +76,9 @@ interface GridEditBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string
   closeOnStop?: boolean
 }
@@ -106,11 +110,11 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     if (row.status !== 'active') return conflict('Only active grids can be edited')
 
     // ---- merge the submitted subset over the stored config ----
-    if (body?.slBasis !== undefined && body.slBasis !== null && body.slBasis !== 'price' && body.slBasis !== 'percent') {
-      return bad('slBasis must be "price" or "percent"')
+    if (body?.slBasis !== undefined && body.slBasis !== null && body.slBasis !== 'price' && body.slBasis !== 'percent' && body.slBasis !== 'atr') {
+      return bad('slBasis must be "price", "percent" or "atr"')
     }
-    if (body?.tpBasis !== undefined && body.tpBasis !== null && body.tpBasis !== 'price' && body.tpBasis !== 'percent') {
-      return bad('tpBasis must be "price" or "percent"')
+    if (body?.tpBasis !== undefined && body.tpBasis !== null && body.tpBasis !== 'price' && body.tpBasis !== 'percent' && body.tpBasis !== 'atr') {
+      return bad('tpBasis must be "price", "percent" or "atr"')
     }
     if (body?.direction !== undefined && body.direction !== null && !isGridDirection(body.direction)) {
       return bad('direction must be "both", "buy" or "sell"')
@@ -125,8 +129,20 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       return bad('Max TP must be a number or null to clear it')
     }
 
-    const slBasis = (body?.slBasis ?? row.slBasis ?? 'price') as 'price' | 'percent'
-    const tpBasis = (body?.tpBasis ?? row.tpBasis ?? 'price') as 'price' | 'percent'
+    const slBasis = (body?.slBasis ?? row.slBasis ?? 'price') as 'price' | 'percent' | 'atr'
+    const tpBasis = (body?.tpBasis ?? row.tpBasis ?? 'price') as 'price' | 'percent' | 'atr'
+    // v1.96.0 — ATR timeframes: explicit valid value wins · else keep the
+    // stored one when the basis stays 'atr' · null when the basis isn't 'atr'
+    const slTf = slBasis === 'atr'
+      ? (body?.slTf !== undefined
+          ? (typeof body.slTf === 'string' && body.slTf in TIMEFRAMES ? body.slTf : '1h')
+          : (row.slTf ?? '1h'))
+      : null
+    const tpTf = tpBasis === 'atr'
+      ? (body?.tpTf !== undefined
+          ? (typeof body.tpTf === 'string' && body.tpTf in TIMEFRAMES ? body.tpTf : '1h')
+          : (row.tpTf ?? '1h'))
+      : null
     const direction = body?.direction ?? row.direction ?? 'both'
     const lower = round2(Number(body?.lowerPrice ?? row.lowerPrice))
     const upper = round2(Number(body?.upperPrice ?? row.upperPrice))
@@ -149,6 +165,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       maxTP,
       slBasis,
       tpBasis,
+      slTf,
+      tpTf,
       isCrypto: row.symbol.includes('/'),
       direction,
     })
@@ -175,6 +193,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
           maxTP,
           slBasis,
           tpBasis,
+          slTf,
+          tpTf,
           direction,
           closeOnStop,
           // keep lastPrice + lots (empty — checked above); only the levels

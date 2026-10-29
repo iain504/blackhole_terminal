@@ -305,8 +305,10 @@ export function normalizeAlgoParams(strategy: AlgoStrategyId, raw: unknown): Rec
   return out
 }
 
-/** Exit modes: 'none' (strategy-managed only) or 'pct' (bracket % from entry). */
-export type AlgoExitMode = 'none' | 'pct'
+/** Exit modes: 'none' (strategy-managed only), 'pct' (bracket % from entry)
+ *  or 'atr' (v1.96.0: value = ATR(14) multiplier, bracket from the entry
+ *  anchor at mult × ATR on the configured timeframe). */
+export type AlgoExitMode = 'none' | 'pct' | 'atr'
 
 /** Position sizing (Task 78 — "Risk Money"): 'fixed' trades `qty` units per
  *  entry (legacy) · 'risk' treats the risk budget as the DOLLARS AT RISK per
@@ -357,6 +359,9 @@ export interface AlpoRunConfig {
   tpValue: number | null
   slMode: AlgoExitMode
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf?: string | null
+  slTf?: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -433,6 +438,9 @@ export interface AlgoRunLike {
   // Task 78e — optional for the same reason (legacy rows default to 'usd')
   riskBasis?: string
   riskMoneyPct?: number | null
+  // v1.96.0 — ATR(14) timeframes when the mode is 'atr' (optional: legacy rows)
+  tpTf?: string | null
+  slTf?: string | null
 }
 
 /** Human label used as the default entry name ("BB + RSI Mean Reversion · TSLA 5m").
@@ -479,10 +487,12 @@ export function runToAlgoConfig(run: AlgoRunLike): AlpoRunConfig {
     riskBasis: run.sizingMode === 'risk' && run.riskBasis === 'pct' ? 'pct' : 'usd',
     riskMoney: run.sizingMode === 'risk' && run.riskBasis !== 'pct' ? (run.riskMoney ?? null) : null,
     riskMoneyPct: run.sizingMode === 'risk' && run.riskBasis === 'pct' ? (run.riskMoneyPct ?? null) : null,
-    tpMode: run.tpMode === 'pct' ? 'pct' : 'none',
-    tpValue: run.tpMode === 'pct' ? run.tpValue : null,
-    slMode: run.slMode === 'pct' ? 'pct' : 'none',
-    slValue: run.slMode === 'pct' ? run.slValue : null,
+    tpMode: run.tpMode === 'pct' ? 'pct' : run.tpMode === 'atr' ? 'atr' : 'none',
+    tpValue: run.tpMode === 'pct' || run.tpMode === 'atr' ? run.tpValue : null,
+    tpTf: run.tpMode === 'atr' ? (run.tpTf ?? null) : null,
+    slMode: run.slMode === 'pct' ? 'pct' : run.slMode === 'atr' ? 'atr' : 'none',
+    slValue: run.slMode === 'pct' || run.slMode === 'atr' ? run.slValue : null,
+    slTf: run.slMode === 'atr' ? (run.slTf ?? null) : null,
     maxTradesDay: run.maxTradesDay,
     rthOnly: run.rthOnly,
     flattenEod: run.flattenEod,
@@ -559,6 +569,9 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
   if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) return 'qty must be a positive number'
   const tpRaw = clampPct(r.tpValue)
   const slRaw = clampPct(r.slValue)
+  // v1.96.0 — ATR-mode multipliers (0.1–20) + timeframes
+  const tpMult = clampAtrMultIn(r.tpValue)
+  const slMult = clampAtrMultIn(r.slValue)
   // Task 78 — Risk Money: sizing is an identity field here (silently downgrading
   // a risk-sized config to fixed qty would change what the engine trades).
   // Task 78e — the budget basis is identity too: '$250' and '1% of equity'
@@ -581,10 +594,16 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
     riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
     riskMoney: sizingMode === 'risk' && riskBasis !== 'pct' ? riskMoney : null,
     riskMoneyPct: sizingMode === 'risk' && riskBasis === 'pct' ? riskMoneyPct : null,
-    tpMode: r.tpMode === 'pct' && tpRaw != null ? 'pct' : 'none',
-    tpValue: r.tpMode === 'pct' ? tpRaw : null,
-    slMode: r.slMode === 'pct' && slRaw != null ? 'pct' : 'none',
-    slValue: r.slMode === 'pct' ? slRaw : null,
+    tpMode: r.tpMode === 'pct' && tpRaw != null ? 'pct'
+      : r.tpMode === 'atr' && tpMult != null ? 'atr' : 'none',
+    tpValue: r.tpMode === 'pct' ? tpRaw : r.tpMode === 'atr' ? tpMult : null,
+    tpTf: r.tpMode === 'atr' && tpMult != null
+      ? (typeof r.tpTf === 'string' && r.tpTf in TIMEFRAMES ? r.tpTf : '1h') : null,
+    slMode: r.slMode === 'pct' && slRaw != null ? 'pct'
+      : r.slMode === 'atr' && slMult != null ? 'atr' : 'none',
+    slValue: r.slMode === 'pct' ? slRaw : r.slMode === 'atr' ? slMult : null,
+    slTf: r.slMode === 'atr' && slMult != null
+      ? (typeof r.slTf === 'string' && r.slTf in TIMEFRAMES ? r.slTf : '1h') : null,
     maxTradesDay: Math.min(50, Math.max(1, Math.round(Number(r.maxTradesDay) || 3))),
     rthOnly: r.rthOnly !== false,
     flattenEod: r.flattenEod !== false,
@@ -679,7 +698,7 @@ export function parseAlgoConfigImport(raw: unknown): AlgoImportResult {
 // an out-of-band rule.
 // ---------------------------------------------------------------------------
 
-export type StrategyRuleExitMode = 'none' | 'price' | 'pct'
+export type StrategyRuleExitMode = 'none' | 'price' | 'pct' | 'atr'
 
 /** Portable rule payload — everything needed to recreate a StrategyRule row. */
 export interface AlgoRuleImportPayload {
@@ -695,6 +714,9 @@ export interface AlgoRuleImportPayload {
   tpValue: number | null
   slMode: StrategyRuleExitMode
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf?: string | null
+  slTf?: string | null
   repeat: boolean
 }
 
@@ -718,7 +740,15 @@ export interface AlgoRuleLike {
 
 const RSI_CONDITIONS = ['cross_above', 'cross_below']
 const MACD_CONDITIONS = ['bull_cross', 'bear_cross', 'cross_above', 'cross_below']
-const RULE_EXIT_MODES: StrategyRuleExitMode[] = ['none', 'price', 'pct']
+const RULE_EXIT_MODES: StrategyRuleExitMode[] = ['none', 'price', 'pct', 'atr']
+// v1.96.0 — ATR multiplier bounds (mirrors src/lib/atr.ts without importing
+// it — this module must stay client-safe)
+const ATR_MULT_MIN = 0.1
+const ATR_MULT_MAX = 20
+const clampAtrMultIn = (v: unknown): number | null => {
+  const n = Number(v)
+  return Number.isFinite(n) && n > 0 ? Math.min(ATR_MULT_MAX, Math.max(ATR_MULT_MIN, n)) : null
+}
 const clampIntIn = (v: unknown, min: number, max: number, dflt: number): number => {
   const n = Math.round(Number(v))
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt
@@ -765,18 +795,25 @@ export function normalizeStrategyRuleImport(raw: unknown): AlgoRuleImportPayload
     params = { fast, slow, signal: clampIntIn(p.signal, 1, 200, 9) }
   }
 
-  const exit = (modeRaw: unknown, value: unknown, label: 'TP' | 'SL'): { mode: StrategyRuleExitMode; value: number | null } | string => {
+  const exit = (modeRaw: unknown, value: unknown, tfRaw: unknown, label: 'TP' | 'SL'): { mode: StrategyRuleExitMode; value: number | null; tf: string | null } | string => {
     const mode = RULE_EXIT_MODES.includes(modeRaw as StrategyRuleExitMode) ? (modeRaw as StrategyRuleExitMode) : null
-    if (!mode) return `${label} mode must be none, price or pct`
-    if (mode === 'none') return { mode, value: null }
+    if (!mode) return `${label} mode must be none, price, pct or atr`
+    if (mode === 'none') return { mode, value: null, tf: null }
+    if (mode === 'atr') {
+      // v1.96.0 — ATR multiplier + timeframe (default '1h', same as the API)
+      const m = clampAtrMultIn(value)
+      if (m == null) return `${label} ATR multiplier must be between ${ATR_MULT_MIN} and ${ATR_MULT_MAX}`
+      const tf = typeof tfRaw === 'string' && tfRaw in TIMEFRAMES ? tfRaw : '1h'
+      return { mode, value: m, tf }
+    }
     const n = Number(value)
     if (!Number.isFinite(n) || n <= 0) return `${label} value must be a positive number`
     if (mode === 'pct' && n > 100) return `${label} % must be ≤ 100`
-    return { mode, value: Math.min(1_000_000_000, n) }
+    return { mode, value: Math.min(1_000_000_000, n), tf: null }
   }
-  const tp = exit(r.tpMode, r.tpValue, 'TP')
+  const tp = exit(r.tpMode, r.tpValue, r.tpTf, 'TP')
   if (typeof tp === 'string') return tp
-  const sl = exit(r.slMode, r.slValue, 'SL')
+  const sl = exit(r.slMode, r.slValue, r.slTf, 'SL')
   if (typeof sl === 'string') return sl
 
   return {
@@ -790,8 +827,10 @@ export function normalizeStrategyRuleImport(raw: unknown): AlgoRuleImportPayload
     qty,
     tpMode: tp.mode,
     tpValue: tp.value,
+    tpTf: tp.tf,
     slMode: sl.mode,
     slValue: sl.value,
+    slTf: sl.tf,
     repeat: r.repeat === true,
   }
 }

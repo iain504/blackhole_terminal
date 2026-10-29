@@ -25,6 +25,7 @@ import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
+import { getAtrSnapshot, atrToPct, atrTfOf } from '@/lib/atr'
 import {
   adxSeries,
   cutlerRsiAt,
@@ -72,6 +73,9 @@ interface AlgoRunRow {
   tpValue: number | null
   slMode: string
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null
+  slTf: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -692,7 +696,9 @@ async function cycle(runId: string) {
           let ref: number | null = null
           let anchorPx: number | null = null
           let spreadBps: number | null = null
-          if (run.tpMode === 'pct' || run.slMode === 'pct' || run.sizingMode === 'risk') {
+          const tpIsAtr = run.tpMode === 'atr'
+          const slIsAtr = run.slMode === 'atr'
+          if (run.tpMode === 'pct' || run.slMode === 'pct' || tpIsAtr || slIsAtr || run.sizingMode === 'risk') {
             try {
               // v1.80.8 — trading:true: the anchor prices TP/SL bracket legs,
               // so a transient data failure must yield NO quote (the honest
@@ -715,9 +721,24 @@ async function cycle(runId: string) {
             // priced (a configured stop is never silently dropped).
           }
           anchorPx = anchorPx ?? ref
+          // v1.96.0 — ATR legs: one cached ATR(14) snapshot per configured
+          // timeframe. A missing snapshot fails CLOSED via the gate below
+          // (entry SKIPPED) exactly like a missing quote for a % leg — a
+          // configured stop is never silently dropped.
+          const atrSnapTp = tpIsAtr ? await getAtrSnapshot(run.symbol, atrTfOf(run.tpTf), run.userId) : null
+          const atrSnapSl = slIsAtr ? await getAtrSnapshot(run.symbol, atrTfOf(run.slTf), run.userId) : null
+          const legPctOf = (m: string, v: number | null, kind: 'tp' | 'sl'): number | null => {
+            if (m === 'pct') return v != null && v > 0 ? Math.min(100, Math.max(0.01, Math.abs(v))) : null
+            if (m === 'atr') {
+              const snap = kind === 'tp' ? atrSnapTp : atrSnapSl
+              if (!snap || v == null || !(v > 0)) return null
+              return atrToPct(snap.atr, v, anchorPx)
+            }
+            return null
+          }
           const pctPx = (m: string, v: number | null, kind: 'tp' | 'sl'): number | undefined => {
-            if (m !== 'pct' || v == null || anchorPx == null || anchorPx <= 0) return undefined
-            const p = Math.min(100, Math.max(0.01, Math.abs(v)))
+            const p = legPctOf(m, v, kind)
+            if (p == null || anchorPx == null || anchorPx <= 0) return undefined
             const profitSide = kind === 'tp' ? res.entry!.side === 'buy' : res.entry!.side === 'sell'
             const px = profitSide ? anchorPx * (1 + p / 100) : anchorPx * (1 - p / 100)
             return px > 0 ? px : undefined
@@ -744,7 +765,13 @@ async function cycle(runId: string) {
               } catch { riskEquity = null }
             }
             riskBudget = riskBudgetUsd(run.riskBasis, Number(run.riskMoney), run.riskMoneyPct, riskEquity)
-            const slPct = run.slMode === 'pct' ? run.slValue : null
+            const slPct = run.slMode === 'pct'
+              ? (run.slValue != null && run.slValue > 0 ? run.slValue : null)
+              : run.slMode === 'atr'
+                ? (atrSnapSl != null && run.slValue != null && run.slValue > 0
+                    ? atrToPct(atrSnapSl.atr, run.slValue, anchorPx)
+                    : null)
+                : null
             const sized = anchorPx != null && slPct != null && sl != null && riskBudget != null
               ? riskSizedQty(riskBudget, anchorPx, slPct, isCryptoSym)
               : null
@@ -765,19 +792,26 @@ async function cycle(runId: string) {
             }
           }
           const storedLegInvalid = (run.tpMode === 'pct' && !(run.tpValue != null && run.tpValue > 0)) ||
-            (run.slMode === 'pct' && !(run.slValue != null && run.slValue > 0))
-          if (ref == null && (run.tpMode === 'pct' || run.slMode === 'pct')) {
+            (run.slMode === 'pct' && !(run.slValue != null && run.slValue > 0)) ||
+            (run.tpMode === 'atr' && !(run.tpValue != null && run.tpValue > 0)) ||
+            (run.slMode === 'atr' && !(run.slValue != null && run.slValue > 0))
+          if (ref == null && (run.tpMode === 'pct' || run.slMode === 'pct' || tpIsAtr || slIsAtr)) {
             // Task 89 — FAIL CLOSED: a % TP/SL that can't be priced used to
             // mean "enter without bracket legs" — a data hiccup silently
             // downgraded the user's stop to none (and for orb15/crypto left
             // the position with NO protection). The entry is skipped this
             // bar; the signal memory keeps the edge-gate semantics honest.
-            await log(runId, run.userId, 'error', 'No live quote to price the % TP/SL bracket — entry SKIPPED this bar (fail-closed; a configured stop is never dropped)')
+            await log(runId, run.userId, 'error', 'No live quote to price the %/ATR TP/SL bracket — entry SKIPPED this bar (fail-closed; a configured stop is never dropped)')
           } else if (storedLegInvalid) {
             // Task 89 — a STORED-INVALID % leg (null/≤ 0 value with mode
             // 'pct', e.g. from an import) must never degrade into a naked
             // entry either — same fail-closed posture, explicit journal.
-            await log(runId, run.userId, 'error', 'Configured % TP/SL has an invalid stored value — entry SKIPPED this bar (fix the run settings; a configured stop is never dropped)')
+            await log(runId, run.userId, 'error', 'Configured %/ATR TP/SL has an invalid stored value — entry SKIPPED this bar (fix the run settings; a configured stop is never dropped)')
+          } else if ((tpIsAtr && atrSnapTp == null) || (slIsAtr && atrSnapSl == null)) {
+            // v1.96.0 — fail-closed parity for ATR legs: no ATR snapshot (no
+            // bars ever, or last-good older than 24h) → the entry is SKIPPED,
+            // never sent naked.
+            await log(runId, run.userId, 'error', `No ATR data to price the ATR ${tpIsAtr && atrSnapTp == null ? `TP (ATR ${atrTfOf(run.tpTf)})` : `SL (ATR ${atrTfOf(run.slTf)})`} bracket — entry SKIPPED this bar (fail-closed; a configured stop is never dropped)`)
           } else if (qty <= 0) {
             await log(runId, run.userId, 'error', 'qty rounds to 0 — fix the run quantity')
           } else {
@@ -912,6 +946,9 @@ export async function startAlgoRun(cfg: {
   tpValue: number | null
   slMode: string
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null
+  slTf: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -936,6 +973,9 @@ export async function startAlgoRun(cfg: {
       tpValue: cfg.tpValue,
       slMode: cfg.slMode,
       slValue: cfg.slValue,
+      // v1.96.0 — ATR timeframes (null unless the mode is 'atr')
+      tpTf: cfg.tpMode === 'atr' ? (cfg.tpTf ?? null) : null,
+      slTf: cfg.slMode === 'atr' ? (cfg.slTf ?? null) : null,
       maxTradesDay: cfg.maxTradesDay,
       rthOnly: cfg.rthOnly,
       flattenEod: cfg.flattenEod,
@@ -978,6 +1018,9 @@ export interface AlgoRunConfigPatch {
   tpValue: number | null
   slMode: string
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null
+  slTf: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -1032,11 +1075,14 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   } else if (patch.sizingMode === 'risk' && patch.riskBasis !== 'pct' && run.riskMoney !== patch.riskMoney) {
     diffs.push(`risk $${run.riskMoney ?? 0} → $${patch.riskMoney ?? 0}/trade`)
   }
-  if (run.tpMode !== patch.tpMode || (patch.tpMode === 'pct' && run.tpValue !== patch.tpValue)) {
-    diffs.push(`TP ${run.tpMode === 'pct' ? `${run.tpValue}%` : 'off'} → ${patch.tpMode === 'pct' ? `${patch.tpValue}%` : 'off'}`)
+  // v1.96.0 — TP/SL diff labels: % stays %, ATR reads "1.5×ATR(1h)"
+  const exitDiffLabel = (mode: string, value: number | null, tf: string | null) =>
+    mode === 'pct' ? `${value ?? 0}%` : mode === 'atr' ? `${value ?? 0}×ATR(${atrTfOf(tf)})` : 'off'
+  if (run.tpMode !== patch.tpMode || run.tpValue !== patch.tpValue || run.tpTf !== patch.tpTf) {
+    diffs.push(`TP ${exitDiffLabel(run.tpMode, run.tpValue, run.tpTf)} → ${exitDiffLabel(patch.tpMode, patch.tpValue, patch.tpTf)}`)
   }
-  if (run.slMode !== patch.slMode || (patch.slMode === 'pct' && run.slValue !== patch.slValue)) {
-    diffs.push(`SL ${run.slMode === 'pct' ? `${run.slValue}%` : 'off'} → ${patch.slMode === 'pct' ? `${patch.slValue}%` : 'off'}`)
+  if (run.slMode !== patch.slMode || run.slValue !== patch.slValue || run.slTf !== patch.slTf) {
+    diffs.push(`SL ${exitDiffLabel(run.slMode, run.slValue, run.slTf)} → ${exitDiffLabel(patch.slMode, patch.slValue, patch.slTf)}`)
   }
   if (run.maxTradesDay !== patch.maxTradesDay) diffs.push(`max trades/day ${run.maxTradesDay} → ${patch.maxTradesDay}`)
   if (run.rthOnly !== patch.rthOnly) diffs.push(`RTH only ${run.rthOnly ? 'ON' : 'OFF'} → ${patch.rthOnly ? 'ON' : 'OFF'}`)
@@ -1060,9 +1106,12 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       riskMoney: patch.sizingMode === 'risk' && patch.riskBasis !== 'pct' ? patch.riskMoney : null,
       riskMoneyPct: patch.sizingMode === 'risk' && patch.riskBasis === 'pct' ? patch.riskMoneyPct : null,
       tpMode: patch.tpMode,
-      tpValue: patch.tpMode === 'pct' ? patch.tpValue : null,
+      tpValue: patch.tpMode === 'pct' || patch.tpMode === 'atr' ? patch.tpValue : null,
       slMode: patch.slMode,
-      slValue: patch.slMode === 'pct' ? patch.slValue : null,
+      slValue: patch.slMode === 'pct' || patch.slMode === 'atr' ? patch.slValue : null,
+      // v1.96.0 — ATR timeframes follow their mode (null when not 'atr')
+      tpTf: patch.tpMode === 'atr' ? (patch.tpTf ?? null) : null,
+      slTf: patch.slMode === 'atr' ? (patch.slTf ?? null) : null,
       maxTradesDay: patch.maxTradesDay,
       rthOnly: patch.rthOnly,
       flattenEod: patch.flattenEod,

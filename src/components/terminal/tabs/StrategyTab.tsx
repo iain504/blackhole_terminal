@@ -21,8 +21,9 @@ import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import {
   StrategyRuleDetail, StrategiesHistoryData, PositionRow, normSym,
 } from '@/components/chart/trading-types'
-import { condSummary, statusBadgeCls } from '../StrategyDrawer'
+import { condSummary, statusBadgeCls, atrTfOf } from '../StrategyDrawer'
 import { cn } from '@/lib/utils'
+import { fmtAtrExit } from '@/lib/atr-client'
 
 const money = (n: number) => `${n >= 0 ? '+' : '−'}$${Math.abs(n).toFixed(2)}`
 const pct = (n: number) => `${n >= 0 ? '+' : '−'}${Math.abs(n).toFixed(2)}%`
@@ -46,8 +47,10 @@ function fmtDateTime(iso: string): string {
   })
 }
 
-/** TP/SL plan text from the rule config (pct shows %, price shows level). */
-function exitText(mode: string, value: number | null): string {
+/** TP/SL plan text from the rule config (pct shows %, price shows level,
+ *  atr shows "1.5×ATR(1h)"). */
+function exitText(mode: string, value: number | null, tf?: string | null): string {
+  if (mode === 'atr' && value != null) return fmtAtrExit(value, tf)
   if (mode === 'pct' && value != null) return `${value >= 10 ? Math.round(value) : value}%`
   if (mode === 'price' && value != null) return fmtPrice(value)
   return '—'
@@ -318,9 +321,9 @@ export default function StrategyTab() {
                 </span>
                 {(hasTp || hasSl) && (
                   <span className="text-zinc-400">
-                    <span className="text-emerald-400/80">TP {exitText(r.tpMode, r.tpValue)}</span>
+                    <span className="text-emerald-400/80">TP {exitText(r.tpMode, r.tpValue, atrTfOf(r, 'tp'))}</span>
                     {' · '}
-                    <span className="text-rose-400/80">SL {exitText(r.slMode, r.slValue)}</span>
+                    <span className="text-rose-400/80">SL {exitText(r.slMode, r.slValue, atrTfOf(r, 'sl'))}</span>
                   </span>
                 )}
                 {r.repeat && (

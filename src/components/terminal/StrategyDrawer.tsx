@@ -12,6 +12,7 @@ import { useToast } from '@/hooks/use-toast'
 import { Bot, Loader2, Zap, AlertTriangle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ttLog } from '@/lib/console-log'
+import { fmtAtrExit, ATR_TF_OPTIONS } from '@/lib/atr-client'
 
 const TFS = ['1m', '5m', '15m', '1h', '4h', '1D', '1W', '1M'] as const
 const TF_LABEL: Record<string, string> = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1D': '1D', '1W': '1W', '1M': '1M' }
@@ -33,10 +34,24 @@ export function condSummary(r: Strategy): string {
 }
 
 /** Short TP/SL chip text (no unit suffix — the row renders it). */
-function exitChip(mode: string, value: number | null): string | null {
+function exitChip(mode: string, value: number | null, tf?: string | null): string | null {
+  // v1.96.0 — ATR legs render as "1.5×ATR(1h)" (the multiplier + timeframe)
+  if (mode === 'atr' && value != null) return fmtAtrExit(value, tf)
   if (mode === 'pct' && value != null) return `${value >= 10 ? Math.round(value) : value}`
   if (mode === 'price' && value != null) return `${value}`
   return null
+}
+
+/** v1.96.0 — the strategies DTO now carries tpTf/slTf (string|null) for ATR
+ *  legs; the local Strategy interface predates the field, so read it
+ *  defensively. Exported for StrategyTab's chips. `tpMode` in the shape gives
+ *  every rule/DTO carrying an exit config a common property (weak-type check). */
+export function atrTfOf(
+  r: { tpMode?: unknown; tpTf?: string | null; slTf?: string | null } | null | undefined,
+  leg: 'tp' | 'sl',
+): string | null {
+  if (!r) return null
+  return (leg === 'tp' ? r.tpTf : r.slTf) ?? null
 }
 
 export function statusBadgeCls(status: string): string {
@@ -83,10 +98,14 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
   // action fields
   const [action, setAction] = useState<'buy' | 'sell'>('buy')
   const [qty, setQty] = useState('1')
-  const [tpMode, setTpMode] = useState<'none' | 'price' | 'pct'>('pct')
+  const [tpMode, setTpMode] = useState<'none' | 'price' | 'pct' | 'atr'>('pct')
   const [tpValue, setTpValue] = useState('2')
-  const [slMode, setSlMode] = useState<'none' | 'price' | 'pct'>('pct')
+  const [slMode, setSlMode] = useState<'none' | 'price' | 'pct' | 'atr'>('pct')
   const [slValue, setSlValue] = useState('1')
+  // v1.96.0 — ATR legs: the value is a multiplier of Wilder ATR(14) on this
+  // timeframe (used only when the leg's mode is 'atr')
+  const [tpTf, setTpTf] = useState('1h')
+  const [slTf, setSlTf] = useState('1h')
   const [repeat, setRepeat] = useState(false)
   // Task 94 — account opt-in: rules default to PAPER; LIVE requires an
   // explicit "I understand" ack (the API refuses mode:'live' without
@@ -116,14 +135,18 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
   // mirroring the alarms drawer's level↔direction auto-flip
   const rsiCondition: 'cross_above' | 'cross_below' = rsiLevelN >= 50 ? 'cross_above' : 'cross_below'
 
+  // ATR multiplier bounds — mirrors the API ("TP ATR multiplier must be
+  // between 0.1 and 20"), so the form refuses the exact values it would 400 on
+  const tpMultOk = Number.isFinite(tpN) && tpN >= 0.1 && tpN <= 20
+  const slMultOk = Number.isFinite(slN) && slN >= 0.1 && slN <= 20
   const formValid =
     symbol.trim().length > 0 &&
     Number.isFinite(qtyN) && qtyN > 0 &&
     (kind === 'rsi'
       ? Number.isFinite(rsiLevelN) && rsiLevelN > 0 && rsiLevelN < 100
       : (cond === 'cross_above' || cond === 'cross_below' ? Number.isFinite(macdLevelN) : true)) &&
-    (tpMode === 'none' || (Number.isFinite(tpN) && tpN > 0)) &&
-    (slMode === 'none' || (Number.isFinite(slN) && slN > 0)) &&
+    (tpMode === 'none' || (tpMode === 'atr' ? tpMultOk : Number.isFinite(tpN) && tpN > 0)) &&
+    (slMode === 'none' || (slMode === 'atr' ? slMultOk : Number.isFinite(slN) && slN > 0)) &&
     // LIVE opt-in gate — the ack checkbox IS the explicit confirmation
     (acctMode === 'paper' || liveAck)
 
@@ -156,8 +179,10 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
         qty: qtyN,
         tpMode,
         tpValue: tpMode === 'none' ? null : tpN,
+        tpTf: tpMode === 'atr' ? tpTf : null,
         slMode,
         slValue: slMode === 'none' ? null : slN,
+        slTf: slMode === 'atr' ? slTf : null,
         repeat,
         // Task 94 — pinned account + explicit live opt-in flag (the server
         // 400s a live arm that lacks liveConfirm, so this must be sent)
@@ -401,32 +426,64 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
               const setMode = k === 'tp' ? setTpMode : setSlMode
               const value = k === 'tp' ? tpValue : slValue
               const setValue = k === 'tp' ? setTpValue : setSlValue
+              const legTf = k === 'tp' ? tpTf : slTf
+              const setLegTf = k === 'tp' ? setTpTf : setSlTf
+              const multOk = k === 'tp' ? tpMultOk : slMultOk
               return (
-                <div key={k} className="flex items-center gap-1.5">
-                  <label className="w-16 shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{label}</label>
-                  <select
-                    value={mode}
-                    onChange={(e) => setMode(e.target.value as 'none' | 'price' | 'pct')}
-                    aria-label={`${label} mode`}
-                    className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
-                  >
-                    <option value="none">— none</option>
-                    <option value="pct">% offset</option>
-                    <option value="price">price</option>
-                  </select>
-                  <Input
-                    type="number" step="any" min={0} value={value}
-                    onChange={(e) => setValue(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && formValid && !creating && void create()}
-                    disabled={mode === 'none'}
-                    aria-label={`${label} value`}
-                    className="h-7 flex-1 border-zinc-700 bg-zinc-950 text-xs disabled:opacity-40"
-                  />
-                  {mode === 'pct' && <span className="text-xs text-zinc-500">%</span>}
-                  {mode === 'pct' && (
-                    <span className="hidden text-[9px] leading-tight text-zinc-600 sm:block">
-                      {action === 'buy' ? (k === 'tp' ? 'above' : 'below') : k === 'tp' ? 'below' : 'above'}
-                    </span>
+                <div key={k} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-1.5">
+                    <label className="w-16 shrink-0 text-[10px] uppercase tracking-wider text-zinc-500">{label}</label>
+                    <select
+                      value={mode}
+                      onChange={(e) => {
+                        const m = e.target.value as 'none' | 'price' | 'pct' | 'atr'
+                        // switching to ATR with a non-multiplier value in the
+                        // input → seed the API default (1.5)
+                        if (m === 'atr' && !(Number(value) >= 0.1 && Number(value) <= 20)) setValue('1.5')
+                        setMode(m)
+                      }}
+                      aria-label={`${label} mode`}
+                      className="h-7 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+                    >
+                      <option value="none">— none</option>
+                      <option value="pct">% offset</option>
+                      <option value="price">price</option>
+                      <option value="atr">ATR ×</option>
+                    </select>
+                    <Input
+                      type="number" step={mode === 'atr' ? '0.1' : 'any'} min={mode === 'atr' ? 0.1 : 0} max={mode === 'atr' ? 20 : undefined}
+                      value={value}
+                      onChange={(e) => setValue(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && formValid && !creating && void create()}
+                      disabled={mode === 'none'}
+                      aria-label={mode === 'atr' ? `${label} ATR multiplier (0.1–20)` : `${label} value`}
+                      aria-invalid={mode === 'atr' && !multOk ? true : undefined}
+                      className="h-7 flex-1 border-zinc-700 bg-zinc-950 text-xs disabled:opacity-40"
+                    />
+                    {mode === 'atr' && (
+                      <select
+                        value={legTf}
+                        onChange={(e) => setLegTf(e.target.value)}
+                        aria-label={`${label} ATR timeframe`}
+                        title="ATR(14) timeframe"
+                        className="h-7 shrink-0 rounded border border-zinc-700 bg-zinc-950 px-1 text-xs text-zinc-200"
+                      >
+                        {ATR_TF_OPTIONS.map((o) => (
+                          <option key={o.value} value={o.value}>{o.value}</option>
+                        ))}
+                      </select>
+                    )}
+                    {mode === 'pct' && <span className="text-xs text-zinc-500">%</span>}
+                    {mode === 'pct' && (
+                      <span className="hidden text-[9px] leading-tight text-zinc-600 sm:block">
+                        {action === 'buy' ? (k === 'tp' ? 'above' : 'below') : k === 'tp' ? 'below' : 'above'}
+                      </span>
+                    )}
+                  </div>
+                  {mode === 'atr' && !multOk && (
+                    <p className="pl-[72px] text-[10px] leading-snug text-rose-400">
+                      {k === 'tp' ? 'TP' : 'SL'} ATR multiplier must be between 0.1 and 20
+                    </p>
                   )}
                 </div>
               )
@@ -531,8 +588,8 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
             </p>
           )}
           {strategies.map((r) => {
-            const tp = exitChip(r.tpMode, r.tpValue)
-            const sl = exitChip(r.slMode, r.slValue)
+            const tp = exitChip(r.tpMode, r.tpValue, atrTfOf(r, 'tp'))
+            const sl = exitChip(r.slMode, r.slValue, atrTfOf(r, 'sl'))
             return (
               <div key={r.id} className="rounded-md px-2 py-1.5 text-xs hover:bg-zinc-800/60">
                 <div className="flex items-center justify-between gap-2">
@@ -611,7 +668,7 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
           })}
         </div>
         <div className="border-t border-zinc-800 px-4 py-2 text-[11px] text-zinc-500">
-          Checked every 20s (also server-side) · fires only on a genuine crossing of the chosen timeframe · order placed as market with bracket TP/SL · % legs resolve from the live quote at fire time
+          Checked every 20s (also server-side) · fires only on a genuine crossing of the chosen timeframe · order placed as market with bracket TP/SL · % legs resolve from the live quote at fire time · ATR legs resolve as mult×ATR(14) on the leg's timeframe
         </div>
       </div>
     </div>

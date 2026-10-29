@@ -90,9 +90,9 @@ export interface BacktestConfig {
   riskMoney: number | null
   riskMoneyPct?: number | null
   isCrypto: boolean // risk sizing floors to whole shares for stocks, 4dp for crypto
-  tpMode: 'none' | 'pct'
+  tpMode: 'none' | 'pct' | 'atr'
   tpValue: number | null
-  slMode: 'none' | 'pct'
+  slMode: 'none' | 'pct' | 'atr'
   slValue: number | null
   maxTradesDay: number
   rthOnly: boolean
@@ -617,7 +617,26 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         const px = profitSide ? fill * (1 + p / 100) : fill * (1 - p / 100)
         return px > 0 ? px : null
       }
-      const slPx = cfg.slMode === 'pct' ? pctPx(cfg.slValue, false) : null
+      // v1.96.0 — ATR-mode brackets: distance = mult × THIS bar's ATR%(14) ×
+      // fill (the dataset's own volatility series — the backtest analogue of
+      // the live engine's entry-time ATR resolution). Warm-up bars (ATR% not
+      // yet seeded) fail CLOSED: no trade, counted as suppressed — matching
+      // the live engine's entry-skip gate for missing ATR data.
+      const atrMissing = (cfg.tpMode === 'atr' || cfg.slMode === 'atr') && !Number.isFinite(atrPct[i])
+      const atrPx = (v: number | null, tp: boolean): number | null => {
+        if (atrMissing || v == null || !(v > 0)) return null
+        const p = Math.min(100, Math.max(0.01, atrPct[i] * v))
+        const profitSide = tp ? dir === 1 : dir === -1
+        const px = fill * (profitSide ? 1 + p / 100 : 1 - p / 100)
+        return px > 0 ? px : null
+      }
+      const slPx = atrMissing
+        ? null
+        : cfg.slMode === 'pct'
+          ? pctPx(cfg.slValue, false)
+          : cfg.slMode === 'atr'
+            ? atrPx(cfg.slValue, false)
+            : null
       // Risk-Money sizing (Task 78) — size each trade so the loss to THIS
       // trade's stop ≈ the risk budget, using the actual fill price. Risk-
       // sized trades therefore breathe with volatility exactly like the live
@@ -654,8 +673,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         ? Math.floor((maxNotional / fill) * 1e4) / 1e4 // crypto granularity 4dp
         : Math.floor(maxNotional / fill) // stocks stay whole-share
       const effQty = Math.min(qty, maxQty)
-      if (!(effQty > 0) || effQty * fill < 10) {
+      if (atrMissing || !(effQty > 0) || effQty * fill < 10) {
         // dust — notional below the exchange-minimum ballpark: no trade
+        // (v1.96.0: also the ATR fail-closed skip — no ATR% yet on this bar)
         pending = null
         suppressed++
       } else {
@@ -665,7 +685,11 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
           qty: effQty,
           entryPx: fill,
           entryTime: bar.time,
-          tpPx: cfg.tpMode === 'pct' ? pctPx(cfg.tpValue, true) : null,
+          tpPx: cfg.tpMode === 'pct'
+            ? pctPx(cfg.tpValue, true)
+            : cfg.tpMode === 'atr'
+              ? atrPx(cfg.tpValue, true)
+              : null,
           slPx,
         }
         // Task 89 — parity: counted when the fill SURVIVES the dust check
@@ -969,8 +993,8 @@ function applyOverride(base: BacktestConfig, override: Record<string, number>): 
   let cfg = base
   const tp = override.tpValue
   const sl = override.slValue
-  if (tp != null && Number.isFinite(tp) && tp > 0) cfg = { ...cfg, tpMode: 'pct', tpValue: tp }
-  if (sl != null && Number.isFinite(sl) && sl > 0) cfg = { ...cfg, slMode: 'pct', slValue: sl }
+  if (tp != null && Number.isFinite(tp) && tp > 0) cfg = { ...cfg, tpMode: base.tpMode === 'atr' ? 'atr' : 'pct', tpValue: tp }
+  if (sl != null && Number.isFinite(sl) && sl > 0) cfg = { ...cfg, slMode: base.slMode === 'atr' ? 'atr' : 'pct', slValue: sl }
   const params: Record<string, number> = { ...base.params }
   for (const [k, v] of Object.entries(override)) {
     if (!TP_SL_KEYS.has(k)) params[k] = v

@@ -223,6 +223,45 @@ export function macd(closes: number[], fast: number, slow: number, signal: numbe
   return { macd: macdLine, signal: sig, hist }
 }
 
+/**
+ * Wilder ATR series (v1.96.0) — aligned with the input (null during warm-up),
+ * same seeding convention as dayplan.atrWilder: seed = simple mean of the
+ * first `period` true ranges, then Wilder smoothing ATR = (prev×(p−1)+TR)/p.
+ * True Range = max(high−low, |high−prevClose|, |low−prevClose|).
+ */
+export function atrSeries(bars: BarInput[], period = 14): (number | null)[] {
+  const out: (number | null)[] = new Array(bars.length).fill(null)
+  if (period < 1 || bars.length <= period) return out
+  let atr = 0
+  let prevClose = bars[0].close
+  for (let i = 1; i <= period; i++) {
+    const b = bars[i]
+    const tr = Math.max(b.high - b.low, Math.abs(b.high - prevClose), Math.abs(b.low - prevClose))
+    atr += tr
+    prevClose = b.close
+  }
+  atr /= period
+  out[period] = Number.isFinite(atr) && atr > 0 ? atr : null
+  for (let i = period + 1; i < bars.length; i++) {
+    const b = bars[i]
+    const tr = Math.max(b.high - b.low, Math.abs(b.high - prevClose), Math.abs(b.low - prevClose))
+    atr = (atr * (period - 1) + tr) / period
+    prevClose = b.close
+    out[i] = Number.isFinite(atr) && atr > 0 ? atr : null
+  }
+  return out
+}
+
+/** Latest Wilder ATR value over `bars` (null when the series has no warm-up). */
+export function computeAtr(bars: BarInput[], period = 14): number | null {
+  const s = atrSeries(bars, period)
+  for (let i = s.length - 1; i >= 0; i--) {
+    const v = s[i]
+    if (v != null) return v
+  }
+  return null
+}
+
 // --------------------------- chart-facing helpers ---------------------------
 
 const zip = (bars: BarInput[], vals: (number | null)[]): LinePoint[] => {

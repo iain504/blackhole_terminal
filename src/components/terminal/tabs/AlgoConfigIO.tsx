@@ -23,6 +23,7 @@ import {
 } from '@/components/ui/dialog'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
+import { fmtAtrExit } from '@/lib/atr-client'
 import {
   ALGO_STRATEGIES, parseAlgoConfigImport, strategyRuleConditionSummary,
   type AlpoRunConfig, type AlgoConfigFileEntry, type AlgoRuleImportPayload,
@@ -521,7 +522,9 @@ export default function AlgoImportDialog({
                         <Badge variant="outline" className="h-3.5 px-1 text-[9px] text-zinc-400">{e.config.timeframe}</Badge>
                         <span>qty {e.config.qty}</span>
                         {e.config.tpMode === 'pct' && <span className="text-emerald-400/80">TP {e.config.tpValue}%</span>}
+                        {e.config.tpMode === 'atr' && <span className="text-emerald-400/80">TP {fmtAtrExit(e.config.tpValue, e.config.tpTf)}</span>}
                         {e.config.slMode === 'pct' && <span className="text-rose-400/80">SL {e.config.slValue}%</span>}
+                        {e.config.slMode === 'atr' && <span className="text-rose-400/80">SL {fmtAtrExit(e.config.slValue, e.config.slTf)}</span>}
                         {e.config.rthOnly && <span>RTH</span>}
                         {e.config.flattenEod && <span>EOD</span>}
                         {(e.config.cooldownMin ?? 0) > 0 && <span className="text-sky-400/80">cooldown {e.config.cooldownMin}m</span>}
@@ -586,8 +589,10 @@ export default function AlgoImportDialog({
                         <span>qty {rule.qty}</span>
                         {rule.tpMode === 'pct' && <span className="text-emerald-400/80">TP {rule.tpValue}%</span>}
                         {rule.tpMode === 'price' && <span className="text-emerald-400/80">TP {rule.tpValue}</span>}
+                        {rule.tpMode === 'atr' && <span className="text-emerald-400/80">TP {fmtAtrExit(rule.tpValue, rule.tpTf)}</span>}
                         {rule.slMode === 'pct' && <span className="text-rose-400/80">SL {rule.slValue}%</span>}
                         {rule.slMode === 'price' && <span className="text-rose-400/80">SL {rule.slValue}</span>}
+                        {rule.slMode === 'atr' && <span className="text-rose-400/80">SL {fmtAtrExit(rule.slValue, rule.slTf)}</span>}
                         {rule.repeat && <span>repeats</span>}
                       </span>
                     </span>

@@ -1,4 +1,5 @@
 // BLACKHOLE grid setup — portable export/import serialization (Task 10-f).
+import { TIMEFRAMES } from '@/lib/market-types'
 //
 // A "setup" is the pure CONFIG of a grid trade (exactly what the create dialog
 // submits to POST /api/grid) — NOT its runtime state: no id, lots, fills,
@@ -41,9 +42,12 @@ export interface GridSetup {
   spacing: 'arithmetic' | 'geometric'
   qtyPerGrid: number
   maxSL: number | null
-  slBasis: 'price' | 'percent'
+  slBasis: 'price' | 'percent' | 'atr'
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf: string | null
   maxTP: number | null
-  tpBasis: 'price' | 'percent'
+  tpBasis: 'price' | 'percent' | 'atr'
+  tpTf: string | null
   /** Task 10-g — one-sided grids; absent in pre-10-g files reads as 'both' */
   direction: GridSetupDirection
   closeOnStop: boolean
@@ -60,7 +64,8 @@ const round2 = (n: number) => Math.round(n * 100) / 100
 
 /** Minimum shape a grid row (GridTradeDto) must expose to be exported.
  * slBasis/tpBasis are optional strings — pre-10-a rows lack them (→ 'price').
- * direction optional — pre-10-g rows lack it (→ 'both'). */
+ * direction optional — pre-10-g rows lack it (→ 'both').
+ * slTf/tpTf optional — pre-v1.96.0 rows lack them (→ '1h' when basis 'atr'). */
 export type GridSetupRowLike = Pick<
   GridSetup, 'lowerPrice' | 'upperPrice' | 'gridCount' | 'qtyPerGrid' | 'maxSL' | 'maxTP' | 'closeOnStop'
 > & {
@@ -68,6 +73,8 @@ export type GridSetupRowLike = Pick<
   spacing: string
   slBasis?: string | null
   tpBasis?: string | null
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string | null
 }
 
@@ -83,9 +90,11 @@ export function gridSetupFromRow(row: GridSetupRowLike): GridSetupFile {
     spacing: row.spacing === 'geometric' ? 'geometric' : 'arithmetic',
     qtyPerGrid: row.qtyPerGrid,
     maxSL: row.maxSL,
-    slBasis: row.slBasis === 'percent' ? 'percent' : 'price',
+    slBasis: row.slBasis === 'percent' ? 'percent' : row.slBasis === 'atr' ? 'atr' : 'price',
+    slTf: row.slBasis === 'atr' ? (row.slTf ?? '1h') : null,
     maxTP: row.maxTP,
-    tpBasis: row.tpBasis === 'percent' ? 'percent' : 'price',
+    tpBasis: row.tpBasis === 'percent' ? 'percent' : row.tpBasis === 'atr' ? 'atr' : 'price',
+    tpTf: row.tpBasis === 'atr' ? (row.tpTf ?? '1h') : null,
     direction: row.direction === 'buy' || row.direction === 'sell' ? row.direction : 'both',
     closeOnStop: !!row.closeOnStop,
     exportedAt: new Date().toISOString(),
@@ -134,9 +143,13 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
       return { ok: false, error: 'direction must be "both", "buy" or "sell"' }
     }
   }
-  const basis = (v: unknown) => (v === 'percent' ? 'percent' : 'price') as 'price' | 'percent'
+  const basis = (v: unknown) => (v === 'percent' ? 'percent' : v === 'atr' ? 'atr' : 'price') as 'price' | 'percent' | 'atr'
   const slBasis = basis(o.slBasis)
   const tpBasis = basis(o.tpBasis)
+  // v1.96.0 — ATR(14) timeframes (validated chart timeframes, default '1h')
+  const atrTf = (v: unknown): string => (typeof v === 'string' && v in TIMEFRAMES ? v : '1h')
+  const slTf = slBasis === 'atr' ? atrTf(o.slTf) : null
+  const tpTf = tpBasis === 'atr' ? atrTf(o.tpTf) : null
   const rawSL = o.maxSL == null ? null : num(o.maxSL)
   const rawTP = o.maxTP == null ? null : num(o.maxTP)
   if (o.maxSL != null && !(rawSL! > 0)) return { ok: false, error: 'maxSL must be a positive number or null' }
@@ -144,8 +157,14 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
   if (slBasis === 'percent' && rawSL != null && rawSL > 90) {
     return { ok: false, error: 'maxSL percent must be within 0–90' }
   }
+  if (slBasis === 'atr' && rawSL != null && (rawSL < 0.1 || rawSL > 20)) {
+    return { ok: false, error: 'maxSL ATR multiplier must be between 0.1 and 20' }
+  }
   if (tpBasis === 'percent' && rawTP != null && rawTP > 1000) {
     return { ok: false, error: 'maxTP percent must be within 0–1000' }
+  }
+  if (tpBasis === 'atr' && rawTP != null && (rawTP < 0.1 || rawTP > 20)) {
+    return { ok: false, error: 'maxTP ATR multiplier must be between 0.1 and 20' }
   }
   if (direction !== 'sell') {
     // long ordering (both / buy): SL strictly below lower, TP strictly above upper
@@ -175,8 +194,10 @@ export function parseGridSetup(text: string): ParseGridSetupResult {
       qtyPerGrid: qty,
       maxSL: rawSL != null ? round2(rawSL) : null,
       slBasis,
+      slTf,
       maxTP: rawTP != null ? round2(rawTP) : null,
       tpBasis,
+      tpTf,
       direction,
       closeOnStop: o.closeOnStop !== false,
     },

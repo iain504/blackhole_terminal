@@ -36,6 +36,7 @@
 // curve still update on EVERY bar (the gated engine keeps tracking state too).
 import type { Bar } from '@/lib/market-types'
 import { isRegularSession } from '@/lib/sessions'
+import { atrSeries } from '@/lib/indicators'
 import {
   computeLevels, resolveGuards, guardStopText,
   type GridSpacing, type GridDirection,
@@ -49,9 +50,13 @@ export interface GridBacktestConfig {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
-  /** 'price' | 'percent' */
+  /** 'price' | 'percent' | 'atr' (v1.96.0) */
   slBasis: string
   tpBasis: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' (label parity only —
+   *  the replay computes ATR on ITS OWN bars, per-bar) */
+  slTf?: string | null
+  tpTf?: string | null
   closeOnStop: boolean
   /** crypto trades fractional size; stocks are floored to whole shares */
   isCrypto: boolean
@@ -122,7 +127,22 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
   const levels = computeLevels(cfg.lowerPrice, cfg.upperPrice, cfg.gridCount, cfg.spacing)
   const sellGrid = cfg.direction === 'sell'
   const buyOnly = cfg.direction === 'buy'
-  const { slTrigger, tpTrigger } = resolveGuards({
+  // v1.96.0 — ATR-basis guards breathe with volatility in the replay too: a
+  // per-bar Wilder ATR(14) series re-arms the triggers EVERY bar (parity with
+  // the live engine's per-tick re-resolution). Warm-up bars (null ATR) defer
+  // that guard exactly like a data-hiccup tick does live. Non-atr guards keep
+  // the single static resolution (identical numbers to before).
+  const atrBasis = cfg.slBasis === 'atr' || cfg.tpBasis === 'atr'
+  const atrVals = atrBasis ? atrSeries(bars, 14) : null
+  const atrAt = (i: number): number | null => {
+    if (!atrVals) return null
+    for (let j = Math.min(i, atrVals.length - 1); j >= 0; j--) {
+      const v = atrVals[j]
+      if (v != null) return v
+    }
+    return null
+  }
+  const staticTriggers = resolveGuards({
     maxSL: cfg.maxSL,
     maxTP: cfg.maxTP,
     slBasis: cfg.slBasis,
@@ -156,7 +176,20 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
     if (!stopped && ordersOpen) {
       // ---- guards FIRST (SL before TP — same order as evaluateGrid);
       // sell-only fires mirrored (short SL above, short TP below). Deferred
-      // on non-RTH bars exactly like the gated live engine. ----
+      // on non-RTH bars exactly like the gated live engine. ATR basis
+      // re-resolves per bar against THAT bar's ATR (v1.96.0). ----
+      const { slTrigger, tpTrigger } = atrBasis
+        ? resolveGuards({
+            maxSL: cfg.maxSL,
+            maxTP: cfg.maxTP,
+            slBasis: cfg.slBasis,
+            tpBasis: cfg.tpBasis,
+            lowerPrice: cfg.lowerPrice,
+            upperPrice: cfg.upperPrice,
+            direction: cfg.direction ?? 'both',
+            atr: atrAt(bi),
+          })
+        : staticTriggers
       // Task 89 — GAP-AWARE fills: the guard used to close AT the trigger
       // price, but the live engine detects the breach on a tick and closes at
       // MARKET — in a gap (bar opens beyond the trigger, typical on daily
@@ -173,7 +206,7 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
       const tpFillPx = sellGrid ? Math.min(bar.open, tpTrigger ?? bar.open) : Math.max(bar.open, tpTrigger ?? bar.open)
       if (slHit) {
         stopped = true
-        stopReason = guardStopText('sl', cfg.slBasis, cfg.maxSL ?? 0, slTrigger)
+        stopReason = guardStopText('sl', cfg.slBasis, cfg.maxSL ?? 0, slTrigger, cfg.slTf)
         if (cfg.closeOnStop) {
           // the close-all IS the stop close — one fill per lot at the
           // gap-aware fill price
@@ -190,7 +223,7 @@ export function simulateGridBacktest(cfg: GridBacktestConfig, bars: Bar[]): Grid
         }
       } else if (tpHit) {
         stopped = true
-        stopReason = guardStopText('maxtp', cfg.tpBasis, cfg.maxTP ?? 0, tpTrigger)
+        stopReason = guardStopText('maxtp', cfg.tpBasis, cfg.maxTP ?? 0, tpTrigger, cfg.tpTf)
         if (cfg.closeOnStop) {
           for (const lot of lots) {
             const pnl = sellGrid

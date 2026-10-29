@@ -9,6 +9,8 @@ import {
   isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
+import { clampAtrMult } from '@/lib/atr'
+import { TIMEFRAMES } from '@/lib/market-types'
 
 export const dynamic = 'force-dynamic'
 
@@ -27,6 +29,8 @@ export interface AlgoRunDto {
   tpValue: number | null
   slMode: string
   slValue: number | null
+  tpTf?: string | null
+  slTf?: string | null
   maxTradesDay: number
   rthOnly: boolean
   flattenEod: boolean
@@ -44,6 +48,7 @@ export function toDto(r: {
   qty: number; sizingMode?: string; riskBasis?: string
   riskMoney?: number | null; riskMoneyPct?: number | null
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
+  tpTf?: string | null; slTf?: string | null
   maxTradesDay: number; rthOnly: boolean; flattenEod: boolean
   cooldownMin?: number; requireNewSignal?: boolean
   status: string
@@ -59,6 +64,7 @@ export function toDto(r: {
     riskMoney: r.sizingMode === 'risk' && r.riskBasis !== 'pct' ? (r.riskMoney ?? null) : null,
     riskMoneyPct: r.sizingMode === 'risk' && r.riskBasis === 'pct' ? (r.riskMoneyPct ?? null) : null,
     tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
+    tpTf: r.tpTf ?? null, slTf: r.slTf ?? null,
     maxTradesDay: r.maxTradesDay, rthOnly: r.rthOnly, flattenEod: r.flattenEod,
     cooldownMin: r.cooldownMin ?? 0, requireNewSignal: r.requireNewSignal === true,
     status: r.status, tradesToday: st.tradesToday ?? 0,
@@ -124,6 +130,8 @@ interface AlgoStartBody {
   tpValue?: number
   slMode?: string
   slValue?: number
+  tpTf?: string | null
+  slTf?: string | null
   maxTradesDay?: number
   rthOnly?: boolean
   flattenEod?: boolean
@@ -200,12 +208,29 @@ export async function POST(req: NextRequest) {
     // the leg at entry (naked market order). The UI blocks this client-side;
     // this is the API backstop (imports predate it but the engine's
     // stored-leg fail-closed gate catches those at runtime).
-    if (body?.tpMode === 'pct' && clampPct(body?.tpValue) == null) {
-      return NextResponse.json({ error: 'TP % must be a positive number when TP mode is pct' }, { status: 400 })
+    // v1.96.0 — exit legs accept 'pct' (0.01–100) or 'atr' (multiplier 0.1–20
+    // of ATR(14) on a chart timeframe, default '1h') — anything else is 'none'.
+    const parseExitLeg = (mode: unknown, value: unknown, tf: unknown, label: 'TP' | 'SL'):
+      { mode: 'none' | 'pct' | 'atr'; value: number | null; tf: string | null } | string => {
+      if (mode === 'pct') {
+        const p = clampPct(value)
+        if (p == null) return `${label} % must be a positive number when ${label} mode is pct`
+        return { mode: 'pct', value: p, tf: null }
+      }
+      if (mode === 'atr') {
+        const mult = clampAtrMult(value)
+        if (mult == null) return `${label} ATR multiplier must be between 0.1 and 20`
+        if (tf != null && (typeof tf !== 'string' || !(tf in TIMEFRAMES))) {
+          return `${label} ATR timeframe must be one of ${Object.keys(TIMEFRAMES).join('/')}`
+        }
+        return { mode: 'atr', value: mult, tf: typeof tf === 'string' && tf ? tf : '1h' }
+      }
+      return { mode: 'none', value: null, tf: null }
     }
-    if (body?.slMode === 'pct' && clampPct(body?.slValue) == null) {
-      return NextResponse.json({ error: 'SL % must be a positive number when SL mode is pct' }, { status: 400 })
-    }
+    const tpLeg = parseExitLeg(body?.tpMode, body?.tpValue, body?.tpTf, 'TP')
+    if (typeof tpLeg === 'string') return NextResponse.json({ error: tpLeg }, { status: 400 })
+    const slLeg = parseExitLeg(body?.slMode, body?.slValue, body?.slTf, 'SL')
+    if (typeof slLeg === 'string') return NextResponse.json({ error: slLeg }, { status: 400 })
     if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
       return NextResponse.json({ error: 'Risk money must be a positive number when sizing mode is risk' }, { status: 400 })
     }
@@ -221,10 +246,12 @@ export async function POST(req: NextRequest) {
       riskBasis,
       riskMoney,
       riskMoneyPct,
-      tpMode: body?.tpMode === 'pct' ? 'pct' : 'none',
-      tpValue: body?.tpMode === 'pct' ? clampPct(body?.tpValue) : null,
-      slMode: body?.slMode === 'pct' ? 'pct' : 'none',
-      slValue: body?.slMode === 'pct' ? clampPct(body?.slValue) : null,
+      tpMode: tpLeg.mode,
+      tpValue: tpLeg.value,
+      tpTf: tpLeg.tf,
+      slMode: slLeg.mode,
+      slValue: slLeg.value,
+      slTf: slLeg.tf,
       maxTradesDay: Math.min(50, Math.max(1, Math.round(Number(body?.maxTradesDay) || 3))),
       rthOnly: body?.rthOnly !== false,
       flattenEod: body?.flattenEod !== false,

@@ -5,6 +5,7 @@ import { readJson, handleError } from '@/lib/api-helpers'
 import { toDto } from '../route'
 import { ensureStrategySupervisor } from '@/lib/strategy'
 import { hasAlpacaKeys } from '@/lib/alpaca'
+import { TIMEFRAMES } from '@/lib/market-types'
 
 interface PatchBody {
   status?: string // 'armed' | 'paused'
@@ -14,6 +15,9 @@ interface PatchBody {
   tpValue?: number | null
   slMode?: string
   slValue?: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf?: string | null
+  slTf?: string | null
   /** Task 94 — move the rule to another pinned account. paper→live is an
    *  explicit opt-in: requires liveConfirm:true + live keys saved. live→paper
    *  (de-escalation) needs no confirmation. */
@@ -34,12 +38,18 @@ function validateExit(mode: string, value: number | null | undefined, label: str
     if (value == null || !Number.isFinite(value) || value <= 0) return `${label} price must be a positive number`
     return null
   }
+  if (mode === 'atr') {
+    // v1.96.0 — mirrors the create route (../route.ts)
+    if (value == null || !Number.isFinite(value) || value <= 0) return `${label} ATR multiplier must be a positive number`
+    if (value < 0.1 || value > 20) return `${label} ATR multiplier must be between 0.1 and 20`
+    return null
+  }
   if (mode === 'pct') {
     if (value == null || !Number.isFinite(value) || value <= 0) return `${label} % must be a positive number`
     if (value > 100) return `${label} % must be ≤ 100`
     return null
   }
-  return `${label} mode must be none, price or pct`
+  return `${label} mode must be none, price, pct or atr`
 }
 
 // PATCH /api/strategies/[id] — pause / re-arm / edit action side of a rule.
@@ -97,23 +107,33 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // Task 89 — validate the MERGED exit config with the create route's
     // rules. The old PATCH stored whatever arrived (≤ 0, wrong-basis values
     // on mode switches) and the fire path then silently dropped the leg.
-    if (body.tpMode === 'none' || body.tpMode === 'price' || body.tpMode === 'pct') {
+    if (body.tpMode === 'none' || body.tpMode === 'price' || body.tpMode === 'pct' || body.tpMode === 'atr') {
       const modeChanged = body.tpMode !== r.tpMode
       const provided = body.tpValue != null && Number.isFinite(Number(body.tpValue)) ? Number(body.tpValue) : null
       const merged = provided ?? (modeChanged ? null : r.tpValue)
       const err = validateExit(body.tpMode, merged, 'TP')
       if (err) return NextResponse.json({ error: err }, { status: 400 })
+      // v1.96.0 — ATR timeframe: explicit valid value, else keep the stored
+      // one (same mode) or default '1h' on a mode switch
+      const tfProvided = typeof body.tpTf === 'string' && body.tpTf in TIMEFRAMES ? body.tpTf : null
       data.tpMode = body.tpMode
       data.tpValue = body.tpMode === 'none' ? null : (body.tpMode === 'pct' ? clampPct(merged!) : merged)
+      data.tpTf = body.tpMode === 'atr'
+        ? (tfProvided ?? (modeChanged ? '1h' : (r.tpTf ?? '1h')))
+        : null
     }
-    if (body.slMode === 'none' || body.slMode === 'price' || body.slMode === 'pct') {
+    if (body.slMode === 'none' || body.slMode === 'price' || body.slMode === 'pct' || body.slMode === 'atr') {
       const modeChanged = body.slMode !== r.slMode
       const provided = body.slValue != null && Number.isFinite(Number(body.slValue)) ? Number(body.slValue) : null
       const merged = provided ?? (modeChanged ? null : r.slValue)
       const err = validateExit(body.slMode, merged, 'SL')
       if (err) return NextResponse.json({ error: err }, { status: 400 })
+      const tfProvided = typeof body.slTf === 'string' && body.slTf in TIMEFRAMES ? body.slTf : null
       data.slMode = body.slMode
       data.slValue = body.slMode === 'none' ? null : (body.slMode === 'pct' ? clampPct(merged!) : merged)
+      data.slTf = body.slMode === 'atr'
+        ? (tfProvided ?? (modeChanged ? '1h' : (r.slTf ?? '1h')))
+        : null
     }
 
     const updated = await db.strategyRule.update({ where: { id }, data })

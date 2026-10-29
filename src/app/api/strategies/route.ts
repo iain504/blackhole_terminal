@@ -17,10 +17,13 @@ export interface StrategyDto {
   params: { period?: number; fast?: number; slow?: number; signal?: number } | null
   action: string // 'buy' | 'sell'
   qty: number
-  tpMode: string // 'none' | 'price' | 'pct'
+  tpMode: string // 'none' | 'price' | 'pct' | 'atr'
   tpValue: number | null
   slMode: string
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null
+  slTf: string | null
   repeat: boolean
   status: string // armed | paused | placing | triggered | failed
   /** the Alpaca account this rule fires on — PINNED at arm time */
@@ -36,6 +39,7 @@ export function toDto(r: {
   id: string; symbol: string; kind: string; condition: string; level: number
   timeframe: string; params: unknown; action: string; qty: number
   tpMode: string; tpValue: number | null; slMode: string; slValue: number | null
+  tpTf?: string | null; slTf?: string | null
   repeat: boolean; status: string; lastSide: string | null; mode?: string | null
   triggeredAt: Date | null; orderId: string | null; fireNote: string | null; createdAt: Date
 }): StrategyDto {
@@ -44,6 +48,7 @@ export function toDto(r: {
     timeframe: r.timeframe, params: (r.params as StrategyDto['params']) ?? null,
     action: r.action, qty: r.qty,
     tpMode: r.tpMode, tpValue: r.tpValue, slMode: r.slMode, slValue: r.slValue,
+    tpTf: r.tpTf ?? null, slTf: r.slTf ?? null,
     repeat: r.repeat, status: r.status, lastSide: r.lastSide,
     // Task 94 — rules may now be armed on LIVE via explicit opt-in; legacy
     // rows (and any null) read as the safe default 'paper'
@@ -76,10 +81,12 @@ interface CreateBody {
   params?: { period?: number; fast?: number; slow?: number; signal?: number }
   action?: string // 'buy' | 'sell'
   qty?: number
-  tpMode?: string // 'none' | 'price' | 'pct'
+  tpMode?: string // 'none' | 'price' | 'pct' | 'atr'
   tpValue?: number | null
   slMode?: string
   slValue?: number | null
+  tpTf?: string | null
+  slTf?: string | null
   repeat?: boolean
   /** Task 94 — which Alpaca account this rule fires on. Default 'paper'.
    *  'live' is an explicit OPT-IN: the request must carry liveConfirm:true
@@ -107,12 +114,18 @@ function validateExit(mode: string, value: number | null | undefined, label: str
     if (value == null || !Number.isFinite(value) || value <= 0) return `${label} price must be a positive number`
     return null
   }
+  if (mode === 'atr') {
+    // v1.96.0 — ATR multiplier of ATR(14) on the leg's timeframe
+    if (value == null || !Number.isFinite(value) || value <= 0) return `${label} ATR multiplier must be a positive number`
+    if (value < 0.1 || value > 20) return `${label} ATR multiplier must be between 0.1 and 20`
+    return null
+  }
   if (mode === 'pct') {
     if (value == null || !Number.isFinite(value) || value <= 0) return `${label} % must be a positive number`
     if (value > 100) return `${label} % must be ≤ 100`
     return null
   }
-  return `${label} mode must be none, price or pct`
+  return `${label} mode must be none, price, pct or atr`
 }
 
 // POST /api/strategies — create a conditional order rule
@@ -152,14 +165,18 @@ export async function POST(req: Request) {
       }
     }
 
-    const tpMode = ['none', 'price', 'pct'].includes(body.tpMode || '') ? body.tpMode! : 'none'
-    const slMode = ['none', 'price', 'pct'].includes(body.slMode || '') ? body.slMode! : 'none'
+    const tpMode = ['none', 'price', 'pct', 'atr'].includes(body.tpMode || '') ? body.tpMode! : 'none'
+    const slMode = ['none', 'price', 'pct', 'atr'].includes(body.slMode || '') ? body.slMode! : 'none'
     const tpValue = tpMode === 'none' ? null : Number(body.tpValue)
     const slValue = slMode === 'none' ? null : Number(body.slValue)
     const tpErr = validateExit(tpMode, tpValue, 'TP')
     if (tpErr) return NextResponse.json({ error: tpErr }, { status: 400 })
     const slErr = validateExit(slMode, slValue, 'SL')
     if (slErr) return NextResponse.json({ error: slErr }, { status: 400 })
+    // v1.96.0 — ATR(14) timeframes (validated chart timeframes, default '1h')
+    const atrTfValid = (tf: unknown): string => (typeof tf === 'string' && tf in TIMEFRAMES ? tf : '1h')
+    const tpTf = tpMode === 'atr' ? atrTfValid(body.tpTf) : null
+    const slTf = slMode === 'atr' ? atrTfValid(body.slTf) : null
 
     let condition: string
     let level = Number(body.level) || 0
@@ -194,6 +211,7 @@ export async function POST(req: Request) {
         action, qty,
         tpMode, tpValue: tpValue != null && Number.isFinite(tpValue) ? clampPctOrKeep(tpMode, tpValue) : null,
         slMode, slValue: slValue != null && Number.isFinite(slValue) ? clampPctOrKeep(slMode, slValue) : null,
+        tpTf, slTf,
         repeat: Boolean(body.repeat),
         status: 'armed',
         lastSide: null, // first check records the side — fires on a genuine crossing

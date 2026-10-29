@@ -71,6 +71,11 @@ import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
 import { getPositionForSymbol, placeOrderWithExits, pollOrderFillPrice, type TradeMode } from '@/lib/trading'
 import { isRegularSession } from '@/lib/sessions'
+import { TIMEFRAMES } from '@/lib/market-types'
+import { getAtrSnapshot, atrTfOf } from '@/lib/atr'
+
+/** v1.96.0 — throttle for the "ATR guards deferred" warn per grid (5 min). */
+const atrDeferLoggedAt = new Map<string, number>()
 
 /** Task 89 — the PINNED trade mode of a bot row (default for legacy rows:
  *  'paper' — the only mode every creation path ever allowed). */
@@ -171,6 +176,11 @@ export function parseGridState(raw: unknown): GridState {
  *   basis 'percent': slTrigger = lowerPrice × (1 − maxSL/100) — a percent drop
  *                    BELOW the range floor · tpTrigger = upperPrice ×
  *                    (1 + maxTP/100) — a percent rise ABOVE the range ceiling.
+ *   basis 'atr' (v1.96.0): slTrigger = lowerPrice − maxSL × ATR(14) · tpTrigger
+ *                    = upperPrice + maxTP × ATR(14) — the guard breathes with
+ *                    the instrument's volatility (mirrored for 'sell' grids).
+ *                    Needs the CURRENT atr value (null → that guard is
+ *                    deferred this call — the engine keeps the last known).
  *   basis 'price' (or null/unknown basis): the configured values ARE the
  *   absolute-price triggers (legacy behavior).
  * The ENGINE calls this EVERY tick and the backtest per run, so a later config
@@ -186,17 +196,23 @@ export function resolveGuards(g: {
   upperPrice: number
   /** Task 10-g — 'sell' mirrors both triggers to the short side */
   direction?: string | null
+  /** v1.96.0 — current ATR(14) for basis 'atr' (deferred when null) */
+  atr?: number | null
 }): { slTrigger: number | null; tpTrigger: number | null } {
   const sell = g.direction === 'sell'
   const slTrigger = g.maxSL != null
     ? (g.slBasis === 'percent' && g.maxSL > 0
         ? (sell ? g.upperPrice * (1 + g.maxSL / 100) : g.lowerPrice * (1 - g.maxSL / 100))
-        : g.maxSL)
+        : g.slBasis === 'atr' && g.maxSL > 0 && g.atr != null && g.atr > 0
+          ? (sell ? g.upperPrice + g.maxSL * g.atr : g.lowerPrice - g.maxSL * g.atr)
+          : g.maxSL)
     : null
   const tpTrigger = g.maxTP != null
     ? (g.tpBasis === 'percent' && g.maxTP > 0
         ? (sell ? g.lowerPrice * (1 - g.maxTP / 100) : g.upperPrice * (1 + g.maxTP / 100))
-        : g.maxTP)
+        : g.tpBasis === 'atr' && g.maxTP > 0 && g.atr != null && g.atr > 0
+          ? (sell ? g.lowerPrice - g.maxTP * g.atr : g.upperPrice + g.maxTP * g.atr)
+          : g.maxTP)
     : null
   return { slTrigger, tpTrigger }
 }
@@ -222,12 +238,14 @@ export function sizeCloseQty(tracked: number, held: number | null, isCrypto: boo
   return Math.floor(Math.floor(q * 1e8) / 1e8 * 1e8) / 1e8
 }
 
-/** Guard stop message — includes the percent for percent-basis guards and the
- *  price at which the guard fired (the live price for the engine, the resolved
- *  trigger for the backtest close). Same stems the engine has always used. */
-export function guardStopText(kind: 'sl' | 'maxtp', basis: string | null, value: number, price: number): string {
+/** Guard stop message — includes the percent for percent-basis guards, the
+ *  ATR multiple for atr-basis guards, and the price at which the guard fired
+ *  (the live price for the engine, the resolved trigger for the backtest
+ *  close). Same stems the engine has always used. */
+export function guardStopText(kind: 'sl' | 'maxtp', basis: string | null, value: number, price: number, tf?: string | null): string {
   const pct = basis === 'percent' && value > 0 ? ` ${fmtPct(value)}%` : ''
-  return kind === 'sl' ? `Max SL${pct} hit at ${fmtP(price)}` : `Max TP${pct} reached at ${fmtP(price)}`
+  const atr = basis === 'atr' && value > 0 ? ` ${fmtPct(value)}×ATR(${tf || '1h'})` : ''
+  return kind === 'sl' ? `Max SL${pct}${atr} hit at ${fmtP(price)}` : `Max TP${pct}${atr} reached at ${fmtP(price)}`
 }
 
 // ---------- shared config validation (Task 10-a) ----------
@@ -249,6 +267,9 @@ export function validateGridConfig(c: {
   maxTP: number | null
   slBasis: string | null
   tpBasis: string | null
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   isCrypto: boolean
   /** Task 10-g — absent/null reads as 'both'; an unknown string 400s */
   direction?: string | null
@@ -279,6 +300,10 @@ export function validateGridConfig(c: {
     if (!Number.isFinite(c.maxSL)) return 'Max SL must be a valid number'
     if ((c.slBasis ?? 'price') === 'percent') {
       if (!(c.maxSL > 0) || c.maxSL > 90) return 'Max SL percent must be greater than 0 and at most 90'
+    } else if (c.slBasis === 'atr') {
+      // v1.96.0 — ATR basis: maxSL is a multiplier of ATR(14) on slTf
+      if (c.maxSL < 0.1 || c.maxSL > 20) return 'Max SL ATR multiplier must be between 0.1 and 20'
+      if (c.slTf != null && !(c.slTf in TIMEFRAMES)) return 'Invalid Max SL ATR timeframe'
     } else {
       if (c.maxSL <= 0) return 'Max SL must be a positive price'
       if (sell
@@ -293,6 +318,10 @@ export function validateGridConfig(c: {
     if (!Number.isFinite(c.maxTP)) return 'Max TP must be a valid number'
     if ((c.tpBasis ?? 'price') === 'percent') {
       if (!(c.maxTP > 0) || c.maxTP > 1000) return 'Max TP percent must be greater than 0 and at most 1000'
+    } else if (c.tpBasis === 'atr') {
+      // v1.96.0 — ATR basis: maxTP is a multiplier of ATR(14) on tpTf
+      if (c.maxTP < 0.1 || c.maxTP > 20) return 'Max TP ATR multiplier must be between 0.1 and 20'
+      if (c.tpTf != null && !(c.tpTf in TIMEFRAMES)) return 'Invalid Max TP ATR timeframe'
     } else {
       if (c.maxTP <= 0) return 'Max TP must be a positive price'
       if (sell
@@ -693,6 +722,9 @@ async function evaluateGrid(grid: {
   maxTP: number | null
   slBasis: string | null
   tpBasis: string | null
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   closeOnStop: boolean
   realizedPnl: number
   state: unknown
@@ -783,6 +815,28 @@ async function evaluateGrid(grid: {
   // order the broker would reject outside RTH, and a failed close strands
   // lots in a parked 'error' grid — deferring keeps the grid active so the
   // close fires at the first RTH tick if the trigger still holds.
+  // v1.96.0 — ATR-basis guards re-resolve EVERY tick against the CURRENT
+  // ATR(14) (60s-cached with a 24h last-good fallback in src/lib/atr.ts, so a
+  // data hiccup never disarms a stop). When even the fallback is unavailable
+  // the guard triggers are DEFERRED this tick — same posture as RTH-gated
+  // closes — and the tick journal notes it (throttled to once per 5 min).
+  let guardAtr: number | null = null
+  if (grid.slBasis === 'atr' || grid.tpBasis === 'atr') {
+    const snap = await getAtrSnapshot(
+      grid.symbol,
+      atrTfOf(grid.slBasis === 'atr' ? grid.slTf : grid.tpTf),
+      grid.userId,
+    )
+    if (snap) {
+      guardAtr = snap.atr
+    } else {
+      const last = atrDeferLoggedAt.get(grid.id) ?? 0
+      if (Date.now() - last > 5 * 60_000) {
+        atrDeferLoggedAt.set(grid.id, Date.now())
+        console.warn(`[grid] ${grid.id.slice(-6)} ${grid.symbol}: ATR guards deferred this tick — no ATR(14) data available`)
+      }
+    }
+  }
   const { slTrigger, tpTrigger } = resolveGuards({
     maxSL: grid.maxSL,
     maxTP: grid.maxTP,
@@ -791,13 +845,14 @@ async function evaluateGrid(grid: {
     lowerPrice: grid.lowerPrice,
     upperPrice: grid.upperPrice,
     direction: grid.direction,
+    atr: guardAtr,
   })
   if (ordersOpen && slTrigger != null && (sellGrid ? price >= slTrigger : price <= slTrigger)) {
-    await closeAndStop(grid, 'sl', price, guardStopText('sl', grid.slBasis, grid.maxSL ?? 0, price))
+    await closeAndStop(grid, 'sl', price, guardStopText('sl', grid.slBasis, grid.maxSL ?? 0, price, grid.slTf))
     return
   }
   if (ordersOpen && tpTrigger != null && (sellGrid ? price <= tpTrigger : price >= tpTrigger)) {
-    await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price))
+    await closeAndStop(grid, 'maxtp', price, guardStopText('maxtp', grid.tpBasis, grid.maxTP ?? 0, price, grid.tpTf))
     return
   }
 
@@ -1042,9 +1097,12 @@ export interface StartGridInput {
   qtyPerGrid: number
   maxSL: number | null
   maxTP: number | null
-  /** 'price' | 'percent' (Task 10-a) — how maxSL/maxTP are expressed */
+  /** 'price' | 'percent' | 'atr' (Task 10-a + v1.96.0) — how maxSL/maxTP are expressed */
   slBasis?: string
   tpBasis?: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   /** Task 10-g — 'both' | 'buy' | 'sell' (default 'both') */
   direction?: string
   closeOnStop: boolean
@@ -1076,6 +1134,9 @@ export async function startGridTrade(input: StartGridInput) {
       maxTP: input.maxTP,
       slBasis: input.slBasis ?? 'price',
       tpBasis: input.tpBasis ?? 'price',
+      // v1.96.0 — ATR timeframes (null unless the basis is 'atr')
+      slTf: input.slBasis === 'atr' ? (input.slTf ?? null) : null,
+      tpTf: input.tpBasis === 'atr' ? (input.tpTf ?? null) : null,
       direction: isGridDirection(input.direction) ? input.direction : 'both',
       closeOnStop: input.closeOnStop,
       status: 'active',

@@ -18,6 +18,7 @@ import { Timeframe, TIMEFRAMES } from '@/lib/market-types'
 import { barsFor } from '@/lib/bars-cache'
 import { evalIndicatorSignal, isCross, IndicatorParams } from '@/lib/indicator-eval'
 import { placeOrderWithExits, ensureCryptoOcoSupervisor, isNoKeysError, TradeMode } from '@/lib/trading'
+import { getAtrSnapshot, atrToPct, atrTfOf } from '@/lib/atr'
 
 interface UserSettings {
   telegramTokenEnc?: string
@@ -42,6 +43,9 @@ export interface StrategyRow {
   tpValue: number | null
   slMode: string
   slValue: number | null
+  /** v1.96.0 — ATR(14) timeframes when the mode is 'atr' */
+  tpTf: string | null
+  slTf: string | null
   repeat: boolean
   status: string
   lastSide: string | null
@@ -69,6 +73,35 @@ const SUPERVISOR_MS = 20000
 const inFlight = new Set<string>()
 
 const clampPct = (v: number) => Math.min(100, Math.max(0.01, v))
+
+/**
+ * v1.96.0 — resolve one ATR leg to its PERCENT-equivalent at fire time:
+ * pct = multiplier × ATR(14, tf) / live quote × 100, which then flows through
+ * the SAME resolveExit math as a % leg. Failures return an error string — an
+ * armed rule with a configured ATR stop must fail LOUDLY, never drop the leg.
+ */
+async function resolveAtrLeg(
+  symbol: string,
+  tf: string | null,
+  mult: number | null,
+  ref: number | null,
+  userId: string,
+): Promise<{ pct?: number; error?: string }> {
+  if (mult == null || !(mult > 0)) {
+    return { error: 'Stored ATR multiplier is invalid — edit the rule; firing without the leg is not allowed' }
+  }
+  if (ref == null || !(ref > 0)) {
+    return { error: 'No live quote available to resolve ATR TP/SL' }
+  }
+  const effTf = atrTfOf(tf)
+  const snap = await getAtrSnapshot(symbol, effTf, userId)
+  if (!snap) {
+    return { error: `Cannot resolve ATR — no recent ${effTf} bar data for ${symbol} (retry next cycle)` }
+  }
+  const pct = atrToPct(snap.atr, mult, ref)
+  if (pct == null) return { error: 'Resolved ATR distance is invalid' }
+  return { pct }
+}
 
 /**
  * Resolve one exit price. pct values are PERCENT magnitudes (2 = 2%) applied
@@ -100,7 +133,12 @@ const fmtP = (n: number) => (Math.abs(n) >= 100 ? n.toFixed(2) : n.toFixed(4))
 /** Human text for the exit legs of a fire. */
 function exitText(
   mode: string, value: number | null, price: number | undefined, action: string, kind: 'TP' | 'SL',
+  tf?: string | null,
 ): string {
+  if (mode === 'atr' && price != null) {
+    const m = Math.abs(value ?? 0)
+    return `${kind} ${m.toFixed(m >= 10 ? 1 : 2)}×ATR(${tf || '1h'}) (${fmtP(price)})`
+  }
   if (mode === 'pct' && price != null) {
     const pct = clampPct(Math.abs(value ?? 0))
     const sign = (kind === 'TP') === (action === 'buy') ? '+' : '-'
@@ -238,8 +276,8 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
       let orderId: string | undefined
 
       try {
-        // ---- resolve exits (pct modes need a live reference quote) ----
-        const needsRef = r.tpMode === 'pct' || r.slMode === 'pct'
+        // ---- resolve exits (pct/atr modes need a live reference quote) ----
+        const needsRef = r.tpMode === 'pct' || r.slMode === 'pct' || r.tpMode === 'atr' || r.slMode === 'atr'
         let ref: number | null = null
         if (needsRef) {
           // v1.80.8 — trading:true: % exits anchor to this quote, so a data
@@ -247,10 +285,27 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
           // never anchor legs to a simulator price
           const { quotes } = await getQuotes([symbol], userId, { trading: true })
           ref = quotes.find((q) => q.symbol === symbol)?.price ?? null
-          if (ref == null) failNote = 'No live quote available to resolve % TP/SL'
+          if (ref == null) failNote = 'No live quote available to resolve %/ATR TP/SL'
         }
-        const tp = failNote ? undefined : resolveExit(r.tpMode, r.tpValue, action, ref, 'tp')
-        const sl = failNote ? undefined : resolveExit(r.slMode, r.slValue, action, ref, 'sl')
+        // v1.96.0 — ATR legs resolve to percent-equivalents (mult × ATR(tf)
+        // vs the live quote) and flow through the SAME resolveExit math. Any
+        // resolution failure fails the fire loudly (never a naked entry).
+        let tpEffMode = r.tpMode
+        let tpEffVal = r.tpValue
+        let slEffMode = r.slMode
+        let slEffVal = r.slValue
+        if (!failNote && r.tpMode === 'atr') {
+          const leg = await resolveAtrLeg(symbol, r.tpTf, r.tpValue, ref, userId)
+          if (leg.error) failNote = leg.error
+          else { tpEffMode = 'pct'; tpEffVal = leg.pct ?? null }
+        }
+        if (!failNote && r.slMode === 'atr') {
+          const leg = await resolveAtrLeg(symbol, r.slTf, r.slValue, ref, userId)
+          if (leg.error) failNote = leg.error
+          else { slEffMode = 'pct'; slEffVal = leg.pct ?? null }
+        }
+        const tp = failNote ? undefined : resolveExit(tpEffMode, tpEffVal, action, ref, 'tp')
+        const sl = failNote ? undefined : resolveExit(slEffMode, slEffVal, action, ref, 'sl')
         if (!failNote && (tp === null || sl === null)) failNote = 'Resolved TP/SL price is invalid'
         // Task 89 — FAIL LOUD on a stored-but-invalid exit: resolveExit
         // returns undefined for tpValue/slValue ≤ 0 (a corrupted PATCH used
@@ -282,8 +337,8 @@ async function evaluateInner(userId: string, mode: TradeMode): Promise<StrategyF
           } else {
             orderId = r2.results[0]?.id
             const parts = [
-              exitText(r.tpMode, r.tpValue, tp ?? undefined, action, 'TP'),
-              exitText(r.slMode, r.slValue, sl ?? undefined, action, 'SL'),
+              exitText(r.tpMode, r.tpValue, tp ?? undefined, action, 'TP', r.tpTf),
+              exitText(r.slMode, r.slValue, sl ?? undefined, action, 'SL', r.slTf),
             ].filter(Boolean)
             orderNote = parts.length ? ` · ${parts.join(' ')}` : ''
             if (r2.errors.length > 0) orderNote += ` (partial: ${r2.errors[0]})`

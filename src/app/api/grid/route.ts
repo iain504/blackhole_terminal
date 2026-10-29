@@ -10,6 +10,7 @@ import {
   startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
   isGridSpacing, isGridDirection, parseGridState, findConflictingGrid, type GridSpacing,
 } from '@/lib/grid-engine'
+import { TIMEFRAMES } from '@/lib/market-types'
 
 export const dynamic = 'force-dynamic'
 
@@ -101,6 +102,9 @@ export interface GridTradeDto {
   maxTP: number | null
   slBasis: string
   tpBasis: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf: string | null
+  tpTf: string | null
   direction: string
   closeOnStop: boolean
   status: string
@@ -133,6 +137,8 @@ export function toDto(row: {
   maxTP: number | null
   slBasis: string
   tpBasis: string
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string | null
   closeOnStop: boolean
   status: string
@@ -160,6 +166,8 @@ export function toDto(row: {
     maxTP: row.maxTP,
     slBasis: row.slBasis,
     tpBasis: row.tpBasis,
+    slTf: row.slTf ?? null,
+    tpTf: row.tpTf ?? null,
     direction: isGridDirection(row.direction) ? row.direction : 'both',
     closeOnStop: row.closeOnStop,
     status: row.status,
@@ -221,16 +229,27 @@ interface GridCreateBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string
   closeOnStop?: boolean
 }
 
 const bad = (error: string) => NextResponse.json({ error }, { status: 400 })
 
-/** 'price' | 'percent' guard basis — absent defaults to 'price' (legacy). */
-export function parseGuardBasis(v: unknown): 'price' | 'percent' | null {
+/** 'price' | 'percent' | 'atr' guard basis — absent defaults to 'price' (legacy). */
+export function parseGuardBasis(v: unknown): 'price' | 'percent' | 'atr' | null {
   if (v === undefined || v === null || v === '') return 'price'
-  return v === 'price' || v === 'percent' ? v : null
+  return v === 'price' || v === 'percent' || v === 'atr' ? v : null
+}
+
+/** v1.96.0 — ATR(14) timeframe for an 'atr' basis guard (null when not atr).
+ *  Absent/invalid defaults to '1h' — the same default every ATR surface uses. */
+export function parseGuardTf(v: unknown, basis: string): string | null {
+  if (basis !== 'atr') return null
+  if (typeof v === 'string' && v in TIMEFRAMES) return v
+  return '1h'
 }
 
 export const round2 = (x: number) => Math.round(x * 100) / 100
@@ -251,9 +270,11 @@ export async function POST(req: NextRequest) {
     const symbol = symRaw
 
     const slBasis = parseGuardBasis(body?.slBasis)
-    if (slBasis == null) return bad('slBasis must be "price" or "percent"')
+    if (slBasis == null) return bad('slBasis must be "price", "percent" or "atr"')
     const tpBasis = parseGuardBasis(body?.tpBasis)
-    if (tpBasis == null) return bad('tpBasis must be "price" or "percent"')
+    if (tpBasis == null) return bad('tpBasis must be "price", "percent" or "atr"')
+    const slTf = parseGuardTf(body?.slTf, slBasis)
+    const tpTf = parseGuardTf(body?.tpTf, tpBasis)
     // Task 10-g — grid direction ('both' default; validated again by the
     // shared validator together with the merged guards)
     const direction = body?.direction == null || body?.direction === '' ? 'both' : body.direction
@@ -292,6 +313,8 @@ export async function POST(req: NextRequest) {
       maxTP,
       slBasis,
       tpBasis,
+      slTf,
+      tpTf,
       isCrypto: symbol.includes('/'),
       direction,
     })
@@ -325,6 +348,8 @@ export async function POST(req: NextRequest) {
       maxTP,
       slBasis,
       tpBasis,
+      slTf,
+      tpTf,
       direction,
       closeOnStop: body?.closeOnStop !== false,
     })

@@ -63,8 +63,10 @@ export async function POST(req: NextRequest) {
             qty: norm.qty,
             tpMode: norm.tpMode,
             tpValue: norm.tpValue,
+            tpTf: norm.tpTf ?? null,
             slMode: norm.slMode,
             slValue: norm.slValue,
+            slTf: norm.slTf ?? null,
             repeat: norm.repeat,
             status: 'paused', // NEVER auto-arm imported rules
             lastSide: null,

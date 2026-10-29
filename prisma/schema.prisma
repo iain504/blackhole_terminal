@@ -109,11 +109,16 @@ model StrategyRule {
   qty       Float
   // TP/SL: 'none' | 'price' (absolute) | 'pct' (PERCENT offset from the live
   // quote at fire time, 2 = 2% — applied on the profit side for TP and the
-  // loss side for SL, relative to the action direction)
+  // loss side for SL, relative to the action direction) | 'atr' (v1.96.0:
+  // tpValue/slValue is a MULTIPLIER 0.1–20 of Wilder ATR(14) on tpTf/slTf,
+  // distance from the live quote at fire time — volatility-scaled stop)
   tpMode    String  @default("none")
   tpValue   Float?
   slMode    String  @default("none")
   slValue   Float?
+  // ATR timeframe for mode 'atr' (a Timeframe key: '1m'..'1M'); null = N/A
+  tpTf      String?
+  slTf      String?
   // one-shot (status ends 'triggered') or repeat (re-arms with fresh crossing
   // memory after every fire)
   repeat    Boolean @default(false)
@@ -233,11 +238,16 @@ model AlgoRun {
   riskBasis    String    @default("usd")
   riskMoney    Float?
   riskMoneyPct Float?
-  // exits: 'none' (strategy logic closes) | 'pct' (bracket % from entry)
+  // exits: 'none' (strategy logic closes) | 'pct' (bracket % from entry) |
+  // 'atr' (v1.96.0: tpValue/slValue = ATR(14) multiplier 0.1–20 on tpTf/slTf —
+  // bracket distance = mult × ATR from the entry anchor, resolved at entry)
   tpMode       String    @default("none")
   tpValue      Float?
   slMode       String    @default("none")
   slValue      Float?
+  // ATR timeframe for mode 'atr' (a Timeframe key: '1m'..'1M'); null = N/A
+  tpTf         String?
+  slTf         String?
   maxTradesDay Int       @default(3)
   rthOnly      Boolean   @default(true)
   flattenEod   Boolean   @default(true)
@@ -334,6 +344,11 @@ model GridTrade {
   // later config edit (PUT /api/grid/[id]) re-arms the guards automatically.
   slBasis     String    @default("price")
   tpBasis     String    @default("price")
+  // v1.96.0 — basis 'atr': maxSL/maxTP are ATR(14) multipliers (0.1–20) on
+  // slTf/tpTf; guard triggers = range edge ∓ mult × ATR, re-resolved every
+  // engine tick so the guard breathes with the instrument's volatility
+  slTf        String?
+  tpTf        String?
   // Task 10-g — grid direction: 'both' (classic: buy dips + sell rallies) |
   // 'buy' (ladder-accumulate: buy each level as price falls, no auto-sells) |
   // 'sell' (sell each level as price rises — on stocks Alpaca nets this against

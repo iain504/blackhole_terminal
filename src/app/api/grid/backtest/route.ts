@@ -25,7 +25,7 @@ import { ALGO_MAX_DAYS } from '@/lib/algo-strategies'
 import { fetchBacktestBars } from '@/lib/backtest-history'
 import { validateGridConfig, isGridSpacing, isGridDirection, type GridSpacing } from '@/lib/grid-engine'
 import { simulateGridBacktest, type GridBacktestConfig } from '@/lib/grid-backtest'
-import { parseGuardBasis, round2 } from '../route'
+import { parseGuardBasis, parseGuardTf, round2 } from '../route'
 
 export const dynamic = 'force-dynamic'
 
@@ -40,6 +40,9 @@ interface GridBacktestBody {
   maxTP?: number | null
   slBasis?: string
   tpBasis?: string
+  /** v1.96.0 — ATR(14) timeframes when the basis is 'atr' */
+  slTf?: string | null
+  tpTf?: string | null
   direction?: string
   closeOnStop?: boolean
   days?: number
@@ -74,9 +77,11 @@ export async function POST(req: NextRequest) {
     const symbol = symRaw
 
     const slBasis = parseGuardBasis(body?.slBasis)
-    if (slBasis == null) return bad('slBasis must be "price" or "percent"')
+    if (slBasis == null) return bad('slBasis must be "price", "percent" or "atr"')
     const tpBasis = parseGuardBasis(body?.tpBasis)
-    if (tpBasis == null) return bad('tpBasis must be "price" or "percent"')
+    if (tpBasis == null) return bad('tpBasis must be "price", "percent" or "atr"')
+    const slTf = parseGuardTf(body?.slTf, slBasis)
+    const tpTf = parseGuardTf(body?.tpTf, tpBasis)
     const direction = body?.direction == null || body?.direction === '' ? 'both' : body.direction
     if (!isGridDirection(direction)) return bad('direction must be "both", "buy" or "sell"')
 
@@ -109,6 +114,8 @@ export async function POST(req: NextRequest) {
       maxTP,
       slBasis,
       tpBasis,
+      slTf,
+      tpTf,
       isCrypto: symbol.includes('/'),
       direction,
     })
@@ -137,6 +144,8 @@ export async function POST(req: NextRequest) {
         maxTP,
         slBasis,
         tpBasis,
+        slTf,
+        tpTf,
         closeOnStop,
         isCrypto: symbol.includes('/'),
         direction,

@@ -25,6 +25,7 @@ import {
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { useToast } from '@/hooks/use-toast'
+import { fetchAtr, atrExitPrice, fmtAtrExit, ATR_TF_OPTIONS, type AtrInfo } from '@/lib/atr-client'
 import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import { useTerminal } from '@/store/terminal'
@@ -737,14 +738,14 @@ export default function PositionsTab() {
                     {r.tp?.limitPrice != null ? (
                       fmtPrice(r.tp.limitPrice)
                     ) : (
-                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="tp" onAdded={() => void refresh()} />
+                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="tp" side={r.pos.qty > 0 ? 'buy' : 'sell'} basis={r.pos.current > 0 ? r.pos.current : r.pos.avgEntry} onAdded={() => void refresh()} />
                     )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-rose-300">
                     {r.sl && (r.sl.stopPrice != null || r.sl.limitPrice != null) ? (
                       fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)
                     ) : (
-                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="sl" onAdded={() => void refresh()} />
+                      <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="sl" side={r.pos.qty > 0 ? 'buy' : 'sell'} basis={r.pos.current > 0 ? r.pos.current : r.pos.avgEntry} onAdded={() => void refresh()} />
                     )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-amber-300">
@@ -1297,21 +1298,77 @@ function PendingPriceCell({ mode, p, field, onSaved }: {
 }
 
 /** Small "+ TP"/"+ SL" button for a position row missing that exit — opens an
- * inline price input, POSTs to /positions/[symbol]/exits. */
-function AddExitCell({ mode, tradeSymbol, kind, onAdded }: {
+ * inline price input, POSTs to /positions/[symbol]/exits.
+ * v1.96.0 — the popover gained a Price | ATR mode: ATR resolves
+ * mult×ATR(14) on the chosen timeframe into the SAME absolute price the
+ * existing API receives (payload shape unchanged). `side` comes from the
+ * row's net qty (qty > 0 = long 'buy', else short 'sell') and `basis` is the
+ * position's last price (falling back to the entry price). */
+function AddExitCell({ mode, tradeSymbol, kind, side, basis, onAdded }: {
   mode: Mode
   tradeSymbol: string
   kind: 'tp' | 'sl'
+  side: 'buy' | 'sell'
+  basis: number
   onAdded: () => void
 }) {
   const { toast } = useToast()
   const [open, setOpen] = useState(false)
   const [v, setV] = useState('')
   const [busy, setBusy] = useState(false)
+  // v1.96.0 — ATR mode state (defaults: Price mode, 1.5×, 1h bars)
+  const [unit, setUnit] = useState<'price' | 'atr'>('price')
+  const [atrMult, setAtrMult] = useState('1.5')
+  const [atrTf, setAtrTf] = useState('1h')
+  const [atrInfo, setAtrInfo] = useState<AtrInfo | null>(null)
+
+  // fetch ATR when the popover opens in ATR mode; refresh every 30s while open
+  useEffect(() => {
+    if (!open || unit !== 'atr') return
+    let alive = true
+    const load = () => {
+      void fetchAtr(tradeSymbol, atrTf).then((info) => { if (alive) setAtrInfo(info) }).catch(() => {})
+    }
+    load()
+    const iv = window.setInterval(load, 30000)
+    return () => {
+      alive = false
+      window.clearInterval(iv)
+    }
+  }, [open, unit, tradeSymbol, atrTf])
+
+  // clamp the multiplier to the valid 0.1–20 range and resolve the absolute
+  // exit price the existing payload expects (kind matches the button)
+  const mNum = parseFloat(atrMult)
+  const m = Number.isFinite(mNum) ? Math.min(20, Math.max(0.1, mNum)) : 0
+  const atrPx =
+    unit === 'atr' && m > 0 && basis > 0 && atrInfo?.atr != null
+      ? atrExitPrice(side, basis, m, atrInfo.atr, kind)
+      : null
+  const priceNum: number | null = unit === 'atr' ? atrPx : parseFloat(v)
+  const canSubmit = priceNum != null && Number.isFinite(priceNum) && priceNum > 0
+  const atrReason = !atrInfo
+    ? 'Loading ATR…'
+    : atrInfo.atr == null
+      ? (atrInfo.message || atrInfo.error || 'ATR unavailable')
+      : basis <= 0
+        ? 'No position price yet'
+        : atrPx == null
+          ? 'No valid price — check the multiplier'
+          : null
+
+  // v1.96.0 — Price | ATR mode toggle (compact, mirrors the ticket's unit toggle;
+  // hoisted so the same control renders in both modes)
+  const modeToggle = (
+    <span className="flex items-center rounded border border-zinc-800 bg-zinc-950 p-px" role="group" aria-label={`${kind.toUpperCase()} mode`}>
+      <button type="button" onClick={() => setUnit('price')} aria-pressed={unit === 'price'} title="Enter an absolute price" className={cn('rounded px-1 py-0.5 text-[9px] font-semibold transition-colors', unit === 'price' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>Price</button>
+      <button type="button" onClick={() => setUnit('atr')} aria-pressed={unit === 'atr'} title={`Enter ${kind.toUpperCase()} as a multiple of ATR(14)`} className={cn('rounded px-1 py-0.5 text-[9px] font-semibold transition-colors', unit === 'atr' ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300')}>ATR</button>
+    </span>
+  )
 
   const submit = async () => {
-    const price = parseFloat(v)
-    if (!Number.isFinite(price) || price <= 0) return
+    const price = unit === 'atr' ? atrPx : parseFloat(v)
+    if (price == null || !Number.isFinite(price) || price <= 0) return
     setBusy(true)
     try {
       const res = await fetch(`/api/trading/positions/${encodeURIComponent(tradeSymbol)}/exits`, {
@@ -1352,35 +1409,99 @@ function AddExitCell({ mode, tradeSymbol, kind, onAdded }: {
     )
   }
   return (
-    <span className="relative inline-flex items-center gap-1">
-      <Input
-        autoFocus
-        type="number"
-        step="any"
-        value={v}
-        onChange={(e) => setV(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') void submit()
-          if (e.key === 'Escape') setOpen(false)
-        }}
-        placeholder={`${kind.toUpperCase()} price`}
-        className="h-6 w-28 border-zinc-700 bg-zinc-950 text-[11px]"
-      />
-      <button
-        className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300"
-        onClick={() => void submit()}
-        disabled={busy}
-        aria-label={`Apply ${kind.toUpperCase()}`}
-      >
-        {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
-      </button>
-      <button
-        className="text-[10px] text-zinc-500 hover:text-zinc-300"
-        onClick={() => setOpen(false)}
-        aria-label="Cancel"
-      >
-        ✕
-      </button>
+    <span className={cn('relative inline-flex items-center gap-1', unit === 'atr' && 'flex-col items-stretch rounded-md border border-zinc-700 bg-zinc-900 p-1.5 shadow-lg')}>
+      {unit === 'atr' && (
+        <span className="flex items-center justify-between gap-1">
+          {modeToggle}
+          <button
+            className="text-[10px] text-zinc-500 hover:text-zinc-300"
+            onClick={() => setOpen(false)}
+            aria-label="Cancel"
+          >
+            ✕
+          </button>
+        </span>
+      )}
+      {unit === 'price' && (
+        <>
+          {modeToggle}
+          <Input
+            autoFocus
+            type="number"
+            step="any"
+            value={v}
+            onChange={(e) => setV(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void submit()
+              if (e.key === 'Escape') setOpen(false)
+            }}
+            placeholder={`${kind.toUpperCase()} price`}
+            className="h-6 w-28 border-zinc-700 bg-zinc-950 text-[11px]"
+          />
+          <button
+            className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300"
+            onClick={() => void submit()}
+            disabled={busy}
+            aria-label={`Apply ${kind.toUpperCase()}`}
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+          </button>
+          <button
+            className="text-[10px] text-zinc-500 hover:text-zinc-300"
+            onClick={() => setOpen(false)}
+            aria-label="Cancel"
+          >
+            ✕
+          </button>
+        </>
+      )}
+      {unit === 'atr' && (
+        <>
+          <span className="flex items-center gap-1">
+            <Input
+              autoFocus
+              type="number"
+              min="0.1"
+              max="20"
+              step="0.1"
+              value={atrMult}
+              onChange={(e) => setAtrMult(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && canSubmit) void submit()
+                if (e.key === 'Escape') setOpen(false)
+              }}
+              placeholder="1.5"
+              aria-label={`${kind.toUpperCase()} ATR multiplier`}
+              className="h-6 w-14 border-zinc-700 bg-zinc-950 text-[11px]"
+            />
+            <select
+              aria-label={`${kind.toUpperCase()} ATR timeframe`}
+              value={atrTf}
+              onChange={(e) => setAtrTf(e.target.value)}
+              className="h-6 min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-1 text-[11px] text-zinc-300 outline-none focus:border-zinc-500"
+            >
+              {ATR_TF_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </span>
+          {canSubmit ? (
+            <span className="text-right text-[10px] tabular-nums text-zinc-400">
+              {fmtAtrExit(m, atrTf)} ≈ {fmtPrice(atrPx!)}
+            </span>
+          ) : (
+            <span className="text-right text-[10px] leading-snug text-amber-400/90">{atrReason}</span>
+          )}
+          <button
+            className="self-end text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 disabled:pointer-events-none disabled:opacity-40"
+            onClick={() => void submit()}
+            disabled={busy || !canSubmit}
+            aria-label={`Apply ${kind.toUpperCase()}`}
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+          </button>
+        </>
+      )}
     </span>
   )
 }
