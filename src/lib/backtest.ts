@@ -632,10 +632,17 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       // the live engine's entry-time ATR resolution). Warm-up bars (ATR% not
       // yet seeded) fail CLOSED: no trade, counted as suppressed — matching
       // the live engine's entry-skip gate for missing ATR data.
+      // v1.98.1 UNITS FIX: atrPctSeries() stores atr/close as a FRACTION
+      // (0.0033 = 0.33%) but `p` below is consumed as a PERCENT (÷100) — the
+      // missing ×100 shrank every ATR bracket to the 0.01% clamp floor, i.e.
+      // a 1-bp stop/TP: every bracketed trade died on its entry bar (stop
+      // assumed first) or banked a 1-bp TP, so ANY ATR-mode backtest since
+      // v1.96.0 returned instant-stop noise (probed on NVDA 15m: 10/11
+      // 'stop loss' exits with 0-minute holds, pnl ≈ −costs exactly).
       const atrMissing = (cfg.tpMode === 'atr' || cfg.slMode === 'atr') && !Number.isFinite(atrPct[i])
       const atrPx = (v: number | null, tp: boolean): number | null => {
         if (atrMissing || v == null || !(v > 0)) return null
-        const p = Math.min(100, Math.max(0.01, atrPct[i] * v))
+        const p = Math.min(100, Math.max(0.01, atrPct[i] * 100 * v))
         const profitSide = tp ? dir === 1 : dir === -1
         const px = fill * (profitSide ? 1 + p / 100 : 1 - p / 100)
         return px > 0 ? px : null
