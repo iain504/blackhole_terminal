@@ -59,10 +59,13 @@ import { type Timeframe } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, algoMaxDays, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { rateLimit } from '@/lib/rate-limit'
 import {
-  prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward,
+  prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward, applyOverride,
   type BacktestConfig, type OptimizeRange, type BacktestProgress,
 } from '@/lib/backtest'
 import { monteCarloBootstrap } from '@/lib/algo-regime'
+// v1.99.0 — trust layer: per-trade significance + plain-language verdict for
+// plain runs (unbiased) and the optimizer's best row (selection-biased)
+import { roundTripCostBps, significanceStats, trustVerdict } from '@/lib/backtest-stats'
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 import {
   createBacktestJob, getBacktestJob, tryAcquireBacktestSlot, releaseBacktestSlot,
@@ -427,7 +430,16 @@ async function computeBacktest(
     if (optimize.totalCombos === 0) {
       return { status: 400, body: { error: 'No valid optimize ranges — tick at least one parameter and set min < max' } }
     }
-    return { status: 200, body: { optimize, meta } }
+    // v1.99.0 — trust verdict on the best row: one cheap re-run recovers the
+    // per-trade P&L the optimizer table doesn't ship, and the verdict is
+    // explicitly IN-SAMPLE (the best of N combos is winner's-curse-inflated)
+    let trust: Record<string, unknown> | null = null
+    if (optimize.best) {
+      const bestRun = runBacktest(series, { ...applyOverride(cfg, optimize.best.params), collectEquity: false })
+      const sig = significanceStats(bestRun.trades, roundTripCostBps(cfg))
+      trust = { sig, verdict: trustVerdict(sig, 'in-sample', optimize.evaluated) }
+    }
+    return { status: 200, body: { optimize, trust, meta } }
   }
 
   if (mode === 'sweep') {
@@ -484,11 +496,19 @@ async function computeBacktest(
     result.trades.map((t) => t.pnl),
     capital,
   )
+  // v1.99.0 — TRUST VERDICT on the plain run: per-trade significance (t, p,
+  // day-block bootstrap CI, trades-needed) + a plain-language label. A plain
+  // run has NO selection bias — the config was chosen by the user, not picked
+  // as the best of N — so the verdict is the unbiased window measurement.
+  const costBps = roundTripCostBps(cfg)
+  const sig = significanceStats(result.trades, costBps)
+  const trust = { sig, verdict: trustVerdict(sig, 'plain') }
   return {
     status: 200,
     body: {
       result: wire,
       mc,
+      trust,
       meta: { ...meta, mtmDD: true, skippedShorts: result.metrics.skippedShorts ?? 0, dynSlip: cfg.dynSlip === true && (cfg.slippageBps ?? 0) > 0 },
     },
   }

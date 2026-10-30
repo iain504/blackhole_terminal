@@ -54,6 +54,10 @@ import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessi
 import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
 import type { Bar } from '@/lib/market-types'
 import { memoryGuard } from '@/lib/mem-guard'
+// v1.99.0 — statistical trust layer: per-trade significance stats (t, two-sided
+// p via incomplete beta, DAY-BLOCK bootstrap CI, trades-needed) for the pooled
+// walk-forward OOS trade list and the pure hold-out run
+import { roundTripCostBps, significanceStats, type SignificanceStats, type TradeLike } from './backtest-stats'
 import {
   adxSeries,
   atrPctSeries,
@@ -1053,8 +1057,10 @@ const TP_SL_SPAN = { min: 0.1, max: 50 } as const
  * into the config-level percent brackets (tpMode/slMode='pct') and stripped
  * from params (runBacktest reads cfg.tpValue, and comboInvalid/param clamps
  * must only ever see real strategy params). Returns the combined config.
+ * v1.99.0 — exported so the API route can re-run the optimizer's best row
+ * for its per-trade trust verdict.
  */
-function applyOverride(base: BacktestConfig, override: Record<string, number>): BacktestConfig {
+export function applyOverride(base: BacktestConfig, override: Record<string, number>): BacktestConfig {
   let cfg = base
   const tp = override.tpValue
   const sl = override.slValue
@@ -1534,6 +1540,9 @@ export interface WFFold {
   oosMaxDDPct: number
   oosScore: number | null
   oosValid: boolean // ≥ 3 OOS trades — enough to mean anything
+  // v1.99.0 — per-trade net bps of the fold's OOS run (pooled by the trust
+  // layer into one out-of-sample significance verdict)
+  oosBps: number[]
   params: Record<string, number> // the fold's IS winner (override keys only)
   boundary: boolean // any tuned param sits on its grid min/max
 }
@@ -1547,6 +1556,9 @@ export interface WalkForwardAggregate {
   oosNetMean: number | null
   paramStability: number | null // share of folds choosing the modal params
   modalParams: Record<string, number> | null
+  // v1.99.0 — significance of the POOLED out-of-sample trade list (all folds'
+  // OOS trades concatenated, day-block bootstrap): the honest headline number
+  oosSig: SignificanceStats | null
 }
 
 export interface WalkForwardResult {
@@ -1557,7 +1569,19 @@ export interface WalkForwardResult {
   aggregate: WalkForwardAggregate
   // hold-out stress test: the most trustworthy parameter set (modal when ≥2
   // folds agree, else the best valid OOS fold's winner) re-run on the tail
-  holdout: { from: number; to: number; netPct: number; winRate: number; profitFactor: number; maxDrawdownPct: number; trades: number; regime?: RegimeGateStats } | null
+  holdout: {
+    from: number
+    to: number
+    netPct: number
+    winRate: number
+    profitFactor: number
+    maxDrawdownPct: number
+    trades: number
+    // v1.99.0 — per-trade significance of the hold-out run (the purest number
+    // the walk-forward produces: one config, one untouched window)
+    sig: SignificanceStats | null
+    regime?: RegimeGateStats
+  } | null
   holdoutDisabled?: string // reason when no hold-out could be carved
   evaluated: number
   elapsedMs: number
@@ -1600,6 +1624,7 @@ export async function walkForward(
   while (folds > 2 && Math.floor(wfN / folds) < 60) folds-- // degrade gracefully on short data
   const seg = Math.floor(wfN / folds)
   const outFolds: WFFold[] = []
+  const oosPool: TradeLike[] = [] // every fold's OOS trades — pooled for the trust verdict
   let evaluated = 0
   if (seg < 60) {
     return {
@@ -1610,6 +1635,7 @@ export async function walkForward(
       aggregate: {
         foldsTotal: 0, foldsValid: 0, positiveFolds: 0, robustness: null,
         oosNetMedian: null, oosNetMean: null, paramStability: null, modalParams: null,
+        oosSig: null,
       },
       holdout: null,
       holdoutDisabled: holdoutDisabled ?? `dataset too small for ${folds} folds (need ≥ ~${folds * 60} bars)`,
@@ -1679,7 +1705,7 @@ export async function walkForward(
         oosTo: oosBars[oosBars.length - 1].time,
         isTrades: 0, isNetPct: 0, isScore: null,
         oosTrades: 0, oosNetPct: 0, oosWinRate: 0, oosPF: 0, oosMaxDDPct: 0, oosScore: null,
-        oosValid: false, params: {}, boundary: false,
+        oosValid: false, oosBps: [], params: {}, boundary: false,
       })
       continue
     }
@@ -1706,9 +1732,11 @@ export async function walkForward(
       oosMaxDDPct: om.maxDrawdownPct,
       oosScore: oosValid ? backtestScore(om, minTrades) : null,
       oosValid,
+      oosBps: oosRun.trades.map((t) => +(t.pnlPct * 100).toFixed(2)),
       params: best.params,
       boundary: onBoundary({ ...base.params, ...best.params }),
     })
+    for (const t of oosRun.trades) oosPool.push({ pnlPct: t.pnlPct, entryTime: t.entryTime })
   }
 
   // ---- 3) aggregate the OOS DISTRIBUTION (not one lucky number) ----
@@ -1745,6 +1773,9 @@ export async function walkForward(
     oosNetMean: oosNets.length > 0 ? oosNets.reduce((a, b) => a + b, 0) / oosNets.length : null,
     paramStability: outFolds.length > 0 && modalCount > 0 ? modalCount / outFolds.length : null,
     modalParams,
+    // v1.99.0 — the pooled out-of-sample significance: every fold's OOS trade
+    // in ONE day-block test. This is the number that answers "can I trust it?"
+    oosSig: oosPool.length > 0 ? significanceStats(oosPool, roundTripCostBps(base), 1500) : null,
   }
 
   // ---- 4) hold-out stress test on the most trustworthy parameter set ----
@@ -1779,6 +1810,9 @@ export async function walkForward(
         profitFactor: hm.profitFactor,
         maxDrawdownPct: hm.maxDrawdownPct,
         trades: hm.trades,
+        // v1.99.0 — the purest number the walk-forward produces: one config,
+        // one window no tuning ever saw, tested for per-trade significance
+        sig: significanceStats(hRun.trades, roundTripCostBps(base), 1500),
         // Review P1 #7 — gate contribution on the pure hold-out: how many of
         // the raw signals each regime veto removed in the honest window
         regime: hm.regime,

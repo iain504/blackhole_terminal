@@ -48,6 +48,8 @@ import {
 } from '@/lib/algo-strategies'
 import type { BacktestResult, BacktestMetrics, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
 import type { MonteCarloResult, RegimeGateStats } from '@/lib/algo-regime'
+// v1.99.0 — trust layer: per-trade significance + plain-language verdicts
+import { trustVerdict, TRUST_LEVEL_STYLE, type SignificanceStats, type TrustVerdict } from '@/lib/backtest-stats'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
 import { ALGO_RECOMMENDATIONS, ALGO_RECO_META, type AlgoRecommendation } from '@/lib/algo-recommendations'
 
@@ -165,6 +167,73 @@ const WlChart = dynamic(() => import('./BacktestCharts').then((m) => m.WlChart),
   ),
 })
 
+// v1.99.0 — normalize a wire-traveled SignificanceStats: jsonSafe turns every
+// NaN into null, so every numeric field must be re-validated before math/format
+function num(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : NaN
+}
+
+/**
+ * v1.99.0 — THE TRUST STRIP. The Backtest panel used to render point
+ * estimates only (net%, PF, WR) and the user had to guess whether 21 trades
+ * of +23 bps meant anything. This card turns the per-trade distribution into
+ * a plain-language verdict — SIGNIFICANT / PROMISING / WITHIN NOISE / NO EDGE
+ * / UNTESTABLE — with the numbers that back it (t, two-sided p, day-block
+ * bootstrap 95% CI, trades still needed) and the honest caveats (in-sample
+ * winner's curse, frictionless runs, out-of-sample purity).
+ */
+function TrustStrip({ label, sig: sigRaw, verdict, compact = false }: { label: string; sig: SignificanceStats | null | undefined; verdict: TrustVerdict | null | undefined; compact?: boolean }) {
+  if (!verdict) return null
+  const st = TRUST_LEVEL_STYLE[verdict.level]
+  const sig = sigRaw
+    ? {
+        n: num(sigRaw.n),
+        meanBps: num(sigRaw.meanBps),
+        sdBps: num(sigRaw.sdBps),
+        t: num(sigRaw.t),
+        p: num(sigRaw.p),
+        ciLo: num(sigRaw.ciLo),
+        ciHi: num(sigRaw.ciHi),
+        tradesNeeded: num(sigRaw.tradesNeeded),
+        costBps: num(sigRaw.costBps),
+      }
+    : null
+  return (
+    <div className={cn('rounded-md border bg-zinc-900/70 px-3 py-2.5', st.border)} role="status" aria-label={`Trust verdict: ${verdict.title}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <ShieldCheck className={cn('h-3.5 w-3.5 shrink-0', st.text)} aria-hidden />
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">{label}</span>
+        <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide', st.border, st.text)}>
+          <span className={cn('h-1.5 w-1.5 rounded-full', st.dot)} aria-hidden />
+          {st.label}
+        </span>
+        <span className={cn('text-[11px] font-semibold', st.text)}>{verdict.title}</span>
+        {sig && Number.isFinite(sig.tradesNeeded) && (
+          <Badge variant="outline" className="ml-auto text-[10px] tabular-nums text-zinc-400" title="Trades needed for t ≈ 2 (95% confidence) at the observed edge/σ ratio — collect them forward, don't re-tune the same window">
+            ≈{sig.tradesNeeded} trades to confirm
+          </Badge>
+        )}
+      </div>
+      <p className={cn('mt-1 leading-snug text-zinc-400', compact ? 'text-[9px]' : 'text-[10px]')}>{verdict.detail}</p>
+      {sig && (
+        <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[10px] tabular-nums text-zinc-500">
+          <span>n <span className="text-zinc-300">{Number.isFinite(sig.n) ? sig.n : '—'}</span></span>
+          <span>edge <span className={cn(Number.isFinite(sig.meanBps) ? (sig.meanBps > 0 ? 'text-emerald-400' : 'text-rose-400') : 'text-zinc-300')}>
+            {Number.isFinite(sig.meanBps) ? `${sig.meanBps >= 0 ? '+' : ''}${sig.meanBps.toFixed(1)} bps/trd` : '—'}
+          </span></span>
+          <span>95% CI <span className={cn(Number.isFinite(sig.ciLo) && sig.ciLo > 0 ? 'text-emerald-400' : 'text-zinc-300')}>
+            {Number.isFinite(sig.ciLo) ? `[${sig.ciLo.toFixed(1)}, ${sig.ciHi.toFixed(1)}]` : '—'}
+          </span></span>
+          <span>t <span className="text-zinc-300">{Number.isFinite(sig.t) ? sig.t.toFixed(2) : '—'}</span></span>
+          <span>p <span className="text-zinc-300">{Number.isFinite(sig.p) ? (sig.p < 0.0001 ? '<0.0001' : sig.p.toFixed(4)) : '—'}</span></span>
+          <span>σ <span className="text-zinc-300">{Number.isFinite(sig.sdBps) ? `${sig.sdBps.toFixed(0)} bps` : '—'}</span></span>
+          <span>costs <span className="text-zinc-300">{sig.costBps > 0 ? `${sig.costBps} bps RT` : 'frictionless'}</span></span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cfg: AlgoSetupCfg; onApplyParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void; onApplySetup?: (s: AlgoApplySetup) => void }) {
   const { toast } = useToast()
   const [days, setDays] = useState('30')
@@ -190,6 +259,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [wfAnchored, setWfAnchored] = useState(false)
   const [wfRes, setWfRes] = useState<WalkForwardResult | null>(null)
   const [mcRes, setMcRes] = useState<MonteCarloResult | null>(null)
+  // v1.99.0 — TRUST verdict for the plain run / optimizer best row (computed
+  // server-side on the actual per-trade P&L). Walk-forward verdicts are
+  // derived client-side from wfRes.aggregate.oosSig / wfRes.holdout.sig.
+  const [trustRes, setTrustRes] = useState<{ basis: 'plain' | 'in-sample'; sig: SignificanceStats | null; verdict: TrustVerdict | null } | null>(null)
   // Task 4-a — leverage-honest sizing: max position notional = capital × Lev
   // (route clamps 0.1..10; default 1 = cash-only, matching the baked reco runs)
   const [btLev, setBtLev] = useState('1')
@@ -471,25 +544,30 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       optimize?: OptimizeResult | null
       walkforward?: WalkForwardResult | null
       sweep?: SweepResult | null
+      trust?: { sig: SignificanceStats | null; verdict: TrustVerdict | null } | null
     }
     setMeta(j.meta ?? null)
     if (mode === 'run') {
       setRunRes(j.result ?? null)
       setMcRes(j.mc ?? null)
+      setTrustRes({ basis: 'plain', sig: j.trust?.sig ?? null, verdict: j.trust?.verdict ?? null })
       setOptRes(null)
       setAbRes(null) // a fresh baseline invalidates the gates-off A/B
       setTrailAbRes(null) // a fresh run invalidates the trail-proof A/B
     } else if (mode === 'optimize') {
       setOptRes(j.optimize ?? null)
+      setTrustRes({ basis: 'in-sample', sig: j.trust?.sig ?? null, verdict: j.trust?.verdict ?? null })
       setRunRes(null)
       setMcRes(null)
     } else if (mode === 'walkforward') {
       setWfRes(j.walkforward ?? null)
+      setTrustRes(null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
     } else {
       setSweepRes(j.sweep ?? null)
+      setTrustRes(null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
@@ -1394,6 +1472,12 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             </div>
           )}
 
+          {/* v1.99.0 — TRUST CHECK: the plain-language significance verdict on
+              this run's per-trade P&L, before any other honesty overlays */}
+          {trustRes?.basis === 'plain' && (
+            <TrustStrip label="Trust check — is this edge real?" sig={trustRes.sig} verdict={trustRes.verdict} />
+          )}
+
           {/* Task 12 — Monte Carlo bootstrap (improvement plan P2): resample the
               realized trade sequence to estimate how much of the edge is luck */}
           {mcRes && (
@@ -1500,6 +1584,13 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </Button>
             )}
           </div>
+          {/* v1.99.0 — in-sample trust verdict on the optimizer's best row:
+              explicitly winner's-curse-labeled, capped at 'suggestive' */}
+          {trustRes?.basis === 'in-sample' && (
+            <div className="border-t border-zinc-800/60 px-3 py-2">
+              <TrustStrip label="Best-row trust (in-sample)" sig={trustRes.sig} verdict={trustRes.verdict} compact />
+            </div>
+          )}
           {optRes.results.length === 0 ? (
             <p className="border-t border-zinc-800/60 px-3 py-4 text-center text-xs text-zinc-500">No combination produced a scorable result.</p>
           ) : (
@@ -1743,6 +1834,26 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                 <span className="text-zinc-600"> · {wfRes.holdout.trades} trades · win {wfRes.holdout.winRate.toFixed(0)}% · DD {wfRes.holdout.maxDrawdownPct.toFixed(1)}%</span>
               </span>
             )}
+            {/* v1.99.0 — hold-out significance chip: the purest number the
+                walk-forward produces, labeled in plain language */}
+            {wfRes.holdout?.sig && wfRes.holdout.sig.n > 0 && (() => {
+              const hv = trustVerdict(wfRes.holdout!.sig, 'oos')
+              const hst = TRUST_LEVEL_STYLE[hv.level]
+              return (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span tabIndex={0} className={cn('inline-flex cursor-help items-center gap-1 rounded-full border px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide', hst.border, hst.text)}>
+                      <span className={cn('h-1.5 w-1.5 rounded-full', hst.dot)} aria-hidden />
+                      hold-out {hst.label}
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-80 border-zinc-700 bg-zinc-800 text-zinc-100">
+                    <p className="font-semibold">{hv.title}</p>
+                    <p className="mt-1 leading-snug">{hv.detail}</p>
+                  </TooltipContent>
+                </Tooltip>
+              )
+            })()}
             {/* Review P1 #7 — gate contribution on the pure hold-out window */}
             {wfRes.holdout?.regime && wfRes.holdout.regime.signals > 0 && (
               <span
@@ -1757,6 +1868,13 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </span>
             )}
           </div>
+          {/* v1.99.0 — POOLED OUT-OF-SAMPLE verdict: every fold's OOS trade in
+              one day-block significance test — the honest headline number */}
+          {wfRes.aggregate.oosSig && wfRes.aggregate.oosSig.n > 0 && (
+            <div className="px-3 pb-2">
+              <TrustStrip label="Pooled out-of-sample verdict" sig={wfRes.aggregate.oosSig} verdict={trustVerdict(wfRes.aggregate.oosSig, 'oos')} compact />
+            </div>
+          )}
           {wfRes.folds.length === 0 ? (
             <p className="border-t border-zinc-800/60 px-3 py-4 text-center text-xs text-zinc-500">
               No fold produced a tunable winner — widen the history, tick more parameters in Auto-tune, or lower the min-trades gate.
