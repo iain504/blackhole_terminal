@@ -48,6 +48,8 @@ import {
 } from '@/lib/algo-strategies'
 import type { BacktestResult, BacktestMetrics, OptimizeResult, SweepResult, WalkForwardResult } from '@/lib/backtest'
 import type { MonteCarloResult, RegimeGateStats } from '@/lib/algo-regime'
+// v1.99.1 — pipeline flow chart: blinking yellow phase → green done → golden result
+import { BacktestFlowChart, type BtFlowMode } from '@/components/terminal/tabs/BacktestFlowChart'
 // v1.99.0 — trust layer: per-trade significance + plain-language verdicts
 import { trustVerdict, TRUST_LEVEL_STYLE, type SignificanceStats, type TrustVerdict } from '@/lib/backtest-stats'
 import { type AlgoRiskBasis, type AlgoSizingMode } from '@/lib/algo-strategies'
@@ -302,8 +304,36 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep' | 'walkforward'>(null)
   const [error, setError] = useState<string | null>(null)
   // Task 15 — live progress of a background optimizer job (heavy modes run
-  // detached server-side; this mirrors the GET ?job= poll stream)
-  const [job, setJob] = useState<{ frac: number; stage: string; elapsedSec: number } | null>(null)
+  // detached server-side; this mirrors the GET ?job= poll stream).
+  // v1.99.1 — `phase` is the structured pipeline phase for the flow chart.
+  const [job, setJob] = useState<{ frac: number; stage: string; phase?: string; elapsedSec: number } | null>(null)
+  // v1.99.1 — flow chart: which pipeline is drawn + its outcome. It stays on
+  // screen after completion (all green + golden result) until the next run.
+  const [flowMode, setFlowMode] = useState<BtFlowMode | null>(null)
+  const [flowDone, setFlowDone] = useState(false)
+  const [flowError, setFlowError] = useState(false)
+  // inline 'run' has no job poll — a lightweight client-side estimate walks
+  // fetch → prepare → replay while the request is in flight; the real
+  // response finalizes the chart (all green + golden) on arrival.
+  const [runHint, setRunHint] = useState<'fetch' | 'prepare' | 'replay'>('fetch')
+  const runHintTimers = useRef<ReturnType<typeof setTimeout>[]>([])
+  // v1.99.1 — last REAL phase seen from the server (heavy modes). On failure
+  // the job record is gone but the chart must still paint the node that was
+  // executing red — so remember it here.
+  const lastPhaseRef = useRef<string>('fetch')
+  const startRunHint = () => {
+    runHintTimers.current.forEach(clearTimeout)
+    setRunHint('fetch')
+    runHintTimers.current = [
+      setTimeout(() => setRunHint('prepare'), 1100),
+      setTimeout(() => setRunHint('replay'), 2400),
+    ]
+  }
+  const stopRunHint = () => {
+    runHintTimers.current.forEach(clearTimeout)
+    runHintTimers.current = []
+  }
+  useEffect(() => stopRunHint, [])
   const [meta, setMeta] = useState<BacktestMeta | null>(null)
   const [runRes, setRunRes] = useState<BacktestResult | null>(null)
   const [optRes, setOptRes] = useState<OptimizeResult | null>(null)
@@ -332,6 +362,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setError(null)
     setMcRes(null)
     setAbRes(null)
+    setFlowMode(null) // v1.99.1 — the old pipeline belongs to the old strategy
   }, [cfg.strategy])
 
   // symbol / timeframe switch → the sweep was measured on other data
@@ -578,13 +609,15 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   // (optimize/sweep/walkforward) return 202 {jobId} and run DETACHED
   // server-side, so no HTTP request lives long enough to be killed by proxy
   // timeouts (Render's edge ≈100s) or pod churn — no more 502-with-no-result.
-  const pollJob = async (mode: 'optimize' | 'sweep' | 'walkforward', jobId: string) => {
+  // v1.99.1 — resolves true when a result landed (flow chart → golden),
+  // false on any failure/timeout (flow chart → red node).
+  const pollJob = async (mode: 'optimize' | 'sweep' | 'walkforward', jobId: string): Promise<boolean> => {
     const deadline = Date.now() + 15 * 60_000
     for (;;) {
       if (Date.now() > deadline) {
         setError('Optimizer still running after 15 minutes')
         failToast(mode, 'Still running after 15 minutes — try a smaller grid or a shorter period')
-        return
+        return false
       }
       await new Promise((r) => setTimeout(r, 1500))
       let res: Response
@@ -593,19 +626,25 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       } catch {
         setError('Network error')
         failToast(mode, 'Network error while polling the optimizer job')
-        return
+        return false
       }
       const pj = (await res.json().catch(() => null)) as {
-        status?: string; frac?: number; stage?: string; elapsedSec?: number; error?: string
+        status?: string; mode?: string; phase?: string; frac?: number; stage?: string; elapsedSec?: number; error?: string
       } | null
       if (!res.ok) {
         const msg = pj?.error || `HTTP ${res.status}`
         setError(msg)
         failToast(mode, msg)
-        return
+        return false
       }
       if (pj?.status === 'running') {
-        setJob({ frac: Number(pj.frac) || 0, stage: String(pj.stage || ''), elapsedSec: Number(pj.elapsedSec) || 0 })
+        if (pj.phase) lastPhaseRef.current = String(pj.phase)
+        setJob({
+          frac: Number(pj.frac) || 0,
+          stage: String(pj.stage || ''),
+          phase: pj.phase ? String(pj.phase) : undefined,
+          elapsedSec: Number(pj.elapsedSec) || 0,
+        })
         continue
       }
       setJob(null)
@@ -613,10 +652,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         const msg = pj.error || 'Optimizer failed'
         setError(msg)
         failToast(mode, msg)
-        return
+        return false
       }
       applyResult(mode, pj)
-      return
+      return true
     }
   }
 
@@ -624,6 +663,13 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setBusy(mode)
     setError(null)
     setJob(null)
+    // v1.99.1 — draw the pipeline for THIS run: reset to a fresh chart and,
+    // for the inline run, start the client-side phase estimate
+    setFlowMode(mode)
+    setFlowDone(false)
+    setFlowError(false)
+    lastPhaseRef.current = 'fetch'
+    if (mode === 'run') startRunHint()
     try {
       const res = await fetch('/api/algo/backtest', {
         method: 'POST',
@@ -660,21 +706,27 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       const json = await res.json().catch(() => null)
       // Task 15 — heavy modes come back as 202 {jobId}: poll to completion
       if (res.status === 202 && json?.jobId) {
-        await pollJob(mode as 'optimize' | 'sweep' | 'walkforward', String(json.jobId))
+        const ok = await pollJob(mode as 'optimize' | 'sweep' | 'walkforward', String(json.jobId))
+        if (ok) setFlowDone(true)
+        else setFlowError(true)
         return
       }
       if (!res.ok) {
         setError(json?.error || `HTTP ${res.status}`)
         failToast(mode, json?.error || `HTTP ${res.status}`)
+        setFlowError(true)
         return
       }
       applyResult(mode, json)
+      setFlowDone(true)
     } catch {
       setError('Network error')
+      setFlowError(true)
       toast({ title: 'Request failed', description: 'Network error', variant: 'destructive' })
     } finally {
       setBusy(null)
       setJob(null)
+      stopRunHint()
     }
   }
 
@@ -1140,19 +1192,28 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
           </div>
         </div>
 
-        {/* ---- Task 15 — live optimizer job progress (background-job poll) ---- */}
-        {busy && job && (
-          <div className="mt-2 flex items-center gap-2" role="status" aria-live="polite">
-            <div className="h-1.5 flex-1 overflow-hidden rounded bg-zinc-800">
-              <div
-                className="h-full bg-violet-500 transition-all duration-700"
-                style={{ width: `${Math.max(3, Math.round(job.frac * 100))}%` }}
-              />
-            </div>
-            <span className="whitespace-nowrap text-[10px] tabular-nums text-zinc-400">
-              {Math.round(job.frac * 100)}% · {job.stage || 'working'} · {job.elapsedSec}s
-            </span>
-          </div>
+        {/* ---- v1.99.1 — pipeline flow chart (replaces the bare % line) ----
+            Heavy modes: real server phases from the job poll. Inline run:
+            client-side estimate finalized by the response. Either way the
+            chart stays on screen after the run — all green + golden result. */}
+        {flowMode && (
+          <BacktestFlowChart
+            mode={flowMode}
+            activePhase={flowDone
+              ? null
+              : busy === 'run'
+                ? runHint
+                : flowError
+                  ? lastPhaseRef.current
+                  : (job?.phase ?? 'fetch')}
+            finished={flowDone}
+            failed={flowError}
+            frac={busy === 'run' ? undefined : (job?.frac ?? 0.02)}
+            stage={busy === 'run'
+              ? (runHint === 'fetch' ? 'fetching bars…' : runHint === 'prepare' ? 'preparing series…' : 'replaying strategy over history…')
+              : job?.stage}
+            elapsedSec={busy === 'run' ? undefined : job?.elapsedSec}
+          />
         )}
 
         {/* ---- optimizer ranges ---- */}
@@ -1270,18 +1331,8 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         </div>
       )}
 
-      {busy && (
-        <div className="flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/70 px-3 py-6 text-xs text-zinc-400" role="status">
-          <RefreshCw className="h-4 w-4 animate-spin text-zinc-500" aria-hidden />
-          {busy === 'run'
-            ? 'Replaying history…'
-            : busy === 'optimize'
-              ? 'Searching parameter grid… this can take a few seconds'
-              : busy === 'walkforward'
-                ? 'Walk-forward: re-optimizing on every fold, verifying out-of-sample, stress-testing the hold-out… this can take 10–60s'
-                : 'Sweeping every strategy — defaults + auto-tuned grids for each… this can take 10–30s'}
-        </div>
-      )}
+      {/* v1.99.1 — the flow chart above now carries the busy status live
+          (phase nodes + stage text), so the old static "busy" card is gone. */}
 
       {/* single-run result */}
       {runRes && m && (

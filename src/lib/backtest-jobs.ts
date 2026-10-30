@@ -23,9 +23,20 @@
 // background jobs can never stack.
 import { randomUUID } from 'crypto'
 
+/**
+ * v1.99.1 — pipeline phases for the flow chart. The engines emit free-form
+ * `stage` text; the poll maps it onto ONE of these ids so the UI can render a
+ * deterministic phase pipeline (blinking yellow = active, green = done,
+ * golden = final result) instead of guessing from display strings.
+ */
+export type BacktestPhase =
+  | 'fetch' | 'prepare' | 'replay' | 'grid' | 'sweep' | 'oos' | 'folds' | 'holdout' | 'verdict' | 'result'
+
 export interface BacktestJob {
   id: string
   userId: string
+  /** v1.99.1 — which heavy mode this job runs (drives the flow chart pipeline) */
+  mode: 'optimize' | 'sweep' | 'walkforward'
   status: 'running' | 'done' | 'error'
   /** 0..1 progress of the whole operation (Task 15 progress plumbing) */
   frac: number
@@ -84,13 +95,14 @@ function pruneJobs(): void {
  * The slot is acquired HERE and released by failJob/completeJob — the runner
  * must always end in one of those two.
  */
-export function createBacktestJob(userId: string): BacktestJob | null {
+export function createBacktestJob(userId: string, mode: BacktestJob['mode']): BacktestJob | null {
   if (runningBacktests.has(userId)) return null
   runningBacktests.add(userId)
   pruneJobs()
   const job: BacktestJob = {
     id: randomUUID(),
     userId,
+    mode,
     status: 'running',
     frac: 0,
     stage: 'queued',
@@ -108,6 +120,30 @@ export function getBacktestJob(userId: string, id: string): BacktestJob | null {
   const job = jobs.get(id)
   if (!job || job.userId !== userId) return null
   return job
+}
+
+/**
+ * v1.99.1 — map the engines' free-form stage text onto a flow-chart phase id.
+ * The stage strings are the ones emitted by src/lib/backtest.ts (grid search,
+ * "strategy i/N · Name", "fold i/N", "out-of-sample verification", "hold-out
+ * stress test") and the route ("fetching …", "preparing …"). Any unknown
+ * stage falls back to the mode's core phase, so a renamed label can never
+ * strand the flow chart on the wrong node.
+ */
+export function phaseFromStage(mode: BacktestJob['mode'], stage: string): BacktestPhase {
+  const s = String(stage ?? '').toLowerCase()
+  if (s.startsWith('fetching')) return 'fetch'
+  if (s.startsWith('preparing')) return 'prepare'
+  if (s.startsWith('out-of-sample')) return 'oos'
+  if (s.startsWith('hold-out')) return 'holdout'
+  if (s.startsWith('fold')) return 'folds'
+  if (s.startsWith('strategy')) return 'sweep'
+  if (s.startsWith('grid')) return 'grid'
+  switch (mode) {
+    case 'optimize': return 'grid'
+    case 'sweep': return 'sweep'
+    case 'walkforward': return 'folds'
+  }
 }
 
 /** Progress sink for the engines' onProgress callbacks — O(1), always safe. */

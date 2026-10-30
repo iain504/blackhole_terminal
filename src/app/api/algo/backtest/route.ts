@@ -69,7 +69,7 @@ import { roundTripCostBps, significanceStats, trustVerdict } from '@/lib/backtes
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
 import {
   createBacktestJob, getBacktestJob, tryAcquireBacktestSlot, releaseBacktestSlot,
-  completeJob, failJob, jobProgress,
+  completeJob, failJob, jobProgress, phaseFromStage,
 } from '@/lib/backtest-jobs'
 
 export const dynamic = 'force-dynamic'
@@ -198,7 +198,7 @@ export async function POST(req: NextRequest) {
       if (!memGate.ok) {
         return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
       }
-      const job = createBacktestJob(user.id)
+      const job = createBacktestJob(user.id, mode as 'optimize' | 'sweep' | 'walkforward')
       if (!job) {
         return NextResponse.json({ error: 'A backtest is already running' }, { status: 429 })
       }
@@ -252,8 +252,16 @@ export async function GET(req: NextRequest) {
       )
     }
     if (job.status === 'running') {
+      // v1.99.1 — structured phase for the flow chart: the UI renders a
+      // per-mode pipeline (blinking yellow = current, green = done, golden =
+      // result) and needs a DETERMINISTIC phase id, not the display string.
+      const phase = job.stage === 'queued'
+        ? 'fetch'
+        : phaseFromStage(job.mode, job.stage)
       return NextResponse.json({
         status: 'running',
+        mode: job.mode,
+        phase,
         frac: job.frac,
         stage: job.stage,
         startedAt: job.createdAt,

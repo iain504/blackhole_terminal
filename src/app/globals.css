@@ -168,6 +168,35 @@
 }
 
 /* ===========================================================================
+   v1.99.1 — Backtest flow chart (BacktestFlowChart.tsx) phase animations.
+   The pipeline reads like a production line: the step currently executing
+   BLINKS YELLOW, finished steps turn GREEN, and the final result node turns
+   GOLDEN when the whole run lands. Opacity-only keyframes keep it
+   compositor-friendly (same trick as grid-glow-pulse above).
+   =========================================================================== */
+/* active step — blinking amber */
+@keyframes bt-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.bt-blink { animation: bt-blink 1s ease-in-out infinite; }
+/* active connector — faster blink */
+.bt-blink-fast { animation: bt-blink 0.65s ease-in-out infinite; }
+/* final result node — golden glow pulse */
+@keyframes bt-gold-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 1.5px rgb(234 179 8 / 0.75), 0 0 10px 2px rgb(234 179 8 / 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 2.5px rgb(250 204 21 / 1), 0 0 22px 6px rgb(250 204 21 / 0.65);
+  }
+}
+.bt-gold { animation: bt-gold-pulse 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .bt-blink, .bt-blink-fast, .bt-gold { animation: none; }
+}
+
+/* ===========================================================================
    Task 28 — UI themes. "Christmas" re-skins the whole app by REDEFINING the
    Tailwind color variables under html.theme-christmas: every solid zinc-*
    utility compiles to var(--color-zinc-NNN), so one palette swap re-tints
