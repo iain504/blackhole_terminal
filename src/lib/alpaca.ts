@@ -15,6 +15,14 @@ import { saveBars, loadBars, hasCoverage } from './bar-store'
 
 const DATA_BASE = 'https://data.alpaca.markets'
 const ALPACA_TIMEOUT_MS = 9000
+// v1.99.2 — bar PAGES are the one endpoint with multi-MB JSON payloads: a deep
+// backtest window (e.g. 200d of 5m ≈ 30–50 paginated pages @ ~2k bars/page)
+// legitimately takes >9s per page on a slow link, and the hard 9s abort killed
+// the WHOLE fetch (dev.log: "Alpaca /v2/stocks/bars… failed: The operation was
+// aborted"). Bar pages get a 20s budget + automatic retries below.
+const ALPACA_BARS_TIMEOUT_MS = 20_000
+const ALPACA_FETCH_ATTEMPTS = 3
+const ALPACA_RETRY_BASE_MS = 600
 
 export interface AlpacaKeys {
   keyId: string
@@ -338,31 +346,53 @@ async function tradingAccountStatus(base: string, keyId: string, secret: string)
   }
 }
 
-/** Returns the parsed body plus HTTP status (0 = network/timeout failure). */
-async function alpacaFetch<T>(path: string, keys: AlpacaKeys): Promise<{ data: T | null; status: number }> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), ALPACA_TIMEOUT_MS)
-  try {
-    const res = await fetch(`${DATA_BASE}${path}`, {
-      headers: {
-        'APCA-API-KEY-ID': keys.keyId,
-        'APCA-API-SECRET-KEY': keys.secret,
-        accept: 'application/json',
-      },
-      signal: controller.signal,
-      cache: 'no-store',
-    })
-    if (!res.ok) {
-      console.error(`Alpaca ${path} -> HTTP ${res.status}`)
-      return { data: null, status: res.status }
+/** Returns the parsed body plus HTTP status (0 = network/timeout failure).
+ * v1.99.2 — TRANSIENT-FAILURE RETRY: network stalls and slow pages used to be
+ * fatal after ONE attempt ("The operation was aborted" in dev.log). Now any
+ * network/abort error retries up to ALPACA_FETCH_ATTEMPTS with a linear
+ * backoff. HTTP status errors (401/403/429…) are NOT retried — a rejected key
+ * or a rate limit will not heal in 600ms, and retrying those just delays the
+ * honest error. Cheap endpoints keep the 9s budget; bar pages pass 20s. */
+async function alpacaFetch<T>(
+  path: string,
+  keys: AlpacaKeys,
+  opts?: { timeoutMs?: number },
+): Promise<{ data: T | null; status: number }> {
+  const timeoutMs = opts?.timeoutMs ?? ALPACA_TIMEOUT_MS
+  for (let attempt = 1; attempt <= ALPACA_FETCH_ATTEMPTS; attempt++) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(`${DATA_BASE}${path}`, {
+        headers: {
+          'APCA-API-KEY-ID': keys.keyId,
+          'APCA-API-SECRET-KEY': keys.secret,
+          accept: 'application/json',
+        },
+        signal: controller.signal,
+        cache: 'no-store',
+      })
+      if (!res.ok) {
+        console.error(`Alpaca ${path} -> HTTP ${res.status}`)
+        return { data: null, status: res.status }
+      }
+      return { data: (await res.json()) as T, status: res.status }
+    } catch (e) {
+      if (attempt < ALPACA_FETCH_ATTEMPTS) {
+        console.warn(
+          `Alpaca ${path} attempt ${attempt}/${ALPACA_FETCH_ATTEMPTS} failed` +
+            ` (${e instanceof Error ? e.message : e}) — retrying`,
+        )
+        await new Promise((r) => setTimeout(r, ALPACA_RETRY_BASE_MS * attempt))
+        continue
+      }
+      console.error(`Alpaca ${path} failed after ${attempt} attempts:`, e instanceof Error ? e.message : e)
+      return { data: null, status: 0 }
+    } finally {
+      clearTimeout(timer)
     }
-    return { data: (await res.json()) as T, status: res.status }
-  } catch (e) {
-    console.error(`Alpaca ${path} failed:`, e instanceof Error ? e.message : e)
-    return { data: null, status: 0 }
-  } finally {
-    clearTimeout(timer)
   }
+  return { data: null, status: 0 } // unreachable — loop always returns
 }
 
 // ---------- Bars ----------
@@ -443,9 +473,19 @@ async function fetchBarsPaged(
   let status = 200
   for (let page = 0; page < maxPages; page++) {
     const url = token ? `${path}&page_token=${encodeURIComponent(token)}` : path
-    const { data, status: st } = await alpacaFetch<PagedBars>(url, keys)
+    const { data, status: st } = await alpacaFetch<PagedBars>(url, keys, { timeoutMs: ALPACA_BARS_TIMEOUT_MS })
     if (!data) {
-      // network/HTTP failure — keep what we have (first page failure -> empty)
+      // network/HTTP failure — keep what we have (first page failure -> empty).
+      // v1.99.2 — say it OUT LOUD: a mid-pagination abort silently returns the
+      // OLDEST pages only (pages walk forward from `start`), i.e. a window that
+      // ends days/weeks before now. Callers (backtests!) must be able to trust
+      // `truncated`, and the log must show WHY the window came back short.
+      if (page > 0) {
+        console.warn(
+          `[bars] ${symbol}: page ${page + 1} failed (status ${st}) after retries — ` +
+            `returning ${all.length} PARTIAL bars (truncated, oldest pages only)`,
+        )
+      }
       return { bars: all, status: st, truncated: page > 0 }
     }
     status = st
@@ -587,7 +627,12 @@ export async function getBars(
   timeframe: Timeframe,
   userId?: string,
   opts?: GetBarsOptions,
-): Promise<{ bars: Bar[] } & DemoMeta> {
+): Promise<{ bars: Bar[]; truncated?: boolean } & DemoMeta> {
+  // v1.99.2 — `truncated: true` = the feed dropped part of the requested window
+  // mid-pagination (page failures surviving the retries). Backtests REUSE this
+  // flag to refuse a silently-short history instead of replaying one that ends
+  // weeks before now — a truncated replay looks like a normal result and is
+  // exactly the kind of quiet lie that destroys trust in the numbers.
   // `before` shifts the whole window one chunk INTO THE PAST (end = before),
   // so each call appends the PRECEDING ~barCount bars to the chart.
   const before = opts?.before
@@ -689,7 +734,7 @@ export async function getBars(
       )
     }
     if (timeframe === '1W' || timeframe === '1M') bars = aggregateDaily(bars, timeframe)
-    return { bars, demo: false }
+    return { bars, demo: false, truncated }
   }
 
   // Stocks API: v2/stocks/bars — adjustment enum is `split` (NOT `splits`;
@@ -744,7 +789,9 @@ export async function getBars(
       'empty',
     )
   }
-  return { bars, demo: false }
+  // v1.99.2 — propagate truncation (page-cap or surviving page failure) so the
+  // backtest gate can refuse a window that silently ends before now.
+  return { bars, demo: false, truncated }
 }
 
 // ---------- Quotes / Snapshots ----------

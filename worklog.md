@@ -3427,3 +3427,62 @@ Work Log:
 
 Stage Summary:
 - v1.99.1 — the backtest pipeline is now VISIBLE: a mode-aware flow chart (Fetch bars → Prepare → <mode phases> → 🏆 Result) blinks yellow on the phase currently running, turns finished phases green with check badges, and ends in a golden glowing result node — driven by REAL server phase ids from the job poll (new phaseFromStage mapping), with red failure marking, reduced-motion support, and the old percent-line/busy-card retired. Users can finally SEE what a backtest is doing and how far along it is.
+
+## v1.99.2 — Alpaca bars fetch: the "operation was aborted" fix (user-reported from dev.log)
+
+User: "i found a error in log… this is happen when i backtest TSLA in 5m in Algo Tab:
+`Alpaca /v2/stocks/bars?symbols=TSLA&timeframe=5Min&start=2026-04-13T13:46:39Z&end=2026-10-30T13:46:39Z&limit=10000&adjustment=split&feed=iex failed: The operation was aborted.`"
+
+Root cause chain (src/lib/alpaca.ts):
+1. `alpacaFetch` ran a hard 9s `AbortController` timer per page. A deep backtest
+   window (200d of 5m ≈ 11.6k bars ≈ 6-10 paginated pages @ ~1.5-2k bars/page on
+   IEX) is a chain of those pages — ONE page overrunning 9s aborted the WHOLE
+   fetch. The start=2026-04-13 URL is exactly the 200d lookback window (backtest
+   History field), so the user's deep fetch was killed by our own timer.
+2. Worse: a mid-pagination abort returned PARTIAL bars (oldest pages only —
+   pages walk forward from `start`, so the newest were missing) with
+   `truncated=true` that NOTHING consumed: a backtest could silently replay a
+   window ending days/weeks before now.
+
+Fixes:
+- `alpacaFetch(path, keys, {timeoutMs})`: bar pages get a 20s budget
+  (ALPACA_BARS_TIMEOUT_MS — multi-MB 10k-bar JSON pages legitimately exceed 9s on
+  a slow link; cheap endpoints keep 9s), and network/abort failures now RETRY up
+  to 3 attempts with linear backoff (600ms×n). HTTP status errors (401/403/429)
+  are NOT retried — a rejected key won't heal in 600ms.
+- `fetchBarsPaged` passes the bars timeout and now WARNS loudly when returning
+  partial bars after surviving page failures (`[bars] SYM: page N failed (status
+  0) after retries — returning X PARTIAL bars (truncated, oldest pages only)`).
+- `getBars` return type grows `truncated?: boolean` (stock + crypto paged paths).
+- `backtest-history.ts`: truncated results are NEVER cached (the 120s TTL would
+  re-serve the short window on the immediate retry) and `fetchBacktestBars`
+  REFUSES truncated history with an honest 400: "History came back incomplete —
+  the data feed dropped part of the window mid-download. Press Run again to
+  retry." A backtest on silently-short history is a confident-looking lie.
+- `algo-reco.ts`: reco matrix skips truncated fetches like demo data.
+
+Verification:
+- Probe `scripts/probe-bars-retry.ts [days]` (keep — regression probe, needs
+  `await resolveAppSecret()` first in standalone context or decrypt fails):
+  TSLA 5m 200d through the app's own getBars = 11,604 bars in 13.3s,
+  truncated=false, fresh tail (0.00d old). 13.3s total proves the old 9s/page
+  kill is gone (any single >9s page would have aborted before).
+- E2E agent-browser, fresh account retrytest1 + remembered Alpaca paper keys:
+  Algo tab → Backtest → TSLA 5m · History 200d → Run: flow chart ran
+  Fetch bars ✓ green → Prepare ✓ green → Replay BLINKING YELLOW
+  (/tmp/retry-flow-1.png) → all green + GOLDEN trophy
+  (/tmp/retry-flow-2.png) → result card "TSLA · 5m · data Apr 13, 26 → Oct 30, 26
+  (200d) · 11,603 closed bars · feed: alpaca" (the exact aborted window!),
+  22 trades −$189.68 (honest negative on costs), trust verdict
+  "−23.4 bps/trd · t=−1.41 · p=0.17 · CI [−51.8, +7.0] — nothing here to trust
+  yet", Monte Carlo P(loss) 91.4% (/tmp/retry-trust2.png).
+- dev.log: ZERO "operation was aborted" / "Alpaca … failed" lines for the run.
+- Note: `ALLOW_REGISTRATION=true` added to .env (gitignored) — registration was
+  closed since the DB is no longer empty; needed for the fresh-account E2E
+  pattern. Sandbox convenience, matches how flowtest1 was created.
+
+Stage Summary:
+- v1.99.2 — the TSLA 5m deep backtest no longer dies with "The operation was
+  aborted": bar pages get 20s + 3 retries, partial/truncated windows are
+  announced in the log, never cached, and REFUSED by the backtest gate instead
+  of being silently replayed. Trust = the fetch is honest end to end.

@@ -53,17 +53,22 @@ export async function getBarsCached(symbol: string, tf: Timeframe, userId: strin
   const ttl = isOneM ? ONE_M_TTL_MS : BARS_TTL_MS
   const key = `${userId}|${symbol}|${tf}|${days}`
   const hit = barsCache.get(key)
-  if (hit && Date.now() - hit.at < ttl) return hit.res
+  if (hit && Date.now() - hit.at < ttl && !hit.res.truncated) return hit.res
   const res = await getBars(symbol, tf, userId, { lookbackDays: days })
-  barsCache.set(key, { at: Date.now(), tf, res })
-  // per-class cap first (a 1m insert never evicts a cheap 5m/15m window),
-  // then the global cap
-  if (isOneM) {
-    let oneMCount = 0
-    for (const v of barsCache.values()) if (v.tf === '1m') oneMCount++
-    if (oneMCount > ONE_M_CACHE_MAX) evictOldest(true)
+  // v1.99.2 — a TRUNCATED fetch is never cached: the very next Run must do a
+  // real refetch (the feed stall is usually gone in seconds), not re-serve the
+  // same short window from the 120s TTL cache.
+  if (!res.truncated) {
+    barsCache.set(key, { at: Date.now(), tf, res })
+    // per-class cap first (a 1m insert never evicts a cheap 5m/15m window),
+    // then the global cap
+    if (isOneM) {
+      let oneMCount = 0
+      for (const v of barsCache.values()) if (v.tf === '1m') oneMCount++
+      if (oneMCount > ONE_M_CACHE_MAX) evictOldest(true)
+    }
+    if (barsCache.size > BARS_CACHE_MAX) evictOldest(false)
   }
-  if (barsCache.size > BARS_CACHE_MAX) evictOldest(false)
   return res
 }
 
@@ -89,6 +94,18 @@ export async function fetchBacktestBars(
 ): Promise<BacktestHistory> {
   const res = await getBarsCached(symbol, tf, userId, days)
   let bars = Array.isArray(res.bars) ? res.bars : []
+  // v1.99.2 — TRUNCATED HISTORY IS A HARD REFUSAL: the retries in alpacaFetch
+  // already absorbed transient stalls; if the window still came back short the
+  // feed is having a real problem, and replaying a history that ends days/weeks
+  // before now would produce a confident-looking backtest of the WRONG data.
+  // Fail honestly with a retry hint instead (matches the demo-data refusal).
+  if (res.truncated) {
+    return {
+      ok: false,
+      error:
+        'History came back incomplete — the data feed dropped part of the window mid-download. Press Run again to retry.',
+    }
+  }
   if (res.demo || bars.length < 80) {
     return {
       ok: false,

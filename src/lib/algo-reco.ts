@@ -350,7 +350,10 @@ export async function runRecoSweepMatrix(
         const days = algoMaxDays(tf, symbol.includes('/'))
         const res = await getBars(symbol, tf, userId, { lookbackDays: days })
         let bars = Array.isArray(res.bars) ? res.bars : []
-        if (!res.demo && bars.length >= 80) {
+        // v1.99.2 — truncated fetches (feed dropped pages mid-download) are
+        // skipped, same as demo data: a reco matrix built on a silently-short
+        // window would rank strategies against history that ends weeks early.
+        if (!res.demo && !res.truncated && bars.length >= 80) {
           // drop the forming bar + hard cap (exact route semantics)
           const tfSec = TIMEFRAMES[tf].seconds
           const nowSec = Math.floor(Date.now() / 1000)
