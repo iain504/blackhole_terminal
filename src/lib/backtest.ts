@@ -1938,12 +1938,29 @@ export async function walkForward(
 
   // ---- 2) fold windows: the post-hold-out data is partitioned into `folds`
   // consecutive spans; each span = IS head (isFraction) + OOS tail ----------
-  while (folds > 2 && Math.floor(wfN / folds) < 60) folds-- // degrade gracefully on short data
+  // v2.2.1 — degrade against the REAL honesty floor, not seg ≥ 60: the fold
+  // loop below silently skips any span whose IS head is < 300 bars (or OOS
+  // tail < 60), so a dataset like 30d×1h ≈ 999 bars used to pass the old
+  // `seg ≥ 60` gate, starve every fold, and return an EMPTY walk-forward
+  // (folds: [] · 'no fold produced a tunable winner') that looked like the
+  // strategy had no edge instead of "the window is too short". Each span
+  // needs isFraction·seg ≥ 300 AND (1−isFraction)·seg ≥ 60:
+  const foldFloor = Math.max(Math.ceil(300 / isFraction), Math.ceil(60 / Math.max(1e-9, 1 - isFraction)), 360)
+  const segFits = (n: number, f: number): boolean => Math.floor(n / f) >= foldFloor
+  while (folds > 2 && !segFits(wfN, folds)) folds-- // degrade gracefully on short data
+  if (!segFits(wfN, folds) && holdoutBars != null) {
+    // v2.2.1 — the hold-out starves the folds: yield it so the walk-forward
+    // can run at all (a 2-fold OOS-verified result beats no result), and say so.
+    holdoutDisabled = `hold-out yielded — ${series.n} bars can't fund both a ${Math.round(holdoutFraction * 100)}% hold-out and ${folds} full folds (each span needs ≥ ~${foldFloor} bars); widen the history to restore the hold-out stress test`
+    holdoutBars = null
+    wfN = series.n
+    while (folds > 2 && !segFits(wfN, folds)) folds--
+  }
   const seg = Math.floor(wfN / folds)
   const outFolds: WFFold[] = []
   const oosPool: TradeLike[] = [] // every fold's OOS trades — pooled for the trust verdict
   let evaluated = 0
-  if (seg < 60) {
+  if (!segFits(wfN, folds)) {
     return {
       mode: anchored ? 'anchored' : 'rolling',
       isFraction,
@@ -1955,7 +1972,7 @@ export async function walkForward(
         oosSig: null,
       },
       holdout: null,
-      holdoutDisabled: holdoutDisabled ?? `dataset too small for ${folds} folds (need ≥ ~${folds * 60} bars)`,
+      holdoutDisabled: holdoutDisabled ?? `walk-forward needs ≥ ~${folds * foldFloor} bars for ${folds} fold(s) (each span: IS ≥ 300 + OOS ≥ 60) — got ${series.n}; widen the history window (step ②) or lower Folds`,
       evaluated: 0,
       elapsedMs: Date.now() - t0,
     }

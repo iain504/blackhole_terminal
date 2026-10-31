@@ -3781,3 +3781,28 @@ Stage Summary:
   way the user actually trades — 1D trend + 4H S/R & RSI confirming a 1H trigger — with the
   ladder drawn on screen, the pipeline flow chart showing the HTF aggregate stage, and one click
   running the whole thing from fetch to verdict.
+
+---
+Task ID: POST-2.2.0-VERIFY
+Agent: main
+Task: Post-push browser verification of v2.1.0+v2.2.0 → three fixes (v2.2.1)
+
+Work Log:
+- Pushed 06f946d (v2.1.0) + 2fc7b43 (v2.2.0) to GitHub with the user's new PAT; remote main verified in sync (fetch → origin/main == HEAD).
+- E2E (agent-browser, kronostest1 + TOTP): landing → login → Backtest studio renders (5-step wizard, ⚡/🌙 lane cards, always-on flow chart, one-click "Run head-to-end", 1h/4h/1D swing ladder, Triple-Screen Pullback + HTF S/R Level Bounce with three-screen copy).
+- FOUND BUG 1 (engine): swing walk-forward on 30d×1h (999 bars) returned folds:[] · evaluated:0 · 3ms — the fold-degradation gate checked seg ≥ 60 while the fold loop silently skips spans with IS < 300 / OOS < 60 → every fold starved after the 20% hold-out carve, and the empty result read as "no edge". FIX (backtest.ts walkForward): degrade folds against the REAL floor (foldFloor = max(⌈300/isF⌉, ⌈60/(1−isF)⌉, 360)); when even 2 folds can't fit AND a hold-out was carved, YIELD the hold-out (honest holdoutDisabled reason) and retry; only then return the blocked shape — now with the true bar math in the message ("needs ≥ ~N bars for K fold(s) — got M").
+- FOUND BUG 2 (UI): results header promises "each validation replaces the previous view" but applyResult('sweep') left the previous walk-forward panel rendered below (and vice versa). FIX (BacktestPanel.applyResult): every mode branch now clears all other validation panels (wf/sweep/krAb/run/opt/mc).
+- FOUND BUG 3 (UX): nothing warned that 30d of 1h bars can't fund a 3-fold WF + hold-out. FIX (BacktestStudio): step ⑤ headroom pre-flight — amber note "≈720 bars vs ≈1,609 needed for 3 folds + hold-out — widen History (step ②)" when estimateBars < needed, reusing estimateBars/foldFloor math.
+- E2E re-verified: 30d BTC/USD 1h → headroom note renders; WF run yields hold-out with precise message ("999 bars can't fund both a 20% hold-out and 2 full folds (each span needs ≥ ~429 bars)"), 2 folds actually run, fold table renders. 90d → warning clears (2,997 bars) → "Run head-to-end" → flow chart all-green → Result: WALK-FORWARD rolling · 3 folds re-optimized · 20% pure hold-out · 1,142 sims · param stability 33% · fold 3 winner with params + EDGE badge · honest "HOLD-OUT UNTESTABLE" (1 trade). Sweep regression: 1,470 backtests ranked on live Binance bars, MTF chip "1D trend + 4h confirm", 376 crypto shorts skipped (long-only). Demo-feed refusal still honest (TSLA w/o keys: "No live historical data (demo feed) — cannot backtest").
+- Known ghost (not reproduced after reload): on the pre-reload page, pollJob sometimes stalled after ONE 1.5s poll (UI stuck "Running: fetch" while the job finished server-side); post-reload polling ran at full cadence (6+ polls, sweep + WF completed and applied). Timers/visibility verified healthy (setTimeout drift 1500→1501ms, visibilityState visible); no code change made for it.
+- Version → 2.2.1, stamped 2.2.1+210. Lint clean.
+
+Files: src/lib/backtest.ts, src/components/terminal/tabs/BacktestPanel.tsx,
+src/components/terminal/tabs/backtest/BacktestStudio.tsx, package.json (2.2.1),
+src/generated/version.ts.
+
+Stage Summary:
+- v2.2.1 — the swing walk-forward tells the truth on short windows: folds degrade by the real
+  honesty floor, the hold-out yields with an explanation instead of vanishing, the blocked
+  message states the exact bar math, the wizard warns about headroom BEFORE the run, and the
+  results panel really does replace the previous view.

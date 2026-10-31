@@ -628,6 +628,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       trust?: { sig: SignificanceStats | null; verdict: TrustVerdict | null } | null
     }
     setMeta(j.meta ?? null)
+    // v2.2.1 — every branch clears EVERY other validation panel: the results
+    // header promises 'each validation replaces the previous view', but sweep
+    // used to leave the previous walk-forward (and vice versa) rendered below.
     if (mode === 'run') {
       setRunRes(j.result ?? null)
       setMcRes(j.mc ?? null)
@@ -635,29 +638,41 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setOptRes(null)
       setAbRes(null) // a fresh baseline invalidates the gates-off A/B
       setTrailAbRes(null) // a fresh run invalidates the trail-proof A/B
+      setWfRes(null)
+      setSweepRes(null)
+      setKrAbRes(null)
     } else if (mode === 'optimize') {
       setOptRes(j.optimize ?? null)
       setTrustRes({ basis: 'in-sample', sig: j.trust?.sig ?? null, verdict: j.trust?.verdict ?? null })
       setRunRes(null)
       setMcRes(null)
+      setWfRes(null)
+      setSweepRes(null)
+      setKrAbRes(null)
     } else if (mode === 'walkforward') {
       setWfRes(j.walkforward ?? null)
       setTrustRes(null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
+      setSweepRes(null)
+      setKrAbRes(null)
     } else if (mode === 'kronos-ab') {
       setKrAbRes(j.kronosAb ?? null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
       setTrustRes(null)
+      setWfRes(null)
+      setSweepRes(null)
     } else {
       setSweepRes(j.sweep ?? null)
       setTrustRes(null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
+      setWfRes(null)
+      setKrAbRes(null)
     }
   }
 

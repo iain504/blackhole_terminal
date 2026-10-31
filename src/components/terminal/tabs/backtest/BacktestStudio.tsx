@@ -131,6 +131,21 @@ export default function BacktestStudio(props: BacktestStudioProps) {
   const wfGridCount = gridArmed(props.ranges)
   const running = busy !== null
 
+  // v2.2.1 — walk-forward headroom pre-flight: each fold span needs IS ≥ 300 +
+  // OOS ≥ 60 bars server-side (walkForward foldFloor), and the hold-out takes
+  // another bite of the tail — surface the shortfall in step ⑤ BEFORE the run
+  // instead of a surprise 'no fold produced a tunable winner'.
+  const wfHeadroom = useMemo(() => {
+    if (level !== 'wf') return null
+    const est = estimateBars(Math.max(0, Math.round(Number(studio.days) || 0)), studio.entryTf, studio.symbol.includes('/'))
+    const foldsN = Math.min(6, Math.max(2, Math.round(Number(props.wfFolds) || 3)))
+    const isF = Math.min(0.9, Math.max(0.5, (Number(props.wfIsPct) || 70) / 100))
+    const hoF = Math.min(0.4, Math.max(0, (Number(props.wfHoldout) || 0) / 100))
+    const floor = Math.max(Math.ceil(300 / isF), Math.ceil(60 / Math.max(1e-9, 1 - isF)), 360)
+    const needed = Math.ceil((foldsN * floor) / (1 - hoF))
+    return { foldsN, needed, est, short: est > 0 && est < needed }
+  }, [level, props.wfFolds, props.wfIsPct, props.wfHoldout, studio.days, studio.entryTf, studio.symbol])
+
   // ---- intents -----------------------------------------------------------
   const go = (n: number) => {
     setOpen(n)
@@ -806,6 +821,11 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                   {LEVEL_META[level].label} · {studio.symbol || '—'} {studio.entryTf} · last {studio.days}d —
                   fetch → prepare → … → <span className="text-yellow-500">golden result</span>, one click
                 </span>
+                {wfHeadroom?.short && (
+                  <p className="w-full text-[10px] leading-snug text-amber-400" role="note">
+                    Headroom: ≈{fmtBars(wfHeadroom.est)} bars from the current window vs ≈{fmtBars(wfHeadroom.needed)} needed for {wfHeadroom.foldsN} walk-forward fold(s) + hold-out — widen History (step ②) so folds don&apos;t shrink; the run degrades folds and yields the hold-out to fit.
+                  </p>
+                )}
               </div>
               <p id="bt-run-phase" aria-live="polite" className={cn('mt-1 text-[10px]', flow.failed ? 'text-rose-300' : running ? 'text-amber-300' : 'text-zinc-600')}>
                 {phaseText}
