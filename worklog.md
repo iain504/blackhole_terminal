@@ -3699,3 +3699,85 @@ Stage Summary:
 - v2.1.0 — backtest is now a guided studio: four illustrated steps, the pipeline flow chart always
   on stage, and ONE "Run head-to-end" button from fetch to golden result — with every advanced
   knob one disclosure away instead of scattered across a flat grid.
+
+---
+Task ID: 4-a/4-b (parallel) + integration
+Agent: backend-agent + frontend-agent + main (integrator)
+Task: v2.2.0 — Swing lane for the Backtest Studio: 1h/4h/1D entry timeframes + two
+multi-timeframe (MTF) swing strategies + lane-aware wizard (user: "backtest needs a higher
+timeframe like 1 hour, 4 hour, 1 day … I use 1 Day and 4H resistance/support line + RSI values
+to confirm my 1H chart to trade")
+
+Work Log (backend, Task 4-a):
+- src/lib/mtf.ts (NEW): aggregateBars (exact UTC bucketing, Monday-aligned weeks), htfIndexAt,
+  pivotLevels (confirmedAt = extremeIdx + lookback — no lookahead), nearestLevel.
+- src/lib/algo-strategies.ts: ALGO_TIMEFRAMES + '1h'|'4h'|'1D'; ALGO_MAX_DAYS {'1h':500,'4h':1095,
+  '1D':1825} (1h capped at the Binance 12-page deep-fetch budget); DAY_TFS/SWING_TFS/isSwingTf/
+  strategyLane; FROZEN MTF_TREND_TF/MTF_MID_TF ladders (1h→1D trend + 4h confirm — the user's
+  exact workflow); two new lane:'swing' strategies — 'swing-pullback' (Elder-style triple screen:
+  trend-TF SMA bias → confirm-TF RSI band → entry-TF RSI pullback trigger, RSI-recapture exit)
+  and 'htf-level-bounce' (trend-TF pivot S/R levels: enter within proximityPct of a confirmed
+  swing low while trend up + confirm RSI > threshold, exit at the opposite HTF level);
+  tfAwareHlMax swing entries; applyRegimePreset no-ops gates for swing lanes.
+- src/lib/backtest.ts: BacktestConfig.mtf + TradeMtfContext + trade.mtf (entry-time context:
+  trend dir, confirm RSI, distance-to-level — swing strategies only, old payloads untouched);
+  runBacktest builds aggregated trend/mid series + prefix SMA + Wilder RSI + pivots at prepare
+  time; side-aware swing exits live in the executor (RSI recapture per side; level exits anchored
+  on entry price); swing warmup in entry bars; crypto long-only reuses skippedShorts.
+- src/app/api/algo/backtest/route.ts: 6-timeframe validation, LANE CONSISTENCY 400s (day ⇔
+  intraday, swing ⇔ 1h/4h/1D), swing forces rthOnly/flattenEod/maxTradesDay=0 server-side,
+  body.mtf validated against the frozen maps (derived when omitted), meta.mtf
+  {trendTf, midTf, trendBars, midBars, levels} always present (null on day lane); sweep restricted
+  to the request's lane.
+- INTEGRATION FIX (main): htfIndexAt originally mapped a BUCKET NUMBER (floor(t/htfSec)−1) used
+  as an ARRAY index — wrong whenever the aggregated series starts above bucket 0 or skips sparse
+  buckets (for crypto 1h→1D the clamp would have read the NEWEST HTF bar for every decision =
+  massive lookahead). Replaced with a binary search over the aggregated series for the last bar
+  whose close ≤ the entry bar's open — array-index-exact, sparse-gap-proof, lookahead-free by
+  construction. Verified by a synthetic suite: sparse-gap mapping, warmup, no-lookahead sweep,
+  both strategies firing with mtf context + level exits, day-lane payload parity.
+- src/app/api/algo/route.ts (live runs): swing strategies/timeframes rejected 400 — the live
+  engine has no MTF evaluation; swing is backtest-only by design.
+
+Work Log (frontend, Task 4-b):
+- src/components/terminal/tabs/backtest/ (NEW): BacktestStudio.tsx (5-step wizard: ① Trading
+  style ⚡/🌙 lane cards → ② Market & data (symbol, lane-filtered TF chips, window chips + cap
+  hint + "≈ N bars" estimate, capital/lev, MTF chip "1D trend + 4h confirm → 1h entry") →
+  ③ Strategy (lane-filtered cards; swing cards expand RULES/FIT + params grid + three-screen
+  diagram) → ④ Risk & costs (sizing/TP/SL/trail/costs/regime presets; day-only controls hidden
+  on swing) → ⑤ Validate & run (level tiles + fine-tune disclosures + ONE "Run head-to-end" CTA
+  with blocker hints)), studio-state.ts (StudioState owned by the panel; seed/sync rules; bar
+  estimates; CTA gating issues; tradeMtf reader), illustrations.tsx (DayLaneIllo, SwingLaneIllo,
+  MtfLadderIllo, ThreeScreenIllo, RiskBracketIllo — inline SVG, existing palette), studio-bits.tsx
+  (StepperRail ✓/●/○ + scroll-jump, StudioStep, NumIn, ChipButton…).
+- BacktestPanel.tsx: wizard section replaced by BacktestStudio; POST body built from StudioState
+  (field-by-field source map in-code); results unchanged + meta MTF chip + trades CONTEXT column
+  (trend · midTF RSI · % off level) when swing; AlgoSetupCfg tightened (kronosGate/trailMode/
+  trailArmPct/trailGivePct required) fixing the pre-existing AlpoRunConfig export type errors.
+- BacktestFlowChart.tsx: lane-aware pipeline (dashed swing-only "Aggregate HTF" node between fetch
+  and prepare, mode→validate fan-in, blinking active phase, golden result node); collapse via
+  useSyncExternalStore matchMedia (hydration-safe, lint-clean).
+- AlgoTab.tsx: shared LIVE setup filtered to the day catalog (4 strategies) + DAY_TFS chips —
+  swing configs can never enter the live path from the UI.
+
+E2E (agent-browser, fresh DB → bootstrap kronostest1 + TOTP): login → Algo tab → Backtest →
+swing lane → BTC/USD 1h 420d → Quick check → "Run head-to-end" → complete on 10,079 real bars
+(seed: SQLite Bar store filled with 12k Binance 1h klines via curl — the sandbox's Node-fetch
+TLS fingerprint was Binance-418-banned; stocks refused honestly for lack of Alpaca keys) →
+meta "MTF: 1D trend + 4h confirm · 0 levels" + per-trade CONTEXT ("up · 4h RSI 42", "RSI
+recaptured exit level"); avg hold 33.5h = true swings; trust layer verdict "NOT PROVEN — no edge
+after costs" (honest); 479 crypto shorts skipped (long-only). Day-lane regression: BTC/USD 5m
+BB+RSI 30d → complete via binance, no MTF chip. Lane 400s verified both directions from the
+browser. Live setup shows 4 strategies/3 TFs. Mobile 390px: stacked cards + sticky bottom bar;
+desktop: stepper rail, sticky footer, no console errors; lint clean; our files typecheck clean.
+
+Files: src/lib/mtf.ts, src/lib/algo-strategies.ts, src/lib/backtest.ts,
+src/app/api/algo/backtest/route.ts, src/app/api/algo/route.ts,
+src/components/terminal/tabs/backtest/* (4 new), BacktestPanel.tsx, BacktestFlowChart.tsx,
+AlgoTab.tsx, package.json (2.2.0), src/generated/version.ts.
+
+Stage Summary:
+- v2.2.0 — the backtest studio speaks swing: pick the 🌙 lane, and every entry is confirmed the
+  way the user actually trades — 1D trend + 4H S/R & RSI confirming a 1H trigger — with the
+  ladder drawn on screen, the pipeline flow chart showing the HTF aggregate stage, and one click
+  running the whole thing from fetch to verdict.

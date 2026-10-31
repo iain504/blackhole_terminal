@@ -20,7 +20,11 @@
 //     TrendSpider mean-reversion guides).
 import { TIMEFRAMES } from '@/lib/market-types'
 
+// v2.2.0 — the union grows to 6 ids: the four day-trading strategies plus two
+// multi-timeframe (MTF) SWING strategies (spec §1.1) that confirm every
+// decision against higher timeframes aggregated from the same bars.
 export type AlgoStrategyId = 'bb-reversion' | 'rsi2-connors' | 'orb15' | 'vwap-fade'
+  | 'swing-pullback' | 'htf-level-bounce'
 
 export interface AlgoParamDef {
   key: string
@@ -41,8 +45,12 @@ export interface AlgoStrategyDef {
   /** why it fits Stage 3 / regular hours */
   fit: string
   color: string
-  /** intraday only (chart timeframe restricted) */
-  intradayOnly: true
+  /** intraday only (chart timeframe restricted) — false for the swing defs */
+  intradayOnly: boolean
+  // v2.2.0 — lane this strategy belongs to ('day' default; optional on the
+  // four original defs so they keep their shape). The backtest route enforces
+  // lane ⇔ timeframe consistency (spec §1.2).
+  lane?: 'day' | 'swing'
   defaults: Record<string, number>
   params: AlgoParamDef[]
 }
@@ -161,9 +169,72 @@ export const ALGO_STRATEGIES: Record<AlgoStrategyId, AlgoStrategyDef> = {
       { key: 'hlMax', label: 'Half-life ≤ bars', min: 8, max: 480, step: 4 },
     ],
   },
+  // v2.2.0 — two MTF swing strategies (spec §1.1): the HTF ladder decides
+  // direction/location, the entry TF times the trigger. intradayOnly is
+  // false and lane 'swing' — the backtest route maps them to 1h/4h/1D.
+  'swing-pullback': {
+    id: 'swing-pullback',
+    name: 'Triple-Screen Pullback',
+    tagline: 'HTF trend → mid S/R + RSI confirm → entry-TF trigger',
+    // EXACT rules string (UI shows this):
+    rules: 'SCREEN 1 (trend TF): close > SMA(trendSma) = long bias only (short mirrored) · SCREEN 2 (confirm TF): RSI in the healthy band AND price not chasing (near a swing-low support for longs) · SCREEN 3 (entry TF): RSI < entryRsi pullback trigger → enter next bar open · exit when RSI recaptures exitRsi, or TP/SL/trailing',
+    fit: 'The classic swing workflow (Elder-style triple screen): the higher timeframe decides direction, the middle timeframe confirms momentum and location, the entry timeframe times the pullback.',
+    color: '#a855f7',
+    intradayOnly: false,
+    lane: 'swing',
+    defaults: { trendSma: 50, rsiPeriod: 14, rsiMin: 40, rsiMax: 70, entryRsi: 40, exitRsi: 65, allowShort: 1, regimeTrend: 0, regimeAdx: 0, hlGate: 0 },
+    params: [
+      { key: 'trendSma',  label: 'Trend SMA (trend TF)',  min: 10,  max: 200, step: 5 },
+      { key: 'rsiPeriod', label: 'RSI period (all TFs)',  min: 2,   max: 30,  step: 1 },
+      { key: 'rsiMin',    label: 'Confirm RSI above',     min: 20,  max: 55,  step: 1 },
+      { key: 'rsiMax',    label: 'Confirm RSI below',     min: 45,  max: 90,  step: 1 },
+      { key: 'entryRsi',  label: 'Entry RSI below',       min: 10,  max: 45,  step: 1 },
+      { key: 'exitRsi',   label: 'Exit RSI above',        min: 50,  max: 90,  step: 1 },
+      { key: 'allowShort', label: 'Allow shorts', min: 0, max: 1, step: 1, bool: true },
+    ],
+  },
+  'htf-level-bounce': {
+    id: 'htf-level-bounce',
+    name: 'HTF S/R Level Bounce',
+    tagline: 'Buy higher-timeframe support, sell higher-timeframe resistance',
+    rules: 'Pivot swing highs/lows on the trend TF = S/R levels · LONG when price pulls back within proximityPct of a swing-low support WHILE trend is up AND confirm-TF RSI > midRsi · SHORT mirrored at resistance · exit at the next HTF level (resistance for longs), or TP/SL/trailing',
+    fit: 'Trades the horizontal S/R lines users draw on the 1D/4H chart: enter where the higher timeframe defends a level, exit where it is likely to stall (the opposite level).',
+    color: '#2dd4bf',
+    intradayOnly: false,
+    lane: 'swing',
+    defaults: { trendSma: 50, pivotLookback: 3, pivotScan: 60, proximityPct: 1.5, midRsi: 50, allowShort: 1, regimeTrend: 0, regimeAdx: 0, hlGate: 0 },
+    params: [
+      { key: 'trendSma',      label: 'Trend SMA (trend TF)',    min: 10,  max: 200, step: 5 },
+      { key: 'pivotLookback', label: 'Pivot window (bars each side)', min: 2, max: 10, step: 1 },
+      { key: 'pivotScan',     label: 'Pivot scan depth (trend bars)', min: 20, max: 200, step: 5 },
+      { key: 'proximityPct',  label: 'Level proximity ±%',      min: 0.2, max: 10,  step: 0.1 },
+      { key: 'midRsi',        label: 'Confirm RSI above (long)', min: 35, max: 65, step: 1 },
+      { key: 'allowShort',    label: 'Allow shorts', min: 0, max: 1, step: 1, bool: true },
+    ],
+  },
 }
 
 export const ALGO_STRATEGY_IDS = Object.keys(ALGO_STRATEGIES) as AlgoStrategyId[]
+
+// ---------------------------------------------------------------------------
+// v2.2.0 — Swing lane helpers (spec §1.1): timeframe lanes, per-strategy lane
+// lookup and the FROZEN MTF ladder that maps every swing entry TF to its
+// higher-timeframe confirmers (1h → 1D trend + 4H confirm · 4h → 1D + 1D ·
+// 1D → 1W + 1W).
+// ---------------------------------------------------------------------------
+
+export const DAY_TFS: AlgoTimeframe[] = ['1m', '5m', '15m']
+export const SWING_TFS: AlgoTimeframe[] = ['1h', '4h', '1D']
+
+export function isSwingTf(tf: AlgoTimeframe): boolean { return tf === '1h' || tf === '4h' || tf === '1D' }
+
+export function strategyLane(id: AlgoStrategyId): 'day' | 'swing' {
+  return ALGO_STRATEGIES[id].lane ?? 'day'
+}
+
+/** MTF ladder — which higher TFs confirm each swing entry TF (FROZEN). */
+export const MTF_TREND_TF: Record<'1h' | '4h' | '1D', '1D' | '1W'> = { '1h': '1D', '4h': '1D', '1D': '1W' }
+export const MTF_MID_TF:   Record<'1h' | '4h' | '1D', '4h' | '1D' | '1W'> = { '1h': '4h', '4h': '1D', '1D': '1W' }
 
 // ---------------------------------------------------------------------------
 // Regime research presets (review P0 #2 / P1 #6 / P3 #11) — one switch flips
@@ -207,14 +278,21 @@ export const ALGO_REGIME_PRESETS: Record<AlgoRegimePresetId, AlgoRegimePreset> =
  * bars, so "the deviation reverts within a session-ish horizon" means the
  * same thing on every chart: 1m → 420 bars, 5m → 84, 15m → 28. The old fixed
  * 48 was 4h on 5m and vetoed genuine MR setups.
+ * v2.2.0 — the swing charts join (spec §1.1): 1h → 84, 4h → 42, 1D → 21 —
+ * the same ≈7-hour/3.5-day/3-week horizon philosophy scaled up. Only
+ * consumed by the MR strategies' live preset (swing lanes ship gates OFF).
  */
 export function tfAwareHlMax(tf: AlgoTimeframe): number {
-  return tf === '1m' ? 420 : tf === '5m' ? 84 : 28
+  return tf === '1m' ? 420 : tf === '5m' ? 84 : tf === '15m' ? 28
+    : tf === '1h' ? 84 : tf === '4h' ? 42 : 21
 }
 
 /**
  * Apply a regime preset to a params object (returns a NEW object — the caller
  * must feed the result through normalizeAlgoParams). Strategy-aware:
+ *   • SWING strategies (v2.2.0) treat BOTH presets as a no-op for the gates —
+ *     they ship every gate OFF in both (their whole point IS the MTF screens;
+ *     the generic 200-SMA gate would duplicate the trend screen);
  *   • rsi2-connors keeps ALL gates off even in the live preset — its own
  *     trend SMA already is the trend filter (review P2 #8);
  *   • orb15 gets only the momentum-polarity 200-SMA gate (ADX/half-life are
@@ -229,6 +307,13 @@ export function applyRegimePreset(
   params: Record<string, number>,
 ): Record<string, number> {
   const out = { ...params }
+  // v2.2.0 — swing branch first: all gates OFF in both presets (see above).
+  if (strategyLane(strategy) === 'swing') {
+    out.regimeTrend = 0
+    out.regimeAdx = 0
+    out.hlGate = 0
+    return out
+  }
   if (id === 'research') {
     out.regimeTrend = 0
     out.regimeAdx = 0
@@ -252,8 +337,12 @@ export function applyRegimePreset(
   return out
 }
 
-/** Algo runs trade intraday US sessions — restrict the chart timeframes. */
-export const ALGO_TIMEFRAMES = ['1m', '5m', '15m'] as const
+/**
+ * Backtest chart timeframes (v2.2.0 — spec §1.1): the day lane keeps the
+ * intraday 1m/5m/15m; the swing lane adds 1h / 4h / 1D. Order is the UI chip
+ * order; `isSwingTf`/`DAY_TFS`/`SWING_TFS` above split the union.
+ */
+export const ALGO_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1D'] as const
 export type AlgoTimeframe = (typeof ALGO_TIMEFRAMES)[number]
 
 /**
@@ -269,8 +358,14 @@ export type AlgoTimeframe = (typeof ALGO_TIMEFRAMES)[number]
  * Crypto 1m stays heap-safe via algoMaxDays(): a 24/7 feed produces ≈1,440
  * bars/day, so 180d would be ≈259k bars — the exact allocation that OOM'd the
  * box. Crypto keeps 45d (≈65k bars ≈ the stock cap's load).
+ *
+ * v2.2.0 — swing timeframes join (spec §1.1). NOTE '1h': 500 (not more) —
+ * the Binance klines deep-fetch path paginates 12 pages × 1000 bars ≈ 12k;
+ * crypto 1h at 500d ≈ 12,000 bars exactly fits. 4h 1095d ≈ 6.6k crypto bars;
+ * 1D 1825 ≈ 1.8k. Stocks are ~3-7× lighter.
  */
-export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> = { '1m': 180, '5m': 365, '15m': 730 }
+export const ALGO_MAX_DAYS: Record<AlgoTimeframe, number> =
+  { '1m': 180, '5m': 365, '15m': 730, '1h': 500, '4h': 1095, '1D': 1825 }
 
 /** Crypto-only 1m ceiling (24/7 feed — see the ALGO_MAX_DAYS note). */
 export const ALGO_1M_CRYPTO_MAX_DAYS = 45

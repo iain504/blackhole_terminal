@@ -51,8 +51,16 @@
 // reused by every optimizer combo — each combo then costs ~O(bars) with O(1)
 // per-bar indicator updates (grid of ~800 combos × 40k bars ≈ 1–2s).
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
-import { ALGO_STRATEGIES, ALGO_STRATEGY_IDS, normalizeAlgoParams, type AlgoStrategyId } from '@/lib/algo-strategies'
-import type { Bar } from '@/lib/market-types'
+import {
+  ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES, MTF_MID_TF, MTF_TREND_TF,
+  isSwingTf, normalizeAlgoParams, strategyLane,
+  type AlgoStrategyId, type AlgoTimeframe,
+} from '@/lib/algo-strategies'
+import type { Bar, Timeframe } from '@/lib/market-types'
+import { TIMEFRAMES } from '@/lib/market-types'
+// v2.2.0 — swing MTF mechanics (spec §1.3): exact UTC bucket aggregation,
+// lookahead-free HTF index mapping, confirmed pivots, nearest S/R level.
+import { aggregateBars, htfIndexAt, nearestLevel, pivotLevels, type Pivot } from '@/lib/mtf'
 import { memoryGuard } from '@/lib/mem-guard'
 // v1.99.0 — statistical trust layer: per-trade significance stats (t, two-sided
 // p via incomplete beta, DAY-BLOCK bootstrap CI, trades-needed) for the pooled
@@ -143,6 +151,21 @@ export interface BacktestConfig {
   // sees future bars). Undefined = no gate, zero behavior change everywhere
   // else (sweep/optimizer/plain runs never pass it).
   entryGate?: (i: number, side: 'long' | 'short') => boolean
+  // v2.2.0 — swing MTF lane (spec §1.4): the higher-timeframe ladder for the
+  // swing strategies, e.g. { trendTf: '1D', midTf: '4h' } for a 1h entry.
+  // Presence = swing lane. The route validates/derives the strings against
+  // the FROZEN MTF_TREND_TF/MTF_MID_TF maps; the engine resolves seconds via
+  // the TIMEFRAMES map. Null/absent on day lanes — day behavior untouched.
+  mtf?: { trendTf: string; midTf: string } | null
+}
+
+/** v2.2.0 — per-trade MTF decision context (swing strategies only, spec
+ *  §1.4): HTF trend direction, confirm-TF RSI at the signal, and the distance
+ *  % to the triggering HTF level (htf-level-bounce only; null otherwise). */
+export interface TradeMtfContext {
+  trend: 'up' | 'down'
+  midRsi: number
+  levelPct: number | null
 }
 
 export interface BacktestTrade {
@@ -156,6 +179,10 @@ export interface BacktestTrade {
   pnlPct: number // return on position notional
   exitReason: string
   holdMin: number
+  // v2.2.0 — MTF decision context captured at ENTRY time for swing
+  // strategies only (spec §1.4). Absent on day-lane trades — old payloads
+  // stay byte-identical.
+  mtf?: TradeMtfContext
 }
 
 export interface BacktestMetrics {
@@ -270,6 +297,12 @@ export function prepareSeries(bars: Bar[]): BacktestSeries {
   return { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase, closes: closesArr }
 }
 
+// v2.2.0 — entry-TF lookup from the measured bar spacing (the engine receives
+// bars, not a timeframe string — see the tfSec derivation in runBacktest).
+// Only the six algo TFs map; anything else falls back to a derived label.
+const TF_KEY_BY_SEC: Partial<Record<number, AlgoTimeframe>> = {}
+for (const tf of ALGO_TIMEFRAMES as readonly AlgoTimeframe[]) TF_KEY_BY_SEC[TIMEFRAMES[tf].seconds] = tf
+
 // ---------------------------------------------------------------------------
 // one simulation run
 // ---------------------------------------------------------------------------
@@ -285,6 +318,105 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   const params = normalizeAlgoParams(cfg.strategy, cfg.params)
   const strategy = cfg.strategy
 
+  // timeframe seconds — min positive bar delta over the head of the series
+  // (session/weekend gaps only inflate deltas, so the min is the true tf).
+  // (v2.2.0 — moved up from the executor block; same value, same computation.)
+  // NOTE the 60 floor is intentional legacy: it anchors the cooldown gate and
+  // MUST stay byte-identical for the day lane (1m/5m/15m bars). The swing
+  // warmup uses `entrySec` below instead — the UNfloored spacing.
+  let tfSec = 60
+  for (let k = 1; k < Math.min(n, 61); k++) {
+    const d = bars[k].time - bars[k - 1].time
+    if (d > 0 && d < tfSec) tfSec = d
+  }
+  // v2.2.0 — TRUE entry-TF bar spacing (no 60 floor): the swing warmup's
+  // trend→entry ratio and the entry-TF label need the real bar delta, which
+  // for 1h/4h/1D charts is ≥ 3600. Falls back to tfSec on degenerate data.
+  let entrySec = Number.POSITIVE_INFINITY
+  for (let k = 1; k < Math.min(n, 61); k++) {
+    const d = bars[k].time - bars[k - 1].time
+    if (d > 0 && d < entrySec) entrySec = d
+  }
+  if (!Number.isFinite(entrySec) || !(entrySec > 0)) entrySec = tfSec
+
+  // ---- v2.2.0 — swing MTF lane (spec §1.4) --------------------------------
+  // A swing strategy (or an explicit cfg.mtf) switches the engine into MTF
+  // mode: the entry-TF bars stay the replay spine, while the trend/confirm
+  // series are AGGREGATED from the same bars by exact UTC bucketing
+  // (aggregateBars, O(n)). Every per-bar HTF read goes through htfIndexAt —
+  // the last COMPLETED bucket for the bar's open time — so the ladder is
+  // lookahead-free by construction (the forming bucket is never readable).
+  const swingLane = strategyLane(strategy) === 'swing' || cfg.mtf != null
+  let trendAgg: Bar[] = []
+  let midAgg: Bar[] = []
+  let trendSec = 0
+  let midSec = 0
+  let trendPs: Float64Array | null = null
+  let midRsiArr: Float64Array | null = null
+  let pivHighs: Pivot[] = []
+  let pivLows: Pivot[] = []
+  let mtfTrendLabel = '1D'
+  let mtfMidLabel = '4h'
+  let mtfEntryLabel = ''
+  if (swingLane) {
+    const entryKey = TF_KEY_BY_SEC[entrySec]
+    mtfEntryLabel = entryKey ?? `${Math.round(entrySec / 60)}m`
+    // Resolve the ladder: cfg.mtf (validated upstream by the route) wins;
+    // otherwise derive from the FROZEN maps for the entry TF. Anything
+    // unusable falls back to the 1h lane's ladder (1D trend + 4h confirm).
+    const swingKey = entryKey != null && isSwingTf(entryKey) ? entryKey : null
+    const trendTf = cfg.mtf?.trendTf != null && cfg.mtf.trendTf in TIMEFRAMES
+      ? cfg.mtf.trendTf
+      : (swingKey != null ? MTF_TREND_TF[swingKey] : '1D')
+    const midTf = cfg.mtf?.midTf != null && cfg.mtf.midTf in TIMEFRAMES
+      ? cfg.mtf.midTf
+      : (swingKey != null ? MTF_MID_TF[swingKey] : '4h')
+    trendSec = TIMEFRAMES[trendTf as Timeframe].seconds
+    midSec = TIMEFRAMES[midTf as Timeframe].seconds
+    mtfTrendLabel = trendTf
+    mtfMidLabel = midTf
+    trendAgg = aggregateBars(bars, trendSec)
+    midAgg = aggregateBars(bars, midSec)
+    // trend SMA via prefix sums — O(1) reads at the mapped HTF index
+    const tps = new Float64Array(trendAgg.length + 1)
+    for (let k = 0; k < trendAgg.length; k++) tps[k + 1] = tps[k] + trendAgg[k].close
+    trendPs = tps
+    // Confirm-TF Wilder RSI — the SAME incremental algorithm the entry series
+    // uses for bb-reversion (period: the strategy's rsiPeriod when it defines
+    // one, else the standard 14 — htf-level-bounce has no rsiPeriod param).
+    const mRp = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) : 14
+    const mArr = new Float64Array(midAgg.length).fill(Number.NaN)
+    let mag = 0
+    let mal = 0
+    for (let k = 1; k < midAgg.length; k++) {
+      const d = midAgg[k].close - midAgg[k - 1].close
+      if (k <= mRp) {
+        if (d >= 0) mag += d
+        else mal -= d
+        if (k === mRp) {
+          mag /= mRp
+          mal /= mRp
+          mArr[k] = mal === 0 ? 100 : 100 - 100 / (1 + mag / mal)
+        }
+        continue
+      }
+      mag = (mag * (mRp - 1) + Math.max(0, d)) / mRp
+      mal = (mal * (mRp - 1) + Math.max(0, -d)) / mRp
+      mArr[k] = mal === 0 ? 100 : 100 - 100 / (1 + mag / mal)
+    }
+    midRsiArr = mArr
+    // htf-level-bounce only — confirmed S/R pivots on the TREND series
+    if (strategy === 'htf-level-bounce') {
+      const piv = pivotLevels(
+        trendAgg,
+        Math.max(2, Math.round(params.pivotLookback ?? 3)),
+        Math.max(20, Math.round(params.pivotScan ?? 60)),
+      )
+      pivHighs = piv.highs
+      pivLows = piv.lows
+    }
+  }
+
   // warmup: bars needed before the first decision — ALIGNED to the live
   // engine's evalStrategy guards (`n < period+2` / `n < trendLen+2` allow the
   // first decision at i = period+1 / trendLen+1, so the backtest must too).
@@ -293,6 +425,20 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let warmup = 1
   if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 1
   if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 1
+  // v2.2.0 — swing warmup in ENTRY-TF bars (spec §1.4): the largest of the
+  // entry-TF RSI window (+2), the trend SMA expressed in entry bars (+2) and
+  // the pivot scan depth expressed in entry bars (+2) — each as applicable
+  // to the strategy. The rawDecide guards below still decide per-bar, so
+  // this mostly shapes result.warmupBars / the evaluable window.
+  if (swingLane && trendSec > 0 && entrySec > 0) {
+    const ratio = trendSec / entrySec
+    const trendWarm = Math.ceil(Math.max(10, Math.round(params.trendSma ?? 50)) * ratio) + 2
+    const entryRsiWarm = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) + 2 : 0
+    const pivotWarm = strategy === 'htf-level-bounce'
+      ? Math.ceil((Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3))) * ratio) + 2
+      : 0
+    warmup = Math.max(1, trendWarm, entryRsiWarm, pivotWarm)
+  }
 
   // ---- Task 84 cost model · Task 85 spread · Task 12 vol-scaled impact ----
   // Every MARKET/STOP fill pays half the spread (buy at ask = +half, sell at
@@ -327,11 +473,14 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     costBpsSum += ((limit ? 0 : slipAt(i)) + fee) * 1e4
   }
 
-  // ---- Wilder RSI (bb-reversion) — one incremental pass, O(1)/bar ----
+  // ---- Wilder RSI (bb-reversion AND swing-pullback's entry-TF trigger) —
+  // one incremental pass, O(1)/bar. v2.2.0 — swing-pullback shares the EXACT
+  // same pass (same params.rsiPeriod clamp): SCREEN 3's trigger and the RSI
+  // recapture exit read this array. The MID series gets its own pass above.
   // (live re-seeds from its rolling window start; after ~3×period bars both
   // converge to the same steady state — backtest seeds from history start)
   let rsiArr: Float64Array | null = null
-  if (strategy === 'bb-reversion') {
+  if (strategy === 'bb-reversion' || strategy === 'swing-pullback') {
     const rp = Math.max(2, Math.round(params.rsiPeriod ?? 14))
     // Task 9-l — reuse the series-level scratch (see BacktestSeries.rsiScratch)
     const arr = (series.rsiScratch ??= new Float64Array(n))
@@ -373,6 +522,17 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let orVolSum = 0 // Task 12 — opening-range volume accumulator (breakout vol filter)
   let orVolN = 0
   const orMinutes = Math.max(5, Math.round(params.orMinutes ?? 15))
+
+  // v2.2.0 — per-bar MTF state for the swing branches: the last COMPLETED
+  // trend/confirm HTF bucket indices for the CURRENT bar (assigned in the
+  // replay loop right before decide(); rawDecide only ever runs there, so
+  // they are always fresh for the bar being decided). −1 = none completed yet.
+  let curKt = -1
+  let curKm = -1
+  // MTF context of the entry signal rawDecide just produced (swing only) —
+  // consumed by the executor when the signal becomes a pending order so the
+  // eventual trade carries trade.mtf (spec §1.4).
+  let lastSwingMtf: TradeMtfContext | null = null
 
   const smaAt = (i: number, period: number): number => {
     if (i + 1 < period) return Number.NaN
@@ -453,6 +613,87 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       if (c < orLow && !(onePerSide && firedShort)) return { entry: { side: 'sell', reason: 'close broke OR low' }, exit: null }
       return NONE
     }
+    // ---- v2.2.0 — swing strategies (spec §1.4). Entries only here: their
+    // EXITS are side-aware (need the held side / entry anchor), so they run
+    // in the executor right after this (see step 4 of the replay loop).
+    if (strategy === 'swing-pullback') {
+      const rp = Math.max(2, Math.round(params.rsiPeriod ?? 14))
+      if (i + 1 < rp + 2) return NONE // entry-TF RSI warmup (live-guard alignment)
+      const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
+      const kt = curKt
+      const km = curKm
+      if (kt < 0 || km < 0) return NONE // no completed HTF bar yet (warmup)
+      if (kt < trendLen) return NONE // trend SMA not defined at this HTF index
+      const tPs = trendPs as Float64Array
+      const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
+      const tClose = trendAgg[kt].close
+      const trendUp = tClose > smaT
+      const trendDown = tClose < smaT
+      const midVal = midRsiArr ? midRsiArr[km] : Number.NaN
+      const rsiMin = params.rsiMin ?? 40
+      const rsiMax = params.rsiMax ?? 70
+      const midOkLong = Number.isFinite(midVal) && midVal >= rsiMin && midVal <= rsiMax
+      const midOkShort = Number.isFinite(midVal) && (100 - midVal) >= rsiMin && (100 - midVal) <= rsiMax
+      const entryRsi = params.entryRsi ?? 40
+      const entryRsiVal = rsiArr ? rsiArr[i] : Number.NaN
+      const allowShort = (params.allowShort ?? 1) >= 1
+      if (trendUp && midOkLong && Number.isFinite(entryRsiVal) && entryRsiVal < entryRsi) {
+        lastSwingMtf = { trend: 'up', midRsi: midVal, levelPct: null }
+        return {
+          entry: { side: 'buy', reason: `HTF ${mtfTrendLabel} up · ${mtfMidLabel} RSI ${midVal.toFixed(0)} · ${mtfEntryLabel} RSI ${entryRsiVal.toFixed(0)}` },
+          exit: null,
+        }
+      }
+      if (allowShort && trendDown && midOkShort && Number.isFinite(entryRsiVal) && entryRsiVal > 100 - entryRsi) {
+        lastSwingMtf = { trend: 'down', midRsi: midVal, levelPct: null }
+        return {
+          entry: { side: 'sell', reason: `HTF ${mtfTrendLabel} down · ${mtfMidLabel} RSI ${midVal.toFixed(0)} · ${mtfEntryLabel} RSI ${entryRsiVal.toFixed(0)}` },
+          exit: null,
+        }
+      }
+      return NONE
+    }
+    if (strategy === 'htf-level-bounce') {
+      const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
+      const kt = curKt
+      const km = curKm
+      if (kt < 0 || km < 0) return NONE
+      if (kt < trendLen) return NONE
+      const tPs = trendPs as Float64Array
+      const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
+      const tClose = trendAgg[kt].close
+      const trendUp = tClose > smaT
+      const trendDown = tClose < smaT
+      const midVal = midRsiArr ? midRsiArr[km] : Number.NaN
+      const midThresh = params.midRsi ?? 50
+      const allowShort = (params.allowShort ?? 1) >= 1
+      const proxMax = params.proximityPct ?? 1.5
+      // LONG — pullback INTO a confirmed swing-low support (price ABOVE the
+      // level, within tolerance — not a breakdown through it)
+      if (trendUp && Number.isFinite(midVal) && midVal > midThresh) {
+        const sup = nearestLevel(pivLows, c, 'below', kt)
+        if (sup != null && c > sup.price) {
+          const prox = ((c - sup.price) / sup.price) * 100
+          if (prox <= proxMax) {
+            lastSwingMtf = { trend: 'up', midRsi: midVal, levelPct: prox }
+            return { entry: { side: 'buy', reason: `HTF support ${sup.price.toPrecision(6)} ±${prox.toFixed(2)}% · ${mtfMidLabel} RSI ${midVal.toFixed(0)}` }, exit: null }
+          }
+        }
+      }
+      // SHORT mirrored at resistance (strict structural mirror of the long:
+      // the LEVEL stays the denominator — (resistance − close)/resistance)
+      if (allowShort && trendDown && Number.isFinite(midVal) && midVal < 100 - midThresh) {
+        const res = nearestLevel(pivHighs, c, 'above', kt)
+        if (res != null && c < res.price) {
+          const prox = ((res.price - c) / res.price) * 100
+          if (prox <= proxMax) {
+            lastSwingMtf = { trend: 'down', midRsi: midVal, levelPct: prox }
+            return { entry: { side: 'sell', reason: `HTF resistance ${res.price.toPrecision(6)} ±${prox.toFixed(2)}% · ${mtfMidLabel} RSI ${midVal.toFixed(0)}` }, exit: null }
+          }
+        }
+      }
+      return NONE
+    }
     // vwap-fade
     {
       const devPct = params.devPct ?? 0.6
@@ -511,12 +752,18 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // v1.97.0 — trailing exit memory (mirrors run.state.trailArmed/trailPeak)
     trailArmed: boolean
     trailPeak: number | null
+    // v2.2.0 — MTF decision context captured at the signal bar (swing only);
+    // stamped onto the closed trade as trade.mtf
+    mtfCtx?: TradeMtfContext
   }
   interface Pending {
     side: 1 | -1
   }
   let pos: Pos | null = null
   let pending: Pending | null = null
+  // v2.2.0 — MTF context riding the pending order (set when the signal arms,
+  // consumed/cleared when the pending fills or is dropped)
+  let pendingMtf: TradeMtfContext | null = null
   let cash = cfg.capital
   // Task 3-d — MARK-TO-MARKET drawdown: peak/trough are tracked on the
   // realized+unrealized equity (cash while flat, cash + open P&L at every
@@ -541,13 +788,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let skippedShorts = 0 // Task 3-d — crypto long-only drops
   // v2.0.0 — Kronos gate vetoes (entry signals blocked by cfg.entryGate)
   let gateVetoed = 0
-  // timeframe seconds — min positive bar delta over the head of the series
-  // (session/weekend gaps only inflate deltas, so the min is the true tf)
-  let tfSec = 60
-  for (let k = 1; k < Math.min(n, 61); k++) {
-    const d = bars[k].time - bars[k - 1].time
-    if (d > 0 && d < tfSec) tfSec = d
-  }
+  // v2.2.0 — maxTradesDay 0 = UNLIMITED (the swing lane forces 0 server-side;
+  // day-lane configs always carry ≥ 1, so day behavior is unchanged).
+  const maxTradesDayEff = cfg.maxTradesDay > 0 ? cfg.maxTradesDay : Number.MAX_SAFE_INTEGER
   // re-entry control (Task 70-c)
   let cooldownUntil: number | null = null // bar-time seconds — no entries before this
   let prevLongSig = false // raw entry signal on the previously decided bar
@@ -584,6 +827,9 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       pnlPct: p.entryPx * p.qty > 0 ? (pnl / (p.entryPx * p.qty)) * 100 : 0,
       exitReason: reason,
       holdMin: Math.max(0, (exitTime - p.entryTime) / 60),
+      // v2.2.0 — per-trade MTF context (swing strategies only; absent on day
+      // trades so old payloads stay byte-identical)
+      ...(p.mtfCtx ? { mtf: p.mtfCtx } : {}),
     })
   }
 
@@ -708,6 +954,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         // dust — notional below the exchange-minimum ballpark: no trade
         // (v1.96.0: also the ATR fail-closed skip — no ATR% yet on this bar)
         pending = null
+        pendingMtf = null
         suppressed++
       } else {
         recordFill(i, false) // market entry — pays spread half + impact + fee
@@ -724,6 +971,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
           slPx,
           trailArmed: false,
           trailPeak: null,
+          mtfCtx: pendingMtf ?? undefined,
         }
         // Task 89 — parity: counted when the fill SURVIVES the dust check
         // (see the signal-time comment above) — tradesToday AND orb15's
@@ -736,6 +984,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         }
       }
       pending = null
+      pendingMtf = null
     }
 
     // ---- 2) EOD flatten — WALL-CLOCK parity (equity symbols only — crypto
@@ -746,7 +995,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     //         bar's brackets — no post-gate TP/SL fills can happen. Filling at
     //         the CLOSE (the old model) exited 15:46 / 15:50 / 16:00 on 1m/5m/
     //         15m — up to 15 minutes past the live exit through the close.
-    const eodGate = cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN
+    const eodGate = !swingLane && cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN
     if (pos && eodGate) {
       recordFill(i, false) // market-on-open flatten — pays the full market cost
       closeTrade(pos, slipPx(i, bar.open, pos.side === 1 ? -1 : 1), bar.time, 'EOD flatten')
@@ -832,10 +1081,48 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     }
 
     // ---- 4) evaluate the strategy on this closed bar (exits → entries) ----
+    // v2.2.0 — swing per-bar MTF indices: the last COMPLETED trend/confirm
+    // bucket for THIS bar's open time (the forming bucket is never readable —
+    // no lookahead; see htfIndexAt).
+    if (swingLane) {
+      curKt = htfIndexAt(bar.time, trendAgg, trendSec)
+      curKm = htfIndexAt(bar.time, midAgg, midSec)
+    }
     const dec = decide(i)
-    if (dec.exit && pos) {
+    let exitReason: string | null = dec.exit
+    // v2.2.0 — swing SIDE-AWARE strategy exits. rawDecide is stateless (no
+    // held side / entry anchor), so these live in the executor:
+    //   • swing-pullback — the RSI exit is per-side (a long exits when the
+    //     entry-TF RSI RECAPTURES exitRsi, a short when it falls below the
+    //     mirrored level); a long in a deepening pullback just holds.
+    //   • htf-level-bounce — "exit at the next HTF level": the nearest
+    //     CONFIRMED swing-high above the entry price for longs (swing-low
+    //     below it for shorts). Recomputed each bar so late-confirming pivots
+    //     become valid targets too — still lookahead-free (confirmedAt ≤ kt).
+    //     (The spec's literal 'resistance above close && close >= resistance'
+    //     can never fire statelessly — the entry anchor is the workable
+    //     reading; flagged to the integrator.)
+    if (exitReason == null && pos != null && strategy === 'swing-pullback') {
+      const rv = rsiArr ? rsiArr[i] : Number.NaN
+      if (Number.isFinite(rv)) {
+        if (pos.side === 1) {
+          if (rv > (params.exitRsi ?? 65)) exitReason = 'RSI recaptured exit level'
+        } else if (rv < 100 - (params.exitRsi ?? 65)) {
+          exitReason = 'RSI fell back below exit level'
+        }
+      }
+    } else if (exitReason == null && pos != null && strategy === 'htf-level-bounce' && curKt >= 0) {
+      if (pos.side === 1) {
+        const R = nearestLevel(pivHighs, pos.entryPx, 'above', curKt)
+        if (R != null && bar.close >= R.price) exitReason = 'reached HTF resistance'
+      } else {
+        const S = nearestLevel(pivLows, pos.entryPx, 'below', curKt)
+        if (S != null && bar.close <= S.price) exitReason = 'reached HTF support'
+      }
+    }
+    if (exitReason != null && pos) {
       recordFill(i, false) // market exit at the bar close — pays the full market cost
-      closeTrade(pos, slipPx(i, bar.close, pos.side === 1 ? -1 : 1), bar.time, dec.exit)
+      closeTrade(pos, slipPx(i, bar.close, pos.side === 1 ? -1 : 1), bar.time, exitReason)
       pos = null
     }
     if (dec.entry && !pos && !pending) {
@@ -850,14 +1137,18 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         const edgeBlocked = cfg.requireNewSignal && (
           (dec.entry.side === 'buy' && prevLongSig) ||
           (dec.entry.side === 'sell' && prevShortSig))
-        if (cfg.rthOnly && !cfg.isCrypto && rth[i] !== 1) suppressed++
-        else if (cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
+        if (!swingLane && cfg.rthOnly && !cfg.isCrypto && rth[i] !== 1) suppressed++
+        else if (!swingLane && cfg.flattenEod && !cfg.isCrypto && minutes[i] >= EOD_FLATTEN_MIN) suppressed++
         else if (cooldownBlocked) suppressed++
         else if (edgeBlocked) suppressed++
-        else if (tradesToday >= cfg.maxTradesDay) suppressed++
+        else if (tradesToday >= maxTradesDayEff) suppressed++
         else if (cfg.entryGate && !cfg.entryGate(i, dec.entry.side === 'buy' ? 'long' : 'short')) gateVetoed++
         else {
           pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
+          // v2.2.0 — ride the swing MTF context (captured by rawDecide THIS
+          // bar) onto the pending order → trade.mtf at fill time. Null for
+          // day strategies — old trades never carry the field.
+          pendingMtf = lastSwingMtf
           // Task 89 — tradesToday parity: the LIVE engine increments on FILL
           // success, the backtest used to increment at signal time — a
           // dust-cancelled pending consumed a daily slot the live engine
@@ -1036,6 +1327,10 @@ export function dimValues(r: OptimizeRange): number[] {
 function comboInvalid(strategy: AlgoStrategyId, p: Record<string, number>): boolean {
   if (strategy === 'bb-reversion') return p.rsiOversold >= p.rsiOverbought
   if (strategy === 'rsi2-connors') return p.exitSma >= p.trendSma
+  // v2.2.0 — swing sanity: an inverted confirm band (rsiMin ≥ rsiMax) or an
+  // entry trigger at/above its own exit level (entryRsi ≥ exitRsi) produces
+  // instant self-exits — skip the combo, same spirit as the checks above.
+  if (strategy === 'swing-pullback') return p.rsiMin >= p.rsiMax || p.entryRsi >= p.exitRsi
   return false
 }
 
@@ -1371,13 +1666,22 @@ function sweepSig(strategy: AlgoStrategyId, params: Record<string, number>): str
 export async function sweepStrategies(
   series: BacktestSeries,
   base: BacktestConfig,
-  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number; onProgress?: BacktestProgress },
+  opts?: { minTrades?: number; topX?: number; maxCombosPerStrategy?: number; oosFraction?: number; onProgress?: BacktestProgress; lane?: 'day' | 'swing' },
 ): Promise<SweepResult> {
   const t0 = Date.now()
   const minTrades = Math.max(1, Math.round(opts?.minTrades ?? 8))
   const topX = Math.min(20, Math.max(1, Math.round(opts?.topX ?? 8)))
   const oosFraction = Math.min(0.5, Math.max(0, Number(opts?.oosFraction) || 0))
   const onProgress = opts?.onProgress
+  // v2.2.0 — lane filter (spec §1.2): a sweep replays strategies against the
+  // REQUEST's dataset, so only strategies matching the request's lane are
+  // candidates — day timeframes can't feed MTF swing strategies (no HTF
+  // ladder exists on intraday scalping data) and swing timeframes shouldn't
+  // run intraday scalpers. Default derives from the config (mtf present =
+  // swing lane) so existing day-lane callers (reco matrix) sweep exactly the
+  // same 4 strategies, in the same order, as before this change.
+  const lane: 'day' | 'swing' = opts?.lane ?? (base.mtf != null ? 'swing' : 'day')
+  const laneIds = ALGO_STRATEGY_IDS.filter((sid) => strategyLane(sid) === lane)
   // ---- walk-forward split (Task 3-d) ----
   // IS = the head (tuning window, ALL sweep runs happen here) · OOS = the
   // untouched tail used ONLY to re-verify the selected rows afterwards.
@@ -1391,9 +1695,9 @@ export async function sweepStrategies(
   let evaluated = 0
   let skipped = 0
   let skippedShorts = 0
-  const totalStrategies = ALGO_STRATEGY_IDS.length
+  const totalStrategies = laneIds.length
   for (let si = 0; si < totalStrategies; si++) {
-    const sid = ALGO_STRATEGY_IDS[si]
+    const sid = laneIds[si]
     // Task 9-p — per-strategy heap probe: the sweep runs every strategy's
     // optimizer back-to-back; catch the hot heap BETWEEN strategies (see
     // heapAbortCheck)

@@ -32,9 +32,9 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import { fmtAtrExit, ATR_TF_OPTIONS } from '@/lib/atr-client'
 import {
-  ALGO_STRATEGIES, ALGO_STRATEGY_IDS, ALGO_TIMEFRAMES,
+  ALGO_STRATEGIES, ALGO_STRATEGY_IDS, DAY_TFS,
   normalizeAlgoParams, algoConfigSummaryName, algoExportFileBase,
-  buildAlgoConfigExport, runToAlgoConfig, ruleToExportEntry,
+  buildAlgoConfigExport, runToAlgoConfig, ruleToExportEntry, strategyLane,
   type AlpoRunConfig, type AlgoRiskBasis, type AlgoStrategyId, type AlgoSizingMode, type AlgoTimeframe,
   type AlgoRuleFileEntry, type AlgoRuleLike,
 } from '@/lib/algo-strategies'
@@ -461,7 +461,10 @@ export default function AlgoTab() {
           <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Strategy</p>
             <div className="flex flex-col gap-1.5">
-              {ALGO_STRATEGY_IDS.map((id) => {
+              {/* v2.2.0 — LIVE runs are day-trading only: the swing lane is
+                  backtest-only (its MTF screens live in the backtest engine),
+                  so the shared setup filters to the day catalog/timeframes. */}
+              {ALGO_STRATEGY_IDS.filter((id) => strategyLane(id) === 'day').map((id) => {
                 const s = ALGO_STRATEGIES[id]
                 const sel = id === strategy
                 return (
@@ -508,7 +511,7 @@ export default function AlgoTab() {
                   className="mt-1 w-full"
                   value={timeframe}
                   onChange={(tf) => setTimeframe(tf as AlgoTimeframe)}
-                  options={ALGO_TIMEFRAMES.map((tf) => ({ value: tf, label: tf }))}
+                  options={DAY_TFS.map((tf) => ({ value: tf, label: tf }))}
                 />
               </div>
               {/* position sizing (Task 78 — Risk Money; Task 78e — $ or % basis) */}

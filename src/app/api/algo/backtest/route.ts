@@ -51,12 +51,21 @@
 //   capital?: number                       starting equity for % / DD metrics
 //   minTrades?: number                     (optimize/sweep/walkforward) minimum trades to score
 //   topX?: number                          (sweep) how many winners to list (1..20, default 8)
+//   mtf?: { trendTf?: string, midTf?: string }  (v2.2.0, swing lane) the HTF
+//                                          ladder — validated against the
+//                                          FROZEN MTF maps for the entry tf;
+//                                          derived server-side when absent
 // }
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { type Timeframe, TIMEFRAMES } from '@/lib/market-types'
-import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, algoMaxDays, type AlgoTimeframe } from '@/lib/algo-strategies'
+import {
+  isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, ALGO_STRATEGY_IDS, algoMaxDays,
+  strategyLane, isSwingTf, MTF_TREND_TF, MTF_MID_TF, type AlgoTimeframe,
+} from '@/lib/algo-strategies'
+// v2.2.0 — MTF mechanics for the swing lane's meta counts (spec §1.2)
+import { aggregateBars, pivotLevels } from '@/lib/mtf'
 import { rateLimit } from '@/lib/rate-limit'
 import {
   prepareSeries, runBacktest, optimizeBacktest, sweepStrategies, walkForward, applyOverride,
@@ -180,6 +189,7 @@ interface BacktestBody {
   capital?: number
   minTrades?: number
   topX?: number
+  mtf?: { trendTf?: string; midTf?: string }
 }
 
 export async function POST(req: NextRequest) {
@@ -309,17 +319,59 @@ async function computeBacktest(
   const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' || body.mode === 'kronos-ab'
     ? body.mode
     : 'run'
-  // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
-  // any) is only a placeholder for the shared config validation below; every
-  // sweep candidate gets its own catalog params inside sweepStrategies().
+  // v2.2.0 — the timeframe set widens to 6 (spec §1.2): the day lane keeps
+  // 1m/5m/15m and the swing lane adds 1h/4h/1D.
+  const tf = ALGO_TIMEFRAMES.includes(body.timeframe as AlgoTimeframe) ? (body.timeframe as AlgoTimeframe) : null
+  if (!tf) {
+    return { status: 400, body: { error: 'Timeframe must be one of 1m / 5m / 15m / 1h / 4h / 1D' } }
+  }
+  const isSwingTfVal = isSwingTf(tf)
+  // sweep mode (Task 87) runs a filtered slice of the catalog — the caller's
+  // strategy (if any) is only a placeholder for the shared config validation
+  // below; every sweep candidate gets its own catalog params inside
+  // sweepStrategies(). v2.2.0 — the swept set is restricted to the REQUEST's
+  // lane (spec §1.2), so a placeholder that disagrees with the timeframe is
+  // swapped for a lane-matching one instead of 400ing the whole sweep.
   let strategy = body.strategy
-  if (mode === 'sweep') strategy = isAlgoStrategyId(strategy) ? strategy : 'bb-reversion'
+  const reqLane: 'day' | 'swing' = isSwingTfVal ? 'swing' : 'day'
+  if (mode === 'sweep') {
+    if (!isAlgoStrategyId(strategy) || strategyLane(strategy) !== reqLane) {
+      strategy = ALGO_STRATEGY_IDS.find((id) => strategyLane(id) === reqLane) ?? 'bb-reversion'
+    }
+  }
   if (!isAlgoStrategyId(strategy)) {
     return { status: 400, body: { error: 'Unknown strategy' } }
   }
-  const tf = ALGO_TIMEFRAMES.includes(body.timeframe as AlgoTimeframe) ? (body.timeframe as AlgoTimeframe) : null
-  if (!tf) {
-    return { status: 400, body: { error: 'Timeframe must be one of 1m / 5m / 15m' } }
+  const stratLane = strategyLane(strategy)
+  // v2.2.0 — LANE CONSISTENCY (spec §1.2, 400 on violation): day strategies
+  // reject swing timeframes and swing strategies reject day timeframes.
+  if (stratLane !== reqLane) {
+    return {
+      status: 400,
+      body: {
+        error: stratLane === 'swing'
+          ? `Swing strategy "${strategy}" requires a swing timeframe (1h / 4h / 1D) — got ${tf}`
+          : `Day-trading strategy "${strategy}" requires an intraday timeframe (1m / 5m / 15m) — got ${tf}`,
+      },
+    }
+  }
+  // v2.2.0 — swing MTF ladder (spec §1.2): validated against the FROZEN
+  // MTF_TREND_TF/MTF_MID_TF maps for the entry tf; derived server-side when
+  // the body omits them so the API is usable without them.
+  let mtf: { trendTf: string; midTf: string } | null = null
+  if (stratLane === 'swing') {
+    const swingTf = tf as '1h' | '4h' | '1D'
+    const expTrend = MTF_TREND_TF[swingTf]
+    const expMid = MTF_MID_TF[swingTf]
+    const bodyTrend = typeof body.mtf?.trendTf === 'string' ? body.mtf.trendTf : null
+    const bodyMid = typeof body.mtf?.midTf === 'string' ? body.mtf.midTf : null
+    if (bodyTrend != null && bodyTrend !== expTrend) {
+      return { status: 400, body: { error: `mtf.trendTf must be "${expTrend}" for the ${tf} entry timeframe (got "${bodyTrend}")` } }
+    }
+    if (bodyMid != null && bodyMid !== expMid) {
+      return { status: 400, body: { error: `mtf.midTf must be "${expMid}" for the ${tf} entry timeframe (got "${bodyMid}")` } }
+    }
+    mtf = { trendTf: expTrend, midTf: expMid }
   }
   const symbol = String(body.symbol ?? '').trim().toUpperCase()
   if (!symbol || !/^[A-Z0-9./:-]{1,15}$/.test(symbol)) {
@@ -333,7 +385,15 @@ async function computeBacktest(
     return { status: 400, body: { error: 'Quantity must be > 0' } }
   }
   const capital = Math.max(100, Math.min(100_000_000, Number(body.capital) || 10000))
-  const maxTradesDay = Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
+  // v2.2.0 — swing lane forces the session/pace flags server-side regardless
+  // of body (spec §1.2): swing trades span days → no RTH gate, no EOD
+  // flatten, no per-day trade cap (0 = unlimited; the engine treats 0 as
+  // unlimited). Day lane clamps exactly as before.
+  const maxTradesDay = stratLane === 'swing'
+    ? 0
+    : Math.min(200, Math.max(1, Math.round(Number(body.maxTradesDay) || 3)))
+  const rthOnly = stratLane === 'swing' ? false : body.rthOnly !== false
+  const flattenEod = stratLane === 'swing' ? false : body.flattenEod !== false
   // Task 78 — Risk Money sizing; Task 78e — budget basis ($ or % of equity).
   // risk+usd requires riskMoney > 0 · risk+pct requires riskMoneyPct > 0.
   const sizingMode = body.sizingMode === 'risk' ? 'risk' : 'fixed'
@@ -352,6 +412,8 @@ async function computeBacktest(
   if (sizingMode === 'risk' && riskBasis !== 'pct' && riskMoney == null) {
     return { status: 400, body: { error: 'Risk money must be a positive number when sizing mode is risk' } }
   }
+  // normalized once — feeds the engine config AND the meta level count
+  const normParams = normalizeAlgoParams(strategy, body.params)
 
   // ---- fetch the history (same source the live engine polls; TTL-cached —
   // Task 10-a: shared fetchBacktestBars helper, identical gates/messages) ----
@@ -376,7 +438,7 @@ async function computeBacktest(
 
   const cfg: BacktestConfig = {
     strategy,
-    params: normalizeAlgoParams(strategy, body.params),
+    params: normParams,
     qty: symbol.includes('/') ? qty : Math.max(1, Math.floor(qty)),
     sizingMode,
     riskBasis: sizingMode === 'risk' ? riskBasis : 'usd',
@@ -404,8 +466,8 @@ async function computeBacktest(
       ? Math.min(100, Math.max(0.01, Number(body.trailGivePct)))
       : null,
     maxTradesDay,
-    rthOnly: body.rthOnly !== false,
-    flattenEod: body.flattenEod !== false,
+    rthOnly,
+    flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body.cooldownMin) || 0))),
     requireNewSignal: body.requireNewSignal === true,
     // Task 84 — execution-cost model (bps, default 0 = frictionless)
@@ -420,9 +482,29 @@ async function computeBacktest(
       ? Math.min(10, Math.max(0.1, Number(body.maxNotionalX)))
       : 1,
     capital,
+    // v2.2.0 — swing MTF ladder (null on the day lane — the field stays
+    // present so payloads are uniform; the engine treats null as day lane)
+    mtf,
   }
 
   const series = prepareSeries(bars)
+  // v2.2.0 — meta.mtf (spec §1.2): always present — null for the day lane,
+  // or the resolved ladder + aggregated HTF bar counts + the total number of
+  // confirmed S/R pivots the run's trend series holds (htf-level-bounce
+  // only; swing-pullback doesn't consume levels → 0).
+  let mtfMeta: { trendTf: string; midTf: string; trendBars: number; midBars: number; levels: number } | null = null
+  if (mtf != null) {
+    const trendSecM = TIMEFRAMES[mtf.trendTf as Timeframe].seconds
+    const midSecM = TIMEFRAMES[mtf.midTf as Timeframe].seconds
+    const trendAggM = aggregateBars(bars, trendSecM)
+    const midAggM = aggregateBars(bars, midSecM)
+    let levels = 0
+    if (strategy === 'htf-level-bounce') {
+      const piv = pivotLevels(trendAggM, normParams.pivotLookback ?? 3, normParams.pivotScan ?? 60)
+      levels = piv.highs.length + piv.lows.length
+    }
+    mtfMeta = { trendTf: mtf.trendTf, midTf: mtf.midTf, trendBars: trendAggM.length, midBars: midAggM.length, levels }
+  }
   const meta = {
     symbol,
     timeframe: tf,
@@ -433,6 +515,7 @@ async function computeBacktest(
     coveredDays,
     source: hist.source ?? 'alpaca',
     dataCapped: coveredDays < days - 3,
+    mtf: mtfMeta,
   }
 
   if (mode === 'kronos-ab') {
@@ -579,7 +662,7 @@ async function computeBacktest(
     const oosFraction = Number.isFinite(Number(body.oosFraction))
       ? Math.min(0.5, Math.max(0, Number(body.oosFraction)))
       : 0
-    const sweep = await sweepStrategies(series, cfg, { minTrades, topX, oosFraction, onProgress })
+    const sweep = await sweepStrategies(series, cfg, { minTrades, topX, oosFraction, onProgress, lane: stratLane })
     return {
       status: 200,
       body: { sweep, meta: { ...meta, mtmDD: true, skippedShorts: sweep.skippedShorts ?? 0 } },
