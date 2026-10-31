@@ -54,7 +54,7 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "archive/**", "tests/**"]
+  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills", "archive/**", "tests/**", "mini-services/kronos-service/.venv/**", "mini-services/kronos-service/hf-cache/**"]
 }];
 
 export default eslintConfig;

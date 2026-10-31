@@ -233,10 +233,10 @@ def run_forecast(payload):
         xn = np.clip((x - x_mean) / (x_std + 1e-5), -5, 5)
         xt = torch.from_numpy(xn[np.newaxis, :])
         xst = torch.from_numpy(np.stack([
-            x_ts.minute.values, x_ts.hour.values, x_ts.weekday.values,
+            x_ts.minute.values, x_ts.hour.values, x_ts.day_of_week.values,  # day_of_week: .weekday was removed in pandas 4 (same values, Mon=0)
             x_ts.day.values, x_ts.month.values], axis=1).astype(np.float32)[np.newaxis, :])
         yst = torch.from_numpy(np.stack([
-            y_ts.minute.values, y_ts.hour.values, y_ts.weekday.values,
+            y_ts.minute.values, y_ts.hour.values, y_ts.day_of_week.values,
             y_ts.day.values, y_ts.month.values], axis=1).astype(np.float32)[np.newaxis, :])
 
         max_ctx = slot['max_context']

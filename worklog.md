@@ -3604,3 +3604,36 @@ Stage Summary:
 - v2.0.1 — trust is now PER LANE: the Chart shows Fast (mini) and Quality (small) graded accuracy
   separately, so the Fast-vs-Quality question answers itself with data over time. Dev + sidecar
   survive session reaping via double-fork daemonization; Next heap capped to stop OOM kills.
+
+## v2.0.2 — pandas `.weekday` deprecation fixed + sidecar gets its own venv
+
+USER REPORT: server log showed `Pandas4Warning: DatetimeIndex.weekday is deprecated … use
+DatetimeIndex.day_of_week` from the Kronos sidecar (their deployment runs a newer pandas where
+`.weekday` is deprecated-for-pandas-4; our sandbox venv pandas 2.2.3 is silent — same bug,
+different warning visibility).
+
+FIX (3 sites, all identical semantics — `.day_of_week` returns the same values, Mon=0):
+- server.py:236 x_ts weekday → day_of_week (context timestamp features)
+- server.py:239 y_ts weekday → day_of_week (horizon timestamp features)
+- model/kronos.py:476 calc_time_stamps `dt.weekday` → `dt.day_of_week` (upstream vendored helper —
+  not on our hot path but would warn if ever used; fixed for pandas-4-proofing)
+
+OPS ROOT-CAUSE (discovered while restarting to verify): torch had VANISHED from the sandbox —
+`python3` (the sandbox /home/z/.venv) lost it. Mechanism: the sandbox driver runs `uv run main.py`
+and `uv run` syncs the venv against uv.lock, PRUNING anything not in the lockfile (previous
+session installed torch loose → pruned on the next driver boot; huggingface_hub survived only
+because another dep tree pulls it). DURABLE FIX: the sidecar now owns its venv at
+mini-services/kronos-service/.venv (gitignored) built from requirements.txt (torch 2.15.0+cpu via
+the CPU wheel index, numpy 2.1.3, pandas 2.2.3, einops, huggingface_hub, safetensors); supervisor
+index.ts prefers .venv/bin/python and falls back to python3; uv can never prune it again.
+Gotcha: pkill -f "kronos-service/index.ts" does NOT match the supervisor (cmdline is bare
+`bun index.ts`) — two supervisors briefly fought for :3030; killed via pattern "index.ts".
+
+VERIFY: fresh forecast through the sidecar = ok:true, mini lane, 367ms, p50/band plausible;
+`grep -cE "Pandas4Warning|Deprecat" kronos.log` = 0 (log clean); /api/kronos/status sees both
+lanes. ESLint: .venv (torch ships JS samples) + hf-cache added to eslint ignores + .gitignore.
+
+Stage Summary:
+- v2.0.2 — the sidecar is pandas-4-proof (day_of_week everywhere) and self-contained (own venv +
+  requirements.txt + supervisor fallback), so the Kronos lanes survive sandbox resets, uv syncs,
+  and pandas upgrades alike.

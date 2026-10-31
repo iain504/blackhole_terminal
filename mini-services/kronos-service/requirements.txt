@@ -1,0 +1,11 @@
+# kronos-service deps — install into THIS service's own venv (NOT the sandbox
+# /home/z/.venv: the driver's `uv run` prunes any package absent from uv.lock).
+#   uv venv .venv --python 3.12
+#   uv pip install --python .venv/bin/python -r requirements.txt
+# torch from the CPU wheel index (this box has no GPU; CUDA wheels are ~2GB):
+#   uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0
+numpy==2.1.3
+pandas==2.2.3
+einops>=0.8
+huggingface_hub>=0.34

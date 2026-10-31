@@ -4,7 +4,17 @@
 // The actual service is Python (PyTorch — Kronos cannot run in TS). This
 // wrapper spawns `python3 server.py`, streams its stdout/stderr into the
 // console, restarts it with backoff if it dies, and forwards SIGINT/SIGTERM.
-const CHILD = 'python3'
+//
+// WHY .venv: the sandbox driver's `uv run` syncs /home/z/.venv against
+// uv.lock and PRUNES anything not in it — loose `pip install torch` there
+// vanished overnight and the sidecar died with ModuleNotFoundError. The
+// service owns its venv at ./.venv (gitignored, requirements.txt pinned);
+// the supervisor falls back to bare python3 with a LOUD error if torch is
+// missing (honest failure, never a silent broken boot).
+import { existsSync } from 'node:fs'
+
+const VENV_PY = new URL('./.venv/bin/python', import.meta.url).pathname
+const CHILD = existsSync(VENV_PY) ? VENV_PY : 'python3'
 const SCRIPT = new URL('./server.py', import.meta.url).pathname
 
 let child: ReturnType<typeof Bun.spawn> | null = null
