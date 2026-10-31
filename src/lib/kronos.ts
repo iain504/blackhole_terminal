@@ -22,7 +22,7 @@
 //    the model's running hit-rate. Predictions with a scoreboard.
 import { db } from '@/lib/db'
 import { isCryptoSymbol } from '@/lib/market-types'
-import type { KronosBar, KronosForecastResult, KronosHealth } from '@/lib/kronos-types'
+import type { KronosBar, KronosForecastResult, KronosHealth, KronosModelScore } from '@/lib/kronos-types'
 
 export type { KronosBar, KronosForecastResult, KronosHealth, KronosHitRate, KronosJournalRow, KronosStatus } from '@/lib/kronos-types'
 
@@ -245,9 +245,10 @@ export interface HitRate {
   rate: number | null
   avgAbsErrPct: number | null
   pending: number
+  byModel: KronosModelScore[]
 }
 
-/** Aggregate realized accuracy across ALL journaled forecasts. */
+/** Aggregate realized accuracy across ALL journaled forecasts (+ per-lane split). */
 export async function kronosHitRate(): Promise<HitRate> {
   try {
     const [agg, pending] = await Promise.all([
@@ -268,15 +269,63 @@ export async function kronosHitRate(): Promise<HitRate> {
       if (g.hit != null) n += g._count._all
       if (g._avg.absErrPct != null && g.hit != null) { errSum += g._avg.absErrPct * g._count._all; errN += g._count._all }
     }
+    // per-lane split: trust is earned (or not) PER MODEL — pooling mini and
+    // small into one number hides exactly the comparison a trader needs.
+    const byRows = await db.kronosForecast.groupBy({
+      by: ['model', 'hit'],
+      _count: { _all: true },
+      _avg: { absErrPct: true },
+      where: { realizedClose: { not: null } },
+    })
+    const pendingRows = await db.kronosForecast.groupBy({
+      by: ['model'],
+      _count: { _all: true },
+      where: { realizedClose: null },
+    })
+    const pendingByModel = new Map(pendingRows.map((r) => [r.model, r._count._all]))
+    const laneOf = (model: string): string => (model.toLowerCase().includes('mini') ? 'mini' : 'small')
+    const acc = new Map<string, { model: string; lane: string; n: number; hits: number; errSum: number; errN: number }>()
+    for (const r of byRows) {
+      const key = r.model
+      const cur = acc.get(key) ?? { model: r.model, lane: laneOf(r.model), n: 0, hits: 0, errSum: 0, errN: 0 }
+      cur.n += r._count._all
+      if (r.hit === true) cur.hits += r._count._all
+      if (r.hit != null && r._avg.absErrPct != null) { cur.errSum += r._avg.absErrPct * r._count._all; cur.errN += r._count._all }
+      acc.set(key, cur)
+    }
+    const byModel = [...acc.values()].map((m) => ({
+      model: m.model,
+      lane: m.lane,
+      n: m.n,
+      hits: m.hits,
+      rate: m.n > 0 ? m.hits / m.n : null,
+      avgAbsErrPct: m.errN > 0 ? m.errSum / m.errN : null,
+      pending: pendingByModel.get(m.model) ?? 0,
+    }))
+    // include lanes with only pending forecasts (nothing graded yet)
+    for (const [m, p] of pendingByModel) {
+      if (!byModel.some((b) => b.model === m)) {
+        byModel.push({ model: m, lane: laneOf(m), n: 0, hits: 0, rate: null, avgAbsErrPct: null, pending: p })
+      }
+    }
+    // always surface BOTH lanes — "no graded forecasts yet" on the Quality
+    // lane is decision-relevant info, not noise (absence ≠ permission).
+    for (const [lane, model] of [['mini', 'NeoQuasar/Kronos-mini'], ['small', 'NeoQuasar/Kronos-small']] as const) {
+      if (!byModel.some((b) => b.lane === lane)) {
+        byModel.push({ model, lane, n: 0, hits: 0, rate: null, avgAbsErrPct: null, pending: 0 })
+      }
+    }
+    byModel.sort((a, b) => a.lane.localeCompare(b.lane))
     return {
       n,
       hits,
       rate: n > 0 ? hits / n : null,
       avgAbsErrPct: errN > 0 ? errSum / errN : null,
       pending,
+      byModel,
     }
   } catch {
-    return { n: 0, hits: 0, rate: null, avgAbsErrPct: null, pending: 0 }
+    return { n: 0, hits: 0, rate: null, avgAbsErrPct: null, pending: 0, byModel: [] }
   }
 }
 

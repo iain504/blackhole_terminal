@@ -3560,3 +3560,47 @@ Stage Summary:
   panel gains a walk-forward A/B that measures whether the gate actually helps. All three surfaces
   share one honest rule: the model must have SPOKEN for the bar (no look-ahead, no fake forecasts),
   and every prediction is graded against what really printed.
+
+## v2.0.1 — per-lane trust scoreboard ("Fast vs Quality: which one should I trust?")
+
+User asked: the Chart's Kronos popover offers Fast (mini) vs Quality (small) — which to trust?
+Answer delivered in two parts:
+
+1. THE FACTS. Fast = NeoQuasar/Kronos-mini (4.1M params, Tokenizer-2k, 2048-bar context, ~10s on
+   this CPU). Quality = NeoQuasar/Kronos-small (24.7M params — 6× the capacity, Tokenizer-base,
+   512-bar context, ~55s). Upstream's reference checkpoint is small. So the PRIOR favors small;
+   the platform's answer is that neither is trusted on vibes — both are graded on every forecast.
+
+2. THE DATA GAP (and the fix). The scoreboard pooled both lanes into ONE hit-rate — exactly the
+   comparison a trader needs was invisible. v2.0.1 splits it:
+   - `kronos-types.ts`: KronosHitRate gains `byModel: KronosModelScore[]` (model, lane, n, hits,
+     rate, avgAbsErrPct, pending); new KronosModelScore interface.
+   - `kronos.ts` kronosHitRate(): groupBy(['model','hit']) over realized rows + pending-by-model;
+     per-lane acc (errSum/errN weighted by group counts); BOTH lanes always surfaced ("no graded
+     forecasts yet" on Quality is decision-relevant absence, not noise); sorted mini→small.
+   - `ChartPanel.tsx` popover: per-lane scoreboard block under the model toggle — lane label
+     (highlighted when it's the selected lane), graded hit% of n, avg |err|, pending count,
+     "small sample" flag under 20 graded, footer "Graded = did the direction call at horizon end
+     match the real bar. Compare lanes on YOUR symbols before trusting either."
+
+Current scoreboard state (honest): mini 0 graded (1 pending from v2.0.0 E2E), small 0 graded —
+no lane has earned trust numbers yet; both need ~20+ graded forecasts on the user's symbols.
+
+OPS INCIDENT (root-caused + fixed): the dev server was OOM-killed (dmesg: next-server 1.3GB RSS
+killed; 4GB box, no swap) and THEN background processes started with plain `nohup … &` were
+reaped ~30s after their tool call ended — dev + sidecar died repeatedly. Fix: double-fork
+daemonization (python os.fork ×2 + setsid + fds→devnull/log) for BOTH the Next dev server
+(NODE_OPTIONS=--max-old-space-size=1024) and mini-services/kronos-service; both now survive
+across sessions. Memory budget verified: next 1.6GB + sidecar 425MB (both lanes loaded) fits.
+python3 is fine for the daemonizer even in a TS repo — it's ops glue, not app code.
+
+E2E (agent-browser, kronostest1): login (password reset via scrypt script + TOTP code printed by
+one-off decrypt script — both deleted after use; rate-limit bucket reg:::1 cleared), TSLA chart →
+Kronos popover → per-lane scoreboard renders both rows with pending count
+(/tmp/kronos-per-lane-scoreboard.png). Lint clean. scripts/kronos-scoreboard.ts added (ops probe:
+per-model realized accuracy via `bun scripts/kronos-scoreboard.ts`).
+
+Stage Summary:
+- v2.0.1 — trust is now PER LANE: the Chart shows Fast (mini) and Quality (small) graded accuracy
+  separately, so the Fast-vs-Quality question answers itself with data over time. Dev + sidecar
+  survive session reaping via double-fork daemonization; Next heap capped to stop OOM kills.

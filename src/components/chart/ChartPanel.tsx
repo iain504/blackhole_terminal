@@ -4714,6 +4714,30 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                   </button>
                 ))}
               </div>
+              {/* per-lane graded scoreboard — trust is decided PER MODEL, not pooled */}
+              {(krStatus?.hitRate.byModel?.length ?? 0) > 0 && (
+                <div className="mt-1.5 space-y-1 rounded border border-zinc-800/80 bg-zinc-900/40 p-1.5">
+                  {krStatus!.hitRate.byModel.map((s) => (
+                    <div key={s.model} className="flex items-baseline justify-between gap-2 text-[10px]">
+                      <span className={cn('shrink-0', krModel === s.lane ? 'font-semibold text-amber-300' : 'text-zinc-400')}>
+                        {s.lane === 'mini' ? 'Fast (mini)' : 'Quality (small)'}
+                      </span>
+                      {s.n > 0 ? (
+                        <span className="text-right text-zinc-300">
+                          <span className={cn('font-semibold', s.rate! >= 0.5 ? 'text-emerald-400' : 'text-rose-400')}>{(s.rate! * 100).toFixed(0)}%</span>
+                          {' '}of {s.n} graded
+                          {s.avgAbsErrPct != null && <> · |err| {s.avgAbsErrPct.toFixed(2)}%</>}
+                          {s.pending > 0 && <> · {s.pending} pending</>}
+                          {s.n < 20 && <span className="text-zinc-500"> · small sample</span>}
+                        </span>
+                      ) : (
+                        <span className="text-zinc-500">no graded forecasts yet{s.pending > 0 ? ` (${s.pending} pending)` : ''}</span>
+                      )}
+                    </div>
+                  ))}
+                  <p className="text-[9px] leading-relaxed text-zinc-600">Graded = did the direction call at horizon end match the real bar. Compare lanes on YOUR symbols before trusting either.</p>
+                </div>
+              )}
               <Button
                 size="sm"
                 className="mt-2.5 h-8 w-full gap-1.5 border border-amber-500/40 bg-amber-400/10 text-xs font-semibold text-amber-300 hover:bg-amber-400/20"

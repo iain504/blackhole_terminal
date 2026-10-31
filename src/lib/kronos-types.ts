@@ -50,6 +50,20 @@ export interface KronosHitRate {
   rate: number | null
   avgAbsErrPct: number | null
   pending: number
+  /** graded accuracy split per lane (mini vs small) — trust is per-lane, not pooled */
+  byModel: KronosModelScore[]
+}
+
+export interface KronosModelScore {
+  /** sidecar model id, e.g. 'NeoQuasar/Kronos-mini' */
+  model: string
+  /** lane key: 'mini' | 'small' */
+  lane: string
+  n: number
+  hits: number
+  rate: number | null
+  avgAbsErrPct: number | null
+  pending: number
 }
 
 export interface KronosJournalRow {
