@@ -29,7 +29,7 @@ import { DayLaneIllo, MtfLadderIllo, RiskBracketIllo, SwingLaneIllo, ThreeScreen
 import { ChipButton, NextStepButton, NumIn, StepperRail, StudioStep, ToggleRow, type RailStep } from './studio-bits'
 import {
   ALGO_STRATEGIES, ALGO_REGIME_PRESETS, LEVEL_META, clampParam, estimateBars, fmtBars, gridArmed,
-  laneTfs, makeStudioState, mtfLadder, studioIssues, suggestCosts,
+  laneTfs, makeStudioState, mtfLadder, studioIssues, suggestCosts, swingSeedDays,
   type AlgoRegimePresetId, type AlgoStrategyId, type AlgoTimeframe, type BtBusy, type BtLevel, type RangeState, type StudioState,
 } from './studio-state'
 import { algoMaxDays, normalizeAlgoParams, strategyLane } from '@/lib/algo-strategies'
@@ -167,13 +167,32 @@ export default function BacktestStudio(props: BacktestStudioProps) {
       dynSlip: studio.dynSlip,
       regimePreset: studio.regimePreset,
     })
-    // keep the user's window, clamped to the NEW timeframe's feed cap
-    next.days = clampDays(studio.days || next.days, next.entryTf)
+    if (next.lane === 'swing') {
+      // v2.2.2 — day→swing RAISES the window to the swing seed (never lowers
+      // a deeper user choice): 30–200d day-lane windows starve the swing trend
+      // screen on stocks (~7 hourly bars/day), which is exactly the "0 trades
+      // on every symbol" report. Clamped to the feed cap.
+      const seed = swingSeedDays(next.entryTf)
+      const userDays = Math.round(Number(studio.days)) || 0
+      next.days = String(Math.min(algoMaxDays(next.entryTf, next.symbol.includes('/')), Math.max(userDays, seed)))
+    } else {
+      // swing→day keeps the user's window, clamped to the day TF's feed cap
+      next.days = clampDays(studio.days || next.days, next.entryTf)
+    }
     patch(next)
   }
   const pickTf = (tf: AlgoTimeframe) => {
     if (tf === studio.entryTf) return
-    patch({ entryTf: tf, days: clampDays(studio.days, tf) })
+    if (studio.lane === 'swing') {
+      // v2.2.2 — swing TFs need different calendar depth (1D needs ≈50 WEEKLY
+      // buckets ≈ 1.4y; keeping a 1h-sized window starved the 1D lane into a
+      // silent zero-trade result). Re-seed, but never below a deeper user pick.
+      const userDays = Math.round(Number(studio.days)) || 0
+      const seed = swingSeedDays(tf)
+      patch({ entryTf: tf, days: String(Math.min(algoMaxDays(tf, isCrypto), Math.max(userDays, seed))) })
+    } else {
+      patch({ entryTf: tf, days: clampDays(studio.days, tf) })
+    }
   }
   const pickStrategy = (id: AlgoStrategyId) => {
     if (id === studio.strategy) return
@@ -350,7 +369,11 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                 <span className="ml-1 text-zinc-600">· cap {maxDays}d for {studio.entryTf}{isCrypto ? ' crypto' : ''}</span>
               </Label>
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                {[7, 30, 60, 90, 200].map((d) => (
+                {/* v2.2.2 — lane-aware chips: swing needs calendar depth (the
+                    trend screen eats ≈50 higher-TF bars before the first
+                    decision), so the day chips 7–200d are replaced by a
+                    90d–1825d row; values beyond the feed cap are disabled. */}
+                {(isSwing ? [90, 180, 365, 730, 1095, 1825] : [7, 30, 60, 90, 200]).map((d) => (
                   <ChipButton
                     key={d}
                     active={daysNum === d}
@@ -376,6 +399,13 @@ export default function BacktestStudio(props: BacktestStudioProps) {
               {daysNum > maxDays && (
                 <p className="mt-0.5 text-[10px] text-amber-400" role="note">
                   {daysNum}d exceeds the {maxDays}-day feed cap for {studio.entryTf} — the run replays whatever the feed returns ({maxDays}d max), not the full window.
+                </p>
+              )}
+              {isSwing && (
+                <p className="mt-0.5 text-[10px] leading-snug text-purple-300/80" role="note">
+                  Swing needs deep history — the {ladder?.trendTf ?? 'higher'}-TF trend screen waits for ≈{Math.round(Number(studio.params.trendSma)) || 50} closed
+                  higher-TF bars before its first decision, and stocks print only ~7 hourly / ~1 daily bar per day. Each timeframe seeds its widest sane window;
+                  widen further if a run still reports 0 trades.
                 </p>
               )}
             </div>

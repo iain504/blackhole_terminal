@@ -3806,3 +3806,55 @@ Stage Summary:
   honesty floor, the hold-out yields with an explanation instead of vanishing, the blocked
   message states the exact bar math, the wizard warns about headroom BEFORE the run, and the
   results panel really does replace the previous view.
+
+---
+Task ID: POST-2.2.1-SWING-ZERO
+Agent: main
+Task: "For Swing Trade backtest, no symbol can backtest and have trade in result" → v2.2.2
+
+Work Log:
+- DIAGNOSED (scripts/probe-swing-zero.ts, real Binance bars through the app's own getBars):
+  the swing ENGINE was healthy on crypto (31-157 trades on BTC/ETH/SOL at 1h/4h/1D) — the
+  zero-trade report is a WARMUP-vs-WINDOW starvation that hits exactly the non-crypto path.
+  The v2.2.0 swing warmup converted the trend length into entry bars with the raw tf ratio
+  (trendSec/entrySec), silently assuming the entry chart prints 24 hourly bars per DAY — true
+  for 24/7 crypto, FALSE for stocks (RTH ≈7 hourly / ~2 four-hourly / 1 daily bar per day).
+  On TSLA 1h it demanded 1,202 bars of warmup while the wizard's 180d seed carries ~900 →
+  `if (i < warmup) continue` skipped EVERY bar → 0 trades, 0 signals, zero explanation on
+  every stock symbol; 4h (302 vs ~256) and 1D (352 vs ~128) starved too, and the wizard kept
+  180d when switching entry TFs (1D needs ≈50 WEEKLY buckets ≈ 1.4y).
+- FIX 1 (src/lib/backtest.ts) — DATA-DRIVEN swing warmup: warmup is now the first bar where
+  the rawDecide guard set can actually decide — kt >= trendLen (SMA on the AGGREGATED trend
+  series, whose bucket count follows TRADING time), km >= RSI period, i >= rp+2 — each found
+  by binary search over the monotone HTF index sequence (new firstBarWhere lower_bound
+  helper). Exact on any feed/calendar/density: crypto values nearly unchanged (1202→1204,
+  302→301, 352→356 — trade counts identical, day lane untouched); stock-shaped synthetic
+  series drop 352→51 (1D), 302→101 (4h) and trades immediately fire.
+- FIX 2 (backtest.ts BacktestMetrics.zeroTrade) — honest zero-trade attribution: when a run
+  closes no trades the engine now reports { code: warmup|no-signal|filtered, message,
+  evaluableBars, rawSignals } — warmup starvation (with the exact bucket math), conditions
+  never aligned, or every signal filtered (crypto long-only shorts / dust / cooldown counts).
+- FIX 3 (studio-state.ts) — swingSeedDays per entry TF (1h→365d · 4h→730d · 1D→1825d, all ≤
+  feed caps) replaces the flat 180d seed; estimateBars 1D-stock branch (5/7 per calendar day)
+  stops understating daily windows 2.6×.
+- FIX 4 (BacktestStudio.tsx) — lane-aware days chips (swing row 90–1825d); pickTf in swing
+  re-seeds to the TF's depth (never below a deeper user pick); day→swing raises the window to
+  the seed; swing note under the ≈bars hint explains the higher-TF warmup and why stocks need
+  calendar depth.
+- FIX 5 (BacktestPanel.tsx) — amber "0 trades — <reason>" banner renders metrics.zeroTrade
+  verbatim above the metric tiles; generic dashed "no trades" note now only shows when the
+  engine had no more specific reason.
+- Verified: probe matrix (3 crypto symbols × 3 TFs × 180d/max + starved cases) — crypto trade
+  counts byte-identical pre/post fix, zeroTrade banner fires with correct code + message on
+  starved synthetic series (stock-shaped 7-bar/day 1h needs 63 1D buckets for
+  htf-level-bounce → banner, not silence). Version → 2.2.2 (stamped +211).
+
+Files: src/lib/backtest.ts, src/components/terminal/tabs/backtest/studio-state.ts,
+src/components/terminal/tabs/backtest/BacktestStudio.tsx, src/components/terminal/tabs/BacktestPanel.tsx,
+scripts/probe-swing-zero.ts (new), package.json (2.2.2), src/generated/version.ts.
+
+Stage Summary:
+- v2.2.2 — swing backtests trade on every asset class: the warmup is measured from the data
+  instead of assuming a 24/7 clock, the wizard seeds and re-seeds calendar-depth windows per
+  timeframe, and a zero-trade result always says WHY (window too short / conditions never
+  aligned / signals filtered) instead of silently returning an empty table.

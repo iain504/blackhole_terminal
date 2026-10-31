@@ -115,10 +115,15 @@ export const laneTfs = (lane: 'day' | 'swing'): readonly AlgoTimeframe[] =>
 
 const tfSec = (tf: AlgoTimeframe): number => TIMEFRAMES[tf]?.seconds ?? 900
 
-/** Spec §2.2 — live "≈ N bars" hint: days × (86400/tfSec) × (crypto 24/7 ? 1 : 0.27). */
-export const estimateBars = (days: number, tf: AlgoTimeframe, isCrypto: boolean): number =>
-  Math.max(0, Math.round(days * (86400 / tfSec(tf)) * (isCrypto ? 1 : 0.27)))
-
+/** Spec §2.2 — live "≈ N bars" hint. Stocks: intraday TFs print ≈27% of clock
+ *  hours (RTH 6.5h/24h ≈ 0.27); 1D prints ≈5 bars per 7 calendar days. Crypto
+ *  trades 24/7 so the full clock ratio applies. (v2.2.2 — the 1D stock branch:
+ *  the old 0.27× clock formula said 0.27 bars/day where reality is ~0.71 —
+ *  the hint understated a 5-year daily window by 2.6×.) */
+export const estimateBars = (days: number, tf: AlgoTimeframe, isCrypto: boolean): number => {
+  if (tf === '1D' && !isCrypto) return Math.max(0, Math.round(days * (5 / 7)))
+  return Math.max(0, Math.round(days * (86400 / tfSec(tf)) * (isCrypto ? 1 : 0.27)))
+}
 export const fmtBars = (n: number): string => (n >= 10000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : n.toLocaleString('en-US'))
 
 /** Resolved MTF ladder labels for a swing entry TF (FROZEN maps, §1.1). */
@@ -150,6 +155,21 @@ const SWING_RISK_SEED = {
 }
 
 /**
+ * v2.2.2 — recommended history window per swing entry TF (calendar days).
+ * The swing trend screen is an SMA(50) on the AGGREGATED daily/weekly series,
+ * and stocks print only ~7 hourly / ~2 four-hourly / 1 daily bar per day — a
+ * 180-day window (the v2.2.0 seed) carries ~900 hourly bars on TSLA but the
+ * trend screen needs ≈50 CLOSED daily buckets, and the 1D entry lane needs
+ * ≈50 WEEKLY buckets ≈ 1.4 years. These seeds keep a healthy evaluable
+ * window on BOTH asset classes (crypto prints 24 bars/day and is never
+ * starved) and all fit the step-② days-chip row:
+ *   1h → 365d (stocks ≈1.8k bars) · 4h → 730d (≈1.0k) · 1D → 1825d (≈1.3k)
+ * All are ≤ algoMaxDays caps (500 / 1095 / 1825), so the route never clamps.
+ */
+export const swingSeedDays = (entryTf: AlgoTimeframe): number =>
+  entryTf === '1D' ? 1825 : entryTf === '4h' ? 730 : 365
+
+/**
  * Seed the wizard from the shared run setup (spec §2.1 sync rules).
  * `lane` overrides the lane (used by "Reset to defaults" to keep the lane);
  * `keep` preserves user-entered fields across a lane reset (symbol, capital…).
@@ -167,7 +187,9 @@ export function makeStudioState(cfg: AlgoSetupCfg, lane?: 'day' | 'swing', keep?
       entryTf,
       strategy,
       params: normalizeAlgoParams(strategy, ALGO_STRATEGIES[strategy].defaults),
-      days: String(Math.min(180, algoMaxDays(entryTf, symbol.includes('/')))),
+      // v2.2.2 — deep per-TF seed (was a flat 180d, which starved stocks:
+      // ~7 hourly bars/day meant the trend screen never finished its warmup)
+      days: String(swingSeedDays(entryTf)),
       capital: keep?.capital ?? '10000',
       lev: keep?.lev ?? '1',
       ...SWING_RISK_SEED,

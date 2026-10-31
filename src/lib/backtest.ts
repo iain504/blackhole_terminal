@@ -225,6 +225,16 @@ export interface BacktestMetrics {
   // half + slippage impact + fee; resting TP limit legs count at their fee
   // only). A round trip ≈ 2× this. Compare against live fills later.
   avgFillCostBps?: number
+  // v2.2.2 — WHY a run produced zero closed trades (null/absent otherwise).
+  // The UI renders `message` verbatim so a starved window or an all-filtered
+  // signal stream never reads as a broken engine:
+  //   warmup    — the dataset ends before the indicator warmup does (the
+  //               classic stocks-swing starvation: ~7 hourly bars/day vs a
+  //               calendar-naive expected 24)
+  //   no-signal — warmup fine, but the entry screens never aligned
+  //   filtered  — raw signals existed but every one was dropped (crypto
+  //               long-only shorts, dust, cooldown, Kronos gate vetoes…)
+  zeroTrade?: { code: 'warmup' | 'no-signal' | 'filtered'; message: string; evaluableBars: number; rawSignals: number } | null
 }
 
 export interface BacktestResult {
@@ -312,6 +322,22 @@ interface Dec {
   exit: string | null
 }
 const NONE: Dec = { entry: null, exit: null }
+
+/** v2.2.2 — lower_bound over bar indices for a MONOTONE predicate (must be
+ *  false…false → true…true across ascending i; HTF index reads qualify since
+ *  bar times ascend and the last-completed-bucket index only grows). Returns
+ *  n when the predicate never holds — the caller treats that as "warmup
+ *  exceeds the dataset" (honest zero-trade starvation, reported, not hidden). */
+function firstBarWhere(bars: Bar[], n: number, ok: (i: number) => boolean): number {
+  let lo = 0
+  let hi = n
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (ok(mid)) hi = mid
+    else lo = mid + 1
+  }
+  return lo
+}
 
 export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): BacktestResult {
   const { bars, n, dayIdx, minutes, rth, ps, ps2, adx, hl, atrPct, atrBase } = series
@@ -425,19 +451,34 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let warmup = 1
   if (strategy === 'bb-reversion') warmup = Math.max(5, Math.round(params.bbPeriod ?? 20)) + 1
   if (strategy === 'rsi2-connors') warmup = Math.max(10, Math.round(params.trendSma ?? 200)) + 1
-  // v2.2.0 — swing warmup in ENTRY-TF bars (spec §1.4): the largest of the
-  // entry-TF RSI window (+2), the trend SMA expressed in entry bars (+2) and
-  // the pivot scan depth expressed in entry bars (+2) — each as applicable
-  // to the strategy. The rawDecide guards below still decide per-bar, so
-  // this mostly shapes result.warmupBars / the evaluable window.
-  if (swingLane && trendSec > 0 && entrySec > 0) {
-    const ratio = trendSec / entrySec
-    const trendWarm = Math.ceil(Math.max(10, Math.round(params.trendSma ?? 50)) * ratio) + 2
+  // v2.2.2 — DATA-DRIVEN swing warmup. The v2.2.0 formula converted the trend
+  // length into entry bars with the raw tf ratio (trendSec/entrySec), which
+  // silently assumes the entry chart prints trendSec/entrySec bars per trend
+  // bucket — true for crypto (24×1h per day), FALSE for stocks (RTH only:
+  // ~7 hourly / ~2 four-hourly / 1 daily bar per day). On TSLA 1h it demanded
+  // 1,202 bars of warmup while the wizard's 180d seed carries ~900 — EVERY bar
+  // was skipped and the run returned zero trades with zero explanation
+  // (user: "no symbol can backtest and have trade in result").
+  // What actually gates the first decision is the rawDecide guard set:
+  //   kt >= trendLen (trend SMA defined on the AGGREGATED series — its bucket
+  //                  count follows TRADING time, not clock time),
+  //   km >= rsi period (mid RSI defined),
+  //   i >= rp + 2 (entry-TF RSI warmup).
+  // Both HTF index sequences are monotone in the bar time, so the first bar
+  // satisfying each is found by binary search and warmup is their max — exact
+  // on any feed, any session calendar, any bar density. (Day-lane warmups are
+  // untouched.) swingNeedTrend also feeds the zero-trade reason below.
+  let swingNeedTrend = 0
+  if (swingLane && trendSec > 0) {
+    const trendLenW = Math.max(10, Math.round(params.trendSma ?? 50))
+    swingNeedTrend = strategy === 'htf-level-bounce'
+      ? Math.max(trendLenW, Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3)))
+      : trendLenW
+    const mRpW = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) : 14
+    const firstKt = firstBarWhere(bars, n, (i) => htfIndexAt(bars[i].time, trendAgg, trendSec) >= swingNeedTrend)
+    const firstKm = firstBarWhere(bars, n, (i) => htfIndexAt(bars[i].time, midAgg, midSec) >= mRpW)
     const entryRsiWarm = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) + 2 : 0
-    const pivotWarm = strategy === 'htf-level-bounce'
-      ? Math.ceil((Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3))) * ratio) + 2
-      : 0
-    warmup = Math.max(1, trendWarm, entryRsiWarm, pivotWarm)
+    warmup = Math.max(1, firstKt, firstKm, entryRsiWarm)
   }
 
   // ---- Task 84 cost model · Task 85 spread · Task 12 vol-scaled impact ----
@@ -1208,6 +1249,41 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   const losses = evaluated - wins
   const netPnl = cash - cfg.capital
   const spanSec = n > warmup ? bars[n - 1].time - bars[warmup].time : 0
+  // v2.2.2 — zero-trade honesty: when a run closes no trades (and carries no
+  // open-at-end position), attribute WHY so the UI can act instead of shrug.
+  // evaluableBars = decided-bar count; rawSignals = raw entries the strategy
+  // produced on those bars (regime stats count them even with gates off).
+  let zeroTrade: BacktestMetrics['zeroTrade'] = null
+  if (evaluated === 0 && !openAtEnd) {
+    const evaluable = Math.max(0, n - warmup)
+    const rawSignals = regStats.signals
+    if (evaluable <= 0) {
+      zeroTrade = {
+        code: 'warmup',
+        evaluableBars: 0,
+        rawSignals,
+        message: swingLane
+          ? `History window too short for the ${mtfTrendLabel} trend screen — the first decision needs ≈${swingNeedTrend} CLOSED ${mtfTrendLabel} bars (SMA on the aggregated trend series) plus the confirm-TF RSI, but ${n.toLocaleString('en-US')} ${mtfEntryLabel || 'entry'} bars cover fewer. Widen the history window (stocks print ~7 hourly / ~1 daily bar per day — swing needs real calendar depth) or switch to a faster entry timeframe.`
+          : `History window too short — the indicator warmup needs ${warmup.toLocaleString('en-US')} bars, the fetch returned only ${n.toLocaleString('en-US')}. Widen the history window.`,
+      }
+    } else if (rawSignals === 0) {
+      zeroTrade = {
+        code: 'no-signal',
+        evaluableBars: evaluable,
+        rawSignals: 0,
+        message: swingLane
+          ? `Warmup ok — ${evaluable.toLocaleString('en-US')} evaluable ${mtfEntryLabel || ''} bars — but the MTF entry screens never aligned (trend bias + confirm-TF RSI band + entry trigger). Try a longer window, more symbols, or looser params (entryRsi / RSI band / level proximity).`
+          : `Warmup ok — ${evaluable.toLocaleString('en-US')} evaluable bars — but the entry conditions never fired in this window. Try a longer window, more symbols, or looser params.`,
+      }
+    } else {
+      zeroTrade = {
+        code: 'filtered',
+        evaluableBars: evaluable,
+        rawSignals,
+        message: `${rawSignals.toLocaleString('en-US')} raw signal(s) never became a trade — shorts skipped on long-only crypto: ${skippedShorts.toLocaleString('en-US')} · session/dust/cooldown/cap suppressed: ${suppressed.toLocaleString('en-US')} · Kronos gate vetoes: ${gateVetoed.toLocaleString('en-US')}${cfg.isCrypto ? '. Alpaca crypto cannot short — a long-only stretch with no pullback leaves zero trades.' : '.'}`,
+      }
+    }
+  }
   const metrics: BacktestMetrics = {
     trades: evaluated,
     wins,
@@ -1243,6 +1319,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     gateVetoed,
     // Review P3 #12 — realized execution cost per fill (0 when frictionless)
     avgFillCostBps: costFills > 0 ? costBpsSum / costFills : 0,
+    // v2.2.2 — honest zero-trade reason (null when trades exist)
+    zeroTrade,
   }
   return { metrics, trades, equity: collectEquity ? equity : [], warmupBars: warmup }
 }

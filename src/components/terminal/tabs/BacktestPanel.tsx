@@ -26,7 +26,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import dynamic from 'next/dynamic'
 import {
-  FlaskConical, RefreshCw, TrendingDown, Table2, Wand2, ChevronDown, ChevronUp, Check, Dices, ShieldCheck, Zap, Repeat, Sparkles,
+  FlaskConical, RefreshCw, TrendingDown, Table2, Wand2, ChevronDown, ChevronUp, Check, Dices, ShieldCheck, Zap, Repeat, Sparkles, TriangleAlert,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -1110,6 +1110,21 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       {/* single-run result */}
       {runRes && m && (
         <>
+          {/* v2.2.2 — zero-trade honesty: the engine attributes WHY a run
+              closed no trades (warmup starvation / no aligned signal / every
+              signal filtered). Rendered verbatim so 0 trades is always an
+              actionable diagnosis, never a silent shrug. */}
+          {m.zeroTrade && (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2.5" role="alert">
+              <div className="flex flex-wrap items-center gap-2">
+                <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-amber-300">
+                  0 trades — {m.zeroTrade.code === 'warmup' ? 'history window too short' : m.zeroTrade.code === 'no-signal' ? 'entry conditions never aligned' : 'every signal was filtered'}
+                </span>
+              </div>
+              <p className="mt-1 text-[11px] leading-snug text-zinc-300">{m.zeroTrade.message}</p>
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <Metric label="Net P&L" value={fmtUsd(m.netPnl)} sub={fmtPct(m.netPct)} cls={pnlColor(m.netPnl)} />
             <Metric label="Win rate" value={`${m.winRate.toFixed(1)}%`} sub={`${m.wins}W / ${m.losses}L`} cls="text-zinc-100" />
@@ -1398,7 +1413,10 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </div>
             </div>
           )}
-          {runRes.trades.length === 0 && (
+          {/* v2.2.2 — only the generic fallback when the engine had no more
+              specific reason to give (zeroTrade banner above covers the
+              attributed cases: warmup starvation / no signal / all filtered) */}
+          {runRes.trades.length === 0 && !m.zeroTrade && (
             <p className="rounded-md border border-dashed border-zinc-800 bg-zinc-900/40 px-3 py-4 text-center text-xs text-zinc-500">
               No trades fired with this configuration — try wider TP/SL, a higher daily cap, different parameters or a longer period.
             </p>
