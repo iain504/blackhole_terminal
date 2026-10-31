@@ -23,10 +23,11 @@
 //     walk-forward out-of-sample (OOS) re-run and grid-boundary flags, sizing
 //     is leverage-honest (Lev = maxNotionalX), crypto short-skips are reported
 //     as meta, and recharts moved behind next/dynamic (BacktestCharts.tsx).
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import dynamic from 'next/dynamic'
 import {
   FlaskConical, RefreshCw, SlidersHorizontal, TrendingUp, TrendingDown, Table2, Wand2, Zap, Sparkles, Check, Repeat, Dices, ShieldCheck,
+  Bot, Coins, Database, ChevronDown, ChevronUp, Rocket, type LucideIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -109,6 +110,18 @@ interface BacktestMeta {
 }
 
 interface RangeState { on: boolean; min: string; max: string; step: string }
+
+// v2.1.0 — Backtest Studio: the validation depth picked in step ④. ONE CTA
+// runs the whole pipeline for the chosen level head-to-end (the old five
+// sibling buttons collapse into this picker).
+export type BtLevel = 'quick' | 'wf' | 'sweep' | 'kronos'
+
+const LEVEL_META: Record<BtLevel, { mode: 'run' | 'walkforward' | 'sweep' | 'kronos-ab'; flow: BtFlowMode; label: string; time: string }> = {
+  quick: { mode: 'run', flow: 'run', label: 'Quick check', time: 'seconds' },
+  wf: { mode: 'walkforward', flow: 'walkforward', label: 'Walk-forward', time: 'minutes' },
+  sweep: { mode: 'sweep', flow: 'sweep', label: 'Sweep all strategies', time: 'minutes' },
+  kronos: { mode: 'kronos-ab', flow: 'kronos-ab', label: 'Kronos AI A/B', time: '≈5 min first run' },
+}
 
 const fmtUsd = (v: number) =>
   (Math.abs(v) >= 1000 ? `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString('en-US', { maximumFractionDigits: 0 })}` : `${v < 0 ? '-' : ''}$${Math.abs(v).toFixed(2)}`)
@@ -352,6 +365,20 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [trailAbBusy, setTrailAbBusy] = useState(false)
   // win/loss breakdown granularity (Task 71-2)
   const [wlGran, setWlGran] = useState<BtGran>('hour')
+
+  // v2.1.0 — BACKTEST STUDIO rewiring: one guided pipeline instead of five
+  // sibling buttons. `level` is the step-④ choice; the CTA posts its mode;
+  // the flow chart is always on stage (idle → blinking → golden); disclosures
+  // keep the rare knobs (fine-tune, auto-tune grid, fill-model docs, reco
+  // table) out of the main sightline. jumpTo() powers the step rail.
+  const [level, setLevel] = useState<BtLevel>('wf')
+  const [fineOpen, setFineOpen] = useState(false)
+  const [fmOpen, setFmOpen] = useState(false)
+  const [recosOpen, setRecosOpen] = useState(false)
+  const secRef = useRef<Record<'s1' | 's2' | 's3' | 's4' | 'res', HTMLDivElement | null>>({ s1: null, s2: null, s3: null, s4: null, res: null })
+  const jumpTo = (k: 's1' | 's2' | 's3' | 's4' | 'res') => {
+    secRef.current[k]?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 
   const def = ALGO_STRATEGIES[cfg.strategy]
 
@@ -720,8 +747,14 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       // Task 15 — heavy modes come back as 202 {jobId}: poll to completion
       if (res.status === 202 && json?.jobId) {
         const ok = await pollJob(mode, String(json.jobId))
-        if (ok) setFlowDone(true)
-        else setFlowError(true)
+        if (ok) {
+          setFlowDone(true)
+          // v2.1.0 — head-to-end: when the pipeline lands, take the user to it
+          setTimeout(() => jumpTo('res'), 400)
+        } else {
+          setFlowError(true)
+          setTimeout(() => jumpTo('s4'), 400)
+        }
         return
       }
       if (!res.ok) {
@@ -732,6 +765,8 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       }
       applyResult(mode, json)
       setFlowDone(true)
+      // v2.1.0 — head-to-end: land on the result when the run completes
+      setTimeout(() => jumpTo('res'), 400)
     } catch {
       setError('Network error')
       setFlowError(true)
@@ -856,6 +891,20 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     return null
   }
 
+  // v2.1.0 — one-click default grid: tick every numeric strategy parameter at
+  // its native min→max:step so Walk-forward is runnable straight from the
+  // studio CTA without a detour through Auto-tune (gate-inert dims are still
+  // sent; the engine drops them and the UI flags them inline).
+  const useDefaultGrid = () => {
+    const next: Record<string, RangeState> = {}
+    for (const p of def.params) {
+      if (p.bool) continue
+      next[p.key] = { on: true, min: String(p.min), max: String(p.max), step: String(p.step) }
+    }
+    setRanges(next)
+    toast({ title: 'Default grid armed', description: `${Object.keys(next).length} parameters will be re-optimized on every walk-forward fold — narrow them in Auto-tune if you want a smaller search.` })
+  }
+
   // downsample the equity curve for the chart
   const eqData = useMemo(() => {
     const pts = runRes?.equity ?? []
@@ -878,6 +927,21 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const sizingOk = cfg.sizingMode === 'risk'
     ? riskBudget > 0 && cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0
     : cfg.qty > 0
+
+  // v2.1.0 — studio helpers: the data-window cap for step ① chips + read-only
+  // chips summarizing the shared run setup (strategy params, brackets,
+  // session guards, sizing) so step ② reads at a glance
+  const maxDays = algoMaxDays(cfg.timeframe as AlgoTimeframe, cfg.symbol.includes('/'))
+  const paramChips = def.params.slice(0, 8).map((p) => ({ label: p.label, value: paramsStr(cfg.params[p.key]) }))
+  const setupChips: { label: string; value: string }[] = [
+    { label: 'TP', value: cfg.tpMode === 'none' ? 'off' : cfg.tpMode === 'atr' ? `${cfg.tpValue ?? '—'}×ATR` : `${cfg.tpValue ?? '—'}%` },
+    { label: 'SL', value: cfg.slMode === 'none' ? 'off' : cfg.slMode === 'atr' ? `${cfg.slValue ?? '—'}×ATR` : `${cfg.slValue ?? '—'}%` },
+    { label: 'Trail', value: cfg.trailMode === 'pct' ? `arm ${cfg.trailArmPct ?? '—'}% · give ${cfg.trailGivePct ?? '—'}%` : 'off' },
+    { label: 'RTH only', value: cfg.rthOnly ? 'on' : 'off' },
+    { label: 'EOD flatten', value: cfg.flattenEod ? 'on' : 'off' },
+    { label: 'Max/day', value: String(cfg.maxTradesDay) },
+    { label: 'Sizing', value: cfg.sizingMode === 'risk' ? (cfg.riskBasis === 'pct' ? `risk ${cfg.riskMoneyPct ?? '—'}% eq` : `risk $${cfg.riskMoney ?? '—'}`) : `qty ${cfg.qty}` },
+  ]
 
   // fixed win/loss buckets by EXIT time (America/New_York, Task 71-2) —
   // zero-count buckets stay visible so the shape of the day/week/year reads true
@@ -902,35 +966,92 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
 
   return (
     <div className="flex flex-col gap-2">
-      {/* ---- run configuration (shared) + backtest period ---- */}
+      {/* ==== v2.1.0 BACKTEST STUDIO — one guided pipeline, head to end ====
+          The old flat 8-input grid + five sibling buttons became four numbered,
+          illustrated steps: ① market & data ② strategy & rules ③ costs &
+          realism ④ validate & run. The flow chart is always on stage in ④
+          (idle → blinking → golden) and ONE button runs the chosen validation
+          from fetch to golden result. Every control that existed before still
+          exists — grouped, with the rare ones collapsed into disclosures. */}
       <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
         <div className="flex flex-wrap items-center gap-2">
           <FlaskConical className="h-4 w-4 text-violet-400" aria-hidden />
-          <span className="text-sm font-semibold text-zinc-100">Backtest</span>
+          <span className="text-sm font-semibold text-zinc-100">Backtest Studio</span>
           <Badge variant="outline" className="text-[10px] text-zinc-400">
             {def.name} · {cfg.symbol || '—'} {cfg.timeframe}
           </Badge>
-          <span className="ml-auto text-[11px] text-zinc-500">same config as the run setup on the left</span>
+          <span className="ml-auto text-[11px] text-zinc-500">same strategy config as the run setup</span>
         </div>
 
-        <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <div>
+        {/* step rail — click to jump */}
+        <nav aria-label="Backtest steps" className="mt-2 flex flex-wrap items-center gap-1">
+          {([
+            { k: 's1', label: 'Market & data' },
+            { k: 's2', label: 'Strategy & rules' },
+            { k: 's3', label: 'Costs & realism' },
+            { k: 's4', label: 'Validate & run' },
+          ] as const).map((s, i) => (
+            <span key={s.k} className="flex items-center gap-1">
+              {i > 0 && <span className="px-0.5 text-zinc-700" aria-hidden>→</span>}
+              <button
+                type="button"
+                onClick={() => jumpTo(s.k)}
+                className="flex items-center gap-1.5 rounded-full border border-zinc-800 bg-zinc-950/80 px-2.5 py-1 text-[10px] text-zinc-400 transition-colors hover:border-zinc-600 hover:text-zinc-200"
+              >
+                <span className="grid h-4 w-4 place-items-center rounded-full bg-violet-500/25 text-[9px] font-bold text-violet-300">{i + 1}</span>
+                {s.label}
+              </button>
+            </span>
+          ))}
+        </nav>
+
+        {/* ---- STEP 1 · market & data ---- */}
+        <StepCard
+          refEl={(el) => { secRef.current.s1 = el }}
+          n={1}
+          icon={Database}
+          tone="bg-emerald-500/15 text-emerald-400"
+          title="Market & data"
+          sub="what to replay, how far back, how big the simulated account is"
+          status={`${cfg.symbol || '—'} · ${cfg.timeframe} · last ${days}d`}
+        >
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <div className="col-span-2 sm:col-span-1">
             <Label htmlFor="bt-days" className="text-[10px] text-zinc-500">
-              History (calendar days)
-              <span className="ml-1 text-zinc-600">· max {algoMaxDays(cfg.timeframe as AlgoTimeframe, cfg.symbol.includes('/'))} for {cfg.timeframe}</span>
+              History (days)
+              <span className="ml-1 text-zinc-600">· max {maxDays} for {cfg.timeframe}</span>
             </Label>
-            <Input
-              id="bt-days"
-              value={days}
-              onChange={(e) => setDays(e.target.value)}
-              onBlur={() => {
-                const n = Math.round(Number(days) || 30)
-                const max = algoMaxDays(cfg.timeframe as AlgoTimeframe, cfg.symbol.includes('/'))
-                setDays(String(Math.min(max, Math.max(1, n))))
-              }}
-              inputMode="numeric"
-              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
-            />
+            <div className="mt-1 flex flex-wrap items-center gap-1">
+              {[7, 30, 60, 90, 200].map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  disabled={d > maxDays}
+                  onClick={() => setDays(String(d))}
+                  aria-pressed={Math.round(Number(days) || 0) === d}
+                  title={d > maxDays ? `beyond the ${maxDays}-day feed cap for ${cfg.timeframe}` : `last ${d} days`}
+                  className={cn(
+                    'h-7 rounded border px-2 text-[10px] tabular-nums transition-colors',
+                    Math.round(Number(days) || 0) === d
+                      ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300'
+                      : d > maxDays
+                        ? 'border-zinc-800/60 text-zinc-700'
+                        : 'border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800',
+                  )}
+                >
+                  {d}d
+                </button>
+              ))}
+              <Input
+                id="bt-days"
+                value={days}
+                onChange={(e) => setDays(e.target.value)}
+                onBlur={() => setDays(String(Math.min(maxDays, Math.max(1, Math.round(Number(days) || 30)))))}
+                inputMode="numeric"
+                aria-label="History in calendar days (custom)"
+                className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs"
+              />
+            </div>
             {cfg.symbol.includes('/') && (
               <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">crypto: ≈104d on 15m / 35d on 5m (Alpaca crypto feed) · 1m caps at 45d (24/7 bars ≈ 6× stock count)</p>
             )}
@@ -960,17 +1081,74 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             />
             <p className="mt-0.5 text-[9px] leading-tight text-zinc-600">notional cap per position — 1 = no leverage</p>
           </div>
-          <div>
-            <Label htmlFor="bt-cooldown" className="text-[10px] text-zinc-500">Cooldown after close (min)</Label>
-            <Input
-              id="bt-cooldown"
-              value={btCooldown}
-              onChange={(e) => setBtCooldown(e.target.value)}
-              onBlur={() => setBtCooldown(String(Math.min(240, Math.max(0, Math.round(Number(btCooldown) || 0)))))}
-              inputMode="numeric"
-              className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
-            />
           </div>
+        </StepCard>
+
+        {/* ---- STEP 2 · strategy & rules ---- */}
+        <StepCard
+          refEl={(el) => { secRef.current.s2 = el }}
+          n={2}
+          icon={Bot}
+          tone="bg-amber-500/15 text-amber-400"
+          title="Strategy & rules"
+          sub="the shared run setup at a glance — re-entry rules are tuned right here"
+          status={def.name}
+        >
+          <div className="flex flex-wrap gap-1.5">
+            {paramChips.map((c) => (
+              <span key={c.label} className="rounded border border-zinc-800 bg-zinc-900/80 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                {c.label} <span className="tabular-nums text-zinc-200">{c.value}</span>
+              </span>
+            ))}
+            {setupChips.map((c) => (
+              <span
+                key={c.label}
+                className={cn(
+                  'rounded border px-1.5 py-0.5 text-[10px]',
+                  c.value === 'off' ? 'border-zinc-800/70 bg-zinc-900/50 text-zinc-600' : 'border-zinc-800 bg-zinc-900/80 text-zinc-400',
+                )}
+              >
+                {c.label} <span className="tabular-nums text-zinc-200">{c.value}</span>
+              </span>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[10px] leading-snug text-zinc-600">
+            Strategy, quantity, TP/SL brackets, trailing exit and sizing live in the <span className="text-zinc-400">Run setup</span> — tune them there and they
+            mirror 1:1 into every backtest below. The two re-entry rules are backtest-local.
+          </p>
+          <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div>
+              <Label htmlFor="bt-cooldown" className="text-[10px] text-zinc-500">Cooldown after close (min)</Label>
+              <Input
+                id="bt-cooldown"
+                value={btCooldown}
+                onChange={(e) => setBtCooldown(e.target.value)}
+                onBlur={() => setBtCooldown(String(Math.min(240, Math.max(0, Math.round(Number(btCooldown) || 0)))))}
+                inputMode="numeric"
+                className="h-8 mt-1 border-zinc-800 bg-zinc-950 text-xs"
+              />
+            </div>
+            <div className="flex flex-col justify-between">
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="bt-fresh" className="text-[10px] leading-tight text-zinc-500">Require fresh signal</Label>
+                <Switch id="bt-fresh" checked={btFresh} onCheckedChange={setBtFresh} className="scale-90" />
+              </div>
+              <p className="text-[9px] leading-tight text-zinc-600">edge-triggered re-entry — wait for a new cross</p>
+            </div>
+          </div>
+        </StepCard>
+
+        {/* ---- STEP 3 · costs & realism ---- */}
+        <StepCard
+          refEl={(el) => { secRef.current.s3 = el }}
+          n={3}
+          icon={Coins}
+          tone="bg-orange-500/15 text-orange-400"
+          title="Costs & realism"
+          sub="what the market charges per fill — start honest, not frictionless"
+          status={`${btSlip}/${btFee}/${btSpread} bps slip·fee·spread`}
+        >
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <div>
             <div className="flex items-center justify-between">
               <Label htmlFor="bt-slip" className="text-[10px] text-zinc-500">Slippage (bps)</Label>
@@ -1041,13 +1219,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
           </div>
           <div className="flex flex-col justify-between">
             <div className="flex items-center justify-between gap-2">
-              <Label htmlFor="bt-fresh" className="text-[10px] leading-tight text-zinc-500">Require fresh signal</Label>
-              <Switch id="bt-fresh" checked={btFresh} onCheckedChange={setBtFresh} className="scale-90" />
-            </div>
-            <p className="text-[9px] leading-tight text-zinc-600">edge-triggered re-entry — wait for a new cross</p>
-          </div>
-          <div className="flex flex-col justify-between">
-            <div className="flex items-center justify-between gap-2">
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Label htmlFor="bt-dynslip" className="w-fit cursor-help text-[10px] leading-tight text-zinc-500 underline decoration-dotted decoration-zinc-600 underline-offset-2">
@@ -1063,7 +1234,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             <p className="text-[9px] leading-tight text-zinc-600">impact breathes with volatility — high-ATR bars pay more</p>
           </div>
           {/* Review P0 #2 / P1 #6 — one-click regime presets (discovery vs realism) */}
-          <div className="col-span-2 sm:col-span-4">
+          <div className="sm:col-span-3">
             <Label className="text-[10px] text-zinc-500">Regime preset</Label>
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               {(Object.keys(ALGO_REGIME_PRESETS) as AlgoRegimePresetId[]).map((id) => {
@@ -1099,149 +1270,186 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               </span>
             </div>
           </div>
-          <div className="col-span-2 flex items-end sm:col-span-4">
-            <p className="text-[10px] leading-snug text-zinc-500">
-              Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Vol-scaled slip multiplies the impact by the bar's ATR% vs the dataset average (clamped 0.5–3×). Regime gates (200-SMA trend — hard or soft ±% — / ADX chop / half-life) veto entries that fight the regime; they live in the strategy parameters, are mirrored 1:1 by the live engine, and every run reports how many signals each gate blocked. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
-              {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
-                <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
-              )}
-              {cfg.sizingMode === 'risk' && !(cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0) && (
-                <> <span className="text-amber-400">Risk Money sizing needs an SL % — turn Stop loss % ON in the run setup.</span></>
-              )}
+          <div className="sm:col-span-3">
+            <button
+              type="button"
+              onClick={() => setFmOpen((v) => !v)}
+              aria-expanded={fmOpen}
+              className="flex w-full items-center gap-1.5 text-left text-[10px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
+            >
+              <ChevronDown className={cn('h-3 w-3 shrink-0 transition-transform', fmOpen && 'rotate-180')} aria-hidden />
+              How fills, costs & regime gates are modeled — read before trusting a number
+            </button>
+            {fmOpen && (
+              <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
+                Fill model: entries at next-bar open · TP/SL intrabar (stop first) · strategy exits at bar close · EOD flatten fills at the 15:45 ET gate bar's OPEN (wall-clock parity with the live 15:45:00 exit — the gate bar's brackets are preempted). Slippage bps = impact beyond the quote on market/stop fills; spread bps = the bid/ask — half is charged per market fill (buys at ask, sells at bid) so a round trip pays it in full; TP is a resting limit and fills clean either way; fee bps charges every fill. Vol-scaled slip multiplies the impact by the bar's ATR% vs the dataset average (clamped 0.5–3×). Regime gates (200-SMA trend — hard or soft ±% — / ADX chop / half-life) veto entries that fight the regime; they live in the strategy parameters, are mirrored 1:1 by the live engine, and every run reports how many signals each gate blocked. Live diverges from ANY replay: entries/exits are market orders seconds after the close, % legs anchor on the fill-side quote (ask for buys, bid for sells — not the actual fill), and bars that closed while the engine was down never produce entries (exits are replayed). The algo journal logs the live spread on every ENTRY line — mirror it here. Paper fills price off SIP while stock bars come from IEX; crypto backtests deeper than ~35d on 5m read Alpaca while live crypto reads Binance. Cooldown blocks entries on bars opening within N minutes after a close; fresh-signal fires only on a false→true cross.
+                {cfg.sizingMode === 'risk' && cfg.slMode === 'pct' && riskBudget > 0 && (
+                  <> Sizing: <span className="text-sky-400/90">Risk Money</span> — every trade is sized to risk ≈ {cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of current equity (compounds with the simulated account)` : `$${cfg.riskMoney}`} to its stop (qty = risk ÷ (open × {cfg.slValue}%)), so size breathes with volatility.</>
+                )}
+                {cfg.sizingMode === 'risk' && !(cfg.slMode === 'pct' && (cfg.slValue ?? 0) > 0) && (
+                  <> <span className="text-amber-400">Risk Money sizing needs an SL % — turn Stop loss % ON in the run setup.</span></>
+                )}
+              </p>
+            )}
+          </div>
+          </div>
+        </StepCard>
+
+        {/* ---- STEP 4 · validate & run ---- */}
+        <StepCard
+          refEl={(el) => { secRef.current.s4 = el }}
+          n={4}
+          icon={ShieldCheck}
+          tone="bg-violet-500/15 text-violet-400"
+          title="Validate & run"
+          sub="pick how hard to test — one button runs the whole pipeline head-to-end"
+          status={LEVEL_META[level].label}
+        >
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-label="Validation depth">
+            <LevelTile active={level === 'quick'} icon={TrendingUp} title="Quick check" time="seconds" desc="One replay of the exact setup over the chosen window — is there an edge at all?" onClick={() => setLevel('quick')} />
+            <LevelTile active={level === 'wf'} icon={Repeat} title="Walk-forward" time="minutes" badge="recommended" desc="Re-optimizes on every fold, verifies out-of-sample, then stresses a pure hold-out tail — the honest one." onClick={() => setLevel('wf')} />
+            <LevelTile active={level === 'sweep'} icon={Zap} title="Sweep all strategies" time="minutes" desc="Every strategy in the catalog at defaults + an auto-built grid, ranked with out-of-sample re-runs." onClick={() => setLevel('sweep')} />
+            <LevelTile active={level === 'kronos'} icon={Sparkles} title="Kronos AI A/B" time="≈5 min first run" desc="Walk-forward AI forecasts gate the entries — ungated vs gated, measured on the same window." onClick={() => setLevel('kronos')} />
+          </div>
+
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
+            <Button
+              className="h-10 gap-2 bg-gradient-to-r from-amber-500 to-yellow-500 px-5 text-sm font-bold text-zinc-950 shadow-[0_0_20px_-6px_rgb(245_158_11/0.6)] hover:from-amber-400 hover:to-yellow-400"
+              disabled={busy !== null || !cfg.symbol || !sizingOk || (level === 'wf' && activeRanges.length === 0)}
+              title={!cfg.symbol
+                ? 'Pick a symbol in the run setup first'
+                : !sizingOk
+                  ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
+                  : level === 'wf' && activeRanges.length === 0
+                    ? 'Walk-forward needs a parameter grid — arm the default grid below'
+                    : `Runs the full ${LEVEL_META[level].label} pipeline: fetch → prepare → … → golden result`}
+              onClick={() => void post(LEVEL_META[level].mode)}
+            >
+              {busy !== null ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+              Run head-to-end
+            </Button>
+            <span className="text-[10px] leading-snug text-zinc-500">
+              {LEVEL_META[level].label} · {cfg.symbol || '—'} {cfg.timeframe} · last {days}d —
+              fetch → prepare → … → <span className="text-yellow-500">golden result</span>, one click
+            </span>
+          </div>
+          {!sizingOk && (
+            <p className="mt-1.5 text-[10px] text-amber-400" role="note">
+              {cfg.sizingMode === 'risk'
+                ? 'Risk Money sizing needs a positive risk budget AND SL % ON in the run setup — the CTA stays disabled until then.'
+                : 'Set a positive quantity in the run setup — the CTA stays disabled until then.'}
             </p>
-          </div>
-        </div>
+          )}
+          {level === 'wf' && activeRanges.length === 0 && sizingOk && (
+            <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-amber-400" role="note">
+              Walk-forward re-optimizes parameters on every fold — arm a grid first:
+              <Button variant="outline" className="h-6 gap-1 border-amber-500/40 px-2 text-[10px] text-amber-300 hover:bg-zinc-800" onClick={useDefaultGrid}>
+                <Wand2 className="h-3 w-3" aria-hidden />
+                Arm default grid
+              </Button>
+              <button type="button" className="text-zinc-500 underline underline-offset-2 hover:text-zinc-300" onClick={() => { setOptOpen(true); setFineOpen(true) }}>
+                or pick ranges in Auto-tune
+              </button>
+            </p>
+          )}
 
-        <div className="mt-2 flex flex-wrap gap-2">
-          <Button
-            className="h-8 gap-2 bg-sky-600 px-3 text-xs text-white hover:bg-sky-500"
-            disabled={busy !== null || !cfg.symbol || !sizingOk}
-            title={!sizingOk ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup') : undefined}
-            onClick={() => void post('run')}
-          >
-            {busy === 'run' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <TrendingUp className="h-3.5 w-3.5" />}
-            Run backtest
-          </Button>
-          <Button
-            variant="outline"
-            className="h-8 gap-2 border-zinc-700 px-3 text-xs text-zinc-200 hover:bg-zinc-800"
-            onClick={() => setOptOpen((v) => !v)}
-            aria-expanded={optOpen}
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5" />
-            Auto-tune parameters {optOpen ? '▲' : '▼'}
-          </Button>
-          <div className="flex items-center gap-1.5">
-            <Button
-              className="h-8 gap-2 bg-violet-600 px-3 text-xs text-white hover:bg-violet-500"
-              disabled={busy !== null || !cfg.symbol || !sizingOk}
-              title={!sizingOk
-                ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
-                : 'Backtest every strategy at its defaults + an auto-tuned parameter grid, then rank the top X winners'}
-              onClick={() => void post('sweep')}
-            >
-              {busy === 'sweep' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-              Test all strategies
-            </Button>
-            <Label htmlFor="bt-topx" className="text-[10px] text-zinc-500" title="How many winning configurations to list (1–20)">Top</Label>
-            <Input
-              id="bt-topx"
-              value={topX}
-              onChange={(e) => setTopX(e.target.value)}
-              onBlur={() => setTopX(String(Math.min(20, Math.max(1, Math.round(Number(topX) || 8)))))}
-              inputMode="numeric"
-              aria-label="Number of sweep winners to list"
-              className="h-8 w-14 border-zinc-800 bg-zinc-950 text-xs"
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Button
-              className="h-8 gap-2 bg-emerald-600 px-3 text-xs text-white hover:bg-emerald-500"
-              disabled={busy !== null || !cfg.symbol || !sizingOk || activeRanges.length === 0}
-              title={!sizingOk
-                ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
-                : activeRanges.length === 0
-                  ? 'Tick parameters in Auto-tune first — walk-forward re-optimizes them on every fold'
-                  : 'Re-optimize on every fold\'s in-sample window, verify out-of-sample per fold, then stress the survivor on a pure hold-out tail'}
-              onClick={() => void post('walkforward')}
-            >
-              {busy === 'walkforward' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Repeat className="h-3.5 w-3.5" />}
-              Walk-forward
-            </Button>
-            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-folds">Folds</Label>
-            <Input
-              id="bt-wf-folds"
-              value={wfFolds}
-              onChange={(e) => setWfFolds(e.target.value)}
-              onBlur={() => setWfFolds(String(Math.min(6, Math.max(2, Math.round(Number(wfFolds) || 3)))))}
-              inputMode="numeric"
-              aria-label="Walk-forward folds (2–6)"
-              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
-            />
-            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-is">IS %</Label>
-            <Input
-              id="bt-wf-is"
-              value={wfIsPct}
-              onChange={(e) => setWfIsPct(e.target.value)}
-              onBlur={() => setWfIsPct(String(Math.min(90, Math.max(50, Math.round(Number(wfIsPct) || 70)))))}
-              inputMode="numeric"
-              aria-label="Walk-forward in-sample share percent"
-              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
-            />
-            <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-ho">Hold-out %</Label>
-            <Input
-              id="bt-wf-ho"
-              value={wfHoldout}
-              onChange={(e) => setWfHoldout(e.target.value)}
-              onBlur={() => setWfHoldout(String(Math.min(40, Math.max(0, Math.round(Number(wfHoldout) || 0)))))}
-              inputMode="numeric"
-              aria-label="Pure hold-out tail percent (0–40)"
-              className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs"
-            />
-            <div className="flex items-center gap-1">
-              <Switch id="bt-wf-anch" checked={wfAnchored} onCheckedChange={setWfAnchored} className="scale-90" aria-label="Anchored walk-forward windows" />
-              <Label htmlFor="bt-wf-anch" className="text-[10px] text-zinc-500" title="Anchored = each fold tunes on everything from the start (expanding IS). Off = rolling fixed-length IS window immediately before each out-of-sample segment.">Anchored</Label>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Button
-              className="h-8 gap-2 border border-amber-500/40 bg-amber-400/10 px-3 text-xs font-semibold text-amber-300 hover:bg-amber-400/20"
-              disabled={busy !== null || !cfg.symbol || !sizingOk}
-              title={!sizingOk
-                ? (cfg.sizingMode === 'risk' ? 'Risk Money needs a positive risk $ / % and SL % ON in the run setup' : 'Set a positive quantity in the run setup')
-                : 'Walk-forward Kronos forecasts over the trailing 900 bars (no look-ahead), then replay this config twice: ungated vs Kronos-gated entries. First run ≈ 5 min of model CPU; repeats are instant (cached verdicts).'}
-              onClick={() => void post('kronos-ab')}
-            >
-              {busy === 'kronos-ab' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-              Kronos gate A/B
-            </Button>
-            <span className="text-[10px] text-zinc-600">does the AI gate help or hurt? walk-forward forecasts (24-bar stride) → gated replay</span>
-          </div>
-        </div>
-
-        {/* ---- v1.99.1 — pipeline flow chart (replaces the bare % line) ----
-            Heavy modes: real server phases from the job poll. Inline run:
-            client-side estimate finalized by the response. Either way the
-            chart stays on screen after the run — all green + golden result. */}
-        {flowMode && (
-          <BacktestFlowChart
-            mode={flowMode}
-            activePhase={flowDone
+        {/* ---- v1.99.1 flow chart, v2.1.0 ALWAYS on stage ----
+            Idle (nothing ran yet): the chosen level's pipeline drawn as pending
+            nodes — the step-by-step illustration. Running: real server phases
+            (or the client-side estimate for inline runs) blink through.
+            Finished: all green + golden result — it stays until the next run. */}
+        <BacktestFlowChart
+          mode={flowMode ?? LEVEL_META[level].flow}
+          activePhase={!flowMode && busy === null
+            ? null
+            : flowDone
               ? null
               : busy === 'run'
                 ? runHint
                 : flowError
                   ? lastPhaseRef.current
                   : (job?.phase ?? 'fetch')}
-            finished={flowDone}
-            failed={flowError}
-            frac={busy === 'run' ? undefined : (job?.frac ?? 0.02)}
-            stage={busy === 'run'
+          finished={flowDone}
+          failed={flowError}
+          frac={!flowMode && busy === null ? undefined : busy === 'run' ? undefined : (job?.frac ?? 0.02)}
+          stage={!flowMode && busy === null
+            ? undefined
+            : busy === 'run'
               ? (runHint === 'fetch' ? 'fetching bars…' : runHint === 'prepare' ? 'preparing series…' : 'replaying strategy over history…')
               : job?.stage}
-            elapsedSec={busy === 'run' ? undefined : job?.elapsedSec}
-          />
-        )}
+          elapsedSec={!flowMode && busy === null ? undefined : busy === 'run' ? undefined : job?.elapsedSec}
+ />
+
+        {/* v2.1.0 — fine-tune disclosure: the rare knobs for the chosen level */}
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setFineOpen((v) => !v)}
+            aria-expanded={fineOpen}
+            className="flex items-center gap-1.5 text-[10px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
+          >
+            <ChevronDown className={cn('h-3 w-3 shrink-0 transition-transform', fineOpen && 'rotate-180')} aria-hidden />
+            Fine-tune {LEVEL_META[level].label.toLowerCase()}
+          </button>
+          {fineOpen && (
+            <div className="mt-1.5 rounded border border-zinc-800/70 bg-zinc-950/60 p-2.5">
+              {level === 'quick' && (
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  Nothing to tune — the quick check replays steps ①–③ exactly as configured.
+                </p>
+              )}
+              {level === 'wf' && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-folds">Folds</Label>
+                  <Input id="bt-wf-folds" value={wfFolds} onChange={(e) => setWfFolds(e.target.value)} onBlur={() => setWfFolds(String(Math.min(6, Math.max(2, Math.round(Number(wfFolds) || 3)))))} inputMode="numeric" aria-label="Walk-forward folds (2–6)" className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs" />
+                  <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-is">IS %</Label>
+                  <Input id="bt-wf-is" value={wfIsPct} onChange={(e) => setWfIsPct(e.target.value)} onBlur={() => setWfIsPct(String(Math.min(90, Math.max(50, Math.round(Number(wfIsPct) || 70)))))} inputMode="numeric" aria-label="Walk-forward in-sample share percent" className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs" />
+                  <Label className="text-[10px] text-zinc-500" htmlFor="bt-wf-ho">Hold-out %</Label>
+                  <Input id="bt-wf-ho" value={wfHoldout} onChange={(e) => setWfHoldout(e.target.value)} onBlur={() => setWfHoldout(String(Math.min(40, Math.max(0, Math.round(Number(wfHoldout) || 0)))))} inputMode="numeric" aria-label="Pure hold-out tail percent (0–40)" className="h-8 w-12 border-zinc-800 bg-zinc-950 text-xs" />
+                  <div className="flex items-center gap-1">
+                    <Switch id="bt-wf-anch" checked={wfAnchored} onCheckedChange={setWfAnchored} className="scale-90" aria-label="Anchored walk-forward windows" />
+                    <Label htmlFor="bt-wf-anch" className="text-[10px] text-zinc-500" title="Anchored = each fold tunes on everything from the start (expanding IS). Off = rolling fixed-length IS window immediately before each out-of-sample segment.">Anchored</Label>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="bt-mintrades-wf" className="text-[10px] text-zinc-500">Min trades to score</Label>
+                    <Input id="bt-mintrades-wf" value={minTrades} onChange={(e) => setMinTrades(e.target.value)} inputMode="numeric" aria-label="Minimum trades to score a combination" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
+                  </div>
+                </div>
+              )}
+              {level === 'sweep' && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Label htmlFor="bt-topx" className="text-[10px] text-zinc-500" title="How many winning configurations to list (1–20)">Top</Label>
+                  <Input id="bt-topx" value={topX} onChange={(e) => setTopX(e.target.value)} onBlur={() => setTopX(String(Math.min(20, Math.max(1, Math.round(Number(topX) || 8)))))} inputMode="numeric" aria-label="Number of sweep winners to list" className="h-8 w-14 border-zinc-800 bg-zinc-950 text-xs" />
+                  <span className="text-[10px] text-zinc-600">setups listed</span>
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="bt-mintrades-sw" className="text-[10px] text-zinc-500">Min trades to score</Label>
+                    <Input id="bt-mintrades-sw" value={minTrades} onChange={(e) => setMinTrades(e.target.value)} inputMode="numeric" aria-label="Minimum trades to score a combination" className="h-7 w-16 border-zinc-800 bg-zinc-950 text-xs" />
+                  </div>
+                </div>
+              )}
+              {level === 'kronos' && (
+                <p className="text-[10px] leading-snug text-zinc-500">
+                  First run computes ~35 walk-forward forecasts (≈5 min of model CPU — each origin sees only its past bars, no look-ahead). Verdicts are cached
+                  per window, so re-running with different TP/SL is instant. The same gate is available on LIVE runs ("Kronos AI gate" in the run setup).
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* advanced — auto-tune grid */}
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setOptOpen((v) => !v)}
+            aria-expanded={optOpen}
+            className="flex items-center gap-1.5 text-[10px] font-medium text-zinc-400 transition-colors hover:text-zinc-200"
+          >
+            <ChevronDown className={cn('h-3 w-3 shrink-0 transition-transform', optOpen && 'rotate-180')} aria-hidden />
+            <SlidersHorizontal className="h-3 w-3" aria-hidden />
+            Auto-tune parameter grid (advanced — tick ranges, run the optimizer)
+          </button>
+        </div>
 
         {/* ---- optimizer ranges ---- */}
         {optOpen && (
@@ -1334,9 +1542,19 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         {error && (
           <p className="mt-2 rounded border border-rose-500/30 bg-rose-500/5 px-2.5 py-1.5 text-[11px] text-rose-300" role="alert">{error}</p>
         )}
+        </StepCard>
       </div>
 
-      {/* ---- results ---- */}
+      {/* ---- results (v2.1.0 — anchored region the CTA scrolls to) ---- */}
+      {(meta || runRes || optRes || sweepRes || wfRes || krAbRes) && (
+        <div ref={(el) => { secRef.current.res = el }} className="scroll-mt-20">
+          <div className="flex flex-wrap items-center gap-2 px-1">
+            <Table2 className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Results</span>
+            <span className="text-[10px] text-zinc-600">each validation replaces the previous view — the newest run wins</span>
+          </div>
+        </div>
+      )}
       {meta && (
         <div className="flex flex-col gap-1 px-1">
           <p className="text-[11px] text-zinc-500">
@@ -2091,8 +2309,26 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         </div>
       )}
 
-      {/* recommended setups (Task 89/90) — full-catalog sweep winners, refreshable */}
-      {recos.length > 0 && (
+      {/* recommended setups (Task 89/90) — full-catalog sweep winners.
+          v2.1.0 — collapsed by default (declutter); the count + sweep progress
+          stay visible on the collapsed chip. */}
+      {recos.length > 0 && !recosOpen && (
+        <button
+          type="button"
+          onClick={() => setRecosOpen(true)}
+          aria-expanded={false}
+          className="flex flex-wrap items-center gap-2 rounded-md border border-emerald-500/25 bg-zinc-900/70 px-3 py-2 text-left transition-colors hover:bg-zinc-900"
+        >
+          <Sparkles className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">Recommended setups</span>
+          <Badge variant="outline" className="text-[10px] text-zinc-400">{recos.length} configs</Badge>
+          {recoJob?.running && (
+            <span className="text-[10px] text-emerald-300">sweeping {recoJob.done}/{recoJob.total}…</span>
+          )}
+          <ChevronDown className="ml-auto h-3.5 w-3.5 text-zinc-500" aria-hidden />
+        </button>
+      )}
+      {recos.length > 0 && recosOpen && (
         <div className="rounded-md border border-emerald-500/25 bg-zinc-900/70">
           <div className="flex flex-wrap items-center gap-2 px-3 py-2">
             <Sparkles className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
@@ -2122,6 +2358,15 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
               >
                 <RefreshCw className={cn('h-3 w-3', recoJob?.running && 'animate-spin')} aria-hidden />
                 {recoJob?.running ? `Sweeping ${recoJob.done}/${recoJob.total}` : 'Refresh'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 w-6 p-0 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
+                onClick={() => setRecosOpen(false)}
+                aria-label="Collapse recommended setups"
+              >
+                <ChevronUp className="h-3.5 w-3.5" aria-hidden />
               </Button>
             </div>
           </div>
@@ -2203,6 +2448,80 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
         </div>
       )}
     </div>
+  )
+}
+
+// v2.1.0 — one numbered, illustrated step of the Backtest Studio: a colored
+// icon tile + step badge, a one-line subtitle, and a live status badge on the
+// right so each step summarizes its own state at a glance.
+function StepCard({ n, icon: Icon, tone, title, sub, status, children, refEl }: {
+  n: number
+  icon: LucideIcon
+  tone: string
+  title: string
+  sub: string
+  status?: string
+  children: ReactNode
+  refEl: (el: HTMLDivElement | null) => void
+}) {
+  return (
+    <div ref={refEl} className="scroll-mt-20 rounded-md border border-zinc-800/80 bg-zinc-950/50 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={cn('relative grid h-8 w-8 shrink-0 place-items-center rounded-lg', tone)} aria-hidden>
+          <Icon className="h-4 w-4" />
+          <span className="absolute -right-1.5 -top-1.5 grid h-4 w-4 place-items-center rounded-full border border-zinc-800 bg-zinc-900 text-[9px] font-bold text-zinc-300">
+            {n}
+          </span>
+        </span>
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-zinc-100">{title}</p>
+          <p className="text-[10px] leading-tight text-zinc-500">{sub}</p>
+        </div>
+        {status && (
+          <Badge variant="outline" className="ml-auto max-w-full truncate text-[10px] tabular-nums text-zinc-400">
+            {status}
+          </Badge>
+        )}
+      </div>
+      <div className="mt-2.5">{children}</div>
+    </div>
+  )
+}
+
+// v2.1.0 — a selectable validation-depth tile for step ④: icon, title, time
+// estimate, and a one-line "what this proves" — the five old sibling buttons
+// collapsed into one radio-style picker.
+function LevelTile({ active, icon: Icon, title, time, desc, badge, onClick }: {
+  active: boolean
+  icon: LucideIcon
+  title: string
+  time: string
+  desc: string
+  badge?: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'rounded-md border p-2.5 text-left transition-colors',
+        active ? 'border-violet-500/60 bg-violet-500/10' : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-600 hover:bg-zinc-900',
+      )}
+    >
+      <span className="flex items-center gap-1.5">
+        <Icon className={cn('h-3.5 w-3.5 shrink-0', active ? 'text-violet-300' : 'text-zinc-500')} aria-hidden />
+        <span className={cn('text-[11px] font-semibold', active ? 'text-zinc-100' : 'text-zinc-300')}>{title}</span>
+        {badge && (
+          <Badge variant="outline" className="border-emerald-500/40 px-1 py-0 text-[8px] uppercase tracking-wide text-emerald-300">
+            {badge}
+          </Badge>
+        )}
+        <span className="ml-auto shrink-0 text-[9px] tabular-nums text-zinc-600">{time}</span>
+      </span>
+      <span className={cn('mt-1 block text-[10px] leading-snug', active ? 'text-zinc-400' : 'text-zinc-500')}>{desc}</span>
+    </button>
   )
 }
 

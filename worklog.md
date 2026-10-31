@@ -3637,3 +3637,65 @@ Stage Summary:
 - v2.0.2 — the sidecar is pandas-4-proof (day_of_week everywhere) and self-contained (own venv +
   requirements.txt + supervisor fallback), so the Kronos lanes survive sandbox resets, uv syncs,
   and pandas upgrades alike.
+
+## v2.1.0 — Backtest STUDIO: the backtest revamp (steps, flow chart, one click head-to-end)
+
+USER ASK: "Backtest is now very complicated. Please revamp the layout and possible properties for
+backtest. Step by Step with illustrations. Better with Flow Chart and one click done from head to end."
+
+WHAT WAS WRONG: the panel was ONE flat card — 8+ numeric inputs in a 4-col grid, two toggle rows,
+regime presets, and FIVE sibling run buttons (Run backtest / Auto-tune / Test all strategies /
+Walk-forward / Kronos gate A/B), each with its own inline knobs, plus a 10-line fill-model
+paragraph always on screen. No hierarchy, no order, no sense of "what do I do first".
+
+NEW LAYOUT (BacktestPanel.tsx internal restructure — every control that existed still exists):
+- STEP RAIL under the header: ① Market & data → ② Strategy & rules → ③ Costs & realism →
+  ④ Validate & run — click chips smooth-scroll to the step (scroll-mt for the sticky bar).
+- StepCard (new component): numbered colored icon tile (Database/Bot/Coins/ShieldCheck), title,
+  one-line subtitle, and a LIVE STATUS BADGE summarizing the step (symbol·TF·days / strategy name
+  / "2/0/0 bps slip·fee·spread" / chosen validation level).
+- Step ①: history preset CHIPS (7/30/60/90/200d, disabled beyond the feed cap, active highlighted)
+  + custom input + capital + leverage.
+- Step ②: the shared run setup as READ-ONLY CHIPS (every strategy param + TP/SL/Trail/RTH/EOD/
+  Max-day/Sizing) + the two backtest-local re-entry rules editable (cooldown, fresh signal) + a
+  pointer to the Run setup for the rest.
+- Step ③: slip/fee/spread with their suggested/live chips + vol-scaled slip + regime presets +
+  the fill-model wall-of-text COLLAPSED behind "How fills, costs & regime gates are modeled".
+- Step ④: the five buttons became a 4-tile radio picker — Quick check (seconds) / Walk-forward
+  (minutes, RECOMMENDED badge) / Sweep all strategies (minutes) / Kronos AI A/B (≈5 min first run)
+  — each tile = icon + time estimate + "what this proves" line. ONE golden CTA "🚀 Run head-to-end"
+  posts the chosen mode; on 202-job success it auto-scrolls to Results, on failure back to step ④.
+- FLOW CHART ALWAYS ON STAGE (was: only while running): idle = the chosen level's pipeline drawn as
+  pending nodes (the step-by-step illustration), running = blinking server phases, finished =
+  all green + golden result. mode = flowMode ?? LEVEL_META[level].flow.
+- Walk-forward one-click fix: WF needs an optimizer grid; the CTA now disables with an inline hint
+  + "Arm default grid" button (ticks every numeric param at its native min→max:step) or jumps to
+  Auto-tune — no more dead-end button.
+- Disclosures: "Fine-tune <level>" shows only the relevant knobs (WF: folds/IS/hold-out/anchored/
+  min-trades · Sweep: top-X/min-trades · Kronos: caching note · Quick: nothing) with DISTINCT
+  input ids (bt-mintrades-wf/sw) so no duplicate-DOM ids when Auto-tune is also open. Recommended
+  setups table COLLAPSED by default (count + sweep progress stay visible on the chip; expand/
+  collapse chevrons both sides).
+- Results region got an anchored header (the CTA scroll target) — all result cards unchanged.
+- post(): success → jumpTo('res') after 400ms; failure → jumpTo('s4').
+
+HONESTY: nothing about the engine changed — no backend edits; the demo-feed refusal ("No live
+historical data … cannot backtest") now paints the flow chart's Fetch node RED under the CTA,
+which is the failure made visible instead of a silent dead click.
+
+E2E (agent-browser, fresh DB → fresh account btstudio1 + TOTP): studio renders (desktop 1440 +
+mobile 390 via the mobile shell's Algo tab — step rail wraps, tiles stack 1-col, pipeline chart
+scrolls horizontally); Quick check → Run head-to-end → honest red Fetch node + inline error
+(sandbox has no Alpaca keys, Binance IP-banned — every symbol refuses at fetch, by design);
+Walk-forward tile → CTA disabled + hint → "Arm default grid" → CTA ENABLED; Fine-tune/Fill-model/
+Auto-tune disclosures open+close; step-rail jump scrolls; Recommended setups collapsed→expanded;
+browser console clean (HMR only). Golden-completion state is the unchanged v1.99.1 flow chart on
+the same finished/failed props verified then — not re-producible today without a live feed.
+
+Files: src/components/terminal/tabs/BacktestPanel.tsx (restructure + StepCard/LevelTile +
+BtLevel/LEVEL_META + useDefaultGrid + jumpTo), package.json (2.1.0), src/generated/version.ts.
+
+Stage Summary:
+- v2.1.0 — backtest is now a guided studio: four illustrated steps, the pipeline flow chart always
+  on stage, and ONE "Run head-to-end" button from fetch to golden result — with every advanced
+  knob one disclosure away instead of scattered across a flat grid.
