@@ -529,6 +529,7 @@ export default function AlgoImportDialog({
                         {e.config.flattenEod && <span>EOD</span>}
                         {(e.config.cooldownMin ?? 0) > 0 && <span className="text-sky-400/80">cooldown {e.config.cooldownMin}m</span>}
                         {e.config.requireNewSignal && <span className="text-amber-400/80">fresh-signal</span>}
+                        {e.config.kronosGate && <span className="font-semibold text-amber-300">✦ Kronos gate</span>}
                         {e.enabled === true && (
                           <Badge variant="outline" className="h-3.5 border-emerald-500/40 px-1 text-[9px] text-emerald-400" title="The run was RUNNING when exported — importing starts it right away (paper mode only)">
                             was RUNNING

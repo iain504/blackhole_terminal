@@ -31,12 +31,13 @@ import { randomUUID } from 'crypto'
  */
 export type BacktestPhase =
   | 'fetch' | 'prepare' | 'replay' | 'grid' | 'sweep' | 'oos' | 'folds' | 'holdout' | 'verdict' | 'result'
+  | 'forecast' | 'gate' // v2.0.0 — Kronos gate A/B pipeline
 
 export interface BacktestJob {
   id: string
   userId: string
   /** v1.99.1 — which heavy mode this job runs (drives the flow chart pipeline) */
-  mode: 'optimize' | 'sweep' | 'walkforward'
+  mode: 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'
   status: 'running' | 'done' | 'error'
   /** 0..1 progress of the whole operation (Task 15 progress plumbing) */
   frac: number
@@ -136,6 +137,8 @@ export function phaseFromStage(mode: BacktestJob['mode'], stage: string): Backte
   if (s.startsWith('preparing')) return 'prepare'
   if (s.startsWith('out-of-sample')) return 'oos'
   if (s.startsWith('hold-out')) return 'holdout'
+  if (s.startsWith('forecasting')) return 'forecast' // v2.0.0 — Kronos walk-forward forecasts
+  if (s.startsWith('gate replay') || s.startsWith('replaying')) return 'gate'
   if (s.startsWith('fold')) return 'folds'
   if (s.startsWith('strategy')) return 'sweep'
   if (s.startsWith('grid')) return 'grid'
@@ -143,6 +146,7 @@ export function phaseFromStage(mode: BacktestJob['mode'], stage: string): Backte
     case 'optimize': return 'grid'
     case 'sweep': return 'sweep'
     case 'walkforward': return 'folds'
+    case 'kronos-ab': return 'forecast'
   }
 }
 

@@ -136,6 +136,13 @@ export interface BacktestConfig {
   // Metrics (incl. mark-to-market maxDrawdownPct) are unaffected — MTM peak/
   // trough tracking is separate from this display array.
   collectEquity?: boolean
+  // v2.0.0 — Kronos AI entry-gate hook (optional). When present, an entry
+  // signal only becomes a pending order if the callback allows THIS bar+side.
+  // Contract: pure + deterministic per (i, side), built ONLY from forecasts
+  // whose origin bar is < i (walk-forward stride sampling — the model never
+  // sees future bars). Undefined = no gate, zero behavior change everywhere
+  // else (sweep/optimizer/plain runs never pass it).
+  entryGate?: (i: number, side: 'long' | 'short') => boolean
 }
 
 export interface BacktestTrade {
@@ -178,6 +185,7 @@ export interface BacktestMetrics {
   to: number // last bar time (unix s)
   openAtEnd: boolean // position was marked-to-market at the last bar
   suppressed: number // signals suppressed by session/cap/window/cooldown/edge gates
+  gateVetoed: number // v2.0.0 — signals vetoed by the Kronos entry-gate hook (0 when absent)
   // Task 3-d — short entries DROPPED because the market is long-only (Alpaca
   // crypto has no shorting — trading.ts). 0 when absent/undefined for old data.
   skippedShorts?: number
@@ -531,6 +539,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let curDay = -1
   let suppressed = 0
   let skippedShorts = 0 // Task 3-d — crypto long-only drops
+  // v2.0.0 — Kronos gate vetoes (entry signals blocked by cfg.entryGate)
+  let gateVetoed = 0
   // timeframe seconds — min positive bar delta over the head of the series
   // (session/weekend gaps only inflate deltas, so the min is the true tf)
   let tfSec = 60
@@ -845,6 +855,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         else if (cooldownBlocked) suppressed++
         else if (edgeBlocked) suppressed++
         else if (tradesToday >= cfg.maxTradesDay) suppressed++
+        else if (cfg.entryGate && !cfg.entryGate(i, dec.entry.side === 'buy' ? 'long' : 'short')) gateVetoed++
         else {
           pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
           // Task 89 — tradesToday parity: the LIVE engine increments on FILL
@@ -937,6 +948,8 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // Review P0 #3 — gate effectiveness counters (all-zero vetoes when the
     // gates are off; signals still counts the raw signal volume)
     regime: regStats,
+    // v2.0.0 — Kronos gate veto count (0 when no entryGate passed)
+    gateVetoed,
     // Review P3 #12 — realized execution cost per fill (0 when frictionless)
     avgFillCostBps: costFills > 0 ? costBpsSum / costFills : 0,
   }

@@ -71,6 +71,8 @@ export default function AlgoRunSettingsDialog({
   const [flattenEod, setFlattenEod] = useState(true)
   const [cooldownMin, setCooldownMin] = useState('0')
   const [requireNewSignal, setRequireNewSignal] = useState(false)
+  // v2.0.0 — Kronos AI gate: the foundation model must agree with entries
+  const [kronosGate, setKronosGate] = useState(false)
   const [params, setParams] = useState<Record<string, number>>(() => normalizeAlgoParams('bb-reversion', undefined))
   // raw text being typed per param key — keeps decimal points alive while
   // editing (parsing "0." → 0 and re-rendering "0" would otherwise swallow
@@ -105,6 +107,7 @@ export default function AlgoRunSettingsDialog({
     setFlattenEod(run.flattenEod)
     setCooldownMin(String(run.cooldownMin ?? 0))
     setRequireNewSignal(run.requireNewSignal === true)
+    setKronosGate(run.kronosGate === true)
     setParams(normalizeAlgoParams(sid, run.params))
     setParamDraft({})
     setShowParams(false)
@@ -172,6 +175,7 @@ export default function AlgoRunSettingsDialog({
           flattenEod: !isCryptoRun && flattenEod,
           cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
           requireNewSignal,
+          kronosGate,
         }),
       })
       const json = await res.json().catch(() => null)
@@ -516,6 +520,13 @@ export default function AlgoRunSettingsDialog({
                 <p className="text-[10px] leading-snug text-zinc-500">wait for a new cross before re-entering</p>
               </div>
               <Switch id="rs-fresh" checked={requireNewSignal} onCheckedChange={setRequireNewSignal} className="scale-90 shrink-0" />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <Label htmlFor="rs-kronos" className="text-[11px] text-amber-300/90">Kronos AI gate</Label>
+                <p className="text-[10px] leading-snug text-zinc-500">the local Kronos foundation model must agree with the entry direction — fail-closed</p>
+              </div>
+              <Switch id="rs-kronos" checked={kronosGate} onCheckedChange={setKronosGate} className="scale-90 shrink-0" />
             </div>
           </div>
 

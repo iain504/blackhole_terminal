@@ -265,6 +265,12 @@ model AlgoRun {
   // only fire on a false→true edge vs the previously processed closed bar
   cooldownMin     Int     @default(0)
   requireNewSignal Boolean @default(false)
+  // v2.0.0 — Kronos AI gate: before ANY entry the engine asks the local Kronos
+  // foundation model (sidecar :3030) for a horizon-end direction forecast and
+  // only enters when the model AGREES (P(up) ≥ 0.55 long / ≤ 0.45 short).
+  // Forecast is cached per closed bar; the signal must survive to the next
+  // 15s cycle if the forecast isn't ready yet (fail-closed, never pre-enter).
+  kronosGate    Boolean   @default(false)
   // 'running' | 'stopped'
   status       String    @default("running")
   state        Json?
@@ -455,4 +461,40 @@ model RateLimitBucket {
   resetAt DateTime
 
   @@index([resetAt])
+}
+
+// v2.0.0 — Kronos forecast journal (shiyu-coder/Kronos sidecar, port 3030).
+// Every user-triggered chart forecast is journaled so the UI can show the
+// model's REALIZED accuracy — the accountability loop that makes an AI
+// prediction trustworthy: each row is later resolved against the bar that
+// actually printed at horizon end (realizedClose/hit/absErrPct), and the
+// status route aggregates the running hit-rate. Without this, forecasts are
+// unfalsifiable vapor; with it, users see the score.
+model KronosForecast {
+  id            String   @id @default(cuid())
+  userId        String?
+  symbol        String
+  tf            String
+  market        String   @default("stock")
+  model         String
+  madeAt        DateTime @default(now())
+  // unix sec of the LAST CONTEXT bar (the forecast is conditioned on data ≤ this)
+  barTime       Int
+  tfSec         Int
+  horizonBars   Int
+  lastClose     Float
+  endP50        Float
+  upProb        Float
+  bandPct       Float?
+  contextBars   Int?
+  latencyMs     Int?
+  // realization (filled lazily once the horizon-end bar exists)
+  realizedClose Float?
+  realizedAt    Int?
+  hit           Boolean?
+  absErrPct     Float?
+
+  @@unique([symbol, tf, barTime, horizonBars])
+  @@index([userId, madeAt])
+  @@index([symbol, tf, realizedClose])
 }

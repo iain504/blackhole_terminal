@@ -21,10 +21,10 @@
 // The inline 'run' mode has no job poll — the panel feeds a lightweight
 // client-side estimate (fetch → prepare → replay) that is finalized by the
 // actual response, so a fast run simply sweeps through to golden.
-import { BadgeCheck, ChartLine, Check, Database, Grid3x3, Layers, Play, Repeat, ShieldCheck, Target, Trophy, type LucideIcon } from 'lucide-react'
+import { BadgeCheck, BrainCircuit, ChartLine, Check, Database, Filter, Grid3x3, Layers, Play, Repeat, ShieldCheck, Target, Trophy, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export type BtFlowMode = 'run' | 'optimize' | 'sweep' | 'walkforward'
+export type BtFlowMode = 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'
 
 interface FlowNodeDef {
   id: string
@@ -44,6 +44,8 @@ const NODES: Record<string, FlowNodeDef> = {
   oos: { id: 'oos', label: 'OOS verify', icon: ShieldCheck, hint: 'Re-run the winners untouched on the out-of-sample tail' },
   holdout: { id: 'holdout', label: 'Hold-out', icon: Target, hint: 'Stress the surviving config on pure unseen data' },
   verdict: { id: 'verdict', label: 'Trust verdict', icon: BadgeCheck, hint: 'Per-trade significance, bootstrap confidence interval, plain-language verdict' },
+  forecast: { id: 'forecast', label: 'WF forecasts', icon: BrainCircuit, hint: 'Walk-forward Kronos forecasts — each origin sees only its past bars, never the future it predicts' },
+  gate: { id: 'gate', label: 'Gate A/B', icon: Filter, hint: 'Replay the same config twice: ungated baseline vs Kronos-gated entries' },
 }
 
 /** Per-mode pipeline (the golden result node is appended automatically). */
@@ -52,6 +54,7 @@ const PIPELINES: Record<BtFlowMode, string[]> = {
   optimize: ['fetch', 'prepare', 'grid', 'verdict'],
   sweep: ['fetch', 'prepare', 'sweep', 'oos'],
   walkforward: ['fetch', 'prepare', 'folds', 'holdout'],
+  'kronos-ab': ['fetch', 'prepare', 'forecast', 'gate'],
 }
 
 const MODE_LABEL: Record<BtFlowMode, string> = {
@@ -59,6 +62,7 @@ const MODE_LABEL: Record<BtFlowMode, string> = {
   optimize: 'Optimizer',
   sweep: 'Strategy sweep',
   walkforward: 'Walk-forward',
+  'kronos-ab': 'Kronos gate A/B',
 }
 
 interface BacktestFlowChartProps {

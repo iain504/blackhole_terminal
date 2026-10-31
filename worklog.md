@@ -3486,3 +3486,77 @@ Stage Summary:
   aborted": bar pages get 20s + 3 retries, partial/truncated windows are
   announced in the log, never cached, and REFUSED by the backtest gate instead
   of being silently replayed. Trust = the fetch is honest end to end.
+
+## v2.0.0 — Kronos foundation-model integration: live AI prediction in the chart + the algo engine
+
+User: "Check out https://github.com/shiyu-coder/Kronos and incorporate into our platform as a new
+functions of live prediction in chart AND algo and even more, you think about it. iterate and make it
+work perfectly."
+
+WHAT KRONOS IS: the first open-source foundation model for financial candlesticks (AAAI 2026,
+shiyu-coder) — a tokenizer quantizes OHLCV bars into hierarchical discrete tokens, a decoder-only
+transformer autoregressively predicts the next bars. We run Kronos-small (24.7M) + Kronos-mini
+(4.1M fast lane) LOCALLY on this box — no cloud, no API keys, weights from HuggingFace at first boot.
+
+NEW SIDECAR mini-services/kronos-service/ (port 127.0.0.1:3030, Python 3.12 + torch 2.15 CPU,
+vendored model/ from the upstream repo; bun index.ts supervisor spawns python3 server.py with
+auto-restart backoff; hf-cache gitignored):
+  • GET /health → ready/loading/lanes; POST /forecast → JOB-BASED (submit → poll): forecasts take
+    8-50s of CPU and bun fetch resets held connections ~70s, so EVERYTHING goes submit/poll — no
+    long-held requests anywhere.
+  • Sample-preserving fork of upstream auto_regressive_inference: upstream predict() AVERAGES the
+    sample paths away (predict_samples() in server.py keeps the sample axis) → real p10/p50/p90
+    quantile bands + P(up) from path fractions + a consistent median-sample OHLC path.
+  • Dual lanes: mini @ctx512 = 8.4s/forecast (interactive default); small @ctx384 = 51s (quality
+    option). Time features are LOCAL-NAIVE: stocks America/New_York (session clock), crypto UTC.
+  • Honesty contract: never fabricates (caller supplies real bars; model-not-ready is an error,
+    never a random-walk fallback); every result ships provenance (model, ctx bars, samples, latency).
+
+CHART — LIVE AI PREDICTION (ChartPanel): a "✦ Kronos" toolbar button opens the forecast popover —
+service status + the model's REALIZED accuracy line, horizon 12/24/48 bars, model lane picker,
+"Forecast next N bars" → job poll → the chart draws the AMBER CONFERENCE CONE: p50 median path
+(dashed), p10-p90 filled cone, "now" divider at the last real bar, endpoint chip
+"Kronos ↓0.66% · P(up) 25%", rightOffset widened so the cone is visible, autoscale extended to the
+cone tail, forecast cleared on symbol/tf switch. Overlay drawn via the existing xOf/yOf canvas
+pipeline (future times = linear extrapolation past the last bar, same helper the drawing tools use).
+
+ACCOUNTABILITY LOOP (the trust answer): every user-triggered chart forecast is journaled
+(KronosForecast, deduped per symbol|tf|barTime|horizon) and LATER GRADED — when the horizon-end bar
+exists, realizePendingForecasts records the realized close, hit (P(up)≥0.5 vs realized sign) and
+abs error; /api/kronos/status aggregates the running hit-rate + avg |err|, and the popover shows
+"realized accuracy so far: NN% of N graded forecasts". Predictions with a scoreboard.
+
+ALGO — LIVE KRONOS GATE: AlgoRun +kronosGate (schema/DTO/start/patch/config-IO round-trip); engine
+gate chain slot AFTER the daily cap: kronosEntryOk asks the sidecar per closed bar (cached per bar
+in lib/kronos gateCache, horizon 12, mini) — long only when P(up) ≥ 0.55, short ≤ 0.45; FAIL-CLOSED
+(forecast pending ≈ 8-10s → entry re-evaluated next 15s cycle only if the signal is still live;
+sidecar down → suppressed). Journal lines: "Kronos gate PASSED — …", "Signal suppressed (Kronos
+gate): … model disagrees (P(up)=0.52; needs ≥ 0.55 long / ≤ 0.45 short)". UI: run-setup switch
+(AlgoTab + AlgoRunSettings) with amber ✦ "Kronos gate" chip on the run card.
+
+BACKTEST — KRONOS GATE A/B (does the AI gate help or hurt?): new heavy mode 'kronos-ab' through the
+existing background-job + flow chart infra. Walk-forward forecasts over the trailing 900 bars:
+origin o covers o+1..o+24 conditioned on data ≤ o (NO look-ahead), 35 origins × ~8.5s ≈ 4-5 min
+(job progress "forecasting Kronos 5/35…"), verdict map cached per window (re-runs instant). Then
+the SAME config replays twice via a new optional runBacktest entryGate hook (pure, deterministic,
+default-undefined = zero behavior change anywhere else): A ungated baseline vs B Kronos-gated —
+trades/net%/win-rate/PF/expectancy/maxDD + veto count. BacktestFlowChart grows the mode pipeline
+Fetch → Prepare → WF forecasts (BrainCircuit) → Gate A/B (Filter) → golden Result.
+
+E2E (agent-browser, fresh account kronostest1 + paper keys, market closed weekend):
+  chart: TSLA 5m forecast → 25% P(up) · ↓0.66% · Kronos-mini · 255 bars ctx · 8 samples · cone ±1.8%
+  · 11.4s — amber cone + "now" divider + chip rendered (/tmp/kronos-cone.png); first POST 500'd
+  (kronosHealth import missing in the route) → fixed → 200.
+  algo: run started with journal "… · Kronos AI gate", run card ✦ Kronos gate chip.
+  A/B: TSLA 5m 30d — 35/35 forecasts in 225s, flow chart all-green + golden, card renders
+  (4 trades both variants — 0 vetoes on 4 signals, avg P(up) 63%; honest small-sample outcome)
+  (/tmp/krab-result.png).
+OPS: pkill "bun run dev" killed the sidecar too (same script name) — restart it separately; probe
+scripts from the bench session removed; ALLOW_REGISTRATION already in .env from v1.99.2.
+
+Stage Summary:
+- v2.0.0 — Kronos foundation models run locally: the chart gains a live AI forecast cone with a
+  graded hit-rate scoreboard, live algo runs gain a fail-closed AI entry gate, and the backtest
+  panel gains a walk-forward A/B that measures whether the gate actually helps. All three surfaces
+  share one honest rule: the model must have SPOKEN for the bar (no look-ahead, no fake forecasts),
+  and every prediction is graded against what really printed.

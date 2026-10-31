@@ -23,6 +23,7 @@ import {
 } from '@/lib/indicators'
 import { cn } from '@/lib/utils'
 import { chartBg, chartVar, UI_THEME_CHANGE_EVENT } from '@/lib/ui-theme'
+import type { KronosForecastResult, KronosStatus } from '@/lib/kronos-types'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -318,6 +319,21 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   // chart style — seeded from the persisted pane setting, changes are pushed
   // up through onChartTypeChange so the layout autosave carries them
   const [chartType, setChartType] = useState<'candles' | 'line'>(chartTypeProp ?? 'candles')
+  // ---------- v2.0.0 — Kronos AI forecast (OHLCV foundation model) ----------
+  // The rendered cone lives in kronosResultRef (read by renderOverlay — refs
+  // never go stale); this state drives the toolbar UI around it.
+  type KronosUi =
+    | { status: 'idle' }
+    | { status: 'loading'; horizon: number; model: 'mini' | 'small'; startedAt: number }
+    | { status: 'ready'; horizon: number; model: 'mini' | 'small'; result: KronosForecastResult; at: number }
+    | { status: 'error'; horizon: number; model: 'mini' | 'small'; error: string }
+  const [kronos, setKronos] = useState<KronosUi>({ status: 'idle' })
+  const [krOpen, setKrOpen] = useState(false)
+  const [krHorizon, setKrHorizon] = useState(24)
+  const [krModel, setKrModel] = useState<'mini' | 'small'>('mini')
+  const [krStatus, setKrStatus] = useState<KronosStatus | null>(null)
+  const kronosResultRef = useRef<{ symbol: string; tf: Timeframe; result: KronosForecastResult } | null>(null)
+  const kronosStopRef = useRef<(() => void) | null>(null)
   const [quote, setQuote] = useState<{ price: number; changePct: number; change: number; prevClose?: number } | null>(null)
   // streaming ticks (stream-service socket.io): badge + pending-tick bookkeeping
   const liveAtRef = useRef(0)
@@ -749,6 +765,70 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
     })
   }, [])
 
+  // ---------- v2.0.0 — Kronos forecast run/clear (job-submit → poll) ----------
+  // Forecasts take ~8-50s of sidecar CPU, so the API is job-based end to end
+  // and this loop just polls — no held connections anywhere.
+  const fetchKronosStatus = useCallback(async () => {
+    try {
+      const r = await fetch('/api/kronos/status', { cache: 'no-store' })
+      if (r.ok) setKrStatus((await r.json()) as KronosStatus)
+    } catch { /* keep last status */ }
+  }, [])
+
+  const clearKronos = useCallback(() => {
+    kronosStopRef.current?.()
+    kronosStopRef.current = null
+    kronosResultRef.current = null
+    setKronos({ status: 'idle' })
+    try { chartRef.current?.timeScale().applyOptions({ rightOffset: 6 }) } catch { /* chart gone */ }
+    scheduleRedraw()
+  }, [scheduleRedraw])
+
+  const runKronos = useCallback(async (horizonArg?: number, modelArg?: 'mini' | 'small') => {
+    const horizon = horizonArg ?? krHorizon
+    const model = modelArg ?? krModel
+    kronosStopRef.current?.()
+    let stopped = false
+    kronosStopRef.current = () => { stopped = true }
+    setKronos({ status: 'loading', horizon, model, startedAt: Date.now() })
+    try {
+      const r = await fetch('/api/kronos/forecast', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ symbol, tf, horizon, model }),
+      })
+      const j = await r.json() as { jobId?: string; error?: string }
+      if (!r.ok || !j.jobId) throw new Error(j.error || `HTTP ${r.status}`)
+      for (;;) {
+        await new Promise((res) => setTimeout(res, 2000))
+        if (stopped) return
+        const pr = await fetch(`/api/kronos/forecast?job=${encodeURIComponent(j.jobId)}`, { cache: 'no-store' })
+        const pj = await pr.json() as { done?: boolean; result?: KronosForecastResult; error?: string }
+        if (stopped) return
+        if (!pj.done) continue
+        if (pj.error) throw new Error(pj.error)
+        if (!pj.result?.ok) throw new Error(pj.result?.error as unknown as string || 'forecast failed')
+        kronosResultRef.current = { symbol, tf, result: pj.result }
+        setKronos({ status: 'ready', horizon, model, result: pj.result, at: Date.now() })
+        // make room for the cone: rightOffset is in bar units of empty space
+        try { chartRef.current?.timeScale().applyOptions({ rightOffset: Math.max(6, pj.result.horizon + 3) }) } catch { /* chart gone */ }
+        scheduleRedraw()
+        return
+      }
+    } catch (e) {
+      if (!stopped) setKronos({ status: 'error', horizon, model, error: e instanceof Error ? e.message : 'forecast failed' })
+    }
+  }, [symbol, tf, krHorizon, krModel, scheduleRedraw])
+
+  // a forecast belongs to ONE symbol+tf — switching either clears it
+  useEffect(() => {
+    kronosStopRef.current?.()
+    kronosStopRef.current = null
+    kronosResultRef.current = null
+    setKronos({ status: 'idle' })
+    return () => { kronosStopRef.current?.() }
+  }, [symbol, tf])
+
   // ---------- overlay rendering ----------
   const renderOverlay = useCallback(() => {
     const canvas = canvasRef.current
@@ -810,6 +890,84 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
             for (const band of bands) ctx.fillRect(band.a, 0, band.b - band.a, paneH)
           }
         } catch { /* chart disposed mid-pass */ }
+      }
+    }
+
+    // ---------- v2.0.0 — Kronos AI forecast overlay (amber cone) ----------
+    // p50 median path = dashed amber line; p10-p90 sample quantiles = filled
+    // cone; "now" divider = dashed vertical at the last REAL bar. Future x
+    // positions come from xOf (linear extrapolation past the last bar, same
+    // helper the drawing tools use), prices from yOf (series price scale).
+    const kr = kronosResultRef.current
+    if (kr && kr.symbol === symbol && kr.tf === tf) {
+      const f = kr.result
+      const x0 = xOf(f.lastTime)
+      if (x0 != null) {
+        ctx.save()
+        clipToPane(ctx, 'price', w)
+        const yLast = yOf(f.lastClose)
+        const pts = f.times.map((t, i) => ({ x: xOf(t), y10: yOf(f.closeP10[i]!), y50: yOf(f.closeP50[i]!), y90: yOf(f.closeP90[i]!) }))
+        const good = pts.filter((p): p is { x: number; y10: number; y50: number; y90: number } => p.x != null && p.y10 != null && p.y50 != null && p.y90 != null)
+        if (good.length >= 2) {
+          // cone fill: last close → p90 out → p10 back
+          ctx.beginPath()
+          if (yLast != null) ctx.moveTo(x0, yLast)
+          else ctx.moveTo(good[0]!.x, good[0]!.y50)
+          for (const p of good) ctx.lineTo(p.x, p.y90)
+          for (let i = good.length - 1; i >= 0; i--) ctx.lineTo(good[i]!.x, good[i]!.y10)
+          ctx.closePath()
+          ctx.fillStyle = 'rgba(251,191,36,0.10)'
+          ctx.fill()
+          // cone edges
+          ctx.lineWidth = 1
+          ctx.strokeStyle = 'rgba(251,191,36,0.35)'
+          ctx.beginPath()
+          for (let i = 0; i < good.length; i++) { const p = good[i]!; if (i === 0) ctx.moveTo(p.x, p.y90); else ctx.lineTo(p.x, p.y90) }
+          ctx.stroke()
+          ctx.beginPath()
+          for (let i = 0; i < good.length; i++) { const p = good[i]!; if (i === 0) ctx.moveTo(p.x, p.y10); else ctx.lineTo(p.x, p.y10) }
+          ctx.stroke()
+          // p50 median path — the headline
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([4, 4])
+          ctx.strokeStyle = '#fbbf24'
+          ctx.beginPath()
+          if (yLast != null) ctx.moveTo(x0, yLast)
+          for (const p of good) ctx.lineTo(p.x, p.y50)
+          ctx.stroke()
+          ctx.setLineDash([])
+          // endpoint dot
+          const lastPt = good[good.length - 1]!
+          ctx.beginPath()
+          ctx.arc(lastPt.x, lastPt.y50, 2.5, 0, Math.PI * 2)
+          ctx.fillStyle = '#fbbf24'
+          ctx.fill()
+          // "now" divider between real bars and the forecast
+          ctx.lineWidth = 1
+          ctx.setLineDash([3, 4])
+          ctx.strokeStyle = 'rgba(161,161,170,0.55)'
+          ctx.beginPath()
+          ctx.moveTo(x0 + 0.5, 0)
+          ctx.lineTo(x0 + 0.5, h)
+          ctx.stroke()
+          ctx.setLineDash([])
+          // end label chip — clamped into the pane
+          const dir = f.closeP50[f.closeP50.length - 1]! >= f.lastClose ? '↑' : '↓'
+          const label = `Kronos ${dir}${Math.abs((f.closeP50[f.closeP50.length - 1]! - f.lastClose) / f.lastClose * 100).toFixed(2)}% · P(up) ${(f.upProb * 100).toFixed(0)}%`
+          ctx.font = '10px ui-monospace, monospace'
+          const tw = ctx.measureText(label).width
+          const bw = tw + 14
+          const bh = 17
+          const bx = Math.min(Math.max(4, lastPt.x + 8), w - bw - 4)
+          const by = Math.min(Math.max(4, lastPt.y50 - bh / 2), h - bh - 4)
+          ctx.fillStyle = 'rgba(251,191,36,0.92)'
+          ctx.beginPath()
+          ctx.roundRect(bx, by, bw, bh, 4)
+          ctx.fill()
+          ctx.fillStyle = '#09090b'
+          ctx.fillText(label, bx + 7, by + 12)
+        }
+        ctx.restore()
       }
     }
 
@@ -3245,6 +3403,13 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           if (pp.tpPrice != null) vals.push(pp.tpPrice)
           if (pp.slPrice != null) vals.push(pp.slPrice)
         }
+        // v2.0.0 — the Kronos cone reaches into the FUTURE where the series has
+        // no data; without this the cone's tail can autoscale off-pane
+        const kr = kronosResultRef.current
+        if (kr && kr.symbol === symbol && kr.tf === tf) {
+          for (const v of kr.result.closeP10) vals.push(v)
+          for (const v of kr.result.closeP90) vals.push(v)
+        }
         if (vals.length === 0) return res
         let min = res?.priceRange?.minValue ?? Math.min(...vals)
         let max = res?.priceRange?.maxValue ?? Math.max(...vals)
@@ -4475,6 +4640,111 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           >
             <LineIcon className="h-3.5 w-3.5" />
           </button>
+        </div>
+        {/* ---------- v2.0.0 — Kronos AI forecast ---------- */}
+        <div className="pointer-events-auto">
+          <Popover open={krOpen} onOpenChange={(o) => { setKrOpen(o); if (o) void fetchKronosStatus() }}>
+            <PopoverTrigger asChild>
+              <button
+                className={cn(
+                  'flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium transition-colors',
+                  kronos.status === 'ready'
+                    ? 'border-amber-500/50 bg-amber-400/10 text-amber-300'
+                    : kronos.status === 'loading'
+                      ? 'border-amber-500/40 bg-zinc-900/80 text-amber-300'
+                      : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-zinc-200',
+                )}
+                aria-label="Kronos AI forecast"
+                aria-expanded={krOpen}
+                title="Kronos — AI candlestick forecast (foundation model, runs locally)"
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                <span className="hidden md:inline">Kronos</span>
+                {kronos.status === 'loading' && <Loader2 className="h-3 w-3 animate-spin" />}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" sideOffset={6} className="w-[300px] border-zinc-800 bg-zinc-950/95 p-3 text-xs text-zinc-200 backdrop-blur-sm">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Kronos AI forecast</span>
+                {kronos.status === 'ready' && (
+                  <button className="text-[10px] text-zinc-500 hover:text-rose-400" onClick={clearKronos}>Clear</button>
+                )}
+              </div>
+              {/* service status + realized accuracy — the accountability line */}
+              <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
+                {!krStatus && 'Checking the model service…'}
+                {krStatus?.loading && 'Model loading (first boot downloads weights)…'}
+                {krStatus?.available && (
+                  <>Foundation model for K-lines (runs on this server). Forecast = {krStatus.lanes?.mini ? 'Kronos-mini fast lane' : 'Kronos-small'}.
+                    {krStatus.hitRate.n > 0 && (
+                      <> · realized accuracy so far: <span className="font-semibold text-amber-400">{(krStatus.hitRate.rate! * 100).toFixed(0)}%</span> of {krStatus.hitRate.n} graded forecasts
+                        {krStatus.hitRate.avgAbsErrPct != null && <> (avg |err| {krStatus.hitRate.avgAbsErrPct.toFixed(2)}%)</>}</>
+                    )}
+                    {krStatus.hitRate.n === 0 && krStatus.hitRate.pending > 0 && <> · {krStatus.hitRate.pending} forecast(s) awaiting their horizon-end bar for grading</>}
+                  </>
+                )}
+                {krStatus && !krStatus.available && !krStatus.loading && (
+                  <span className="text-rose-400">Model service unavailable{krStatus.error ? ` — ${krStatus.error}` : ''}. Start mini-services/kronos-service.</span>
+                )}
+              </p>
+              <div className="mt-2 flex items-center gap-1.5">
+                <span className="text-[10px] text-zinc-500">Horizon</span>
+                {[12, 24, 48].map((h) => (
+                  <button
+                    key={h}
+                    onClick={() => setKrHorizon(h)}
+                    className={cn('rounded border px-1.5 py-0.5 text-[10px] transition-colors',
+                      krHorizon === h ? 'border-amber-500/50 bg-amber-400/10 text-amber-300' : 'border-zinc-800 text-zinc-400 hover:text-zinc-200')}
+                  >
+                    {h} bars
+                  </button>
+                ))}
+                <span className="ml-auto text-[10px] text-zinc-500">{TIMEFRAMES[tf].label}</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <span className="text-[10px] text-zinc-500">Model</span>
+                {([['mini', 'Fast (mini)'], ['small', 'Quality (small)']] as const).map(([m, label]) => (
+                  <button
+                    key={m}
+                    onClick={() => setKrModel(m)}
+                    className={cn('rounded border px-1.5 py-0.5 text-[10px] transition-colors',
+                      krModel === m ? 'border-amber-500/50 bg-amber-400/10 text-amber-300' : 'border-zinc-800 text-zinc-400 hover:text-zinc-200')}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <Button
+                size="sm"
+                className="mt-2.5 h-8 w-full gap-1.5 border border-amber-500/40 bg-amber-400/10 text-xs font-semibold text-amber-300 hover:bg-amber-400/20"
+                disabled={kronos.status === 'loading' || (krStatus != null && !krStatus.available)}
+                onClick={() => void runKronos()}
+              >
+                {kronos.status === 'loading'
+                  ? <><Loader2 className="h-3.5 w-3.5 animate-spin" /> Forecasting… (~{(krModel === 'mini' ? 10 : 55)}s)</>
+                  : <><Sparkles className="h-3.5 w-3.5" /> Forecast next {krHorizon} bars</>}
+              </Button>
+              {kronos.status === 'error' && (
+                <p className="mt-1.5 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-300">{kronos.error}</p>
+              )}
+              {kronos.status === 'ready' && (
+                <div className="mt-2 rounded-md border border-amber-500/25 bg-amber-400/5 p-2">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-lg font-bold text-amber-300">{(kronos.result.upProb * 100).toFixed(0)}% <span className="text-[10px] font-medium text-zinc-400">P(up) at horizon end</span></span>
+                    <span className={cn('text-xs font-semibold', kronos.result.closeP50[kronos.result.closeP50.length - 1]! >= kronos.result.lastClose ? 'text-emerald-400' : 'text-rose-400')}>
+                      {kronos.result.closeP50[kronos.result.closeP50.length - 1]! >= kronos.result.lastClose ? '↑' : '↓'} {(((kronos.result.closeP50[kronos.result.closeP50.length - 1]! - kronos.result.lastClose) / kronos.result.lastClose) * 100).toFixed(2)}%
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[10px] text-zinc-500">
+                    {kronos.result.model} · {kronos.result.contextBars} bars context · {kronos.result.samples} sample paths · cone ±{kronos.result.bandPct.toFixed(1)}% · {kronos.result.latencyMs}ms · new {new Date(kronos.at).toLocaleTimeString()}
+                  </p>
+                  <p className="mt-1 text-[9px] leading-relaxed text-zinc-600">
+                    Probabilistic forecast from sampled paths — NOT a promise. The cone is the p10-p90 spread of {kronos.result.samples} model samples; the model is graded against every forecast it makes.
+                  </p>
+                </div>
+              )}
+            </PopoverContent>
+          </Popover>
         </div>
         <div className="pointer-events-auto">
           <Popover open={indOpen} onOpenChange={setIndOpen}>

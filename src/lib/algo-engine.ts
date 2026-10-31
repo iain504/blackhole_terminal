@@ -24,6 +24,7 @@ import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
+import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
 import { getAtrSnapshot, atrToPct, atrTfOf } from '@/lib/atr'
 import {
@@ -85,6 +86,8 @@ interface AlgoRunRow {
   flattenEod: boolean
   cooldownMin: number
   requireNewSignal: boolean
+  // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
+  kronosGate: boolean
   status: string
   state: unknown
 }
@@ -115,8 +118,12 @@ interface AlgoState {
   hadPosition?: boolean // broker position present on the PREVIOUS cycle
   cooldownUntil?: number // epoch ms — no entries before this after a close
   prevLongSignal?: boolean // raw entry signal on the previously processed bar
-  prevShortSignal?: boolean
+  prevShortSignal?: boolean // raw entry signal on the previously processed bar
   freshGateSide?: 'buy' | 'sell' // side currently edge-suppressed (log once per episode)
+  // v2.0.0 — Kronos gate per-bar log-once memory (pending note / blocked note)
+  kronosPendingBar?: number
+  kronosBlockBar?: number
+  kronosPassBar?: number
   // v1.97.0 — trailing exit memory (persisted so restarts keep the trail)
   trailArmed?: boolean // profit threshold crossed — tracking the best price
   trailPeak?: number // best price since arming (max for long, min for short)
@@ -778,6 +785,9 @@ async function cycle(runId: string) {
           }
         } else if ((st.tradesToday ?? 0) >= run.maxTradesDay) {
           await log(runId, run.userId, 'info', `Signal suppressed (daily cap ${run.maxTradesDay}): ${res.entry.side.toUpperCase()} — ${res.entry.reason}`)
+        } else if (run.kronosGate && !(await kronosEntryOk(runId, run, res.entry.side, bars[lastClosedIdx].time, bars, log))) {
+          // v2.0.0 — the Kronos AI gate; the helper journaled the exact reason
+          // (forecast pending / model disagrees / sidecar down — all fail-closed)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
           // resolve % legs — and Risk-Money sizing — against the live quote.
@@ -1020,6 +1030,71 @@ export function stopEngine(runId: string) {
   console.log(`[algo] engine stopped for run ${runId}`)
 }
 
+/**
+ * v2.0.0 — Kronos AI entry gate (run.kronosGate). Asks the local foundation
+ * model whether the NEXT horizon favors the signal's direction; the entry is
+ * only allowed when the model AGREES:
+ *   long  ← P(up) ≥ KRONOS_GATE_THRESHOLD (0.55)
+ *   short ← P(up) ≤ 1 − KRONOS_GATE_THRESHOLD (0.45)
+ * FAIL-CLOSED semantics: a forecast that isn't ready yet (first bar with a
+ * signal, ~8-10s of CPU) or a sidecar outage BLOCKS the entry — the model
+ * never gets bypassed by impatience. The signal itself must still be live on
+ * a later cycle for the entry to fire (a one-bar signal can honestly be lost
+ * to the wait; that is the gate doing its job).
+ * Returns true = allowed (falls through the gate chain to execution).
+ */
+async function kronosEntryOk(
+  runId: string,
+  run: AlgoRunRow,
+  side: 'buy' | 'sell',
+  barTime: number,
+  bars: { time: number; open: number; high: number; low: number; close: number; volume: number }[],
+  log: (runId: string, userId: string, level: string, message: string) => Promise<void>,
+): Promise<boolean> {
+  const tfSec = TIMEFRAMES[run.timeframe as Timeframe]?.seconds ?? 300
+  const ctx = bars.slice(-512).map((b) => ({ t: b.time, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume }))
+  const verdict = await kronosGateCheck(run.symbol, run.timeframe, tfSec, ctx)
+  const wantLong = side === 'buy'
+  const agrees = verdict.available && !verdict.pending && (wantLong ? verdict.allowLong === true : verdict.allowShort === true)
+  if (verdict.available && !verdict.pending && agrees) {
+    if (st_kronosPassBar(runId) !== barTime) {
+      await log(runId, run.userId, 'info', `Kronos gate PASSED — ${side.toUpperCase()} signal agrees with the model (${verdict.detail})`)
+      st_kronosPassBarSet(runId, barTime)
+    }
+    return true
+  }
+  if (!verdict.available) {
+    await log(runId, run.userId, 'info', `Signal suppressed (Kronos gate down — fail-closed): ${side.toUpperCase()} — ${verdict.detail}`)
+    return false
+  }
+  if (verdict.pending) {
+    if (st_kronosPendingBar(runId) !== barTime) {
+      await log(runId, run.userId, 'info', `Kronos gate: ${verdict.detail} — entry re-evaluated next cycle (15s) if the signal is still live`)
+      st_kronosPendingBarSet(runId, barTime)
+    }
+    return false
+  }
+  // ready but disagrees (or inconclusive band 0.45–0.55)
+  if (st_kronosBlockBar(runId) !== barTime) {
+    await log(runId, run.userId, 'info', `Signal suppressed (Kronos gate): ${side.toUpperCase()} — model disagrees (${verdict.detail}; needs P(up) ≥ ${KRONOS_GATE_THRESHOLD} for long / ≤ ${(1 - KRONOS_GATE_THRESHOLD).toFixed(2)} for short)`)
+    st_kronosBlockBarSet(runId, barTime)
+  }
+  return false
+}
+
+// The log-once memory lives in the run's PERSISTED state (AlgoState), but the
+// gate helper runs before the cycle's state is written. Simplest correct
+// holder: a module map keyed by runId, synced back into st by the cycle after
+// the gate chain (st.kronos*Bar). The map is a LOG-ONCE aid only — worst case
+// after a restart is one duplicate journal line.
+const kronosLogMemo = new Map<string, { pending?: number; block?: number; pass?: number }>()
+function st_kronosPendingBar(runId: string): number | undefined { return kronosLogMemo.get(runId)?.pending }
+function st_kronosPendingBarSet(runId: string, v: number): void { const m = kronosLogMemo.get(runId) ?? {}; m.pending = v; kronosLogMemo.set(runId, m) }
+function st_kronosBlockBar(runId: string): number | undefined { return kronosLogMemo.get(runId)?.block }
+function st_kronosBlockBarSet(runId: string, v: number): void { const m = kronosLogMemo.get(runId) ?? {}; m.block = v; kronosLogMemo.set(runId, m) }
+function st_kronosPassBar(runId: string): number | undefined { return kronosLogMemo.get(runId)?.pass }
+function st_kronosPassBarSet(runId: string, v: number): void { const m = kronosLogMemo.get(runId) ?? {}; m.pass = v; kronosLogMemo.set(runId, m) }
+
 /** Create a run row (and start its engine — unless `opts.autostart === false`,
  *  Task 79: importing a STOPPED config creates the run paused so trading only
  *  begins when the user explicitly presses Start). */
@@ -1053,6 +1128,8 @@ export async function startAlgoRun(cfg: {
   flattenEod: boolean
   cooldownMin: number
   requireNewSignal: boolean
+  // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
+  kronosGate: boolean
 }, opts?: { autostart?: boolean }) {
   const autostart = opts?.autostart !== false
   const run = await db.algoRun.create({
@@ -1085,6 +1162,7 @@ export async function startAlgoRun(cfg: {
       flattenEod: cfg.flattenEod,
       cooldownMin: cfg.cooldownMin,
       requireNewSignal: cfg.requireNewSignal,
+      kronosGate: cfg.kronosGate === true,
       status: autostart ? 'running' : 'stopped',
       ...(autostart ? {} : { stoppedAt: new Date() }),
       state: {} as unknown as object,
@@ -1094,8 +1172,8 @@ export async function startAlgoRun(cfg: {
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', autostart
-    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
-    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
+    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
   if (autostart) startEngine(run.id)
   return run
 }
@@ -1134,6 +1212,8 @@ export interface AlgoRunConfigPatch {
   flattenEod: boolean
   cooldownMin: number
   requireNewSignal: boolean
+  // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
+  kronosGate: boolean
 }
 
 export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPatch) {
@@ -1214,6 +1294,7 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.flattenEod !== patch.flattenEod) diffs.push(`EOD flatten ${run.flattenEod ? 'ON' : 'OFF'} → ${patch.flattenEod ? 'ON' : 'OFF'}`)
   if (run.cooldownMin !== patch.cooldownMin) diffs.push(`cooldown ${run.cooldownMin}m → ${patch.cooldownMin}m`)
   if (run.requireNewSignal !== patch.requireNewSignal) diffs.push(`fresh-signal ${run.requireNewSignal ? 'ON' : 'OFF'} → ${patch.requireNewSignal ? 'ON' : 'OFF'}`)
+  if (run.kronosGate !== patch.kronosGate) diffs.push(`Kronos AI gate ${run.kronosGate ? 'ON' : 'OFF'} → ${patch.kronosGate ? 'ON' : 'OFF'}`)
   for (const k of Object.keys(nextParams)) {
     if (prevParams[k] !== nextParams[k]) diffs.push(`${k} ${prevParams[k]} → ${nextParams[k]}`)
   }
@@ -1246,6 +1327,7 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       flattenEod: patch.flattenEod,
       cooldownMin: patch.cooldownMin,
       requireNewSignal: patch.requireNewSignal,
+      kronosGate: patch.kronosGate === true,
       state: st as unknown as object,
     },
   })

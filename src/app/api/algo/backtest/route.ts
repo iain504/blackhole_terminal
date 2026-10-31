@@ -22,7 +22,7 @@
 // paths via the jobs lib — inline runs and jobs can never stack.
 //
 // body: {
-//   mode?: 'run' | 'optimize' | 'sweep' | 'walkforward'   (default 'run'; sweep ignores strategy)
+//   mode?: 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'   (default 'run'; sweep ignores strategy)
 //   symbol, timeframe ('1m'|'5m'|'15m'), strategy (AlgoStrategyId),
 //   params: Record<string, number>,       base parameters
 //   ranges?: { key, min, max, step }[]    (optimize/walkforward — numeric params
@@ -55,7 +55,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
-import { type Timeframe } from '@/lib/market-types'
+import { type Timeframe, TIMEFRAMES } from '@/lib/market-types'
 import { isAlgoStrategyId, normalizeAlgoParams, ALGO_TIMEFRAMES, algoMaxDays, type AlgoTimeframe } from '@/lib/algo-strategies'
 import { rateLimit } from '@/lib/rate-limit'
 import {
@@ -67,6 +67,8 @@ import { monteCarloBootstrap } from '@/lib/algo-regime'
 // plain runs (unbiased) and the optimizer's best row (selection-biased)
 import { roundTripCostBps, significanceStats, trustVerdict } from '@/lib/backtest-stats'
 import { memoryGuard, memoryGuardResponse } from '@/lib/mem-guard'
+// v2.0.0 — Kronos foundation-model client (gate A/B walk-forward forecasts)
+import { kronosForecastWait, kronosHealth } from '@/lib/kronos'
 import {
   createBacktestJob, getBacktestJob, tryAcquireBacktestSlot, releaseBacktestSlot,
   completeJob, failJob, jobProgress, phaseFromStage,
@@ -77,7 +79,13 @@ export const dynamic = 'force-dynamic'
 const MAX_BARS = 120_000
 
 /** Task 15 — heavy modes run detached as background jobs. */
-const JOB_MODES = new Set(['optimize', 'sweep', 'walkforward'])
+const JOB_MODES = new Set(['optimize', 'sweep', 'walkforward', 'kronos-ab'])
+
+// v2.0.0 — Kronos gate A/B forecast cache: origin → P(up) per dataset+config.
+// The walk-forward forecast loop is the expensive phase (~8-10s × ~34 origins);
+// caching the verdict map makes a config tweak → re-run instant (the gate map
+// only depends on the BARS, so any cfg change reuses it). 30min TTL, 8 entries.
+const kronosAbCache = new Map<string, { map: Map<number, number>; at: number }>()
 
 /**
  * v1.80.1 — wire sanitizer for backtest payloads. The engines score rows that
@@ -186,7 +194,9 @@ export async function POST(req: NextRequest) {
       )
     }
     const body = await readJson<BacktestBody>(req)
-    const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
+    const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' || body.mode === 'kronos-ab'
+      ? body.mode
+      : 'run'
 
     // Task 15 — heavy modes return 202 + jobId and run detached (see
     // backtest-jobs.ts). The response is back in milliseconds; the client
@@ -198,7 +208,7 @@ export async function POST(req: NextRequest) {
       if (!memGate.ok) {
         return NextResponse.json(memoryGuardResponse(memGate), { status: 503, headers: { 'retry-after': '60' } })
       }
-      const job = createBacktestJob(user.id, mode as 'optimize' | 'sweep' | 'walkforward')
+      const job = createBacktestJob(user.id, mode as 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab')
       if (!job) {
         return NextResponse.json({ error: 'A backtest is already running' }, { status: 429 })
       }
@@ -296,8 +306,9 @@ async function computeBacktest(
   if (!memGate.ok) {
     return { status: 503, body: memoryGuardResponse(memGate) as Record<string, unknown> }
   }
-  const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' ? body.mode : 'run'
-
+  const mode = body.mode === 'optimize' || body.mode === 'sweep' || body.mode === 'walkforward' || body.mode === 'kronos-ab'
+    ? body.mode
+    : 'run'
   // sweep mode (Task 87) runs the WHOLE catalog — the caller's strategy (if
   // any) is only a placeholder for the shared config validation below; every
   // sweep candidate gets its own catalog params inside sweepStrategies().
@@ -422,6 +433,109 @@ async function computeBacktest(
     coveredDays,
     source: hist.source ?? 'alpaca',
     dataCapped: coveredDays < days - 3,
+  }
+
+  if (mode === 'kronos-ab') {
+    // v2.0.0 — Kronos gate A/B: walk-forward forecasts (origin bar o covers
+    // o+1..o+H, conditioned on data ≤ o — NO look-ahead) build a per-bar gate,
+    // then the SAME config is replayed twice over the trailing window: ungated
+    // baseline vs Kronos-gated. The forecast loop is the slow phase (~8-10s
+    // per origin on the mini lane) and streams progress to the flow chart.
+    const health = await kronosHealth()
+    if (!health?.ok || !health.ready) {
+      return { status: 503, body: { error: 'Kronos sidecar is not ready — start mini-services/kronos-service (bun run dev) and retry' } }
+    }
+    const KR_WINDOW = 900 // trailing bars under test (bounded forecast count)
+    const KR_H = 24 // forecast horizon = stride (non-overlapping coverage)
+    const KR_MIN_CTX = 64 // sidecar minimum context
+    const win = bars.slice(-KR_WINDOW)
+    const seriesW = prepareSeries(win)
+    const origins: number[] = []
+    for (let o = Math.ceil(KR_MIN_CTX / KR_H) * KR_H; o + 1 < win.length; o += KR_H) origins.push(o)
+    if (origins.length === 0) {
+      return { status: 400, body: { error: 'Not enough bars in the window for walk-forward forecasts' } }
+    }
+    // origin → horizon-end P(up). Cached in-process per dataset so a re-run of
+    // the SAME window (tune cfg → re-check) is instant instead of ~5min.
+    const cacheKey = `${userId}|${symbol}|${tf}|${win.length}|${win[0].time}|${win[win.length - 1].time}|${JSON.stringify(cfg.params)}|${cfg.tpMode}/${cfg.tpValue}/${cfg.slMode}/${cfg.slValue}`
+    const cached = kronosAbCache.get(cacheKey)
+    const verdicts = cached?.map ?? new Map<number, number>()
+    let failed = 0
+    const t0 = Date.now()
+    for (let k = 0; k < origins.length; k++) {
+      const o = origins[k]!
+      if (verdicts.has(o)) continue
+      onProgress?.(0.05 + (k / origins.length) * 0.85, `forecasting Kronos ${k + 1}/${origins.length} (bars ≤ ${o})…`)
+      const ctxBars = win.slice(Math.max(0, o + 1 - 512), o + 1)
+      const r = await kronosForecastWait({
+        bars: ctxBars.map((b) => ({ t: b.time, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume })),
+        horizon: KR_H,
+        samples: 6,
+        market: cfg.isCrypto ? 'crypto' : 'stock',
+        tfSec: TIMEFRAMES[tf as Timeframe].seconds,
+        model: 'mini',
+      }, 150_000)
+      if (!r?.ok) {
+        failed++
+        if (verdicts.size === 0 && failed >= 2) {
+          return { status: 502, body: { error: 'Kronos forecasts are failing (sidecar error) — check mini-services logs and retry' } }
+        }
+        continue
+      }
+      verdicts.set(o, r.upProb)
+    }
+    kronosAbCache.set(cacheKey, { map: verdicts, at: Date.now() })
+    for (const [k, v] of kronosAbCache) {
+      if (Date.now() - v.at > 30 * 60_000) kronosAbCache.delete(k)
+    }
+    onProgress?.(0.92, 'gate replay: baseline vs Kronos-gated…')
+    // the gate for bar i: the covering forecast's origin is the largest
+    // multiple of H strictly below i. No covering forecast (early bars, failed
+    // origin) → the gate is SILENT (allows) — it vetoes only when the model
+    // has actually spoken for that bar.
+    const entryGate = (i: number, side: 'long' | 'short'): boolean => {
+      const o = Math.floor((i - 1) / KR_H) * KR_H
+      const up = verdicts.get(o)
+      if (up == null) return true
+      return side === 'long' ? up >= 0.55 : up <= 0.45
+    }
+    const base = runBacktest(seriesW, { ...cfg, collectEquity: false })
+    const gated = runBacktest(seriesW, { ...cfg, entryGate, collectEquity: false })
+    const summarize = (r: ReturnType<typeof runBacktest>) => {
+      const trades = r.trades
+      const grossWin = trades.filter((t) => t.pnl > 0).reduce((s, t) => s + t.pnl, 0)
+      const grossLoss = Math.abs(trades.filter((t) => t.pnl < 0).reduce((s, t) => s + t.pnl, 0))
+      return {
+        trades: trades.length,
+        netPct: ((r.metrics.finalEquity - cfg.capital) / cfg.capital) * 100,
+        winRate: trades.length > 0 ? (trades.filter((t) => t.pnl > 0).length / trades.length) * 100 : 0,
+        pf: grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 99 : 0,
+        expectancy: trades.length > 0 ? trades.reduce((s, t) => s + t.pnl, 0) / trades.length : 0,
+        maxDDPct: r.metrics.maxDrawdownPct,
+      }
+    }
+    const ups = [...verdicts.values()]
+    return {
+      status: 200,
+      body: {
+        kronosAb: {
+          base: summarize(base),
+          gated: summarize(gated),
+          gateVetoed: gated.metrics.gateVetoed ?? 0,
+          forecasts: verdicts.size,
+          forecastFailed: failed,
+          origins: origins.length,
+          horizon: KR_H,
+          windowBars: win.length,
+          model: 'Kronos-mini (fast lane)',
+          avgUpProb: ups.length > 0 ? ups.reduce((s, v) => s + v, 0) / ups.length : null,
+          elapsedSec: Math.round((Date.now() - t0) / 1000),
+          windowFrom: win[0].time,
+          windowTo: win[win.length - 1].time,
+        },
+        meta,
+      },
+    }
   }
 
   if (body.mode === 'optimize') {

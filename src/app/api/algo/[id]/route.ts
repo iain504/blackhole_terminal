@@ -63,6 +63,8 @@ interface AlgoPatchBody {
   flattenEod?: boolean
   cooldownMin?: number
   requireNewSignal?: boolean
+  // v2.0.0 — Kronos AI gate (model must agree with entries)
+  kronosGate?: boolean
 }
 
 // PATCH /api/algo/[id] — edit an existing run's settings (Task 71-1).
@@ -183,6 +185,7 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       flattenEod: body?.flattenEod !== false,
       cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body?.cooldownMin) || 0))),
       requireNewSignal: body?.requireNewSignal === true,
+      kronosGate: body?.kronosGate === true,
     })
     if (!updated) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
     return NextResponse.json({ run: toDto(updated, []) })
