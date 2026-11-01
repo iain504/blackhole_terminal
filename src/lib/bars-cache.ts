@@ -11,13 +11,18 @@ const barsCache = new Map<string, { bars: Bar[]; demo: boolean; at: number }>()
 const BARS_TTL_MS = 20000
 const MAX_ENTRIES = 8 // ~400MB worst case; LRU-evicted series simply refetch
 
-export async function barsFor(symbol: string, tf: Timeframe, userId: string) {
+export async function barsFor(symbol: string, tf: Timeframe, userId: string, lookbackDays?: number) {
   // Task 89 — the cache key includes the USER dimension: a keyless/demo
   // user's simulated bars used to be served to a keyed user (and vice versa)
   // for up to 20s, making the algo engine log "no live bar data" until TTL
   // expiry. fetchBacktestBars already keys the same way (demo status derives
   // from the user's keys, so userId is the right partition).
-  const key = `${userId}|${symbol}|${tf}`
+  // v2.3.0 — the key also includes the requested DEPTH: swing live runs fetch
+  // a deeper window (their HTF ladder needs trend buckets the chart-width
+  // default doesn't carry), and a 900-bar chart window must never be served
+  // to a swing run (or the deep window to a chart) just because the tf
+  // matches. 0 = default depth (callers that don't care).
+  const key = `${userId}|${symbol}|${tf}|${lookbackDays ?? 0}`
   const hit = barsCache.get(key)
   if (hit && Date.now() - hit.at < BARS_TTL_MS) {
     // refresh recency so the Map insertion order stays an LRU order
@@ -25,7 +30,7 @@ export async function barsFor(symbol: string, tf: Timeframe, userId: string) {
     barsCache.set(key, hit)
     return hit
   }
-  const res = await getBars(symbol, tf, userId)
+  const res = await getBars(symbol, tf, userId, lookbackDays != null ? { lookbackDays } : undefined)
   const entry = { bars: res.bars, demo: Boolean(res.demo), at: Date.now() }
   if (!barsCache.has(key) && barsCache.size >= MAX_ENTRIES) {
     // oldest-inserted key (recency is kept fresh on hits)

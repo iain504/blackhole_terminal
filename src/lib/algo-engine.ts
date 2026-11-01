@@ -23,9 +23,13 @@ import { closePositionFull, getAccount, getPositions, placeOrderWithExits, trade
 import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
-import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
+import { TIMEFRAMES, type Bar, type Timeframe } from '@/lib/market-types'
 import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
-import { isAlgoStrategyId, normalizeAlgoParams, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId } from '@/lib/algo-strategies'
+import { isAlgoStrategyId, normalizeAlgoParams, strategyLane, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
+// v2.3.0 — swing lane live unlock: the HTF ladder evaluated from the closed-bar
+// window every cycle (see swing-eval.ts for the parity contract with the
+// backtest's swing branches)
+import { swingSetup, swingDecide, swingLookbackDays, type SwingStrategyId } from '@/lib/swing-eval'
 import { getAtrSnapshot, atrToPct, atrTfOf } from '@/lib/atr'
 import {
   adxSeries,
@@ -319,6 +323,21 @@ function evalRaw(
   }
 }
 
+// v2.3.0 — swing lane live evaluation: build the HTF ladder from the closed
+// window, decide the eval bar. Exits need the held side + entry anchor (the
+// backtest's executor provides the same two to its swing exits).
+function evalSwingLive(
+  strategy: SwingStrategyId,
+  params: Record<string, number>,
+  bars: BarRow[],
+  pos: { side: 'long' | 'short'; entryPx: number } | null,
+): EvalResult {
+  const setup = swingSetup(bars as Bar[], strategy, params)
+  if (setup == null) return { entry: null, exit: null, note: 'swing: too few closed bars to build the HTF ladder' }
+  const d = swingDecide(setup, bars as Bar[], bars.length - 1, params, pos)
+  return { entry: d.entry, exit: d.exit, note: d.note }
+}
+
 /**
  * Live evaluator — raw strategy rules + the Task 12 quality gates. Must stay
  * PURE (no I/O) so the backtest engine can diff its own decide() against it
@@ -331,14 +350,21 @@ function evalRaw(
  *     enough (rolling OU fit). NaN inputs fail OPEN — a thin bar window must
  *     never freeze a live strategy.
  * Exits are NEVER gated — the regime veto only suppresses fresh entries.
+ * v2.3.0 — swing strategies evaluate through swing-eval.ts (the HTF ladder is
+ * recomputed from the closed-bar window every call; decision rules byte-mirror
+ * the backtest's swing branches). `pos` carries the held side + entry anchor
+ * so the SIDE-AWARE swing exits can fire — the day lane ignores it.
  */
 export function evalStrategy(
   strategy: AlgoStrategyId,
   params: Record<string, number>,
   bars: BarRow[],
   st: AlgoState,
+  pos?: { side: 'long' | 'short'; entryPx: number } | null,
 ): EvalResult {
-  const out = evalRaw(strategy, params, bars, st)
+  const out = strategyLane(strategy) === 'swing'
+    ? evalSwingLive(strategy as SwingStrategyId, params, bars, pos ?? null)
+    : evalRaw(strategy, params, bars, st)
   if (out.entry == null) return out
   // ---- ORB volume participation filter (P2) ----
   if (strategy === 'orb15') {
@@ -482,10 +508,21 @@ async function cycle(runId: string) {
     }
 
     // ---- bars + last CLOSED bar ----
+    // v2.3.0 — swing runs fetch a DEEPER window: the HTF ladder needs
+    // trendLen (+ pivotScan) trend buckets before its first decision, and the
+    // chart-width defaults (900×1h etc.) starve it silently — the exact
+    // v2.2.2 failure mode. swingLookbackDays sizes the fetch from the params
+    // (buckets follow TRADING time; equities print ~5/7 of the calendar).
+    const swingLive = strategyLane(strategy) === 'swing'
     let bars: BarRow[]
     let demo = false
     try {
-      const res = await barsFor(run.symbol, tf, run.userId)
+      const res = await barsFor(
+        run.symbol,
+        tf,
+        run.userId,
+        swingLive ? swingLookbackDays(tf as AlgoTimeframe, strategy as SwingStrategyId, params, isCrypto) : undefined,
+      )
       bars = res.bars as BarRow[]
       demo = res.demo
     } catch {
@@ -714,7 +751,15 @@ async function cycle(runId: string) {
         if (!st.lastFedBarTime || bars[i].time > (st.lastFedBarTime as number)) {
           feedAccumulators(strategy, orMinutes, bars[i], st, dayKey, isCrypto)
         }
-        const r = evalStrategy(strategy, params, bars.slice(0, i + 1), st)
+        const r = evalStrategy(
+          strategy,
+          params,
+          bars.slice(0, i + 1),
+          st,
+          // v2.3.0 — swing side-aware exits judge the CURRENT book (an exit
+          // earlier in the replay flattens `pos`, and later bars see it gone)
+          pos && posEntry != null ? { side: pos.side, entryPx: posEntry } : null,
+        )
         if (r.exit && pos) {
           const f = await flattenPosition(run.userId, mode, run.symbol)
           if (f.ok) {
@@ -738,7 +783,14 @@ async function cycle(runId: string) {
       }
 
       const closed = bars.slice(0, lastClosedIdx + 1)
-      const res = evalStrategy(strategy, params, closed, st)
+      const res = evalStrategy(
+        strategy,
+        params,
+        closed,
+        st,
+        // v2.3.0 — swing side-aware exits need the held side + entry anchor
+        pos && posEntry != null ? { side: pos.side, entryPx: posEntry } : null,
+      )
       if (res.note) await log(runId, run.userId, 'info', res.note)
 
       // 1) exits first

@@ -6,7 +6,7 @@ import { resolveTradeMode } from '@/lib/trading'
 import { hasAlpacaKeys } from '@/lib/alpaca'
 import { ensureAlgoEngines, startAlgoRun } from '@/lib/algo-engine'
 import {
-  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, strategyLane, isSwingTf, type AlgoTimeframe,
+  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
 import { clampAtrMult } from '@/lib/atr'
@@ -175,13 +175,11 @@ export async function POST(req: NextRequest) {
     if (!isAlgoStrategyId(body?.strategy)) {
       return NextResponse.json({ error: 'Unknown strategy' }, { status: 400 })
     }
-    // v2.2.0 — LIVE runs stay on the day lane: the swing strategies confirm
-    // every decision against higher timeframes INSIDE the backtest engine;
-    // the live engine has no MTF evaluation, so a swing id/tf here would
-    // silently never trade. Backtest-only by design (spec §2.1).
-    if (strategyLane(body.strategy) === 'swing' || isSwingTf(tf as AlgoTimeframe)) {
-      return NextResponse.json({ error: 'Swing strategies are backtest-only — run them from the Algo tab, Backtest view' }, { status: 400 })
-    }
+    // v2.2.0 — swing strategies/tfs were backtest-only here because the live
+    // engine had no MTF evaluation. v2.3.0 — UNLOCKED: the engine evaluates
+    // the full HTF ladder every cycle (src/lib/swing-eval.ts — same mtf.ts
+    // mechanics, decision rules byte-mirroring the backtest's swing branches,
+    // deep per-params bar window). Both lanes start like any other run.
     const strategy = body.strategy
     const qty = Number(body?.qty)
     if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) {

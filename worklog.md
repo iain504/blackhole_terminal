@@ -3858,3 +3858,54 @@ Stage Summary:
   instead of assuming a 24/7 clock, the wizard seeds and re-seeds calendar-depth windows per
   timeframe, and a zero-trade result always says WHY (window too short / conditions never
   aligned / signals filtered) instead of silently returning an empty table.
+
+## v2.3.0 — 2026-11-01 · Swing lane unlocked for LIVE runs
+
+User: "Swing trade are not allowed in Live trade. only allowed in Backtest only.
+Make it allow to start in Live."
+
+The v2.2.0 lock existed for one honest reason: the live engine had NO MTF
+evaluation, so a swing run would silently never trade. The unlock therefore
+PORTS the ladder to live instead of deleting the check:
+
+- src/lib/swing-eval.ts (NEW) — the live swing evaluator, built on the SAME
+  pure mtf.ts mechanics the backtest uses (aggregateBars / htfIndexAt /
+  pivotLevels / nearestLevel). swingSetup rebuilds the whole HTF ladder from
+  the closed-bar window every eval (O(n), ≤ ~2k bars, once per cycle);
+  swingDecide byte-mirrors the backtest's rawDecide swing branches plus the
+  executor's SIDE-AWARE exits (swing-pullback RSI recapture; htf-level-bounce
+  "next HTF level" off the entry anchor). Entry guards sit at needTrend =
+  max(trendLen, pivotScan+lookback) — exactly the backtest's data-driven
+  warmup floor (probe-swing-live caught the bare-trendLen gap: 16 phantom
+  early entries).
+- src/lib/algo-engine.ts — evalStrategy routes swing strategies through
+  swing-eval and takes an optional pos {side, entryPx} so side-aware exits
+  fire (replay path included); the cycle fetches a DEEPER window for swing
+  runs (swingLookbackDays: trend buckets → calendar days, ×7/5 for equities'
+  5/7 trading calendar — the v2.2.2 lesson) so the ladder can actually arm.
+- src/lib/bars-cache.ts — barsFor takes lookbackDays; the cache key includes
+  the depth so chart-width windows and swing windows never cross-serve.
+- src/app/api/algo/route.ts — the swing 400 is gone; both lanes validate the
+  same way. The universal live-mode + keys gates are untouched.
+- AlgoTab — the full 6-strategy catalog renders with day/swing lane chips;
+  the timeframe segmented flips per lane (1m/5m/15m ↔ 1h/4h/1D) and
+  pickStrategy re-grounds the chart on a lane switch.
+- scripts/probe-swing-live.ts (NEW) — engine-level parity on REAL Binance
+  bars through the app's getBars: swing-pullback 52/52 signals EXACT, 5/5
+  trade sequence IDENTICAL; htf-level-bounce 66/66 EXACT, 1/1 IDENTICAL.
+- E2E (agent-browser, fresh bootstrap account): both swing strategies render
+  with SWING badges, timeframe flips to 1h/4h/1D, run creation passes
+  validation (stops only at the universal Alpaca-keys gate, as every lane
+  does without keys).
+- Version → 2.3.0 (stamped +213).
+
+Files: src/lib/swing-eval.ts (new), src/lib/algo-engine.ts, src/lib/bars-cache.ts,
+src/app/api/algo/route.ts, src/components/terminal/tabs/AlgoTab.tsx,
+scripts/probe-swing-live.ts (new), package.json (2.3.0), src/generated/version.ts.
+
+Stage Summary:
+- v2.3.0 — swing strategies start live like everything else: the engine
+  rebuilds the HTF ladder from a deep per-params window every cycle and
+  decides with the same rules the verified backtest uses — proven by an
+  engine-level parity probe (signals and trade sequences IDENTICAL on real
+  bars), with honest warmup notes when a young feed can't arm the ladder yet.

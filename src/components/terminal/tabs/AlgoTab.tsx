@@ -32,7 +32,7 @@ import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
 import { fmtAtrExit, ATR_TF_OPTIONS } from '@/lib/atr-client'
 import {
-  ALGO_STRATEGIES, ALGO_STRATEGY_IDS, DAY_TFS,
+  ALGO_STRATEGIES, ALGO_STRATEGY_IDS, DAY_TFS, SWING_TFS,
   normalizeAlgoParams, algoConfigSummaryName, algoExportFileBase,
   buildAlgoConfigExport, runToAlgoConfig, ruleToExportEntry, strategyLane,
   type AlpoRunConfig, type AlgoRiskBasis, type AlgoStrategyId, type AlgoSizingMode, type AlgoTimeframe,
@@ -124,10 +124,15 @@ export default function AlgoTab() {
   const [settingsRun, setSettingsRun] = useState<AlgoRunDto | null>(null)
 
   // when the strategy changes → prefill its default params
+  // v2.3.0 — lanes pair with their own entry timeframes: crossing between the
+  // day and swing catalogs re-grounds the chart (5m day · 1h swing) so a
+  // swing pick can never start on a 1m/5m/15m chart (and vice versa)
   const pickStrategy = (id: AlgoStrategyId) => {
+    const laneChanged = strategyLane(id) !== strategyLane(strategy)
     setStrategy(id)
     setParams(normalizeAlgoParams(id, undefined))
     setParamDraft({})
+    if (laneChanged) setTimeframe(strategyLane(id) === 'swing' ? '1h' : '5m')
   }
 
   // crypto symbols ("BTC/USD") trade 24/7 — the equity session guards
@@ -461,12 +466,12 @@ export default function AlgoTab() {
           <div className="rounded-md border border-zinc-800/80 bg-zinc-900/70 p-3">
             <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Strategy</p>
             <div className="flex flex-col gap-1.5">
-              {/* v2.2.0 — LIVE runs are day-trading only: the swing lane is
-                  backtest-only (its MTF screens live in the backtest engine),
-                  so the shared setup filters to the day catalog/timeframes. */}
-              {ALGO_STRATEGY_IDS.filter((id) => strategyLane(id) === 'day').map((id) => {
+              {/* v2.3.0 — the full catalog: both lanes start live runs now
+                  (the engine evaluates the swing HTF ladder every cycle). */}
+              {ALGO_STRATEGY_IDS.map((id) => {
                 const s = ALGO_STRATEGIES[id]
                 const sel = id === strategy
+                const swing = strategyLane(id) === 'swing'
                 return (
                   <button
                     key={id}
@@ -481,6 +486,14 @@ export default function AlgoTab() {
                     <span className="flex items-center gap-2">
                       <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: s.color }} aria-hidden />
                       <span className="text-xs font-semibold text-zinc-100">{s.name}</span>
+                      <span
+                        className={cn(
+                          'rounded px-1 py-px text-[9px] font-semibold uppercase tracking-wide',
+                          swing ? 'bg-purple-500/15 text-purple-400' : 'bg-zinc-700/40 text-zinc-400',
+                        )}
+                      >
+                        {swing ? 'swing' : 'day'}
+                      </span>
                       <span className="ml-auto text-[10px] text-zinc-500">{s.tagline}</span>
                     </span>
                     {sel && (
@@ -511,7 +524,7 @@ export default function AlgoTab() {
                   className="mt-1 w-full"
                   value={timeframe}
                   onChange={(tf) => setTimeframe(tf as AlgoTimeframe)}
-                  options={DAY_TFS.map((tf) => ({ value: tf, label: tf }))}
+                  options={(strategyLane(strategy) === 'swing' ? SWING_TFS : DAY_TFS).map((tf) => ({ value: tf, label: tf }))}
                 />
               </div>
               {/* position sizing (Task 78 — Risk Money; Task 78e — $ or % basis) */}
