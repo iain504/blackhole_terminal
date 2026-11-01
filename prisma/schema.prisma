@@ -498,3 +498,45 @@ model KronosForecast {
   @@index([userId, madeAt])
   @@index([symbol, tf, realizedClose])
 }
+
+// v2.4.0 — Nebula Autopilot (智慧體): the FSD-style fleet manager. One row per
+// autonomous campaign: it scans the 100-stock high-VOL US universe (+ crypto
+// majors), backtests every symbol across the algo catalog, tunes the winners
+// on an optimizer grid, ranks by the Calmar-style score, sizes each slot
+// against the account's BUYING POWER and (on engage) spawns real AlgoRun
+// engines. Status machine:
+//   scanning → tuning → ranking → budget → ready → engaged → stopped | error
+// candidates/selected/budget/settings/stats are JSON payloads (same pattern as
+// GridAutoRun.report) — the ranking table IS the session document.
+model AgentSession {
+  id         String   @id @default(cuid())
+  userId     String
+  status     String   @default("scanning")
+  phase      String   @default("")
+  progress   Float    @default(0)
+  mode       String   @default("paper")
+  settings   Json
+  universe   Json?
+  candidates Json?
+  selected   Json?
+  budget     Json?
+  stats      Json?
+  error      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId, createdAt])
+}
+
+// Append-only agent brain feed — every scan/tune/rank/budget/trade decision
+// lands here so the tab can replay exactly WHAT the autopilot was thinking.
+model AgentEvent {
+  id        String   @id @default(cuid())
+  sessionId String
+  userId    String
+  level     String   @default("info")
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt])
+}

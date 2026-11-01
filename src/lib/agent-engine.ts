@@ -1,0 +1,673 @@
+// v2.4.0 — Nebula Autopilot engine (智慧體 / FSD-style fleet manager).
+//
+// One autonomous pipeline per session:
+//   scan    → every universe symbol: deep bars + full-catalog sweeps on BOTH
+//             lanes (day @ 15m, swing @ 1h — MTF ladder included), realistic
+//             per-market costs, 25% OOS walk-forward on every sweep row.
+//   tune    → the top candidates go through optimizeBacktest grids (strategy
+//             params + the virtual tpValue/slValue dims).
+//   ranking → Calmar-score board, OOS-verified rows first, ranked 1..N.
+//   budget  → live account BUYING POWER: deployable = BP × deployCapPct,
+//             per-slot budget, risk-% cap, per-position notional cap → the
+//             exact qty for every fleet slot (riskSizedQty + notional caps).
+//   ready   → the ranking table waits for the ENGAGE command.
+//   engaged → for each fleet slot a REAL AlgoRun engine starts (the same
+//             15s-cycle engine the Algo tab drives), mode per settings —
+//             paper or live (v2.4.0 live unlock).
+//
+// The pipeline runs detached (like backtest-jobs / reco refresh), writes
+// progress into the AgentSession row and every decision into AgentEvent so
+// the tab can replay exactly what the autopilot was thinking.
+import { db } from '@/lib/db'
+import { memoryGuard } from '@/lib/mem-guard'
+import { getAccount } from '@/lib/trading'
+import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
+import { fetchBacktestBars } from '@/lib/backtest-history'
+import {
+  prepareSeries, sweepStrategies, optimizeBacktest, autoOptimizeRanges,
+  type BacktestConfig, type BacktestSeries, type SweepRow, type OptimizeRange,
+} from '@/lib/backtest'
+import {
+  ALGO_STRATEGIES, strategyLane, algoMaxDays, MTF_TREND_TF, MTF_MID_TF,
+  riskSizedQty, type AlgoStrategyId, type AlgoTimeframe,
+} from '@/lib/algo-strategies'
+import { startAlgoRun, stopAlgoRun, ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
+import { costsFor } from '@/lib/algo-reco'
+import { agentUniverse, AGENT_US_100 } from '@/lib/agent-universe'
+import {
+  AGENT_SETTINGS_DEFAULTS, type AgentCandidate, type AgentSettings,
+  type AgentSessionStatus, type AgentStats, type AgentBudget, type AgentRunRow,
+} from '@/lib/agent-types'
+
+const SCAN_DAY_TF: AlgoTimeframe = '15m'
+const SCAN_SWING_TF: AlgoTimeframe = '1h'
+const SCAN_DAY_DAYS = 120
+// v2.4.1 — 400d (was 240d): crypto 1h at 400d ≈ 9.6k bars crosses the 9k
+// deep-path threshold, so crypto swing history comes from the bar-store /
+// Alpaca deep fetch instead of the bursty Binance klines path (which
+// rate-limits whole IPs on a 12-symbol scan burst — HTTP 418). Stocks get a
+// deeper swing window too (~2.8k RTH bars — still light), inside the 500d cap.
+const SCAN_SWING_DAYS = 400
+const SWEEP_TOP_X = 2
+const SWEEP_MAX_COMBOS = 20
+const SWEEP_OOS = 0.25
+const SWEEP_MIN_TRADES = 8
+const TUNE_MAX_COMBOS = 160
+const HEAP_ABORT = 0.78
+const MAX_EVENTS = 400
+const MIN_POS_NOTIONAL = 10 // a planned position below $10 is dust — skipped
+
+type ScanRow = { symbol: string; isCrypto: boolean; row: SweepRow; tf: AlgoTimeframe; lane: 'day' | 'swing'; bars: number; coveredDays: number }
+
+// ---------------------------------------------------------------------------
+// session/job registry (single-flight per user, survives HMR via globalThis)
+// ---------------------------------------------------------------------------
+interface AgentJob {
+  sessionId: string
+  userId: string
+  abort: boolean
+}
+type GlobalWithAgent = typeof globalThis & { __ttAgentJobs?: Map<string, AgentJob> }
+const g = globalThis as GlobalWithAgent
+const jobs: Map<string, AgentJob> = (g.__ttAgentJobs ??= new Map())
+
+export function agentJobRunning(userId: string): boolean {
+  return jobs.has(userId)
+}
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+async function ev(sessionId: string, userId: string, level: string, message: string): Promise<void> {
+  try {
+    await db.agentEvent.create({ data: { sessionId, userId, level, message } })
+    // bound the feed — drop the oldest once the session history grows past MAX_EVENTS
+    const count = await db.agentEvent.count({ where: { sessionId } })
+    if (count > MAX_EVENTS) {
+      const old = await db.agentEvent.findMany({
+        where: { sessionId }, orderBy: { createdAt: 'asc' }, take: count - MAX_EVENTS, select: { id: true },
+      })
+      if (old.length > 0) {
+        await db.agentEvent.deleteMany({ where: { id: { in: old.map((e) => e.id) } } })
+      }
+    }
+  } catch { /* the feed must never break the pipeline */ }
+}
+
+const pct = (v: number, d = 2) => Number(v.toFixed(d))
+
+function agentCfg(symbol: string, isCrypto: boolean, lane: 'day' | 'swing'): BacktestConfig {
+  const costs = costsFor(symbol)
+  return {
+    strategy: 'bb-reversion', // placeholder — sweeps override per strategy
+    params: {},
+    qty: 10,
+    sizingMode: 'fixed',
+    riskBasis: 'usd',
+    riskMoney: null,
+    isCrypto,
+    // autopilot exit policy — tuned later via the virtual tpValue/slValue dims
+    tpMode: 'pct',
+    tpValue: lane === 'day' ? 2.5 : 6,
+    slMode: 'pct',
+    slValue: lane === 'day' ? 1.5 : 3,
+    maxTradesDay: 3,
+    rthOnly: !isCrypto && lane === 'day',
+    flattenEod: lane === 'day',
+    cooldownMin: 0,
+    requireNewSignal: false,
+    slippageBps: costs.slip,
+    feeBps: costs.fee,
+    spreadBps: costs.spread,
+    capital: 10_000,
+    maxNotionalX: 1, // no simulated leverage
+    collectEquity: false,
+    mtf: lane === 'swing' ? { trendTf: MTF_TREND_TF['1h'], midTf: MTF_MID_TF['1h'] } : null,
+  }
+}
+
+function sweepRowToCandidate(r: ScanRow, base: AgentCandidate | null): AgentCandidate {
+  const m = r.row.metrics
+  return {
+    symbol: r.symbol,
+    isCrypto: r.isCrypto,
+    tf: r.tf,
+    strategy: r.row.strategy,
+    params: r.row.params,
+    lane: r.lane,
+    score: Number.isFinite(r.row.score) ? pct(r.row.score, 3) : 0,
+    netPct: pct(m.netPct),
+    winRate: pct(m.winRate, 1),
+    pf: pct(m.profitFactor),
+    maxDDPct: pct(m.maxDrawdownPct),
+    trades: m.trades,
+    oosNetPct: r.row.oos ? pct(r.row.oos.netPct) : null,
+    boundary: r.row.boundary === true,
+    bars: r.bars,
+    coveredDays: r.coveredDays,
+    tuned: false,
+    tpPct: base?.tpPct ?? (r.lane === 'day' ? 2.5 : 6),
+    slPct: base?.slPct ?? (r.lane === 'day' ? 1.5 : 3),
+  }
+}
+
+/** Tuning grid: the strategy's sanctioned auto grid + the exit legs. */
+function tuneRanges(strategy: AlgoStrategyId, lane: 'day' | 'swing'): OptimizeRange[] {
+  const tpValues = lane === 'day' ? [1.5, 2, 2.5, 3, 4] : [4, 5, 6, 8]
+  const slValues = lane === 'day' ? [1, 1.25, 1.5, 2, 2.5] : [2, 2.5, 3, 4]
+  return [
+    ...autoOptimizeRanges(strategy),
+    { key: 'tpValue', min: tpValues[0], max: tpValues[tpValues.length - 1], step: 0.5, values: tpValues },
+    { key: 'slValue', min: slValues[0], max: slValues[slValues.length - 1], step: 0.25, values: slValues },
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// the pipeline
+// ---------------------------------------------------------------------------
+async function runPipeline(sessionId: string, userId: string, settings: AgentSettings): Promise<void> {
+  const job = jobs.get(userId)
+  const dead = () => !job || job.abort
+  const universe = agentUniverse(settings.includeCrypto)
+  const scanTotal = universe.length
+  const stats: AgentStats = {
+    scanned: 0, scanTotal, tuned: 0, tuneTotal: 0,
+    fleetStarted: 0, fleetFailed: 0,
+    startedAt: new Date().toISOString(), finishedAt: null,
+  }
+  const touch = async (patch: {
+    status?: AgentSessionStatus; phase?: string; progress?: number
+    stats?: AgentStats; error?: string | null
+    candidates?: AgentCandidate[]; budget?: AgentBudget; universe?: unknown
+  }) => {
+    const data: Record<string, unknown> = { ...patch }
+    if (patch.stats != null) data.stats = patch.stats as unknown as object
+    if (patch.candidates != null) data.candidates = patch.candidates as unknown as object
+    if (patch.budget != null) data.budget = patch.budget as unknown as object
+    if (patch.universe !== undefined) data.universe = patch.universe as object
+    await db.agentSession.update({ where: { id: sessionId }, data: data as Parameters<typeof db.agentSession.update>[0]['data'] })
+  }
+
+  try {
+    await ev(sessionId, userId, 'info',
+      `Autopilot engaged — scanning ${scanTotal} symbols (${AGENT_US_100.length} US high-VOL${settings.includeCrypto ? ' + crypto majors' : ''}) · tune top ${settings.topTune} · fleet ${settings.topN} slots`)
+    await touch({ universe: { us: AGENT_US_100, crypto: settings.includeCrypto }, stats })
+
+    // ---------------- phase 1 — SCAN ----------------
+    const scanRows: ScanRow[] = []
+    for (let i = 0; i < universe.length; i++) {
+      if (dead()) throw new Error('aborted')
+      const { symbol, isCrypto } = universe[i]
+      const mem = memoryGuard(HEAP_ABORT)
+      if (!mem.ok) throw new Error(`Scan paused — heap ${mem.heapUsedMb}MB / ${mem.limitMb}MB cap. Retry when the server is quieter.`)
+      let added = 0
+      try {
+        // BOTH lanes per symbol — day scalpers on 15m, MTF swing on 1h
+        for (const lane of ['day', 'swing'] as const) {
+          const tf = lane === 'day' ? SCAN_DAY_TF : SCAN_SWING_TF
+          const days = Math.min(lane === 'day' ? SCAN_DAY_DAYS : SCAN_SWING_DAYS, algoMaxDays(tf, isCrypto))
+          const hist = await fetchBacktestBars(symbol, tf, userId, days)
+          if (!hist.ok || !hist.bars || hist.bars.length < 80) continue
+          const bars = hist.bars
+          const series: BacktestSeries = prepareSeries(bars)
+          const cfg = agentCfg(symbol, isCrypto, lane)
+          const sweep = await sweepStrategies(series, cfg, {
+            lane, minTrades: SWEEP_MIN_TRADES, topX: SWEEP_TOP_X,
+            maxCombosPerStrategy: SWEEP_MAX_COMBOS, oosFraction: SWEEP_OOS,
+          })
+          const best = sweep.rows.find((r) => Number.isFinite(r.score) && r.score > 0)
+          if (best) {
+            scanRows.push({ symbol, isCrypto, row: best, tf, lane, bars: series.n, coveredDays: Math.max(1, Math.round((Date.now() / 1000 - bars[0].time) / 86400)) })
+            added++
+          }
+        }
+      } catch { /* unreachable feed for this symbol — the rest still scan */ }
+      stats.scanned = i + 1
+      await touch({
+        phase: `SCAN ${i + 1}/${scanTotal} · ${symbol}${added ? ' ✓' : ''}`,
+        progress: 0.05 + 0.5 * ((i + 1) / scanTotal),
+        stats,
+      })
+      if (added > 0) {
+        const last = scanRows[scanRows.length - 1]
+        await ev(sessionId, userId, 'scan',
+          `${symbol} → ${ALGO_STRATEGIES[last.row.strategy].name} @ ${last.tf} (${last.lane}) · score ${pct(last.row.score, 2)} · net ${pct(last.row.metrics.netPct, 1)}% · ${last.row.metrics.trades} trades${last.row.oos && last.row.oos.netPct > 0 ? ` · OOS +${pct(last.row.oos.netPct, 1)}%` : ''}`)
+      }
+    }
+
+    if (dead()) throw new Error('aborted')
+    if (scanRows.length === 0) {
+      throw new Error('No profitable setup found across the whole universe — every symbol swept clean. Widen settings or retry later.')
+    }
+
+    // ---------------- phase 2 — TUNE ----------------
+    scanRows.sort((a, b) => (Number.isFinite(b.row.score) ? b.row.score : -1e9) - (Number.isFinite(a.row.score) ? a.row.score : -1e9))
+    const tunePool = scanRows.slice(0, Math.max(4, Math.min(40, settings.topTune)))
+    stats.tuneTotal = tunePool.length
+    await touch({ status: 'tuning', phase: `TUNE 0/${tunePool.length}`, stats })
+    await ev(sessionId, userId, 'info', `Scan complete — ${scanRows.length}/${scanTotal} symbols produced positive-score setups. Tuning the top ${tunePool.length}.`)
+
+    const candidates: AgentCandidate[] = []
+    for (let i = 0; i < tunePool.length; i++) {
+      if (dead()) throw new Error('aborted')
+      const t = tunePool[i]
+      const cand = sweepRowToCandidate(t, null)
+      const mem = memoryGuard(HEAP_ABORT)
+      if (mem.ok) {
+        try {
+          const days = Math.min(t.lane === 'day' ? SCAN_DAY_DAYS : SCAN_SWING_DAYS, algoMaxDays(t.tf, t.isCrypto))
+          const hist = await fetchBacktestBars(t.symbol, t.tf, userId, days)
+          if (hist.ok && hist.bars && hist.bars.length >= 80) {
+            const series = prepareSeries(hist.bars)
+            const cfg = agentCfg(t.symbol, t.isCrypto, t.lane)
+            const opt = await optimizeBacktest(series, cfg, tuneRanges(t.row.strategy, t.lane), {
+              minTrades: SWEEP_MIN_TRADES, maxCombos: TUNE_MAX_COMBOS,
+            })
+            if (opt.best && Number.isFinite(opt.best.score) && opt.best.score > cand.score) {
+              const bp = { ...opt.best.params }
+              const tpV = Number(bp.tpValue)
+              const slV = Number(bp.slValue)
+              delete bp.tpValue
+              delete bp.slValue
+              cand.params = bp
+              if (Number.isFinite(tpV) && tpV > 0) cand.tpPct = tpV
+              if (Number.isFinite(slV) && slV > 0) cand.slPct = slV
+              cand.score = pct(opt.best.score, 3)
+              cand.netPct = pct(opt.best.metrics.netPct)
+              cand.winRate = pct(opt.best.metrics.winRate, 1)
+              cand.pf = pct(opt.best.metrics.profitFactor)
+              cand.maxDDPct = pct(opt.best.metrics.maxDrawdownPct)
+              cand.trades = opt.best.metrics.trades
+            }
+            cand.tuned = true
+          }
+        } catch { /* keep the raw sweep row when tuning fails */ }
+      }
+      candidates.push(cand)
+      stats.tuned = i + 1
+      await touch({ phase: `TUNE ${i + 1}/${tunePool.length} · ${t.symbol}`, progress: 0.55 + 0.25 * ((i + 1) / tunePool.length), stats })
+      await ev(sessionId, userId, 'tune',
+        `${t.symbol} tuned — score ${cand.score} · TP ${cand.tpPct}% / SL ${cand.slPct}% · net ${cand.netPct}% · PF ${cand.pf} · DD ${cand.maxDDPct}%`)
+    }
+
+    // ---------------- phase 3 — RANKING ----------------
+    if (dead()) throw new Error('aborted')
+    candidates.sort((a, b) => {
+      const ao = a.oosNetPct != null && a.oosNetPct > 0 ? 1 : 0
+      const bo = b.oosNetPct != null && b.oosNetPct > 0 ? 1 : 0
+      if (ao !== bo) return bo - ao // OOS-verified first
+      return b.score - a.score
+    })
+    const ranked = candidates.slice(0, 40)
+    ranked.forEach((c, i) => { c.rank = i + 1 })
+    await touch({ status: 'ranking', phase: 'RANK', progress: 0.82, candidates: ranked, stats })
+    const top3 = ranked.slice(0, 3).map((c) => `#${c.rank} ${c.symbol} (${c.score})`).join(' · ')
+    await ev(sessionId, userId, 'rank', `Score board published — ${ranked.length} qualified setups. Podium: ${top3}`)
+
+    // ---------------- phase 4 — BUDGET (buying power sizing) ----------------
+    const budget = await computeBudget(userId, settings, ranked, sessionId)
+    if (budget) {
+      await touch({ status: 'budget', phase: 'BUDGET', progress: 0.92, budget, candidates: ranked, stats })
+      await ev(sessionId, userId, 'budget',
+        `Account ${budget.mode.toUpperCase()} — equity $${budget.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })} · buying power $${budget.buyingPower.toLocaleString(undefined, { maximumFractionDigits: 2 })} · deployable $${budget.deployable.toLocaleString(undefined, { maximumFractionDigits: 0 })} · per-slot $${budget.perSlot.toLocaleString(undefined, { maximumFractionDigits: 0 })}`)
+      if (budget.fleetNotional > 0) {
+        await ev(sessionId, userId, 'budget', `Fleet sized — ${ranked.filter((c) => c.selected && (c.allocQty ?? 0) > 0).length} slots × ≈$${(budget.fleetNotional / Math.max(1, ranked.filter((c) => c.selected && (c.allocQty ?? 0) > 0).length)).toLocaleString(undefined, { maximumFractionDigits: 0 })} notional each (risk ${settings.riskPerTradePct}%/trade, position cap ${settings.maxPosPct}% equity)`)
+      }
+    } else {
+      await ev(sessionId, userId, 'warn', 'Account snapshot unavailable — fleet sizing deferred to engage time.')
+    }
+
+    await touch({ status: 'ready', phase: 'READY', progress: 1, candidates: ranked, budget: budget ?? undefined, stats })
+    stats.finishedAt = new Date().toISOString()
+    await touch({ stats })
+    await ev(sessionId, userId, 'info',
+      `Autopilot READY — top ${Math.min(settings.topN, ranked.length)} setups armed. Press ENGAGE to start the fleet${settings.autoEngage ? ' (auto-engage will fire in seconds)' : ''}.`)
+    if (settings.autoEngage && budget) {
+      await ev(sessionId, userId, 'info', 'Auto-engage enabled — launching the fleet.')
+      await engageAgent(userId, sessionId)
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg === 'aborted') {
+      await touch({ status: 'stopped', phase: 'ABORTED', error: null })
+      await ev(sessionId, userId, 'warn', 'Pipeline aborted by user.')
+    } else {
+      await touch({ status: 'error', phase: 'FAILED', error: msg })
+      await ev(sessionId, userId, 'error', `Pipeline failed — ${msg}`)
+    }
+    stats.finishedAt = new Date().toISOString()
+    await db.agentSession.update({ where: { id: sessionId }, data: { stats: stats as unknown as object } }).catch(() => {})
+  } finally {
+    jobs.delete(userId)
+  }
+}
+
+/** Live account snapshot → per-slot sizing over the ranked board. */
+async function computeBudget(
+  userId: string, settings: AgentSettings, ranked: AgentCandidate[], sessionId: string,
+): Promise<AgentBudget | null> {
+  const mode = settings.mode
+  // getAccount wraps the broker payload: { data: TradingAccount | null, status }
+  const acctRes = await getAccount(userId, mode).catch(() => null)
+  const acct = acctRes?.data ?? null
+  if (!acct) return null
+  const equity = Number(acct.equity)
+  const buyingPower = Number(acct.buying_power)
+  if (!(equity > 0) || !(buyingPower > 0)) return null
+  const deployable = buyingPower * (settings.deployCapPct / 100)
+  const eligible = ranked.filter((c) => c.score >= settings.minScore && c.score > 0)
+  const fleetCount = Math.min(settings.topN, eligible.length)
+  const perSlot = fleetCount > 0 ? deployable / fleetCount : deployable
+  const riskPerTrade = equity * (settings.riskPerTradePct / 100)
+  const maxPosNotional = equity * (settings.maxPosPct / 100)
+
+  const symbols = eligible.slice(0, fleetCount).map((c) => c.symbol)
+  const priceBy = new Map<string, number>()
+  if (symbols.length > 0) {
+    const res = await getQuotes(symbols, userId, { trading: true }).catch(() => null)
+    if (res) for (const q of res.quotes) priceBy.set(q.symbol, q.price)
+  }
+
+  let fleetNotional = 0
+  for (const c of ranked) {
+    c.selected = false
+    c.allocQty = null
+    c.allocNotional = null
+    c.skipReason = null
+  }
+  for (const c of eligible.slice(0, fleetCount)) {
+    c.selected = true
+    const price = priceBy.get(c.symbol)
+    if (price == null || !(price > 0)) {
+      c.skipReason = 'no live quote'
+      continue
+    }
+    const capNotional = Math.min(maxPosNotional, perSlot)
+    const qtyNotional = c.isCrypto ? capNotional / price : Math.floor(capNotional / price)
+    const qtyRisk = riskSizedQty(Math.min(riskPerTrade, capNotional * (c.slPct / 100)), price, c.slPct, c.isCrypto)
+    const qty = Math.min(qtyNotional, qtyRisk ?? Infinity)
+    const notional = qty * price
+    if (!Number.isFinite(qty) || qty <= 0 || notional < MIN_POS_NOTIONAL) {
+      c.skipReason = 'budget too small for a position at this price'
+      continue
+    }
+    c.allocQty = qty
+    c.allocNotional = Math.round(notional * 100) / 100
+    fleetNotional += notional
+  }
+
+  return {
+    mode, equity: Math.round(equity * 100) / 100, cash: Math.round(Number(acct.cash) * 100) / 100,
+    buyingPower: Math.round(buyingPower * 100) / 100, currency: acct.currency || 'USD',
+    deployable: Math.round(deployable * 100) / 100, perSlot: Math.round(perSlot * 100) / 100,
+    riskPerTrade: Math.round(riskPerTrade * 100) / 100, maxPosNotional: Math.round(maxPosNotional * 100) / 100,
+    fleetNotional: Math.round(fleetNotional * 100) / 100,
+    at: new Date().toISOString(),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// public commands
+// ---------------------------------------------------------------------------
+export async function startAgentScan(userId: string, rawSettings: Partial<AgentSettings>): Promise<{ sessionId: string } | 'busy'> {
+  if (jobs.has(userId)) return 'busy'
+  const settings: AgentSettings = { ...AGENT_SETTINGS_DEFAULTS, mode: 'paper', ...(rawSettings ?? {}) } as AgentSettings
+  settings.topTune = Math.min(40, Math.max(4, Math.round(settings.topTune)))
+  settings.topN = Math.min(15, Math.max(3, Math.round(settings.topN)))
+  settings.riskPerTradePct = Math.min(3, Math.max(0.1, settings.riskPerTradePct))
+  settings.deployCapPct = Math.min(95, Math.max(10, settings.deployCapPct))
+  settings.maxPosPct = Math.min(25, Math.max(2, settings.maxPosPct))
+  settings.minScore = Math.max(0, settings.minScore)
+  settings.maxTradesDay = Math.min(10, Math.max(1, Math.round(settings.maxTradesDay)))
+  settings.mode = settings.mode === 'live' ? 'live' : 'paper'
+
+  const session = await db.agentSession.create({
+    data: {
+      userId, status: 'scanning', phase: 'WARM-UP', progress: 0.02,
+      mode: settings.mode, settings: settings as unknown as object, stats: {} as unknown as object,
+    },
+  })
+  const job: AgentJob = { sessionId: session.id, userId, abort: false }
+  jobs.set(userId, job)
+  void runPipeline(session.id, userId, settings)
+  return { sessionId: session.id }
+}
+
+export async function abortAgentScan(userId: string): Promise<boolean> {
+  const job = jobs.get(userId)
+  if (!job) return false
+  job.abort = true
+  return true
+}
+
+/** ENGAGE — start the fleet: one real AlgoRun engine per selected slot. */
+export async function engageAgent(userId: string, sessionId: string): Promise<{ ok: boolean; started: number; failed: number; error?: string }> {
+  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId } })
+  if (!session) return { ok: false, started: 0, failed: 0, error: 'Session not found' }
+  if (session.status === 'engaged') return { ok: true, started: 0, failed: 0 }
+  if (session.status !== 'ready') return { ok: false, started: 0, failed: 0, error: `Session is ${session.status} — wait for READY before engaging` }
+
+  const settings = session.settings as unknown as AgentSettings
+  const mode = settings.mode === 'live' ? 'live' : 'paper'
+  // the agent calls startAlgoRun DIRECTLY (no /api/algo route in between), so
+  // the route's keys check must be mirrored HERE — without keys the engines
+  // would spin 15s cycles failing on every broker call
+  if (!(await hasAlpacaKeys(userId))) {
+    const msg = 'Engage refused — no Alpaca keys on this account. Add them in Settings first (the fleet places real paper/live orders).'
+    await ev(sessionId, userId, 'error', msg)
+    return { ok: false, started: 0, failed: 0, error: msg }
+  }
+  if (mode === 'live' && !(await hasAlpacaKeys(userId, 'live'))) {
+    const msg = 'LIVE engage refused — no live Alpaca keys on this account. Add live keys in Settings or engage in paper.'
+    await ev(sessionId, userId, 'error', msg)
+    return { ok: false, started: 0, failed: 0, error: msg }
+  }
+
+  const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
+  const selected = candidates.filter((c) => c.selected && (c.allocQty ?? 0) > 0 && !c.skipReason)
+  if (selected.length === 0) {
+    const msg = 'No sized fleet slots — every candidate skipped (budget/quote). Nothing to engage.'
+    await ev(sessionId, userId, 'warn', msg)
+    return { ok: false, started: 0, failed: 0, error: msg }
+  }
+
+  const running = await db.algoRun.count({ where: { userId, status: 'running' } })
+  let slots = Math.max(0, ALGO_MAX_RUNNING_RUNS - running)
+  let started = 0
+  let failed = 0
+  for (const c of selected) {
+    if (slots <= 0) {
+      c.skipReason = `engine cap reached (${ALGO_MAX_RUNNING_RUNS} running)`
+      await ev(sessionId, userId, 'warn', `${c.symbol} skipped — ${c.skipReason}`)
+      continue
+    }
+    try {
+      const run = await startAlgoRun({
+        userId,
+        symbol: c.symbol,
+        mode, // v2.4.0 — live allowed; the user's explicit settings choice
+        timeframe: c.tf,
+        strategy: c.strategy,
+        params: c.params,
+        qty: c.allocQty ?? 1,
+        sizingMode: 'fixed',
+        riskBasis: 'usd',
+        riskMoney: null,
+        riskMoneyPct: null,
+        tpMode: 'pct',
+        tpValue: c.tpPct,
+        slMode: 'pct',
+        slValue: c.slPct,
+        tpTf: null,
+        slTf: null,
+        trailMode: 'off',
+        trailArmPct: null,
+        trailGivePct: null,
+        maxTradesDay: settings.maxTradesDay,
+        rthOnly: !c.isCrypto && c.lane === 'day',
+        flattenEod: c.lane === 'day',
+        cooldownMin: c.lane === 'day' ? 10 : 0,
+        requireNewSignal: false,
+        kronosGate: false,
+      }, { autostart: true })
+      c.runId = run.id
+      slots--
+      started++
+      await ev(sessionId, userId, 'trade',
+        `FLEET ON — ${c.symbol} ${c.tf} ${ALGO_STRATEGIES[c.strategy].name} ×${c.allocQty} (${mode.toUpperCase()}) · TP ${c.tpPct}% / SL ${c.slPct}% · score ${c.score}`)
+    } catch (e) {
+      failed++
+      c.skipReason = e instanceof Error ? e.message.slice(0, 140) : 'start failed'
+      await ev(sessionId, userId, 'error', `${c.symbol} start FAILED — ${c.skipReason}`)
+    }
+  }
+
+  const stats = (session.stats as unknown as AgentStats | null) ?? {
+    scanned: 0, scanTotal: 0, tuned: 0, tuneTotal: 0, fleetStarted: 0, fleetFailed: 0,
+    startedAt: new Date().toISOString(), finishedAt: null,
+  }
+  stats.fleetStarted = started
+  stats.fleetFailed = failed
+  await db.agentSession.update({
+    where: { id: sessionId },
+    data: {
+      status: started > 0 ? 'engaged' : 'ready',
+      phase: started > 0 ? 'ENGAGED' : 'READY',
+      candidates: candidates as unknown as object,
+      stats: stats as unknown as object,
+    },
+  })
+  await ev(sessionId, userId, 'info',
+    started > 0
+      ? `Fleet ENGAGED — ${started} engine(s) live in ${mode.toUpperCase()}${failed ? `, ${failed} failed` : ''}. The rainbow is spinning.`
+      : `Engage produced 0 engines — session stays READY.`)
+  return { ok: started > 0, started, failed }
+}
+
+/** DISENGAGE — stop every fleet engine (optionally flatten positions). */
+export async function disengageAgent(userId: string, sessionId: string, flatten: boolean): Promise<{ ok: boolean; stopped: number; error?: string }> {
+  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId } })
+  if (!session) return { ok: false, stopped: 0, error: 'Session not found' }
+  if (session.status !== 'engaged') return { ok: true, stopped: 0 }
+  const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
+  let stopped = 0
+  for (const c of candidates) {
+    if (!c.runId) continue
+    try {
+      await stopAlgoRun(c.runId, flatten)
+      stopped++
+      await ev(sessionId, userId, 'trade', `FLEET OFF — ${c.symbol} engine stopped${flatten ? ' · positions flattened' : ''}`)
+    } catch (e) {
+      await ev(sessionId, userId, 'error', `${c.symbol} stop FAILED — ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+  await db.agentSession.update({ where: { id: sessionId }, data: { status: 'stopped', phase: 'DISENGAGED' } })
+  await ev(sessionId, userId, 'info', `Autopilot DISENGAGED — ${stopped} engine(s) stopped. Rainbow parked.`)
+  return { ok: true, stopped }
+}
+
+/** Settings update — only meaningful on a READY session (re-sizes the fleet). */
+export async function updateAgentSettings(userId: string, sessionId: string, patch: Partial<AgentSettings>): Promise<{ ok: boolean; error?: string }> {
+  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId } })
+  if (!session) return { ok: false, error: 'Session not found' }
+  if (session.status !== 'ready') return { ok: false, error: `Settings are editable while READY only (current: ${session.status})` }
+  const settings = { ...(session.settings as unknown as AgentSettings), ...patch }
+  settings.topN = Math.min(15, Math.max(3, Math.round(settings.topN)))
+  settings.riskPerTradePct = Math.min(3, Math.max(0.1, settings.riskPerTradePct))
+  settings.deployCapPct = Math.min(95, Math.max(10, settings.deployCapPct))
+  settings.maxPosPct = Math.min(25, Math.max(2, settings.maxPosPct))
+  settings.minScore = Math.max(0, settings.minScore)
+  settings.mode = settings.mode === 'live' ? 'live' : 'paper'
+
+  const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
+  const budget = await computeBudget(userId, settings, candidates, sessionId)
+  await db.agentSession.update({
+    where: { id: sessionId },
+    data: { settings: settings as unknown as object, candidates: candidates as unknown as object, budget: (budget ?? undefined) as object | undefined },
+  })
+  await ev(sessionId, userId, 'budget',
+    `Settings updated — fleet ${settings.topN} slots · risk ${settings.riskPerTradePct}%/trade · deploy ${settings.deployCapPct}% BP · position cap ${settings.maxPosPct}% · mode ${settings.mode.toUpperCase()} — fleet re-sized.`)
+  return { ok: true }
+}
+
+export async function deleteAgentSession(userId: string, sessionId: string): Promise<{ ok: boolean; error?: string }> {
+  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId } })
+  if (!session) return { ok: false, error: 'Session not found' }
+  if (session.status === 'engaged') return { ok: false, error: 'Disengage the fleet before deleting this session' }
+  const job = jobs.get(userId)
+  if (job?.sessionId === sessionId) return { ok: false, error: 'The pipeline is still running — abort it first' }
+  await db.agentEvent.deleteMany({ where: { sessionId } })
+  await db.agentSession.delete({ where: { id: sessionId } })
+  return { ok: true }
+}
+
+// ---------------------------------------------------------------------------
+// state read — the GET payload builder (also self-heals crashed pipelines)
+// ---------------------------------------------------------------------------
+export async function getAgentState(userId: string): Promise<{
+  session: unknown
+  candidates: AgentCandidate[]
+  events: { id: string; level: string; message: string; createdAt: string }[]
+  runs: AgentRunRow[]
+} | null> {
+  const session = await db.agentSession.findFirst({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+  })
+  if (!session) return null
+
+  // crash healing: an in-flight status with no live job means the process
+  // restarted under it — mark the session failed instead of spinning forever
+  const inflight = ['scanning', 'tuning', 'ranking', 'budget'] as const
+  if ((inflight as readonly string[]).includes(session.status)) {
+    const job = jobs.get(userId)
+    if (!job || job.sessionId !== session.id) {
+      await db.agentSession.update({
+        where: { id: session.id },
+        data: { status: 'error', phase: 'INTERRUPTED', error: 'Pipeline interrupted by a server restart — run a new scan.' },
+      }).catch(() => {})
+      session.status = 'error'
+      session.phase = 'INTERRUPTED'
+    }
+  }
+
+  const events = await db.agentEvent.findMany({
+    where: { sessionId: session.id },
+    orderBy: { createdAt: 'desc' },
+    take: 120,
+  })
+  const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
+  const runIds = candidates.map((c) => c.runId).filter((v): v is string => typeof v === 'string' && v.length > 0)
+  const runs: AgentRunRow[] = []
+  if (runIds.length > 0) {
+    const rows = await db.algoRun.findMany({ where: { id: { in: runIds } } })
+    const logs = await db.algoLog.findMany({
+      where: { runId: { in: runIds } },
+      orderBy: { createdAt: 'desc' },
+      take: runIds.length * 30,
+    })
+    const lastLog = new Map<string, { message: string; level: string }>()
+    for (const l of logs) {
+      if (!lastLog.has(l.runId)) lastLog.set(l.runId, { message: l.message, level: l.level })
+    }
+    for (const r of rows) {
+      const ll = lastLog.get(r.id)
+      runs.push({
+        runId: r.id, symbol: r.symbol, timeframe: r.timeframe, strategy: r.strategy,
+        status: r.status, mode: r.mode, qty: r.qty, tradesToday: 0,
+        startedAt: r.startedAt?.toISOString() ?? null,
+        lastLog: ll?.message ?? null, lastLogLevel: ll?.level ?? null,
+      })
+    }
+  }
+  return {
+    session: {
+      id: session.id, status: session.status, phase: session.phase, progress: session.progress,
+      mode: session.mode, settings: session.settings, stats: session.stats, budget: session.budget,
+      error: session.error, createdAt: session.createdAt.toISOString(), updatedAt: session.updatedAt.toISOString(),
+    },
+    candidates,
+    events: events.reverse().map((e) => ({ id: e.id, level: e.level, message: e.message, createdAt: e.createdAt.toISOString() })),
+    runs,
+  }
+}

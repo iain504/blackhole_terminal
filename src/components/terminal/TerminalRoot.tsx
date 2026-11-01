@@ -17,6 +17,7 @@ import StrategyTab from './tabs/StrategyTab'
 import ReportTab from './tabs/ReportTab'
 import AlgoTab from './tabs/AlgoTab'
 import GridTab from './tabs/GridTab'
+import AgentTab from './tabs/AgentTab'
 import { StrategyDrawer } from './StrategyDrawer'
 import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'
@@ -644,6 +645,7 @@ function ActiveTabContent() {
   if (active.type === 'report') return <ReportTab />
   if (active.type === 'algo') return <AlgoTab />
   if (active.type === 'grid') return <GridTab />
+  if (active.type === 'agent') return <AgentTab key={active.id} />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 

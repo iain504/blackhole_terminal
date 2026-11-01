@@ -3909,3 +3909,38 @@ Stage Summary:
   decides with the same rules the verified backtest uses — proven by an
   engine-level parity probe (signals and trade sequences IDENTICAL on real
   bars), with honest warmup notes when a young feed can't arm the ladder yet.
+
+---
+Task ID: v2.4.0
+Agent: main
+Task: 智慧體 NEBULA AUTOPILOT — FSD-style autonomous fleet tab + complete the v2.3.0 live unlock
+
+Work Log:
+- COMPLETION of the previous session's swing-live task: b3e8973 had ported the MTF ladder into the live engine (swing-eval.ts) but BOTH route gates remained — `POST /api/algo` refused autostart when mode==='live' and `POST /api/algo/[id]/start` refused resume. Both hard blocks REMOVED (v2.4.0 LIVE UNLOCK comment): the mode is the user's explicit settings choice, Alpaca keys are still required, the 20-running-runs cap still applies. Swing can now actually START in Live, as the user directed.
+- Prisma: AgentSession (status machine scanning→tuning→ranking→budget→ready→engaged→stopped|error, settings/universe/candidates/selected/budget/stats JSON payloads) + AgentEvent (bounded 400/session brain feed). db:push OK.
+- src/lib/agent-universe.ts: AGENT_US_100 — exactly 100 curated high-VOL US tickers (mega tech 12, semis 8, software 10, AI/quantum movers 12, EV/mobility 8, space/defense 4, finance 8, healthcare 6, energy 5, consumer 9, industrials 6, telecom 4, liquid ETFs 8) + crypto majors from CRYPTO_UNIVERSE.
+- src/lib/agent-engine.ts — the autonomous pipeline (single-flight per user on globalThis):
+  · SCAN: every symbol × BOTH lanes — day @15m/120d + swing @1h/400d — via sweepStrategies (lane filter, auto grids 20 combos/strategy, topX 2, oosFraction 0.25, minTrades 8, realistic costsFor costs, memoryGuard 0.78). 1h swing window raised 240→400d: crypto 1h@400d ≈9.6k bars crosses the deep-path threshold so crypto swing history rides the bar-store/Alpaca deep fetch instead of the bursty Binance klines path (sandbox HTTP 418 lesson).
+  · TUNE: top candidates through optimizeBacktest (maxCombos 160) with autoOptimizeRanges + VIRTUAL tpValue/slValue dims (day 1.5-4%/1-2.5%, swing 4-8%/2-4%) — exits are tuned with the params.
+  · RANKING: OOS-verified rows first, then Calmar score desc (same honesty rule as the reco panel), ranks 1..40.
+  · BUDGET: live getAccount(mode) snapshot → deployable = buying_power × deployCapPct, perSlot = deployable/topN, riskPerTrade = equity × riskPerTradePct, maxPosNotional = equity × maxPosPct; per-slot qty = min(notional cap, riskSizedQty) via live quotes (trading:true); dust <$10 skipped with reason.
+  · ENGAGE: keys guard (mirrors the route check — the agent calls startAlgoRun DIRECTLY), live-keys check in live mode, ALGO_MAX_RUNNING_RUNS slot budget, one real AlgoRun engine per selected slot (fixed qty, pct TP/SL from tuned exits, day lane RTH+EOD-flat+cooldown 10m, swing lane 24/7). DISENGAGE stops every fleet engine with optional flatten.
+  · Crash healing: an in-flight session with no live job (server restart) is marked error/INTERRUPTED instead of spinning forever.
+- src/app/api/agent/route.ts: GET (state+events+runs join+mode+configured) / POST actions start|abort|engage|disengage|update|delete, heap-gated at 0.7.
+- AgentTab.tsx (new 智慧體 tab): gradient title, status/mode chips, rainbow marquee ticker of fleet symbols while ENGAGED, mission-parameter deck (fleet size, tune pool, risk%/trade, deploy cap %BP, position cap, max trades/day, min score, crypto toggle, LIVE toggle, auto-engage), scan progress bar + scanline sweep + abort, stat chips, budget strip (equity/buying power/deployable/per-slot/risk/fleet notional), Autopilot brain feed (level-colored, autoscroll), Fleet operations cards (live P&L from /api/trading/positions every 15s), Score board table (rank/symbol/tf/strategy+lane/score/net/win/PF/DD/trades/OOS/qty/notional/status with ARMED/TRADING states), engage/disengage AlertDialogs with LIVE warning, session clear.
+- Rainbow FSD halo (globals.css): .agent-rainbow-frame (conic-gradient spinning on an oversized ::before layer, GPU transform, works without @property) + .agent-rainbow-glow blur halo + .agent-marquee (−50% translate loop, duplicated track) + .agent-scanline + slim neon scrollbars; all disabled under prefers-reduced-motion.
+- Tab wiring (all 5 points): TabType +'agent', hydrate whitelist, TYPE_META (Sparkles icon, "智慧體 AI Agent"), +tab dropdown, ActiveTabContent switch.
+- package.json 2.3.0 → 2.4.0.
+
+E2E (agent-browser, fresh sandbox db — seeded kronostest1):
+- Tab renders, login → +tab → 智慧體 AI Agent; mission defaults 8/24/0.5/60/12/3/0.1.
+- First scan failed honestly in ~4s: stocks demo-refused (no keys) + Binance HTTP 418 (sandbox IP burst-banned) → "No profitable setup found across the whole universe" — correct refusal path.
+- Seeded bar-store (scripts-tmp/seed-agent-bars.ts) with covering synthetic crypto history (BTC/ETH/SOL × 15m@130d + 1h@410d ≈ 67k bars) → relaunch: SCAN 112/112 with REAL sweeps (BTC/USD → HTF S/R Level Bounce @1h score 31.99, net 39%, 29 trades, OOS +6.2%; 20 symbols qualified), TUNE 20/20 (exits tuned), RANK published (OOS-first podium), BUDGET honest warn (no account without keys), READY.
+- ENGAGE flow: confirm dialog renders fleet notional + LIVE warning variant; confirm without keys → clean refusal event "Engage refused — no Alpaca keys…" and the session STAYS READY (no orphan engines).
+- ENGAGED visuals probed via scripts-tmp/agent-probe-engage.ts (honest synthetic probe): rainbow frame + marquee ticker + budget strip + ops board + LIVE pulse all render; restored to READY after.
+- Mobile width (<lg) shows the standalone MobileShell (desktop tab types unused there — same scope as Algo/Grid tabs); responsive grids stack correctly in the terminal.
+- Lint clean; tsc clean for all agent files; no runtime errors in dev.log.
+
+Notes:
+- scripts-tmp/{seed-e2e-user,seed-agent-bars,agent-events,agent-probe-engage,agent-restore}.ts are dev-only helpers (untracked by git via scripts-tmp convention? verify before commit).
+- The rainbow frame only mounts while status==='engaged' — a real engage with keys on the user's machine will spin it for real.

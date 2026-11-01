@@ -190,11 +190,13 @@ export async function POST(req: NextRequest) {
     }
     const mode = await resolveTradeMode(user.id)
     // Task 79 — a STOPPED run places no orders, so importing configs as
-    // stopped runs is safe even in live mode; only STARTING runs is paper-only.
+    // stopped runs is safe in any mode.
     const autoStart = body?.autoStart !== false
-    if (autoStart && mode === 'live') {
-      return NextResponse.json({ error: 'Refusing to start algo runs in LIVE mode — switch the trade mode to paper' }, { status: 400 })
-    }
+    // v2.4.0 — LIVE UNLOCK (user directive, completes the v2.3.0 swing-lane
+    // work: the engine already evaluates every lane live, including the MTF
+    // ladder). The mode is the user's EXPLICIT settings choice, keys are
+    // verified above and the running-run cap below still applies — starting
+    // runs in live is no longer refused at the route.
     // Task 89 — cap the number of RUNNING runs per user: each one is a 15s
     // engine cycle (bars + positions + quotes + state writes); unbounded runs
     // would churn the Alpaca rate budget and SQLite for no benefit.
