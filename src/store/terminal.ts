@@ -69,7 +69,9 @@ export function layoutPaneCount(id: GridLayoutId): number {
   return GRID_LAYOUTS.find((l) => l.id === id)?.panes ?? 1
 }
 
-export type PanelId = 'watchlist' | 'quote' | 'news'
+// v2.5.0 — 'sentiment' joins the movable sidebar (Market Sentiment Engine:
+// per-symbol score, scored headlines, market leaderboard).
+export type PanelId = 'watchlist' | 'quote' | 'news' | 'sentiment'
 
 /** Which y-scale a drawing point lives in: the main price scale or one of
  *  the indicator strips (volume / RSI / MACD). 'price' = main scale.
@@ -308,7 +310,7 @@ const DEFAULT_LAYOUT: LayoutBlob = {
   v: 1,
   tabs: [],
   activeTabId: null,
-  sidebar: { panelOrder: ['watchlist', 'quote', 'news'], panelCollapsed: {}, mainSizes: [72, 28] },
+  sidebar: { panelOrder: ['watchlist', 'quote', 'news', 'sentiment'], panelCollapsed: {}, mainSizes: [72, 28] },
   showDrawings: true,
   showExtendedHours: true,
   positionsPanelSizes: [5, 3, 3],
@@ -633,7 +635,14 @@ export const useTerminal = create<TerminalState>((set, get) => ({
     set({
       tabs,
       activeTabId,
-      panelOrder: sb?.panelOrder?.length === 3 ? sb.panelOrder : DEFAULT_LAYOUT.sidebar.panelOrder,
+      // v2.5.0 — layouts saved before the sentiment panel migrate forward:
+      // length 3 = old order kept, 'sentiment' appended; anything else = default
+      panelOrder:
+        sb?.panelOrder?.length === 3
+          ? [...sb.panelOrder, 'sentiment' as PanelId]
+          : sb?.panelOrder?.length === 4
+            ? sb.panelOrder
+            : DEFAULT_LAYOUT.sidebar.panelOrder,
       panelCollapsed: sb?.panelCollapsed || {},
       mainSizes,
       showDrawings: blob.showDrawings !== false,

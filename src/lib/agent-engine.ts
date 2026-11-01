@@ -32,6 +32,7 @@ import {
   riskSizedQty, type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { startAlgoRun, stopAlgoRun, ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
+import { getSentimentSummary } from '@/lib/sentiment-engine'
 import { costsFor } from '@/lib/algo-reco'
 import { agentUniverse, AGENT_US_100 } from '@/lib/agent-universe'
 import {
@@ -292,6 +293,45 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
 
     // ---------------- phase 3 — RANKING ----------------
     if (dead()) throw new Error('aborted')
+
+    // v2.5.0 — SENTIMENT BLEND: the score board now folds in the Market
+    // Sentiment Engine. Each candidate's backtest Calmar score (scoreBase) is
+    // adjusted by its freshest news-sentiment snapshot: score × (1 + 0.25 ×
+    // sentiment). A +1.0 bullish tape boosts a setup 25%, a -1.0 bearish one
+    // cuts it 25% — enough to re-order neighbours, never enough to rescue a
+    // bad backtest. Symbols with no fresh snapshot keep their raw score.
+    // The fleet's live runs also arm the sentiment GATE on engage.
+    const SENTIMENT_WEIGHT = 0.25
+    let sentimentHits = 0
+    try {
+      const snaps = await getSentimentSummary()
+      const bySymbol = new Map(snaps.filter((s) => !s.stale).map((s) => [s.symbol, s]))
+      for (const c of candidates) {
+        c.scoreBase = c.score
+        const s = bySymbol.get(c.symbol)
+        if (!s) continue
+        c.sent = s.score
+        const adj = c.score * (1 + SENTIMENT_WEIGHT * s.score)
+        c.score = Math.round(Math.max(0, adj) * 1000) / 1000
+        sentimentHits++
+      }
+      if (sentimentHits > 0) {
+        candidates.sort((a, b) => {
+          const ao = a.oosNetPct != null && a.oosNetPct > 0 ? 1 : 0
+          const bo = b.oosNetPct != null && b.oosNetPct > 0 ? 1 : 0
+          if (ao !== bo) return bo - ao // OOS-verified first
+          return b.score - a.score
+        })
+        await ev(sessionId, userId, 'rank',
+          `Sentiment blended — ${sentimentHits}/${candidates.length} setups carried a fresh news score (weight ±${Math.round(SENTIMENT_WEIGHT * 100)}%); the sentiment gate will also guard every fleet entry`)
+      } else {
+        await ev(sessionId, userId, 'info',
+          'Sentiment: no fresh snapshots yet — ranking on pure backtest scores. Run a sentiment scan (Chart → Sentiment panel) to feed news into the board.')
+      }
+    } catch {
+      await ev(sessionId, userId, 'warn', 'Sentiment blend skipped (engine unavailable) — ranking on pure backtest scores.')
+    }
+
     candidates.sort((a, b) => {
       const ao = a.oosNetPct != null && a.oosNetPct > 0 ? 1 : 0
       const bo = b.oosNetPct != null && b.oosNetPct > 0 ? 1 : 0
@@ -509,6 +549,9 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
         cooldownMin: c.lane === 'day' ? 10 : 0,
         requireNewSignal: false,
         kronosGate: false,
+        // v2.5.0 — the autopilot ALWAYS arms the sentiment gate: fleet entries
+        // must not fight fresh news (the ranking already blended sentiment in)
+        sentimentGate: true,
       }, { autostart: true })
       c.runId = run.id
       slots--

@@ -52,6 +52,11 @@ export interface AgentCandidate {
   lane: 'day' | 'swing'
   // ranking metrics
   score: number
+  // v2.5.0 — Market Sentiment Engine: scoreBase = the pure backtest score,
+  // sent = the freshest news-sentiment snapshot (-1..1) that was blended in
+  // (score = scoreBase × (1 + 0.25 × sent); null when never scanned/stale)
+  scoreBase?: number | null
+  sent?: number | null
   netPct: number
   winRate: number
   pf: number

@@ -40,6 +40,7 @@ export interface AlgoRunDto {
   cooldownMin: number
   requireNewSignal: boolean
   kronosGate: boolean
+  sentimentGate: boolean
   status: string
   tradesToday: number
   startedAt: string
@@ -57,6 +58,7 @@ export function toDto(r: {
   maxTradesDay: number; rthOnly: boolean; flattenEod: boolean
   cooldownMin?: number; requireNewSignal?: boolean
   kronosGate?: boolean
+  sentimentGate?: boolean
   status: string
   state: unknown; startedAt: Date; stoppedAt: Date | null
 }, logs: AlgoRunDto['logs']): AlgoRunDto {
@@ -77,6 +79,7 @@ export function toDto(r: {
     maxTradesDay: r.maxTradesDay, rthOnly: r.rthOnly, flattenEod: r.flattenEod,
     cooldownMin: r.cooldownMin ?? 0, requireNewSignal: r.requireNewSignal === true,
     kronosGate: r.kronosGate === true,
+    sentimentGate: r.sentimentGate === true,
     status: r.status, tradesToday: st.tradesToday ?? 0,
     startedAt: r.startedAt.toISOString(), stoppedAt: r.stoppedAt?.toISOString() ?? null,
     logs,
@@ -152,6 +155,8 @@ interface AlgoStartBody {
   requireNewSignal?: boolean
   // v2.0.0 — Kronos AI gate (model must agree with entries)
   kronosGate?: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight fresh news)
+  sentimentGate?: boolean
   // Task 79 — false = create the run STOPPED (imports of stopped configs);
   // no engine, no orders. Only STARTING runs stays paper-only.
   autoStart?: boolean
@@ -297,6 +302,8 @@ export async function POST(req: NextRequest) {
       cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body?.cooldownMin) || 0))),
       requireNewSignal: body?.requireNewSignal === true,
       kronosGate: body?.kronosGate === true,
+      // v2.5.0 — Market sentiment gate (user opt-in, mirrors the Kronos toggle)
+      sentimentGate: body?.sentimentGate === true,
     }, { autostart: autoStart })
     return NextResponse.json({ run: toDto(run, []) }, { status: 201 })
   } catch (e) {

@@ -471,6 +471,8 @@ export interface AlpoRunConfig {
   requireNewSignal: boolean
   // v2.0.0 — Kronos AI gate (foundation model must agree with entries)
   kronosGate: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
+  sentimentGate: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +539,9 @@ export interface AlgoRunLike {
   // v2.0.0 — optional so legacy configs still satisfy the type; honored by the
   // live engine when starting from an imported config
   kronosGate?: boolean
+  // v2.5.0 — optional so legacy rows/DTOs still satisfy the type; honored by
+  // the live engine when starting from an imported config
+  sentimentGate?: boolean
   // Task 78 — optional so legacy rows/DTOs (pre-Risk-Money) still satisfy it
   sizingMode?: string
   riskMoney?: number | null
@@ -613,6 +618,7 @@ export function runToAlgoConfig(run: AlgoRunLike): AlpoRunConfig {
     cooldownMin: clampCooldown(run.cooldownMin),
     requireNewSignal: run.requireNewSignal === true,
     kronosGate: run.kronosGate === true,
+    sentimentGate: run.sentimentGate === true,
   }
 }
 
@@ -732,6 +738,7 @@ export function normalizeAlgoRunConfig(raw: unknown): AlpoRunConfig | string {
     cooldownMin: clampCooldown(r.cooldownMin),
     requireNewSignal: r.requireNewSignal === true,
     kronosGate: r.kronosGate === true,
+    sentimentGate: r.sentimentGate === true,
   }
 }
 

@@ -65,6 +65,8 @@ interface AlgoPatchBody {
   requireNewSignal?: boolean
   // v2.0.0 — Kronos AI gate (model must agree with entries)
   kronosGate?: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight fresh news)
+  sentimentGate?: boolean
 }
 
 // PATCH /api/algo/[id] — edit an existing run's settings (Task 71-1).
@@ -186,6 +188,7 @@ export async function PATCH(req: NextRequest, { params: routeParams }: { params:
       cooldownMin: Math.min(240, Math.max(0, Math.round(Number(body?.cooldownMin) || 0))),
       requireNewSignal: body?.requireNewSignal === true,
       kronosGate: body?.kronosGate === true,
+      sentimentGate: body?.sentimentGate === true,
     })
     if (!updated) return NextResponse.json({ error: 'Run not found' }, { status: 404 })
     return NextResponse.json({ run: toDto(updated, []) })

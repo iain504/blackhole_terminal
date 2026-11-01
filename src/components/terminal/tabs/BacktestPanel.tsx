@@ -105,6 +105,8 @@ export interface AlgoSetupCfg {
    * level; carrying the field keeps setupCfg structurally an AlpoRunConfig
    * for config export). */
   kronosGate: boolean
+  /** v2.5.0 — the shared setup's live-run sentiment gate (same pattern). */
+  sentimentGate: boolean
 }
 
 interface BacktestMeta {

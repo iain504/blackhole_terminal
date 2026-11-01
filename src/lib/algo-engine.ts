@@ -25,6 +25,7 @@ import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Bar, type Timeframe } from '@/lib/market-types'
 import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
+import { sentimentForSymbol, STALE_MS } from '@/lib/sentiment-engine'
 import { isAlgoStrategyId, normalizeAlgoParams, strategyLane, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 // v2.3.0 — swing lane live unlock: the HTF ladder evaluated from the closed-bar
 // window every cycle (see swing-eval.ts for the parity contract with the
@@ -92,6 +93,8 @@ interface AlgoRunRow {
   requireNewSignal: boolean
   // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
   kronosGate: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
+  sentimentGate: boolean
   status: string
   state: unknown
 }
@@ -840,6 +843,10 @@ async function cycle(runId: string) {
         } else if (run.kronosGate && !(await kronosEntryOk(runId, run, res.entry.side, bars[lastClosedIdx].time, bars, log))) {
           // v2.0.0 — the Kronos AI gate; the helper journaled the exact reason
           // (forecast pending / model disagrees / sidecar down — all fail-closed)
+        } else if (run.sentimentGate && !(await sentimentEntryOk(runId, run, res.entry.side, bars[lastClosedIdx].time, log))) {
+          // v2.5.0 — the Market sentiment gate; the helper journaled the reason
+          // (fresh bearish news against a BUY / bullish against a SELL — stale
+          // or missing snapshots pass through, the gate never bricks a symbol)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
           // resolve % legs — and Risk-Money sizing — against the live quote.
@@ -1101,7 +1108,7 @@ async function kronosEntryOk(
   side: 'buy' | 'sell',
   barTime: number,
   bars: { time: number; open: number; high: number; low: number; close: number; volume: number }[],
-  log: (runId: string, userId: string, level: string, message: string) => Promise<void>,
+  log: (runId: string, userId: string, level: 'info' | 'signal' | 'trade' | 'error', message: string) => Promise<void>,
 ): Promise<boolean> {
   const tfSec = TIMEFRAMES[run.timeframe as Timeframe]?.seconds ?? 300
   const ctx = bars.slice(-512).map((b) => ({ t: b.time, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume }))
@@ -1147,6 +1154,63 @@ function st_kronosBlockBarSet(runId: string, v: number): void { const m = kronos
 function st_kronosPassBar(runId: string): number | undefined { return kronosLogMemo.get(runId)?.pass }
 function st_kronosPassBarSet(runId: string, v: number): void { const m = kronosLogMemo.get(runId) ?? {}; m.pass = v; kronosLogMemo.set(runId, m) }
 
+// ---------------------------------------------------------------------------
+// v2.5.0 — Market sentiment entry gate (run.sentimentGate). Before ANY entry
+// the engine reads the symbol's latest stored sentiment snapshot and blocks
+// entries that FIGHT the crowd: a BUY is refused while sentiment ≤ -0.30, a
+// SELL while sentiment ≥ +0.30. Snapshot older than 12h (or missing entirely)
+// passes through — the gate degrades gracefully instead of bricking quiet
+// symbols that no scan has covered yet. Fresh, AGREEING sentiment is journaled
+// once per bar as a positive confirmation, same discipline as the Kronos gate.
+// ---------------------------------------------------------------------------
+const SENTIMENT_BLOCK_LEVEL = 0.3
+const sentimentLogMemo = new Map<string, { block?: number; pass?: number; none?: number }>()
+
+async function sentimentEntryOk(
+  runId: string,
+  run: AlgoRunRow,
+  side: 'buy' | 'sell',
+  barTime: number,
+  log: (runId: string, userId: string, level: 'info' | 'signal' | 'trade' | 'error', message: string) => Promise<void>,
+): Promise<boolean> {
+  const memo = sentimentLogMemo.get(runId) ?? {}
+  sentimentLogMemo.set(runId, memo)
+  let snap: Awaited<ReturnType<typeof sentimentForSymbol>> = null
+  try {
+    snap = await sentimentForSymbol(run.symbol)
+  } catch {
+    snap = null // store hiccup → pass, never brick trading on the read path
+  }
+  if (!snap) {
+    if (memo.none !== barTime) {
+      await log(runId, run.userId, 'info', `Sentiment gate: no snapshot for ${run.symbol} yet — entry allowed (run a sentiment scan from the Chart's Sentiment panel to arm the gate)`)
+      memo.none = barTime
+    }
+    return true
+  }
+  if (snap.stale) {
+    if (memo.none !== barTime) {
+      await log(runId, run.userId, 'info', `Sentiment gate: snapshot stale (> ${Math.round(STALE_MS / 3600_000)}h) — entry allowed, rescan to re-arm`)
+      memo.none = barTime
+    }
+    return true
+  }
+  const wantLong = side === 'buy'
+  const fights = wantLong ? snap.score <= -SENTIMENT_BLOCK_LEVEL : snap.score >= SENTIMENT_BLOCK_LEVEL
+  if (!fights) {
+    if (memo.pass !== barTime && Math.abs(snap.score) > 0.15) {
+      await log(runId, run.userId, 'info', `Sentiment gate PASSED — ${side.toUpperCase()} aligned with news sentiment (${snap.score >= 0 ? '+' : ''}${snap.score.toFixed(2)})`)
+      memo.pass = barTime
+    }
+    return true
+  }
+  if (memo.block !== barTime) {
+    await log(runId, run.userId, 'info', `Signal suppressed (sentiment gate): ${side.toUpperCase()} — news sentiment ${snap.score >= 0 ? '+' : ''}${snap.score.toFixed(2)} is ${wantLong ? 'bearish (≤ -' : 'bullish (≥ +'}${SENTIMENT_BLOCK_LEVEL}); needs |score| < ${SENTIMENT_BLOCK_LEVEL} or a sentiment flip`)
+    memo.block = barTime
+  }
+  return false
+}
+
 /** Create a run row (and start its engine — unless `opts.autostart === false`,
  *  Task 79: importing a STOPPED config creates the run paused so trading only
  *  begins when the user explicitly presses Start). */
@@ -1182,6 +1246,8 @@ export async function startAlgoRun(cfg: {
   requireNewSignal: boolean
   // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
   kronosGate: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
+  sentimentGate: boolean
 }, opts?: { autostart?: boolean }) {
   const autostart = opts?.autostart !== false
   const run = await db.algoRun.create({
@@ -1215,6 +1281,7 @@ export async function startAlgoRun(cfg: {
       cooldownMin: cfg.cooldownMin,
       requireNewSignal: cfg.requireNewSignal,
       kronosGate: cfg.kronosGate === true,
+      sentimentGate: cfg.sentimentGate === true,
       status: autostart ? 'running' : 'stopped',
       ...(autostart ? {} : { stoppedAt: new Date() }),
       state: {} as unknown as object,
@@ -1224,8 +1291,8 @@ export async function startAlgoRun(cfg: {
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', autostart
-    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
-    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
+    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
   if (autostart) startEngine(run.id)
   return run
 }
@@ -1266,6 +1333,8 @@ export interface AlgoRunConfigPatch {
   requireNewSignal: boolean
   // v2.0.0 — Kronos AI gate (model must agree with the entry direction)
   kronosGate: boolean
+  // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
+  sentimentGate: boolean
 }
 
 export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPatch) {
@@ -1347,6 +1416,7 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.cooldownMin !== patch.cooldownMin) diffs.push(`cooldown ${run.cooldownMin}m → ${patch.cooldownMin}m`)
   if (run.requireNewSignal !== patch.requireNewSignal) diffs.push(`fresh-signal ${run.requireNewSignal ? 'ON' : 'OFF'} → ${patch.requireNewSignal ? 'ON' : 'OFF'}`)
   if (run.kronosGate !== patch.kronosGate) diffs.push(`Kronos AI gate ${run.kronosGate ? 'ON' : 'OFF'} → ${patch.kronosGate ? 'ON' : 'OFF'}`)
+  if (run.sentimentGate !== patch.sentimentGate) diffs.push(`sentiment gate ${run.sentimentGate ? 'ON' : 'OFF'} → ${patch.sentimentGate ? 'ON' : 'OFF'}`)
   for (const k of Object.keys(nextParams)) {
     if (prevParams[k] !== nextParams[k]) diffs.push(`${k} ${prevParams[k]} → ${nextParams[k]}`)
   }
@@ -1380,6 +1450,7 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       cooldownMin: patch.cooldownMin,
       requireNewSignal: patch.requireNewSignal,
       kronosGate: patch.kronosGate === true,
+      sentimentGate: patch.sentimentGate === true,
       state: st as unknown as object,
     },
   })

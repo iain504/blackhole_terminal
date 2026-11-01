@@ -10,6 +10,7 @@ import { useIsMobile } from '@/hooks/use-mobile'
 import { WatchlistPanel } from './sidebar/WatchlistPanel'
 import { QuotePanel } from './sidebar/QuotePanel'
 import { NewsPanel } from './sidebar/NewsPanel'
+import { SentimentPanel } from './sidebar/SentimentPanel'
 import { ChartPanel } from '@/components/chart/ChartPanel'
 import { ChevronDown, ChevronUp } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -18,6 +19,7 @@ const PANEL_TITLES: Record<PanelId, string> = {
   watchlist: 'Watchlist',
   quote: 'Quote',
   news: 'News',
+  sentiment: 'Sentiment',
 }
 
 export function ChartWorkspace({ tab }: { tab: Tab }) {
@@ -64,6 +66,7 @@ export function ChartWorkspace({ tab }: { tab: Tab }) {
             {id === 'watchlist' && <WatchlistPanel />}
             {id === 'quote' && <QuotePanel symbol={focusedPaneSymbol(tab)} />}
             {id === 'news' && <NewsPanel symbol={focusedPaneSymbol(tab)} />}
+            {id === 'sentiment' && <SentimentPanel symbol={focusedPaneSymbol(tab)} />}
           </div>
         )}
       </Panel>
@@ -96,6 +99,7 @@ export function ChartWorkspace({ tab }: { tab: Tab }) {
                   {id === 'watchlist' && <WatchlistPanel />}
                   {id === 'quote' && <QuotePanel symbol={focusedPaneSymbol(tab)} />}
                   {id === 'news' && <NewsPanel symbol={focusedPaneSymbol(tab)} />}
+                  {id === 'sentiment' && <SentimentPanel symbol={focusedPaneSymbol(tab)} />}
                 </div>
               )}
             </div>

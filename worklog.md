@@ -3944,3 +3944,67 @@ E2E (agent-browser, fresh sandbox db — seeded kronostest1):
 Notes:
 - scripts-tmp/{seed-e2e-user,seed-agent-bars,agent-events,agent-probe-engage,agent-restore}.ts are dev-only helpers (untracked by git via scripts-tmp convention? verify before commit).
 - The rainbow frame only mounts while status==='engaged' — a real engage with keys on the user's machine will spin it for real.
+
+## v2.5.0 — MARKET SENTIMENT ENGINE (news → FinBERT-slot NLP → gates → autopilot ranking)
+
+Implements the user's "Financial Sentiment Dashboard" plan natively in this stack
+(FastAPI/PostgreSQL/FinBERT of the reference repo are replaced by Next API routes /
+Prisma SQLite / the backend LLM with an offline lexicon fallback — same architecture:
+free news ingestion → NLP sentiment → per-symbol storage → sentiment↔price IC/Rank-IC
+evaluation → exposed to the trading engines through an API).
+
+Sources probed from this sandbox (2026-11): Google News RSS 200 OK (primary, per-symbol
+`"$SYM" OR "SYM stock"` / crypto coin queries) · Yahoo RSS legacy endpoint 404 (dead —
+registered-but-disabled in the pluggable provider list) · Yahoo rssindex 429 ·
+Reddit/StockTwits 403 (bot-blocked). Google News RSS is personal/non-commercial per its
+terms — flagged to the user alongside the FinBERT non-commercial licence caveat.
+
+- prisma: SentimentHeadline (article journal, (symbol,url) unique = idempotent ingest,
+  label/score/confidence/engine nullable until scored) + SentimentScore (hourly snapshot,
+  (symbol,bucket) unique, recency×confidence-weighted score, bull/bear/neutral, momentum
+  vs previous bucket, dominant engine) + AlgoRun.sentimentGate Boolean default false.
+- src/lib/sentiment-news.ts: dependency-free RSS 2.0 parser (entities/CDATA/source tags,
+  " - Publisher" tail stripping), 20-min per-symbol fetch TTL, provider registry,
+  pre-filter dedupe (SQLite createMany has no skipDuplicates).
+- src/lib/sentiment-score.ts: LLM batch scorer (20/batch, strict JSON contract, finance
+  prompt = the FinBERT slot) + finance lexicon fallback (VADER-style bull/bear patterns +
+  negation flip) + 429 rate-limit discipline (single-file batch queue with 400ms gap,
+  2.5s backoff retry — measured 429s on concurrent batches during the first probe).
+- src/lib/sentiment-engine.ts: single-flight scan job (≤3 symbols inline for the panel
+  button, full universe AGENT_US_100+crypto as background sweep, concurrency 6), 18h
+  half-life × confidence aggregation window 72h, read paths (sentimentForSymbol for the
+  gates, summary leaderboard, history sparkline, headlines feed) + computeSentimentIc:
+  daily-bucket sentiment vs NEXT-day return over the app's own getBars — per-symbol
+  Pearson/Spearman + cross-sectional IC/Rank-IC averaged over days with ≥5 symbols,
+  honestly "journal too young" until real daily history accumulates.
+- API: GET/POST /api/sentiment (symbol snapshot+history+headlines+state / scan action),
+  GET /api/sentiment/correlation. All requireUser.
+- Chart right movable tab: SentimentPanel (scope symbol|market chips like News) — score
+  gauge (live/stale), momentum arrow, bull/bear/neutral split bar, SVG sparkline,
+  IC/Rank-IC expander, scored headline feed (sentiment dot, publisher, confidence),
+  Market leaderboard with bipolar bars; store PanelId +'sentiment' (defaults + old-3-panel
+  layout migration appends it), ChartWorkspace desktop+mobile branches wired, movable
+  up/down + collapse inherit from the panel frame.
+- Algo engine: sentimentEntryOk gate (mirrors kronosEntryOk discipline; log-once memos,
+  BUY blocked ≤ -0.30 sentiment, SELL ≥ +0.30, stale >12h or missing snapshot passes
+  through — degrades gracefully, never bricks a symbol), wired into the cycle gate chain
+  after Kronos; startAlgoRun + AlpoRunConfig/AlgoSetupCfg + POST/PATCH /api/algo(+[id])
+  + config import/export carry sentimentGate; AlgoTab + AlgoRunSettings toggles
+  ("Market sentiment gate") + run-row ◍ sentiment badge + AlgoConfigIO badge.
+- Agent/FSD: RANK phase blends sentiment into the score board (score = scoreBase ×
+  (1 + 0.25 × sent) — ±25% re-orders neighbours, never rescues a bad backtest; brain-feed
+  event reports hits), ENGAGE arms sentimentGate: true on every fleet run, scoreboard
+  score cell shows ▲/▼ sentiment chip with base-score tooltip.
+- scripts-tmp/sentiment-probe.ts: engine E2E (90 headlines ingested across AAPL/NVDA/
+  BTC in ~8s, LLM-scored with confidence, hourly buckets + momentum, IC honestly empty
+  at pairs=0; second run idempotent in 1.1s).
+
+E2E (agent-browser): login → Chart tab shows SENTIMENT in the movable sidebar (old saved
+layout migrated to 4 panels) → rescan AAPL → +0.39 LIVE gauge, 7/2/1 split, scored
+MarketBeat/Barchart/Zacks headlines with confidence → IC expander renders honest empty
+stats → Market leaderboard ranks AAPL/NVDA/BTC → Move Sentiment up reorders panels and
+persists → Algo tab "Market sentiment gate" switch toggles (checked state verified) →
+智慧體 tab healthy. Restart-to-reload Prisma client after db:push was required (500s on
+the new models until restart — classic cached-client gotcha, noted for future sessions).
+Lint clean; tsc clean for all touched files (9 pre-existing errors elsewhere untouched);
+no runtime errors in dev.log.

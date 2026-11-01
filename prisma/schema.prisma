@@ -271,6 +271,12 @@ model AlgoRun {
   // Forecast is cached per closed bar; the signal must survive to the next
   // 15s cycle if the forecast isn't ready yet (fail-closed, never pre-enter).
   kronosGate    Boolean   @default(false)
+  // v2.5.0 — Market sentiment gate: before ANY entry the engine reads the
+  // symbol's latest stored sentiment snapshot (SentimentScore) and blocks
+  // entries that FIGHT the crowd — a BUY is refused while sentiment ≤ -0.30,
+  // a SELL while sentiment ≥ +0.30. Stale snapshots (> 12h) pass through so
+  // the gate degrades gracefully instead of bricking quiet symbols.
+  sentimentGate Boolean   @default(false)
   // 'running' | 'stopped'
   status       String    @default("running")
   state        Json?
@@ -539,4 +545,56 @@ model AgentEvent {
   createdAt DateTime @default(now())
 
   @@index([sessionId, createdAt])
+}
+
+// v2.5.0 — MARKET SENTIMENT ENGINE. Free news ingestion (Google News RSS —
+// the only external feed reachable from this box; Yahoo RSS is dead 404 and
+// Reddit/StockTwits hard-403) + NLP sentiment scoring (LLM finance scorer as
+// the FinBERT-equivalent engine, with an offline finance lexicon fallback) +
+// per-symbol historical sentiment storage for the sentiment↔price IC / Rank-IC
+// evaluation. One row per (symbol, article) — the (symbol,url) unique key makes
+// ingestion idempotent across scans.
+model SentimentHeadline {
+  id          String    @id @default(cuid())
+  symbol      String
+  source      String    @default("google_news_rss")
+  publisher   String?
+  title       String
+  url         String
+  publishedAt DateTime?
+  fetchedAt   DateTime  @default(now())
+  // null until scored — the scorer backfills pending rows after each ingest
+  label       String?   // 'positive' | 'negative' | 'neutral'
+  score       Float?    // -1..1 (label collapsed to a signed value)
+  confidence  Float?    // 0..1 — LLM self-reported / lexicon match strength
+  engine      String?   // 'llm-finance-v1' | 'lexicon-finance-v1'
+
+  @@unique([symbol, url])
+  @@index([symbol, publishedAt])
+  @@index([symbol, score])
+  @@index([fetchedAt])
+}
+
+// Hourly sentiment snapshot per symbol — the aggregate the gates, the algo
+// engine and the autopilot ranking actually read. `score` is the
+// recency×confidence-weighted mean headline score (-1..1); momentum is the
+// delta vs the previous stored bucket. Buckets are hourly ISO strings so the
+// (symbol,bucket) unique key is idempotent for repeated scans.
+model SentimentScore {
+  id         String    @id @default(cuid())
+  symbol     String
+  bucket     String    // '2026-11-01T17:00' hourly bucket (UTC)
+  asOf       DateTime
+  score      Float
+  bull       Int       @default(0)
+  bear       Int       @default(0)
+  neutral    Int       @default(0)
+  headlines  Int       @default(0)
+  momentum   Float?
+  engine     String    @default("llm-finance-v1")
+  createdAt  DateTime  @default(now())
+
+  @@unique([symbol, bucket])
+  @@index([symbol, asOf])
+  @@index([asOf])
 }

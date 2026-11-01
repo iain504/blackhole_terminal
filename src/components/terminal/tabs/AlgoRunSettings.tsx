@@ -73,6 +73,8 @@ export default function AlgoRunSettingsDialog({
   const [requireNewSignal, setRequireNewSignal] = useState(false)
   // v2.0.0 — Kronos AI gate: the foundation model must agree with entries
   const [kronosGate, setKronosGate] = useState(false)
+  // v2.5.0 — Market sentiment gate: entries must not fight fresh news
+  const [sentimentGate, setSentimentGate] = useState(false)
   const [params, setParams] = useState<Record<string, number>>(() => normalizeAlgoParams('bb-reversion', undefined))
   // raw text being typed per param key — keeps decimal points alive while
   // editing (parsing "0." → 0 and re-rendering "0" would otherwise swallow
@@ -108,6 +110,7 @@ export default function AlgoRunSettingsDialog({
     setCooldownMin(String(run.cooldownMin ?? 0))
     setRequireNewSignal(run.requireNewSignal === true)
     setKronosGate(run.kronosGate === true)
+    setSentimentGate(run.sentimentGate === true)
     setParams(normalizeAlgoParams(sid, run.params))
     setParamDraft({})
     setShowParams(false)
@@ -176,6 +179,7 @@ export default function AlgoRunSettingsDialog({
           cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
           requireNewSignal,
           kronosGate,
+          sentimentGate,
         }),
       })
       const json = await res.json().catch(() => null)
@@ -527,6 +531,13 @@ export default function AlgoRunSettingsDialog({
                 <p className="text-[10px] leading-snug text-zinc-500">the local Kronos foundation model must agree with the entry direction — fail-closed</p>
               </div>
               <Switch id="rs-kronos" checked={kronosGate} onCheckedChange={setKronosGate} className="scale-90 shrink-0" />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <Label htmlFor="rs-sentiment" className="text-[11px] text-emerald-300/90">Market sentiment gate</Label>
+                <p className="text-[10px] leading-snug text-zinc-500">entries must not fight fresh news — BUY blocked while sentiment ≤ -0.30, SELL while ≥ +0.30 (scan from the Chart's Sentiment panel)</p>
+              </div>
+              <Switch id="rs-sentiment" checked={sentimentGate} onCheckedChange={setSentimentGate} className="scale-90 shrink-0" />
             </div>
           </div>
 

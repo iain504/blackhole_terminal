@@ -504,7 +504,21 @@ export default function AgentTab() {
                         {ALGO_STRATEGIES[c.strategy]?.name ?? c.strategy}
                         <span className={cn('ml-1 text-[9px] font-bold uppercase', c.lane === 'swing' ? 'text-violet-400' : 'text-cyan-500')}>{c.lane}</span>
                       </td>
-                      <td className="px-3 py-1.5 text-right font-mono font-bold text-zinc-100">{num(c.score)}</td>
+                      <td className="px-3 py-1.5 text-right font-mono font-bold text-zinc-100">
+                        {num(c.score)}
+                        {/* v2.5.0 — news sentiment blended into the rank score */}
+                        {c.sent != null && (
+                          <span
+                            className={cn(
+                              'ml-1 align-middle text-[9px] font-semibold',
+                              c.sent > 0.15 ? 'text-emerald-400' : c.sent < -0.15 ? 'text-rose-400' : 'text-zinc-500',
+                            )}
+                            title={`news sentiment ${c.sent >= 0 ? '+' : ''}${c.sent.toFixed(2)} blended (base ${c.scoreBase != null ? num(c.scoreBase) : '—'}); fleet entries also carry the sentiment gate`}
+                          >
+                            {c.sent >= 0 ? '▲' : '▼'}{Math.abs(c.sent).toFixed(2)}
+                          </span>
+                        )}
+                      </td>
                       <td className={cn('px-3 py-1.5 text-right font-mono', c.netPct >= 0 ? 'text-emerald-400' : 'text-rose-400')}>{num(c.netPct, 1)}</td>
                       <td className="px-3 py-1.5 text-right font-mono text-zinc-400">{num(c.winRate, 0)}</td>
                       <td className="px-3 py-1.5 text-right font-mono text-zinc-400">{num(c.pf)}</td>
