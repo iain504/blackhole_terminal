@@ -50,6 +50,10 @@ export interface SwingSetup {
   trendAgg: Bar[]
   midAgg: Bar[]
   trendPs: Float64Array // trend closes prefix sums — smaAt is O(1)
+  // v2.6.0 — optional confluence screens (parity with backtest.ts's
+  // trendEmaArr/trendAdxArr; both null when the param is off)
+  trendEmaArr: Float64Array | null // EMA(trendLen) over trend closes, SMA-seeded at trendLen−1
+  trendAdxArr: Float64Array | null // Wilder ADX(14) over the trend OHLC
   midRsi: Float64Array // Wilder RSI on the confirm series (NaN until index period)
   entryRsi: Float64Array | null // Wilder RSI on the entry series (swing-pullback only)
   pivHighs: Pivot[]
@@ -85,9 +89,13 @@ export function swingLookbackDays(
   isCrypto: boolean,
 ): number {
   const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
-  const needTrend = strategy === 'htf-level-bounce'
+  let needTrend = strategy === 'htf-level-bounce'
     ? Math.max(trendLen, Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3)))
     : trendLen
+  // v2.6.0 — mirror the backtest's warmup deepening for the optional screens
+  // (slope: +3 completed buckets · ADX: finite from bucket 2×14−1)
+  if ((params.trendSlope ?? 0) > 0) needTrend += 3
+  if ((params.trendAdx ?? 0) > 0) needTrend += 2 * 14 - 1
   const trendKey = isSwingTf(entryTf) ? MTF_TREND_TF[entryTf] : '1D'
   const trendSec = TIMEFRAMES[trendKey].seconds
   const rawDays = Math.ceil((needTrend * trendSec) / 86400)
@@ -158,6 +166,77 @@ export function swingSetup(
   // trend SMA via prefix sums — O(1) reads at the mapped HTF index
   const trendPs = new Float64Array(trendAgg.length + 1)
   for (let k = 0; k < trendAgg.length; k++) trendPs[k + 1] = trendPs[k] + trendAgg[k].close
+  // v2.6.0 — optional EMA trend screen (trendEma=1): the EXACT seeding the
+  // backtest uses (SMA at index trendLen−1, then Wilder EMA recursion), so
+  // the parity probe diffs to zero on the same bars + params.
+  let trendEmaArr: Float64Array | null = null
+  if ((params.trendEma ?? 0) >= 1) {
+    const len = Math.max(10, Math.round(params.trendSma ?? 50))
+    const arr = new Float64Array(trendAgg.length).fill(Number.NaN)
+    if (trendAgg.length >= len) {
+      let seed = 0
+      for (let k = 0; k < len; k++) seed += trendAgg[k].close
+      arr[len - 1] = seed / len
+      const alpha = 2 / (len + 1)
+      for (let k = len; k < trendAgg.length; k++) {
+        arr[k] = arr[k - 1] + alpha * (trendAgg[k].close - arr[k - 1])
+      }
+    }
+    trendEmaArr = arr
+  }
+  // v2.6.0 — optional ADX(14) trend-strength series (trendAdx > 0): the EXACT
+  // Wilder pass the backtest runs on its trendAgg (same first-value mean of
+  // P DX readings, same recursion after).
+  let trendAdxArr: Float64Array | null = null
+  if ((params.trendAdx ?? 0) > 0) {
+    const P = 14
+    const len = trendAgg.length
+    const plusDI = new Float64Array(len).fill(Number.NaN)
+    const minusDI = new Float64Array(len).fill(Number.NaN)
+    const dx = new Float64Array(len).fill(Number.NaN)
+    const adx = new Float64Array(len).fill(Number.NaN)
+    let trS = 0
+    let pS = 0
+    let mS = 0
+    let adxAcc = 0
+    let adxCount = 0
+    for (let k = 1; k < len; k++) {
+      const upMove = trendAgg[k].high - trendAgg[k - 1].high
+      const downMove = trendAgg[k - 1].low - trendAgg[k].low
+      const pDM = upMove > downMove && upMove > 0 ? upMove : 0
+      const mDM = downMove > upMove && downMove > 0 ? downMove : 0
+      const tr = Math.max(trendAgg[k].high - trendAgg[k].low, Math.abs(trendAgg[k].high - trendAgg[k - 1].close), Math.abs(trendAgg[k].low - trendAgg[k - 1].close))
+      if (k <= P) {
+        trS += tr
+        pS += pDM
+        mS += mDM
+        if (k === P) {
+          plusDI[k] = trS > 0 ? (100 * pS) / trS : 0
+          minusDI[k] = trS > 0 ? (100 * mS) / trS : 0
+          dx[k] = plusDI[k] + minusDI[k] > 0 ? (100 * Math.abs(plusDI[k] - minusDI[k])) / (plusDI[k] + minusDI[k]) : 0
+        }
+        continue
+      }
+      trS = trS - trS / P + tr
+      pS = pS - pS / P + pDM
+      mS = mS - mS / P + mDM
+      plusDI[k] = trS > 0 ? (100 * pS) / trS : 0
+      minusDI[k] = trS > 0 ? (100 * mS) / trS : 0
+      dx[k] = plusDI[k] + minusDI[k] > 0 ? (100 * Math.abs(plusDI[k] - minusDI[k])) / (plusDI[k] + minusDI[k]) : 0
+      if (k >= 2 * P - 1) {
+        if (adxCount === 0) {
+          adxAcc = 0
+          for (let j = k - P + 1; j <= k; j++) adxAcc += dx[j]
+          adxAcc /= P
+          adxCount = P
+        } else {
+          adxAcc = (adxAcc * (P - 1) + dx[k]) / P
+        }
+        adx[k] = adxAcc
+      }
+    }
+    trendAdxArr = adx
+  }
   // confirm-TF Wilder RSI — period: the strategy's rsiPeriod when it defines
   // one, else the standard 14 (htf-level-bounce has no rsiPeriod param)
   const mRp = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) : 14
@@ -181,13 +260,16 @@ export function swingSetup(
   const curKt = htfIndexAt(bars[n - 1].time, trendAgg, trendSec)
   const curKm = htfIndexAt(bars[n - 1].time, midAgg, midSec)
   const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
-  const needTrend = strategy === 'htf-level-bounce'
+  let needTrend = strategy === 'htf-level-bounce'
     ? Math.max(trendLen, Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3)))
     : trendLen
+  // v2.6.0 — mirror the backtest's warmup deepening (slope +3 · ADX +27)
+  if ((params.trendSlope ?? 0) > 0) needTrend += 3
+  if ((params.trendAdx ?? 0) > 0) needTrend += 2 * 14 - 1
   return {
     strategy, n, entrySec, entryKey,
     mtfEntryLabel, mtfTrendLabel: trendTf, mtfMidLabel: midTf,
-    trendSec, midSec, trendAgg, midAgg, trendPs, midRsi, entryRsi,
+    trendSec, midSec, trendAgg, midAgg, trendPs, trendEmaArr, trendAdxArr, midRsi, entryRsi,
     pivHighs, pivLows, curKt, curKm, needTrend,
   }
 }
@@ -213,6 +295,44 @@ export function swingDecide(
     : undefined
   const c = bars[i].close
 
+  // v2.6.0 — the TREND screen, byte-mirror of backtest.ts's swingTrendAt:
+  // EMA vs SMA (trendEma) + optional slope over 3 completed buckets
+  // (trendSlope) + optional Wilder ADX(14) floor (trendAdx), every addition
+  // AND-ed into the direction booleans.
+  const SLOPE_BARS = 3
+  const swingTrendAt = (kt: number): { up: boolean; down: boolean } => {
+    const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
+    const emaOn = (params.trendEma ?? 0) >= 1 && setup.trendEmaArr != null
+    const tPs = setup.trendPs
+    const v = emaOn ? (setup.trendEmaArr as Float64Array)[kt] : (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
+    const tClose = setup.trendAgg[kt].close
+    let up = tClose > v
+    let down = tClose < v
+    const slopeMin = params.trendSlope ?? 0
+    if (slopeMin > 0 && kt >= SLOPE_BARS) {
+      const vPrev = emaOn
+        ? (setup.trendEmaArr as Float64Array)[kt - SLOPE_BARS]
+        : (tPs[kt + 1 - SLOPE_BARS] - tPs[kt + 1 - SLOPE_BARS - trendLen]) / trendLen
+      if (Number.isFinite(vPrev) && vPrev !== 0) {
+        const slope = ((v - vPrev) / vPrev) * 100
+        up = up && slope >= slopeMin
+        down = down && slope <= -slopeMin
+      } else {
+        up = false
+        down = false
+      }
+    }
+    const adxMin = params.trendAdx ?? 0
+    if (adxMin > 0) {
+      const adxV = setup.trendAdxArr != null ? setup.trendAdxArr[kt] : Number.NaN
+      if (!(Number.isFinite(adxV) && adxV >= adxMin)) {
+        up = false
+        down = false
+      }
+    }
+    return { up, down }
+  }
+
   if (setup.strategy === 'swing-pullback') {
     // ---- side-aware exit FIRST (the cycle resolves exits before entries) —
     // backtest executor: the entry-TF RSI recaptures (long) / falls back
@@ -236,11 +356,7 @@ export function swingDecide(
     // rawDecide AND its data-driven warmup
     if (kt < 0 || km < 0 || kt < setup.needTrend) return { entry: null, exit: null, note }
     const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
-    const tPs = setup.trendPs
-    const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
-    const tClose = setup.trendAgg[kt].close
-    const trendUp = tClose > smaT
-    const trendDown = tClose < smaT
+    const { up: trendUp, down: trendDown } = swingTrendAt(kt)
     const midVal = setup.midRsi[km]
     const rsiMin = params.rsiMin ?? 40
     const rsiMax = params.rsiMax ?? 70
@@ -290,11 +406,7 @@ export function swingDecide(
   const km = setup.curKm
   if (kt < 0 || km < 0 || kt < setup.needTrend) return { entry: null, exit: null, note }
   const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
-  const tPs = setup.trendPs
-  const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
-  const tClose = setup.trendAgg[kt].close
-  const trendUp = tClose > smaT
-  const trendDown = tClose < smaT
+  const { up: trendUp, down: trendDown } = swingTrendAt(kt)
   const midVal = setup.midRsi[km]
   const midThresh = params.midRsi ?? 50
   const allowShort = (params.allowShort ?? 1) >= 1

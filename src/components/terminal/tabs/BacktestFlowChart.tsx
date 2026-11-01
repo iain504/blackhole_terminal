@@ -97,6 +97,8 @@ interface BacktestFlowChartProps {
   failed?: boolean
   /** overall 0..1 progress (thin bar under the chart) */
   frac?: number
+  /** v2.6.0 — swing lanes: the resolved ladder ("1D + 4h"), shown on the HTF node */
+  ladderLabel?: string
   /** live stage text from the engine, shown under the chart */
   stage?: string
   elapsedSec?: number
@@ -112,7 +114,7 @@ function subscribeMd(cb: () => void): () => void {
 const mdSnapshot = (): boolean => window.matchMedia('(min-width: 768px)').matches
 const mdServerSnapshot = (): boolean => true
 
-export function BacktestFlowChart({ mode, swing = false, activePhase, finished = false, failed = false, frac, stage, elapsedSec }: BacktestFlowChartProps) {
+export function BacktestFlowChart({ mode, swing = false, activePhase, finished = false, failed = false, frac, stage, elapsedSec, ladderLabel }: BacktestFlowChartProps) {
   // collapsible: open on md+, collapsed on mobile (spec §2.4); an explicit
   // user toggle wins over the breakpoint until the breakpoint itself changes
   const md = useSyncExternalStore(subscribeMd, mdSnapshot, mdServerSnapshot)
@@ -218,6 +220,7 @@ export function BacktestFlowChart({ mode, swing = false, activePhase, finished =
                     )}
                   >
                     {node.label}
+                    {id === 'htf' && ladderLabel && <span className="ml-1 text-purple-300/90">· {ladderLabel}</span>}
                   </p>
                   <p className="text-[9px] leading-tight text-zinc-700">{node.hint}</p>
                 </div>

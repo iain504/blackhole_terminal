@@ -4043,3 +4043,51 @@ Host remediation for the user (docker VM): docker system prune -f (safe — ./db
 mount), remove old images/containers, truncate /var/lib/docker/containers/*/*-json.log or
 recreate the stack so the new log caps apply: docker compose up -d --build, then df -h .
 Lint clean; /api/health + /api/agent compile verified on the running dev server.
+
+## 2026-11-01 — v2.6.0: Backtest MTF extension — custom HTF ladders + researched confluence screens
+
+User: "Backtest revamp (Step-by-Step + flow chart) + Backtest MTF extension — do it." Recon
+showed the revamp itself already shipped in v2.2.0 (5-step wizard + illustrations + flow
+chart + one-click Run head-to-end CTA) and swing ladders existed for 1h/4h/1D with FROZEN
+maps; the real remaining work was flexibility + confluence depth. Also: an apparent
+"TIMEFRAMESidTf" corruption in backtest.ts turned out to be a DISPLAY-channel artifact
+(some sanitizer eats the literal substring "[m" — codepoints proved the source says
+"TIMEFRAMES[midTf"); no corruption, nothing to fix.
+
+Engine (researched via LLM review of Elder triple-screen + successors; ADX/EMA/slope were
+the top actionable refinements):
+- algo-strategies.ts: swing-pullback + htf-level-bounce gain 3 optional params (defaults
+  preserve byte-identical behavior): trendEma (EMA vs SMA trend screen, SMA-seeded
+  Wilder EMA), trendSlope (screen value must rise/fall ≥X% over 3 completed HTF buckets),
+  trendAdx (Wilder ADX(14) on the trend OHLC must reach the floor — whipsaw filter).
+- backtest.ts: trendEmaArr/trendAdxArr built on the trendAgg series; shared swingTrendAt()
+  helper ANDs the new screens into the direction booleans; data-driven warmup (v2.2.2)
+  deepens swingNeedTrend by +3 (slope) / +27 (ADX finite from bucket 2×14−1); SLOPE_BARS
+  is module-scope (TDZ lesson: the warmup block runs before the closure consts).
+- swing-eval.ts (live parity): exact mirrors of both new series + swingTrendAt + the
+  swingLookbackDays deepening — the parity contract stays probe-diffable.
+- API route: FROZEN-ladder enforcement replaced by STRUCTURAL validation — custom
+  mtf {trendTf, midTf} accepted when mid is STRICTLY higher than the entry and trend ≥ mid
+  (both real TIMEFRAMES); absent fields still derive from the frozen maps (old callers
+  byte-compatible). Wizard state now carries ladderMode/ladderTrend/ladderMid.
+
+Wizard UI (BacktestStudio step ②): the MTF card grew Auto/Custom chips — Custom reveals
+Trend + Confirm selects (choices derived from TIMEFRAMES vs the entry seconds), a live
+"valid ladder" chip or the exact structural error, and an amber "trend screen needs ≈Nd —
+bump history" button (ladderMinDays: 80 buckets, stocks ×7/5) that raises the window
+without exceeding the feed cap. pickTf snaps an invalid custom ladder back to Auto.
+studioIssues blocks the CTA on a structurally-invalid custom ladder. FlowChart's HTF node
+prints the resolved ladder ("· 1D + 4h") via the new ladderLabel prop. BacktestPanel POSTs
+the resolved ladder. Step ③ renders the three new params from the schema automatically.
+
+Verification: tsc clean on touched files (all remaining errors pre-exist in
+examples/scripts/tests); lint clean; synthetic probe — defaults 29 trades, EMA 30,
+slope 0.3 → 23, ADX 25 → 17, all-gates 17, custom 4h+4h ladder 49 (screens tighten
+monotonically, custom ladder honored); REAL-data parity probe (BTC/USDT 1h, 1999 bars):
+live signals 52/52 EXACT, trades 5/5 IDENTICAL with the refactored helper (defaults
+byte-parity held). E2E agent-browser: login → Backtest → 🌙 swing → step ② → Custom →
+1W+1D deep ladder ("valid ladder" + ≈784d bump chip → click → days capped 500) → step ③
+shows EMA/slope/ADX → enable all + ladder 1D+4h → step ⑤ flow chart shows "Aggregate
+HTF · 1D + 4h" → Run head-to-end on BTC/USDT completes with "MTF: 1D trend + 4h confirm"
+in the results header → Auto resets the picker. (TSLA 400s in-sandbox on an empty demo
+feed — data availability, not code.) Stamped v2.6.0+2xx.

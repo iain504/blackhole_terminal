@@ -323,6 +323,11 @@ interface Dec {
 }
 const NONE: Dec = { entry: null, exit: null }
 
+// v2.6.0 — trend-slope lookback (completed HTF buckets) for the optional
+// confluence slope screen; module scope because BOTH the data-driven warmup
+// and the decide-side helper read it.
+const SLOPE_BARS = 3
+
 /** v2.2.2 — lower_bound over bar indices for a MONOTONE predicate (must be
  *  false…false → true…true across ascending i; HTF index reads qualify since
  *  bar times ascend and the last-completed-bucket index only grows). Returns
@@ -379,6 +384,14 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let midSec = 0
   let trendPs: Float64Array | null = null
   let midRsiArr: Float64Array | null = null
+  // v2.6.0 — optional confluence screens on the TREND series (all default OFF,
+  // untouched params keep the v2.2.x behavior byte-identical):
+  //   trendEmaArr  — EMA(trendLen) over the trend closes (trendEma=1). Seeded
+  //                  with the SMA at index trendLen−1 so the SAME kt ≥ trendLen
+  //                  guard covers both modes.
+  //   trendAdxArr  — Wilder ADX(adxPeriod=14) over the trend OHLC (trendAdx>0).
+  let trendEmaArr: Float64Array | null = null
+  let trendAdxArr: Float64Array | null = null
   let pivHighs: Pivot[] = []
   let pivLows: Pivot[] = []
   let mtfTrendLabel = '1D'
@@ -407,6 +420,77 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     const tps = new Float64Array(trendAgg.length + 1)
     for (let k = 0; k < trendAgg.length; k++) tps[k + 1] = tps[k] + trendAgg[k].close
     trendPs = tps
+    // v2.6.0 — optional EMA trend screen (trendEma=1): SMA-seeded Wilder EMA.
+    // Defined from index trendLen−1, so the frozen kt ≥ trendLen guard is
+    // valid for BOTH modes and no other warmup logic changes.
+    if ((params.trendEma ?? 0) >= 1) {
+      const len = Math.max(10, Math.round(params.trendSma ?? 50))
+      const arr = new Float64Array(trendAgg.length).fill(Number.NaN)
+      if (trendAgg.length >= len) {
+        let seed = 0
+        for (let k = 0; k < len; k++) seed += trendAgg[k].close
+        arr[len - 1] = seed / len
+        const alpha = 2 / (len + 1)
+        for (let k = len; k < trendAgg.length; k++) {
+          arr[k] = arr[k - 1] + alpha * (trendAgg[k].close - arr[k - 1])
+        }
+      }
+      trendEmaArr = arr
+    }
+    // v2.6.0 — optional ADX(14) trend-strength series on the TREND OHLC
+    // (trendAdx > 0). Wilder smoothing throughout; ADX is NaN until the
+    // second smoothing pass completes (index 2×period−2), the classic
+    // definition — the decide-side guard reads Number.isFinite anyway.
+    if ((params.trendAdx ?? 0) > 0) {
+      const P = 14
+      const len = trendAgg.length
+      const plusDI = new Float64Array(len).fill(Number.NaN)
+      const minusDI = new Float64Array(len).fill(Number.NaN)
+      const dx = new Float64Array(len).fill(Number.NaN)
+      const adx = new Float64Array(len).fill(Number.NaN)
+      let trS = 0
+      let pS = 0
+      let mS = 0
+      let adxAcc = 0
+      let adxCount = 0
+      for (let k = 1; k < len; k++) {
+        const upMove = trendAgg[k].high - trendAgg[k - 1].high
+        const downMove = trendAgg[k - 1].low - trendAgg[k].low
+        const pDM = upMove > downMove && upMove > 0 ? upMove : 0
+        const mDM = downMove > upMove && downMove > 0 ? downMove : 0
+        const tr = Math.max(trendAgg[k].high - trendAgg[k].low, Math.abs(trendAgg[k].high - trendAgg[k - 1].close), Math.abs(trendAgg[k].low - trendAgg[k - 1].close))
+        if (k <= P) {
+          trS += tr
+          pS += pDM
+          mS += mDM
+          if (k === P) {
+            plusDI[k] = trS > 0 ? (100 * pS) / trS : 0
+            minusDI[k] = trS > 0 ? (100 * mS) / trS : 0
+            dx[k] = plusDI[k] + minusDI[k] > 0 ? (100 * Math.abs(plusDI[k] - minusDI[k])) / (plusDI[k] + minusDI[k]) : 0
+          }
+          continue
+        }
+        trS = trS - trS / P + tr
+        pS = pS - pS / P + pDM
+        mS = mS - mS / P + mDM
+        plusDI[k] = trS > 0 ? (100 * pS) / trS : 0
+        minusDI[k] = trS > 0 ? (100 * mS) / trS : 0
+        dx[k] = plusDI[k] + minusDI[k] > 0 ? (100 * Math.abs(plusDI[k] - minusDI[k])) / (plusDI[k] + minusDI[k]) : 0
+        if (k >= 2 * P - 1) {
+          if (adxCount === 0) {
+            // first ADX value = mean of the first P DX readings
+            adxAcc = 0
+            for (let j = k - P + 1; j <= k; j++) adxAcc += dx[j]
+            adxAcc /= P
+            adxCount = P
+          } else {
+            adxAcc = (adxAcc * (P - 1) + dx[k]) / P
+          }
+          adx[k] = adxAcc
+        }
+      }
+      trendAdxArr = adx
+    }
     // Confirm-TF Wilder RSI — the SAME incremental algorithm the entry series
     // uses for bb-reversion (period: the strategy's rsiPeriod when it defines
     // one, else the standard 14 — htf-level-bounce has no rsiPeriod param).
@@ -474,6 +558,11 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     swingNeedTrend = strategy === 'htf-level-bounce'
       ? Math.max(trendLenW, Math.max(20, Math.round(params.pivotScan ?? 60)) + Math.max(2, Math.round(params.pivotLookback ?? 3)))
       : trendLenW
+    // v2.6.0 — the optional confluence screens deepen the trend-bucket floor:
+    //   slope compares the screen value against SLOPE_BARS buckets earlier,
+    //   ADX becomes finite from bucket 2×14−1 (classic Wilder definition)
+    if ((params.trendSlope ?? 0) > 0) swingNeedTrend += SLOPE_BARS
+    if ((params.trendAdx ?? 0) > 0) swingNeedTrend += 2 * 14 - 1
     const mRpW = strategy === 'swing-pullback' ? Math.max(2, Math.round(params.rsiPeriod ?? 14)) : 14
     const firstKt = firstBarWhere(bars, n, (i) => htfIndexAt(bars[i].time, trendAgg, trendSec) >= swingNeedTrend)
     const firstKm = firstBarWhere(bars, n, (i) => htfIndexAt(bars[i].time, midAgg, midSec) >= mRpW)
@@ -585,6 +674,49 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     return v > 0 ? Math.sqrt(v) : 0
   }
 
+  // v2.6.0 — the TREND screen, shared by both swing branches (research:
+  // Elder triple screen + successors). Three optional refinements, every one
+  // AND-ed into the direction booleans so untouched params keep the v2.2.x
+  // decisions byte-identical:
+  //   trendEma=1  → EMA(trendLen) instead of SMA (faster HTF response)
+  //   trendSlope>0 → the screen value must RISE (long) / FALL (short) by ≥
+  //                 trendSlope % over the last SLOPE_BARS completed buckets
+  //                 — trend in motion, not a flat average
+  //   trendAdx>0  → Wilder ADX(14) on the trend OHLC must reach the floor
+  //                 — filters range-market whipsaws (classic ≥20–25 gate)
+  const swingTrendAt = (kt: number): { up: boolean; down: boolean } => {
+    const trendLen = Math.max(10, Math.round(params.trendSma ?? 50))
+    const emaOn = (params.trendEma ?? 0) >= 1 && trendEmaArr != null
+    const tPs = trendPs as Float64Array
+    const v = emaOn ? (trendEmaArr as Float64Array)[kt] : (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
+    const tClose = trendAgg[kt].close
+    let up = tClose > v
+    let down = tClose < v
+    const slopeMin = params.trendSlope ?? 0
+    if (slopeMin > 0 && kt >= SLOPE_BARS) {
+      const vPrev = emaOn
+        ? (trendEmaArr as Float64Array)[kt - SLOPE_BARS]
+        : (tPs[kt + 1 - SLOPE_BARS] - tPs[kt + 1 - SLOPE_BARS - trendLen]) / trendLen
+      if (Number.isFinite(vPrev) && vPrev !== 0) {
+        const slope = ((v - vPrev) / vPrev) * 100
+        up = up && slope >= slopeMin
+        down = down && slope <= -slopeMin
+      } else {
+        up = false
+        down = false
+      }
+    }
+    const adxMin = params.trendAdx ?? 0
+    if (adxMin > 0) {
+      const adxV = trendAdxArr != null ? trendAdxArr[kt] : Number.NaN
+      if (!(Number.isFinite(adxV) && adxV >= adxMin)) {
+        up = false
+        down = false
+      }
+    }
+    return { up, down }
+  }
+
   const rawDecide = (i: number): Dec => {
     const c = bars[i].close
     if (strategy === 'bb-reversion') {
@@ -665,11 +797,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       const km = curKm
       if (kt < 0 || km < 0) return NONE // no completed HTF bar yet (warmup)
       if (kt < trendLen) return NONE // trend SMA not defined at this HTF index
-      const tPs = trendPs as Float64Array
-      const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
-      const tClose = trendAgg[kt].close
-      const trendUp = tClose > smaT
-      const trendDown = tClose < smaT
+      const { up: trendUp, down: trendDown } = swingTrendAt(kt)
       const midVal = midRsiArr ? midRsiArr[km] : Number.NaN
       const rsiMin = params.rsiMin ?? 40
       const rsiMax = params.rsiMax ?? 70
@@ -700,11 +828,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
       const km = curKm
       if (kt < 0 || km < 0) return NONE
       if (kt < trendLen) return NONE
-      const tPs = trendPs as Float64Array
-      const smaT = (tPs[kt + 1] - tPs[kt + 1 - trendLen]) / trendLen
-      const tClose = trendAgg[kt].close
-      const trendUp = tClose > smaT
-      const trendDown = tClose < smaT
+      const { up: trendUp, down: trendDown } = swingTrendAt(kt)
       const midVal = midRsiArr ? midRsiArr[km] : Number.NaN
       const midThresh = params.midRsi ?? 50
       const allowShort = (params.allowShort ?? 1) >= 1

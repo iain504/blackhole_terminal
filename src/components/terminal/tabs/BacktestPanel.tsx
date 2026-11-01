@@ -543,8 +543,14 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       days: Math.max(1, Math.round(Number(studio.days) || 30)),
       capital: Number(studio.capital) || 10000,
       // v2.2.0 — swing lane tells the engine which HTFs confirm (§1.4)
+      // v2.2.0 — swing lane tells the engine which HTFs confirm (§1.4);
+      // v2.6.0 — the resolved ladder honors the wizard's CUSTOM pick
       ...(swing && isSwingTf(studio.entryTf)
-        ? { mtf: { trendTf: MTF_TREND_TF[studio.entryTf], midTf: MTF_MID_TF[studio.entryTf] } }
+        ? {
+            mtf: studio.ladderMode === 'custom'
+              ? { trendTf: studio.ladderTrend, midTf: studio.ladderMid }
+              : { trendTf: MTF_TREND_TF[studio.entryTf], midTf: MTF_MID_TF[studio.entryTf] },
+          }
         : {}),
     }
   }, [studio, btCooldown, btFresh])

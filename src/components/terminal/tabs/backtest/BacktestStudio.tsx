@@ -29,10 +29,12 @@ import { DayLaneIllo, MtfLadderIllo, RiskBracketIllo, SwingLaneIllo, ThreeScreen
 import { ChipButton, NextStepButton, NumIn, StepperRail, StudioStep, ToggleRow, type RailStep } from './studio-bits'
 import {
   ALGO_STRATEGIES, ALGO_REGIME_PRESETS, LEVEL_META, clampParam, estimateBars, fmtBars, gridArmed,
-  laneTfs, makeStudioState, mtfLadder, studioIssues, suggestCosts, swingSeedDays,
+  laneTfs, makeStudioState, resolveLadder, studioIssues, suggestCosts, swingSeedDays,
+  ladderMinDays, validateLadder,
   type AlgoRegimePresetId, type AlgoStrategyId, type AlgoTimeframe, type BtBusy, type BtLevel, type RangeState, type StudioState,
 } from './studio-state'
-import { algoMaxDays, normalizeAlgoParams, strategyLane } from '@/lib/algo-strategies'
+import { algoMaxDays, normalizeAlgoParams, strategyLane, MTF_TREND_TF, MTF_MID_TF } from '@/lib/algo-strategies'
+import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import type { AlgoSetupCfg } from '../BacktestPanel'
 
 export interface BacktestStudioProps {
@@ -122,7 +124,17 @@ export default function BacktestStudio(props: BacktestStudioProps) {
   const allIssues = [...issues.market, ...issues.sizing, ...issues.params]
   const daysNum = Math.round(Number(studio.days) || 0)
   const barEst = estimateBars(Math.max(0, daysNum), studio.entryTf, isCrypto)
-  const ladder = mtfLadder(studio.entryTf)
+  // v2.6.0 — the MTF ladder: frozen map (auto) or the user's custom pick.
+  // Custom picks validate structurally (mid > entry, trend ≥ mid) and deep
+  // trend TFs surface a history auto-bump instead of starving silently.
+  const ladder = resolveLadder(studio.entryTf, studio)
+  const ladderCustom = isSwing && studio.ladderMode === 'custom'
+  const ladderError = isSwing ? validateLadder(studio.entryTf, studio.ladderTrend, studio.ladderMid) : null
+  const ladderNeedsDays = isSwing && !ladderError ? ladderMinDays(studio.ladderTrend, isCrypto) : 0
+  const ladderMidChoices = (Object.keys(TIMEFRAMES) as Timeframe[])
+    .filter((tf) => TIMEFRAMES[tf].seconds > TIMEFRAMES[studio.entryTf].seconds && tf !== '1M')
+  const ladderTrendChoices = (Object.keys(TIMEFRAMES) as Timeframe[])
+    .filter((tf) => TIMEFRAMES[tf].seconds >= TIMEFRAMES[studio.ladderMid].seconds && tf !== '1M')
   const laneStrategies = useMemo(
     () => Object.values(ALGO_STRATEGIES).filter((d) => strategyLane(d.id) === studio.lane),
     [studio.lane],
@@ -189,7 +201,14 @@ export default function BacktestStudio(props: BacktestStudioProps) {
       // silent zero-trade result). Re-seed, but never below a deeper user pick.
       const userDays = Math.round(Number(studio.days)) || 0
       const seed = swingSeedDays(tf)
-      patch({ entryTf: tf, days: String(Math.min(algoMaxDays(tf, isCrypto), Math.max(userDays, seed))) })
+      // v2.6.0 — a custom ladder can become structurally invalid on a new
+      // entry TF (mid no longer higher); snap back to that TF's frozen map.
+      const customOk = studio.ladderMode === 'custom' && validateLadder(tf, studio.ladderTrend, studio.ladderMid) == null
+      patch({
+        entryTf: tf,
+        days: String(Math.min(algoMaxDays(tf, isCrypto), Math.max(userDays, seed))),
+        ...(customOk ? {} : { ladderMode: 'auto' as const, ladderTrend: MTF_TREND_TF[tf], ladderMid: MTF_MID_TF[tf] }),
+      })
     } else {
       patch({ entryTf: tf, days: clampDays(studio.days, tf) })
     }
@@ -413,11 +432,73 @@ export default function BacktestStudio(props: BacktestStudioProps) {
             {isSwing && ladder && (
               <div className="mt-3 grid gap-3 rounded-md border border-purple-500/25 bg-purple-500/5 p-3 sm:grid-cols-[minmax(0,1fr)_150px]">
                 <div>
-                  <p className="text-[11px] font-semibold text-purple-300">Multi-timeframe confirmation ladder</p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold text-purple-300">Multi-timeframe confirmation ladder</p>
+                    <div className="flex items-center gap-1.5" role="group" aria-label="Ladder mode">
+                      <ChipButton
+                        active={studio.ladderMode === 'auto'}
+                        onClick={() => patch({ ladderMode: 'auto', ladderTrend: MTF_TREND_TF[studio.entryTf], ladderMid: MTF_MID_TF[studio.entryTf] })}
+                      >
+                        Auto
+                      </ChipButton>
+                      <ChipButton active={studio.ladderMode === 'custom'} onClick={() => patch({ ladderMode: 'custom' })}>
+                        Custom
+                      </ChipButton>
+                    </div>
+                  </div>
                   <p className="mt-1 text-[10px] leading-snug text-zinc-400">
                     Every entry bar is screened against two higher timeframes: the <span className="text-purple-300">{ladder.trendTf}</span> trend screen
                     decides long/short bias, the <span className="text-amber-300">{ladder.midTf}</span> confirm screen checks momentum + S/R location, and the{' '}
                     <span className="text-sky-300">{ladder.entryTf}</span> trigger times the actual entry. No look-ahead: a higher-TF bar is only used once it has closed.
+                  </p>
+                  {ladderCustom && (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <label className="flex items-center gap-1.5 text-[10px] text-zinc-500">
+                        Trend
+                        <select
+                          value={studio.ladderTrend}
+                          onChange={(e) => patch({ ladderTrend: e.target.value as Timeframe })}
+                          aria-label="Custom trend timeframe"
+                          className="h-8 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-xs text-zinc-200"
+                        >
+                          {ladderTrendChoices.map((tf) => (
+                            <option key={tf} value={tf}>{tf}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex items-center gap-1.5 text-[10px] text-zinc-500">
+                        Confirm
+                        <select
+                          value={studio.ladderMid}
+                          onChange={(e) => patch({ ladderMid: e.target.value as Timeframe })}
+                          aria-label="Custom confirm timeframe"
+                          className="h-8 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-xs text-zinc-200"
+                        >
+                          {ladderMidChoices.map((tf) => (
+                            <option key={tf} value={tf}>{tf}</option>
+                          ))}
+                        </select>
+                      </label>
+                      {ladderError ? (
+                        <p className="text-[10px] text-rose-400" role="alert">{ladderError}</p>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-400">
+                          valid ladder
+                        </span>
+                      )}
+                      {!ladderError && daysNum < ladderNeedsDays && (
+                        <button
+                          type="button"
+                          onClick={() => patch({ days: String(Math.min(maxDays, ladderNeedsDays)) })}
+                          className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300 hover:bg-amber-500/20"
+                        >
+                          ⤴ trend screen needs ≈{ladderNeedsDays}d — bump history
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  <p className="mt-1.5 text-[10px] leading-snug text-zinc-500">
+                    Step ③ adds optional confluence screens: EMA vs SMA trend, a minimum trend slope and an ADX(14) strength floor.
                   </p>
                 </div>
                 <MtfLadderIllo trendTf={ladder.trendTf} midTf={ladder.midTf} entryTf={ladder.entryTf} className="mx-auto h-32 w-auto" />
@@ -874,6 +955,7 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                 frac={flow.frac}
                 stage={flow.stage}
                 elapsedSec={flow.elapsedSec}
+                ladderLabel={isSwing && ladder ? `${ladder.trendTf} + ${ladder.midTf}` : undefined}
               />
 
               {/* advanced — auto-tune grid */}

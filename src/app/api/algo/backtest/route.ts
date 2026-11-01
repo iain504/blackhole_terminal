@@ -52,9 +52,11 @@
 //   minTrades?: number                     (optimize/sweep/walkforward) minimum trades to score
 //   topX?: number                          (sweep) how many winners to list (1..20, default 8)
 //   mtf?: { trendTf?: string, midTf?: string }  (v2.2.0, swing lane) the HTF
-//                                          ladder — validated against the
-//                                          FROZEN MTF maps for the entry tf;
-//                                          derived server-side when absent
+//                                          ladder. v2.6.0: CUSTOM ladders are
+//                                          accepted — mid must be a strictly
+//                                          higher TF than the entry, trend ≥
+//                                          mid, both real TIMEFRAMES; derived
+//                                          from the frozen maps when absent
 // }
 import { NextRequest, NextResponse } from 'next/server'
 import { requireUser } from '@/lib/auth'
@@ -355,23 +357,36 @@ async function computeBacktest(
       },
     }
   }
-  // v2.2.0 — swing MTF ladder (spec §1.2): validated against the FROZEN
-  // MTF_TREND_TF/MTF_MID_TF maps for the entry tf; derived server-side when
-  // the body omits them so the API is usable without them.
+  // v2.2.0 — swing MTF ladder (spec §1.2). v2.6.0 — CUSTOM LADDERS: the body
+  // may override the frozen per-entry map (e.g. a 1h entry confirmed on 4h
+  // trend + 1h mid, or a 1D entry riding the 1W trend). Validation is
+  // structural, not frozen: mid must be STRICTLY higher than the entry
+  // (seconds(mid) > seconds(entry)) and trend ≥ mid — Elder's screen order.
+  // Absent fields derive from the frozen maps, so existing callers are
+  // byte-compatible.
   let mtf: { trendTf: string; midTf: string } | null = null
   if (stratLane === 'swing') {
     const swingTf = tf as '1h' | '4h' | '1D'
-    const expTrend = MTF_TREND_TF[swingTf]
-    const expMid = MTF_MID_TF[swingTf]
+    const entrySec = TIMEFRAMES[swingTf].seconds
     const bodyTrend = typeof body.mtf?.trendTf === 'string' ? body.mtf.trendTf : null
     const bodyMid = typeof body.mtf?.midTf === 'string' ? body.mtf.midTf : null
-    if (bodyTrend != null && bodyTrend !== expTrend) {
-      return { status: 400, body: { error: `mtf.trendTf must be "${expTrend}" for the ${tf} entry timeframe (got "${bodyTrend}")` } }
+    if (bodyTrend != null && !(bodyTrend in TIMEFRAMES)) {
+      return { status: 400, body: { error: `mtf.trendTf "${bodyTrend}" is not a known timeframe` } }
     }
-    if (bodyMid != null && bodyMid !== expMid) {
-      return { status: 400, body: { error: `mtf.midTf must be "${expMid}" for the ${tf} entry timeframe (got "${bodyMid}")` } }
+    if (bodyMid != null && !(bodyMid in TIMEFRAMES)) {
+      return { status: 400, body: { error: `mtf.midTf "${bodyMid}" is not a known timeframe` } }
     }
-    mtf = { trendTf: expTrend, midTf: expMid }
+    const trendTf = bodyTrend ?? MTF_TREND_TF[swingTf]
+    const midTf = bodyMid ?? MTF_MID_TF[swingTf]
+    const midSec = TIMEFRAMES[midTf as Timeframe].seconds
+    const trendSecV = TIMEFRAMES[trendTf as Timeframe].seconds
+    if (!(midSec > entrySec)) {
+      return { status: 400, body: { error: `mtf.midTf "${midTf}" must be a STRICTLY higher timeframe than the ${swingTf} entry` } }
+    }
+    if (!(trendSecV >= midSec)) {
+      return { status: 400, body: { error: `mtf.trendTf "${trendTf}" must be ≥ mtf.midTf "${midTf}" (trend screen order)` } }
+    }
+    mtf = { trendTf, midTf }
   }
   const symbol = String(body.symbol ?? '').trim().toUpperCase()
   if (!symbol || !/^[A-Z0-9./:-]{1,15}$/.test(symbol)) {

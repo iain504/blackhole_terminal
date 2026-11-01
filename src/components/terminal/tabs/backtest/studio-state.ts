@@ -27,7 +27,7 @@ import {
   type AlgoStrategyId,
   type AlgoTimeframe,
 } from '@/lib/algo-strategies'
-import { TIMEFRAMES } from '@/lib/market-types'
+import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import type { BtFlowMode } from '../BacktestFlowChart'
 import type { AlgoSetupCfg } from '../BacktestPanel'
 
@@ -90,6 +90,12 @@ export interface StudioState {
   dynSlip: boolean
   /** last-clicked regime preset (research = frictionless discovery) */
   regimePreset: AlgoRegimePresetId
+  /** v2.6.0 — swing MTF ladder: 'auto' = the frozen per-entry map,
+   *  'custom' = the user's trend/mid pick (validated by validateLadder).
+   *  Typed as Timeframe (not AlgoTimeframe) so a 1D entry can ride 1W. */
+  ladderMode: 'auto' | 'custom'
+  ladderTrend: Timeframe
+  ladderMid: Timeframe
   /** day-lane-only session guards (swing hides them; server forces them off) */
   maxTradesDay: string
   rthOnly: boolean
@@ -130,6 +136,47 @@ export const fmtBars = (n: number): string => (n >= 10000 ? `${(n / 1000).toFixe
 export const mtfLadder = (entryTf: AlgoTimeframe): { trendTf: string; midTf: string; entryTf: string } | null => {
   if (!isSwingTf(entryTf)) return null
   return { trendTf: MTF_TREND_TF[entryTf], midTf: MTF_MID_TF[entryTf], entryTf }
+}
+
+/** v2.6.0 — resolved ladder honoring a custom pick (falls back to frozen). */
+export const resolveLadder = (
+  entryTf: AlgoTimeframe,
+  ladder?: { ladderMode: 'auto' | 'custom'; ladderTrend: Timeframe; ladderMid: Timeframe },
+): { trendTf: string; midTf: string; entryTf: string } | null => {
+  const base = mtfLadder(entryTf)
+  if (base == null || ladder?.ladderMode !== 'custom') return base
+  return { trendTf: ladder.ladderTrend, midTf: ladder.ladderMid, entryTf }
+}
+
+/**
+ * v2.6.0 — structural ladder validation (mirrors the API route): mid must be
+ * a STRICTLY higher TF than the entry, trend ≥ mid, both real TIMEFRAMES.
+ * Returns the error text or null when the ladder is valid.
+ */
+export const validateLadder = (
+  entryTf: AlgoTimeframe,
+  trendTf: Timeframe,
+  midTf: Timeframe,
+): string | null => {
+  const sec = (tf: Timeframe): number => TIMEFRAMES[tf]?.seconds ?? 0
+  const entrySec = sec(entryTf)
+  const midSec = sec(midTf)
+  const trendSec = sec(trendTf)
+  if (!(midSec > entrySec)) return `Confirm TF (${midTf}) must be strictly higher than the ${entryTf} entry`
+  if (!(trendSec >= midSec)) return `Trend TF (${trendTf}) must be ≥ the confirm TF (${midTf})`
+  return null
+}
+
+/**
+ * v2.6.0 — calendar days the TREND screen needs (trendSma 50 + slope/ADX
+ * headroom, stock calendars widened ×7/5) so a deep custom ladder (1W trend)
+ * can auto-bump the history window instead of starving silently.
+ */
+export const ladderMinDays = (trendTf: Timeframe, isCrypto: boolean): number => {
+  const trendSec = TIMEFRAMES[trendTf]?.seconds ?? 86400
+  const needBuckets = 50 + 30 // trendSma default + slope/ADX headroom
+  const raw = Math.ceil((needBuckets * trendSec) / 86400)
+  return isCrypto ? raw : Math.ceil((raw * 7) / 5)
 }
 
 // The lane TF sets + MTF maps re-exported for the wizard's illustrations.
@@ -198,6 +245,10 @@ export function makeStudioState(cfg: AlgoSetupCfg, lane?: 'day' | 'swing', keep?
       spreadBps: keep?.spreadBps ?? '0',
       dynSlip: keep?.dynSlip ?? true,
       regimePreset: keep?.regimePreset ?? 'live',
+      // v2.6.0 — ladder seed: frozen map for the seeded entry TF (1h here)
+      ladderMode: keep?.ladderMode ?? 'auto',
+      ladderTrend: keep?.ladderTrend ?? MTF_TREND_TF[entryTf],
+      ladderMid: keep?.ladderMid ?? MTF_MID_TF[entryTf],
       // swing lane: the server forces these off regardless (spec §1.2)
       maxTradesDay: '0',
       rthOnly: false,
@@ -236,6 +287,11 @@ export function makeStudioState(cfg: AlgoSetupCfg, lane?: 'day' | 'swing', keep?
     spreadBps: keep?.spreadBps ?? '0',
     dynSlip: keep?.dynSlip ?? true,
     regimePreset: keep?.regimePreset ?? 'live',
+    // v2.6.0 — inert on the day lane (the ladder UI only renders for swing);
+    // seeded to the 1h frozen map so a lane flip starts from a valid ladder
+    ladderMode: keep?.ladderMode ?? 'auto',
+    ladderTrend: keep?.ladderTrend ?? '1D',
+    ladderMid: keep?.ladderMid ?? '4h',
     maxTradesDay: String(cfg.maxTradesDay ?? 0),
     rthOnly: cfg.rthOnly,
     flattenEod: cfg.flattenEod,
@@ -276,6 +332,12 @@ export function studioIssues(s: StudioState): StudioIssues {
   if (!s.symbol.trim()) market.push('Pick a symbol in step ②')
   const days = Math.round(numOr(s.days, 0))
   if (!(days > 0)) market.push('Set a history window in step ②')
+  // v2.6.0 — a structurally-invalid CUSTOM ladder blocks the run CTA with the
+  // same copy the API would 400 on (mid > entry, trend ≥ mid)
+  if (s.lane === 'swing' && s.ladderMode === 'custom') {
+    const ladderErr = validateLadder(s.entryTf, s.ladderTrend, s.ladderMid)
+    if (ladderErr != null) market.push(`Fix the MTF ladder in step ② — ${ladderErr.toLowerCase()}`)
+  }
   const riskBudget = s.sizingMode === 'risk' ? (s.riskBasis === 'pct' ? numOr(s.riskMoneyPct) : numOr(s.riskMoney)) : 0
   if (s.sizingMode === 'fixed') {
     if (!(numOr(s.qty) > 0)) sizing.push('Set a positive quantity in step ④')
