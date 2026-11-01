@@ -68,6 +68,15 @@ const yahooRssProvider: NewsProvider = {
 
 export const NEWS_PROVIDERS: NewsProvider[] = [googleNewsProvider, yahooRssProvider]
 
+// v2.6.1 — staleness gate. Google News SEARCH feeds quietly resurface
+// month-old articles when a symbol's coverage is thin (NVDA pulled a
+// "Jun 2026" piece into a feed labelled "23h ago"). Sentiment on stale news
+// is worse than no news: the journal only ever holds current-affairs items.
+export const MAX_HEADLINE_AGE_DAYS = 10
+const MAX_AGE_MS = MAX_HEADLINE_AGE_DAYS * 24 * 3600 * 1000
+// absurd future dates (clock skew / bad feeds) are rejected too
+const FUTURE_SKEW_MS = 5 * 60 * 1000
+
 // Re-fetch a symbol at most every 20 minutes — RSS content moves slower and
 // Google rate-limits identical queries aggressively.
 const FETCH_TTL_MS = 20 * 60 * 1000
@@ -106,9 +115,20 @@ export async function ingestSymbolNews(symbol: string, isCrypto: boolean): Promi
 
   if (all.length === 0) return { fetched: 0, inserted: 0, providers: used }
 
+  // v2.6.1 — drop stale (and absurdly future-dated) items BEFORE the cap so
+  // the journal never accumulates old-affairs rows in the first place
+  const nowMs = Date.now()
+  const current = all.filter((h) => {
+    if (!h.title || !h.url) return false
+    if (!h.publishedAt) return true // undated — kept, rendered without an age
+    const t = h.publishedAt.getTime()
+    return t >= nowMs - MAX_AGE_MS && t <= nowMs + FUTURE_SKEW_MS
+  })
+  if (current.length === 0) return { fetched: 0, inserted: 0, providers: used }
+
   // dedupe by url within the batch, cap 30 headlines per symbol per sweep
   const seen = new Set<string>()
-  const rows = all
+  const rows = current
     .filter((h) => {
       if (!h.title || !h.url || seen.has(h.url)) return false
       seen.add(h.url)

@@ -4091,3 +4091,43 @@ shows EMA/slope/ADX → enable all + ladder 1D+4h → step ⑤ flow chart shows 
 HTF · 1D + 4h" → Run head-to-end on BTC/USDT completes with "MTF: 1D trend + 4h confirm"
 in the results header → Auto resets the picker. (TSLA 400s in-sandbox on an empty demo
 feed — data availability, not code.) Stamped v2.6.0+2xx.
+
+## v2.6.1 — UX bugfix pair: Autopilot paper/live switch + sentiment stale-news honesty (2026-11-01)
+
+Two user-reported defects from live use of the v2.4/v2.5 features.
+
+**1) NEBULA AUTOPILOT — the paper/live "radio" was not switchable.**
+Root cause: the LIVE-mode Switch's `checked` was derived from the SERVER
+session (`session?.settings.mode`), while `onCheckedChange` wrote the LOCAL
+settings form — the controlled value never moved, so the switch looked frozen.
+Fix (AgentTab): mode now derives from the local form while the fleet is
+idle/ready (instant PAPER↔LIVE flip across switch + header chip + engage
+button + LIVE warning line); once scanning/engaged the mode is baked into the
+session, so the display locks to the server truth and the switch disables with
+a "mode is locked" tooltip. Footgun closed: the engage dialog now sends the
+current settings form and POST /api/agent `engage` applies them via
+updateAgentSettings (ready-only, re-computes BUDGET) before engaging — a
+paper/live flip made after READY takes effect on that very engage instead of
+being silently ignored.
+
+**2) Chart SENTIMENT panel — "Jun 2026" headlines labelled "23h ago".**
+Root cause chain: Google News SEARCH feeds resurface month-old articles when a
+symbol's coverage is thin (NVDA journal held a Jun 25 2026 piece); the journal
+had no age gate, `getHeadlines` had no time window, and the summary line's bare
+"· 23h ago" (snapshot age) read like the news' age. Fix at four layers:
+ingestion gate rejects headlines older than 10 days (MAX_HEADLINE_AGE_DAYS) or
+>5min in the future BEFORE the per-sweep cap; `getHeadlines` only serves the
+10-day window (undated rows included); `pruneOldHeadlines()` runs after every
+sweep (10+4d cutoff, best-effort) — plus a one-off purge of the existing
+stale rows (16 deleted, journal now spans Oct 20→Nov 1); UI timeAgo gained
+month granularity past 60d, every age label carries the absolute datetime on
+hover, and the summary copy is now "N headlines · updated 2h ago" so the
+snapshot age can't be misread as article age.
+
+Verification: agent-browser E2E as kronostest1 — LIVE switch toggles both
+ways with header chip + "ENGAGE FLEET · LIVE/PAPER" + warning line following
+in real time; AAPL feed clean (11h→6d, no stale items); NVDA API feed now
+2026-10-26→11-01 (Sep/Jun rows gone); live SPCX rescan ingested 30 headlines
+all inside the 10-day window; tooltips verified ("Nov 1, 2026, 9:49 AM");
+market leaderboard renders; lint clean; dev.log free of errors. Purge
+verified: 90→74 rows, oldest 2026-10-20. Stamped v2.6.1+221.

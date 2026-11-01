@@ -196,7 +196,9 @@ function SymbolView({
                 {fmt(me.momentum)}
               </span>
             )}
-            <span className="text-[10px] text-zinc-600">· {me.headlines} headlines · {timeAgo(me.asOf)}</span>
+            <span className="text-[10px] text-zinc-600" title={`snapshot ${fullDate(me.asOf)}`}>
+              · {me.headlines} headlines · updated {timeAgo(me.asOf)}
+            </span>
           </div>
           {/* bull/bear/neutral split bar */}
           <div className="mt-1.5 flex h-1.5 overflow-hidden rounded-full bg-zinc-800">
@@ -343,7 +345,7 @@ function HeadlineList({ headlines }: { headlines: SentimentHeadlineDto[] }) {
               <p className="mt-1 flex items-center gap-1.5 text-[9.5px] text-zinc-600">
                 {h.symbol && <span className="rounded bg-zinc-800/80 px-1 py-px text-zinc-400">{h.symbol}</span>}
                 <span>{h.publisher ?? h.source}</span>
-                {h.publishedAt && <span>· {timeAgo(h.publishedAt)}</span>}
+                {h.publishedAt && <span title={fullDate(h.publishedAt)}>· {timeAgo(h.publishedAt)}</span>}
                 {h.confidence != null && <span>· {(h.confidence * 100).toFixed(0)}%</span>}
                 <ExternalLink className="h-2.5 w-2.5" />
               </p>
@@ -395,10 +397,23 @@ function scoreBg(v: number): string {
   return v > 0.15 ? 'bg-emerald-500/10' : v < -0.15 ? 'bg-red-500/10' : 'bg-zinc-800/40'
 }
 
+// v2.6.1 — honest relative time: future-safe, month granularity past 60 days
+// ("128d ago" read like fresh news next to "23h ago" labels), and every label
+// carries the absolute datetime on hover so there is zero ambiguity.
 function timeAgo(iso: string): string {
   const diff = (Date.now() - new Date(iso).getTime()) / 1000
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86400)}d ago`
+  const d = Math.floor(diff / 86400)
+  if (d < 60) return `${d}d ago`
+  return `${Math.round(d / 30.44)}mo ago`
+}
+
+function fullDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+  } catch {
+    return iso
+  }
 }

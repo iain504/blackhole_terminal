@@ -86,7 +86,12 @@ export default function AgentTab() {
   const inFlight = status === 'scanning' || status === 'tuning' || status === 'ranking' || status === 'budget'
   const budget = (session?.budget ?? null) as AgentBudget | null
   const stats = (session?.stats ?? null) as AgentStats | null
-  const mode = session?.settings?.mode === 'live' ? 'live' : 'paper'
+  // v2.6.1 — the paper/live switch must respond INSTANTLY: while the fleet is
+  // idle/ready the mode comes from the local settings form (the switch writes
+  // there); once scanning/engaged the mode is baked into the session, so the
+  // display locks to the server's truth and the switch disables.
+  const modeLocked = engaged || inFlight
+  const mode = ((modeLocked ? session?.settings?.mode : settings.mode) === 'live' ? 'live' : 'paper') as 'live' | 'paper'
 
   // ---- poll the agent state (3s) ----
   const load = useCallback(async () => {
@@ -316,8 +321,15 @@ export default function AgentTab() {
               </label>
             </div>
             <div className="flex items-end gap-4 pb-1">
-              <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
-                <Switch checked={mode === 'live'} onCheckedChange={(v) => setS({ mode: v ? 'live' : 'paper' })} />
+              <label
+                className={cn('flex items-center gap-2 text-xs text-zinc-300', !modeLocked && 'cursor-pointer')}
+                title={modeLocked ? 'Mode is locked while the fleet is scanning or engaged' : 'PAPER = simulated orders · LIVE = real orders on your Alpaca account'}
+              >
+                <Switch
+                  checked={mode === 'live'}
+                  disabled={modeLocked}
+                  onCheckedChange={(v) => setS({ mode: v ? 'live' : 'paper' })}
+                />
                 <span className={mode === 'live' ? 'font-semibold text-rose-300' : ''}>LIVE mode</span>
               </label>
               <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
@@ -591,7 +603,10 @@ export default function AgentTab() {
               className={mode === 'live' ? 'bg-rose-600 hover:bg-rose-500' : 'bg-emerald-600 hover:bg-emerald-500'}
               onClick={() => {
                 setConfirmEngage(false)
-                if (session) void post({ action: 'engage', sessionId: session.id }, 'Fleet engaged')
+                // v2.6.1 — carry the current form so a paper/live flip made
+                // after READY is applied at engage time (server applies the
+                // settings patch, re-sizes the budget, then engages)
+                if (session) void post({ action: 'engage', sessionId: session.id, settings }, 'Fleet engaged')
               }}
             >
               ENGAGE {mode === 'live' ? 'LIVE' : 'PAPER'}

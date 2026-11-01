@@ -15,7 +15,7 @@ import { db } from '@/lib/db'
 import { getBars } from '@/lib/alpaca'
 import { agentUniverse } from '@/lib/agent-universe'
 import { isCryptoSymbol } from '@/lib/market-types'
-import { ingestSymbolNews } from './sentiment-news'
+import { ingestSymbolNews, MAX_HEADLINE_AGE_DAYS } from './sentiment-news'
 import { scoreHeadlines } from './sentiment-score'
 import type {
   SentimentHeadlineDto,
@@ -117,6 +117,29 @@ async function runScan(list: { symbol: string; isCrypto: boolean }[]): Promise<v
   } finally {
     scanState.running = false
     scanState.current = null
+    // v2.6.1 — journal hygiene after every sweep (best-effort)
+    void pruneOldHeadlines()
+  }
+}
+
+/** v2.6.1 — drop headlines older than the freshness window (published past
+ *  the cutoff, or undated rows fetched past it) so the feed, the aggregator
+ *  and the IC eval can never resurface stale news. */
+export async function pruneOldHeadlines(): Promise<number> {
+  const cutoff = new Date(Date.now() - (MAX_HEADLINE_AGE_DAYS + 4) * 24 * 3600 * 1000)
+  try {
+    const res = await db.sentimentHeadline.deleteMany({
+      where: {
+        OR: [
+          { publishedAt: { lt: cutoff } },
+          { publishedAt: null, fetchedAt: { lt: cutoff } },
+        ],
+      },
+    })
+    if (res.count > 0) console.log(`[sentiment] pruned ${res.count} stale headlines (>${MAX_HEADLINE_AGE_DAYS + 4}d)`)
+    return res.count
+  } catch {
+    return 0 // maintenance is best-effort
   }
 }
 
@@ -276,8 +299,14 @@ export async function getSentimentHistory(symbol: string, hours: number): Promis
 }
 
 export async function getHeadlines(symbol: string | null, limit: number): Promise<SentimentHeadlineDto[]> {
+  // v2.6.1 — the feed is "current affairs": never resurface stale journal rows
+  // (Google News search feeds resurface month-old articles for thin symbols)
+  const since = new Date(Date.now() - MAX_HEADLINE_AGE_DAYS * 24 * 3600 * 1000)
   const rows = await db.sentimentHeadline.findMany({
-    where: symbol ? { symbol: symbol.toUpperCase() } : {},
+    where: {
+      ...(symbol ? { symbol: symbol.toUpperCase() } : {}),
+      OR: [{ publishedAt: { gte: since } }, { publishedAt: null }],
+    },
     orderBy: [{ publishedAt: 'desc' }, { fetchedAt: 'desc' }],
     take: Math.min(Math.max(limit, 1), 100),
   })

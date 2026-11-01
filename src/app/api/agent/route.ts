@@ -81,6 +81,15 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(ok ? { ok: true } : { error: 'No running pipeline' }, { status: ok ? 200 : 409 })
       }
       case 'engage': {
+        // v2.6.1 — the dialog sends the current settings form: apply it first
+        // (re-sizes the budget, persists the mode flip) so a paper/live change
+        // made after READY takes effect on this very engage
+        if (body?.settings && Object.keys(body.settings).length > 0) {
+          const upd = await updateAgentSettings(user.id, sessionId, body.settings)
+          if (!upd.ok) {
+            return NextResponse.json({ error: upd.error ?? 'Could not apply settings before engage' }, { status: 400 })
+          }
+        }
         const res = await engageAgent(user.id, sessionId)
         return NextResponse.json(res, { status: res.ok ? 200 : 400 })
       }
