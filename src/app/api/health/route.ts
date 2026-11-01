@@ -9,7 +9,8 @@
 // from hammering SQLite. Sub-checks are individually guarded so one broken
 // dependency never hides the rest of the report.
 import { NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { statSync } from 'node:fs'
+import { db, dbDiskStatus } from '@/lib/db'
 import { APP_VERSION } from '@/generated/version'
 import { rateLimitStore } from '@/lib/rate-limit'
 import { log } from '@/lib/logger'
@@ -36,6 +37,11 @@ interface HealthPayload {
   version: string
   sha: string
   ts: string
+  // v2.5.1 — storage pressure (host disk is what trips SQLite error 13)
+  dbMB: number | null
+  walMB: number | null
+  diskFreeMB: number | null
+  diskLow: boolean | null
 }
 
 let cache: { at: number; payload: HealthPayload; httpStatus: number } | null = null
@@ -114,6 +120,21 @@ async function compute(): Promise<{ payload: HealthPayload; httpStatus: number }
   }
 
   const mem = process.memoryUsage()
+
+  // v2.5.1 — storage pressure report (all best-effort, never breaks the probe)
+  let dbMB: number | null = null
+  let walMB: number | null = null
+  try {
+    const p = process.env.DATABASE_URL?.startsWith('file:')
+      ? process.env.DATABASE_URL.slice('file:'.length).split('?')[0]
+      : './db/custom.db'
+    dbMB = Math.round((statSync(p).size / (1024 * 1024)) * 10) / 10
+    walMB = Math.round((statSync(`${p}-wal`).size / (1024 * 1024)) * 10) / 10
+  } catch { /* wal may not exist yet / path unresolvable */ }
+  const disk = dbDiskStatus()
+  const diskFreeMB = disk.freeBytes != null ? Math.round(disk.freeBytes / (1024 * 1024)) : null
+  const diskLow = diskFreeMB != null ? diskFreeMB < 512 : null
+
   const payload: HealthPayload = {
     status: dbOk ? 'ok' : 'degraded',
     uptimeSec: Math.round(process.uptime()),
@@ -128,9 +149,16 @@ async function compute(): Promise<{ payload: HealthPayload; httpStatus: number }
     version: APP_VERSION.display,
     sha: APP_VERSION.sha,
     ts: new Date().toISOString(),
+    dbMB,
+    walMB,
+    diskFreeMB,
+    diskLow,
   }
   if (!dbOk) {
     log.warn('health_degraded', { uptimeSec: payload.uptimeSec, memoryMB: payload.memoryMB })
+  }
+  if (diskLow) {
+    log.warn('health_disk_low', { diskFreeMB, dbMB, walMB })
   }
   return { payload, httpStatus: dbOk ? 200 : 503 }
 }
@@ -172,6 +200,10 @@ export async function GET() {
       version: APP_VERSION.display,
       sha: APP_VERSION.sha,
       ts: new Date().toISOString(),
+      dbMB: null,
+      walMB: null,
+      diskFreeMB: null,
+      diskLow: null,
     }
     return NextResponse.json(payload, { status: 503 })
   }

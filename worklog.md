@@ -4008,3 +4008,38 @@ persists → Algo tab "Market sentiment gate" switch toggles (checked state veri
 the new models until restart — classic cached-client gotcha, noted for future sessions).
 Lint clean; tsc clean for all touched files (9 pre-existing errors elsewhere untouched);
 no runtime errors in dev.log.
+
+## 2026-11-01 — v2.5.1 urgent fix: FSD "Launch Full Scan" dying with SQLite error 13 (database or disk is full)
+
+User hit `Error code 13: Insertion failed because database is full` /
+`SqliteError { extended_code: 13, message: "database or disk is full" }` during the FSD
+full scan on their docker deployment (blackhole-terminal-app/stream/kronos). Root cause:
+the docker host volume ran out of space — the app then spammed full prisma dumps to
+stdout, which (unbounded json-file log driver) eats the very disk that's already full.
+Sandbox db verified tiny (7.6MB + 4MB WAL) with 7.3G free — this is a host-volume issue,
+so the fix is resilience + prevention, shipped in-repo:
+
+- src/lib/db.ts: disk-pressure toolkit — dbDiskStatus() (statfs on the DB dir),
+  checkpointWal() (wal_checkpoint(TRUNCATE)), isDiskFullError() (matches SQLite code-13
+  message variants incl. the Prisma connector wording), DISK_MIN_FREE_BYTES (256MB hard)
+  / DISK_WARN_FREE_BYTES (512MB soft), humanBytes(), diskFullError() (actionable text).
+- agent-engine.ts: PRE-FLIGHT guard in startAgentScan (refuse to start + checkpoint WAL +
+  prune sessions beyond the newest 20/user with their events; returns {error} → API 507),
+  MID-FLIGHT guard every 10 symbols (abort cleanly below the floor, warn + checkpoint
+  below soft floor), disk-full symbol failures stop the whole scan (not swallowed),
+  resilient failure path (safeTouch/safeEv so the catch can't throw when the disk is
+  full; phase shows DISK FULL).
+- grid-engine.ts: gridCycle is disk-full aware — no failCount increment / no parking as
+  'error' (environment, not grid), one compact log line per cycle instead of a prisma
+  dump per grid per tick, single checkpoint attempt, evaluations skipped until space
+  returns (grids stay active).
+- /api/agent POST start → 507 {error} on pre-flight refusal (UI toast shows the message).
+- /api/health: new dbMB / walMB / diskFreeMB / diskLow fields + health_disk_low warn log.
+- docker-compose.yml: json-file logging caps (max-size 10m, max-file 3) on app + stream —
+  the root-cause prevention for unbounded container logs on the host.
+- package.json 2.5.0 → 2.5.1 (stamped v2.5.1+219).
+
+Host remediation for the user (docker VM): docker system prune -f (safe — ./db is a bind
+mount), remove old images/containers, truncate /var/lib/docker/containers/*/*-json.log or
+recreate the stack so the new log caps apply: docker compose up -d --build, then df -h .
+Lint clean; /api/health + /api/agent compile verified on the running dev server.

@@ -36,6 +36,15 @@ services:
     volumes:
       - ./db:/app/db
     restart: unless-stopped
+    # v2.5.1 — the default json-file log driver is UNBOUNDED: prisma:error
+    # spam from a disk-full storm (or any chatty cycle) can eat gigabytes of
+    # the host disk, which is itself what makes SQLite fail with "database
+    # or disk is full". Cap every container's log and rotate it.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
@@ -48,6 +57,11 @@ services:
     ports:
       - "3030:3030"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3030/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 20s

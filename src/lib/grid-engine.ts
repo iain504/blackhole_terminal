@@ -67,7 +67,7 @@
 //      (one click recovery instead of a dead row).
 //   3. Per-lot TP sells ('both' grids) are capped by the live balance too —
 //      the LAST lot's TP used to 403 on the accumulated fee shortfall.
-import { db } from '@/lib/db'
+import { db, dbDiskStatus, checkpointWal, isDiskFullError, humanBytes } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
 import { getPositionForSymbol, placeOrderWithExits, pollOrderFillPrice, type TradeMode } from '@/lib/trading'
 import { isRegularSession } from '@/lib/sessions'
@@ -991,6 +991,14 @@ type GlobalWithGrid = typeof globalThis & {
 async function gridCycle(entry: { busy: boolean }): Promise<void> {
   if (entry.busy) return
   entry.busy = true
+  // v2.5.1 — disk-pressure state for THIS cycle: when SQLite reports
+  // "database or disk is full" the environment, not the grid, is broken.
+  // Parking grids as 'error' on that would be wrong (they're healthy), and
+  // logging a full prisma dump per grid per tick fills docker's json log
+  // faster than anything else in the app. One compact line per cycle + a
+  // single checkpoint attempt, and every evaluation is skipped until the
+  // volume has room again.
+  let diskFull = false
   try {
     const grids = await db.gridTrade.findMany({ where: { status: 'active' } })
     if (grids.length === 0) return
@@ -1018,6 +1026,7 @@ async function gridCycle(entry: { busy: boolean }): Promise<void> {
     }
     // SEQUENTIAL evaluation — a failing grid must never kill the loop
     for (const grid of grids) {
+      if (diskFull) break // volume is out of space — nothing more will write this tick
       try {
         const price = priceByKey.get(`${grid.userId}|${grid.symbol}`)
         if (price == null) {
@@ -1037,6 +1046,13 @@ async function gridCycle(entry: { busy: boolean }): Promise<void> {
         }
         await evaluateGrid(grid, price)
       } catch (e) {
+        if (isDiskFullError(e)) {
+          diskFull = true
+          void checkpointWal('truncate')
+          const disk = dbDiskStatus()
+          console.warn(`[grid] DISK FULL (${humanBytes(disk.freeBytes)} free) — cycle skipped, grids stay active. Free host space to resume.`)
+          break
+        }
         const msg = e instanceof Error ? e.message : String(e)
         console.warn(`[grid] evaluation failed for ${grid.symbol}:`, msg)
         try {
@@ -1065,6 +1081,12 @@ async function gridCycle(entry: { busy: boolean }): Promise<void> {
       }
     }
   } catch (e) {
+    if (isDiskFullError(e)) {
+      void checkpointWal('truncate')
+      const disk = dbDiskStatus()
+      console.warn(`[grid] DISK FULL (${humanBytes(disk.freeBytes)} free) — cycle skipped, grids stay active. Free host space to resume.`)
+      return
+    }
     console.warn('[grid] cycle failed:', e instanceof Error ? e.message : e)
   } finally {
     entry.busy = false

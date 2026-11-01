@@ -64,6 +64,11 @@ export async function POST(req: NextRequest) {
       if (res === 'busy') {
         return NextResponse.json({ error: 'An autopilot pipeline is already running — abort it first or wait for READY.' }, { status: 409 })
       }
+      // v2.5.1 — pre-flight guard result (disk full): refuse cleanly with the
+      // actionable message instead of letting the pipeline die mid-storm.
+      if (typeof res === 'object' && res !== null && 'error' in res) {
+        return NextResponse.json({ error: res.error }, { status: 507 })
+      }
       return NextResponse.json({ ok: true, sessionId: res.sessionId }, { status: 202 })
     }
 

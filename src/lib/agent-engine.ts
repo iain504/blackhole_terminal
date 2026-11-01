@@ -18,7 +18,10 @@
 // The pipeline runs detached (like backtest-jobs / reco refresh), writes
 // progress into the AgentSession row and every decision into AgentEvent so
 // the tab can replay exactly what the autopilot was thinking.
-import { db } from '@/lib/db'
+import {
+  db, dbDiskStatus, checkpointWal, isDiskFullError, diskFullError,
+  DISK_MIN_FREE_BYTES, DISK_WARN_FREE_BYTES, humanBytes,
+} from '@/lib/db'
 import { memoryGuard } from '@/lib/mem-guard'
 import { getAccount } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
@@ -222,8 +225,28 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
             added++
           }
         }
-      } catch { /* unreachable feed for this symbol — the rest still scan */ }
+      } catch (e) {
+        // v2.5.1 — a DISK FULL failure is an environment problem, not a bad
+        // symbol: stop the whole scan cleanly instead of hammering 100 more
+        // symbols into the same full volume (each retry spams prisma errors
+        // to stdout → docker logs → even less disk).
+        if (isDiskFullError(e)) throw diskFullError(dbDiskStatus())
+        /* otherwise unreachable feed for this symbol — the rest still scan */
+      }
       stats.scanned = i + 1
+      // v2.5.1 — MID-FLIGHT DISK GUARD: every 10 symbols measure the volume,
+      // truncate the WAL and warn early / abort cleanly below the floor.
+      if ((i + 1) % 10 === 0) {
+        const disk = dbDiskStatus()
+        if (disk.freeBytes != null) {
+          if (disk.freeBytes < DISK_MIN_FREE_BYTES) throw diskFullError(disk)
+          if (disk.freeBytes < DISK_WARN_FREE_BYTES) {
+            await checkpointWal('truncate')
+            await ev(sessionId, userId, 'warn',
+              `Disk running low — ${humanBytes(disk.freeBytes)} free on the database volume. Consider pruning the host before the next scan.`)
+          }
+        }
+      }
       await touch({
         phase: `SCAN ${i + 1}/${scanTotal} · ${symbol}${added ? ' ✓' : ''}`,
         progress: 0.05 + 0.5 * ((i + 1) / scanTotal),
@@ -368,13 +391,20 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    if (msg === 'aborted') {
-      await touch({ status: 'stopped', phase: 'ABORTED', error: null })
-      await ev(sessionId, userId, 'warn', 'Pipeline aborted by user.')
-    } else {
-      await touch({ status: 'error', phase: 'FAILED', error: msg })
-      await ev(sessionId, userId, 'error', `Pipeline failed — ${msg}`)
-    }
+    // v2.5.1 — every touch() below can itself fail when the disk is full;
+    // belt-and-braces .catch so the failure path can never throw past the
+    // pipeline (getAgentState's crash-heal marks orphaned in-flight rows).
+    const safeTouch = (patch: Parameters<typeof touch>[0]) => touch(patch).catch(() => {})
+    const safeEv = (level: string, message: string) => ev(sessionId, userId, level, message)
+    try {
+      if (msg === 'aborted') {
+        await safeTouch({ status: 'stopped', phase: 'ABORTED', error: null })
+        await safeEv('warn', 'Pipeline aborted by user.')
+      } else {
+        await safeTouch({ status: 'error', phase: isDiskFullError(e) ? 'DISK FULL' : 'FAILED', error: msg })
+        await safeEv('error', `Pipeline failed — ${msg}`)
+      }
+    } catch { /* even the failure path is unwritable — nothing more we can do */ }
     stats.finishedAt = new Date().toISOString()
     await db.agentSession.update({ where: { id: sessionId }, data: { stats: stats as unknown as object } }).catch(() => {})
   } finally {
@@ -449,8 +479,31 @@ async function computeBudget(
 // ---------------------------------------------------------------------------
 // public commands
 // ---------------------------------------------------------------------------
-export async function startAgentScan(userId: string, rawSettings: Partial<AgentSettings>): Promise<{ sessionId: string } | 'busy'> {
+export async function startAgentScan(userId: string, rawSettings: Partial<AgentSettings>): Promise<{ sessionId: string } | 'busy' | { error: string }> {
   if (jobs.has(userId)) return 'busy'
+  // v2.5.1 — PRE-FLIGHT DISK GUARD: the scan is the heaviest writer in the app
+  // (progress touches + events + WAL growth per symbol × 100+ symbols). On a
+  // nearly-full docker volume it dies mid-storm with SQLite error 13 and the
+  // failure spam itself makes the disk situation worse. Refuse to start with
+  // an actionable message instead, and checkpoint the WAL while we're here.
+  const preDisk = dbDiskStatus()
+  if (preDisk.freeBytes != null && preDisk.freeBytes < DISK_MIN_FREE_BYTES) {
+    return { error: diskFullError(preDisk).message }
+  }
+  await checkpointWal('truncate')
+  // housekeeping — sessions with their big candidates JSON pile up forever;
+  // keep the newest 20 per user and drop the rest (+ their event feeds) before
+  // creating another one.
+  try {
+    const old = await db.agentSession.findMany({
+      where: { userId }, orderBy: { createdAt: 'desc' }, skip: 20, select: { id: true },
+    })
+    if (old.length > 0) {
+      const ids = old.map((s) => s.id)
+      await db.agentEvent.deleteMany({ where: { sessionId: { in: ids } } })
+      await db.agentSession.deleteMany({ where: { id: { in: ids } } })
+    }
+  } catch { /* pruning is best-effort */ }
   const settings: AgentSettings = { ...AGENT_SETTINGS_DEFAULTS, mode: 'paper', ...(rawSettings ?? {}) } as AgentSettings
   settings.topTune = Math.min(40, Math.max(4, Math.round(settings.topTune)))
   settings.topN = Math.min(15, Math.max(3, Math.round(settings.topN)))
