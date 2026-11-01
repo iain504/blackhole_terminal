@@ -35,7 +35,7 @@ import {
   riskSizedQty, type AlgoStrategyId, type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { startAlgoRun, stopAlgoRun, ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
-import { getSentimentSummary } from '@/lib/sentiment-engine'
+import { getSentimentSummary, topUpSentiment, startFleetSentimentRefresher } from '@/lib/sentiment-engine'
 import { costsFor } from '@/lib/algo-reco'
 import { agentUniverse, AGENT_US_100 } from '@/lib/agent-universe'
 import {
@@ -319,14 +319,39 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
 
     // v2.5.0 — SENTIMENT BLEND: the score board now folds in the Market
     // Sentiment Engine. Each candidate's backtest Calmar score (scoreBase) is
-    // adjusted by its freshest news-sentiment snapshot: score × (1 + 0.25 ×
-    // sentiment). A +1.0 bullish tape boosts a setup 25%, a -1.0 bearish one
-    // cuts it 25% — enough to re-order neighbours, never enough to rescue a
+    // adjusted by its freshest news-sentiment snapshot: score × (1 + W ×
+    // sentiment). A +1.0 bullish tape boosts a setup W%, a -1.0 bearish one
+    // cuts it W% — enough to re-order neighbours, never enough to rescue a
     // bad backtest. Symbols with no fresh snapshot keep their raw score.
     // The fleet's live runs also arm the sentiment GATE on engage.
-    const SENTIMENT_WEIGHT = 0.25
+    // v2.7.0 — the weight is user-tunable (mission parameters) and the
+    // pipeline now pulls its own news: before blending, the top of the board
+    // without a current snapshot gets an inline ingest+score top-up, so the
+    // blend runs on real data instead of hoping the user scanned by hand.
+    const SENTIMENT_WEIGHT = Math.min(1, Math.max(0, settings.sentimentWeight ?? 0.25))
     let sentimentHits = 0
     try {
+      const snapsPre = await getSentimentSummary()
+      const freshPre = new Set(snapsPre.filter((s) => !s.stale).map((s) => s.symbol))
+      // top-up pool: highest-scored candidates first (candidates arrive in
+      // sweep-score order), never symbols that already have a fresh snapshot
+      const cap = Math.min(Math.max(settings.topTune, 12), 24)
+      const pool: { symbol: string; force?: boolean }[] = []
+      const seenPool = new Set<string>()
+      for (const c of [...candidates].sort((a, b) => b.score - a.score)) {
+        if (pool.length >= cap) break
+        if (seenPool.has(c.symbol)) continue
+        if (freshPre.has(c.symbol)) continue
+        seenPool.add(c.symbol)
+        pool.push({ symbol: c.symbol, force: !snapsPre.some((s) => s.symbol === c.symbol) })
+      }
+      if (pool.length > 0) {
+        await touch({ phase: 'SENTIMENT', progress: 0.8, stats })
+        await ev(sessionId, userId, 'scan', `Sentiment top-up — pulling fresh news for ${pool.length} setup(s) without a current snapshot…`)
+        const topped = await topUpSentiment(pool)
+        await ev(sessionId, userId, 'scan', `Sentiment top-up done — ${topped}/${pool.length} symbol(s) refreshed.`)
+      }
+
       const snaps = await getSentimentSummary()
       const bySymbol = new Map(snaps.filter((s) => !s.stale).map((s) => [s.symbol, s]))
       for (const c of candidates) {
@@ -512,6 +537,8 @@ export async function startAgentScan(userId: string, rawSettings: Partial<AgentS
   settings.maxPosPct = Math.min(25, Math.max(2, settings.maxPosPct))
   settings.minScore = Math.max(0, settings.minScore)
   settings.maxTradesDay = Math.min(10, Math.max(1, Math.round(settings.maxTradesDay)))
+  // v2.7.0 — sentiment blend weight is user-tunable now
+  settings.sentimentWeight = Math.min(1, Math.max(0, Number.isFinite(settings.sentimentWeight) ? settings.sentimentWeight : 0.25))
   settings.mode = settings.mode === 'live' ? 'live' : 'paper'
 
   const session = await db.agentSession.create({
@@ -673,6 +700,8 @@ export async function updateAgentSettings(userId: string, sessionId: string, pat
   settings.deployCapPct = Math.min(95, Math.max(10, settings.deployCapPct))
   settings.maxPosPct = Math.min(25, Math.max(2, settings.maxPosPct))
   settings.minScore = Math.max(0, settings.minScore)
+  // v2.7.0 — sentiment blend weight is user-tunable now
+  settings.sentimentWeight = Math.min(1, Math.max(0, Number.isFinite(settings.sentimentWeight) ? settings.sentimentWeight : 0.25))
   settings.mode = settings.mode === 'live' ? 'live' : 'paper'
 
   const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
@@ -706,6 +735,9 @@ export async function getAgentState(userId: string): Promise<{
   events: { id: string; level: string; message: string; createdAt: string }[]
   runs: AgentRunRow[]
 } | null> {
+  // v2.7.0 — first touch after boot starts the fleet sentiment refresher
+  // (15-min heartbeat; globalThis-guarded so it only ever runs once)
+  startFleetSentimentRefresher()
   const session = await db.agentSession.findFirst({
     where: { userId },
     orderBy: { createdAt: 'desc' },

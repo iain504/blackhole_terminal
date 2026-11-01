@@ -25,7 +25,7 @@ import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
 import { TIMEFRAMES, type Bar, type Timeframe } from '@/lib/market-types'
 import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
-import { sentimentForSymbol, STALE_MS } from '@/lib/sentiment-engine'
+import { sentimentForSymbol, refreshSymbolSentiment, STALE_MS } from '@/lib/sentiment-engine'
 import { isAlgoStrategyId, normalizeAlgoParams, strategyLane, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 // v2.3.0 — swing lane live unlock: the HTF ladder evaluated from the closed-bar
 // window every cycle (see swing-eval.ts for the parity contract with the
@@ -50,8 +50,9 @@ const EOD_FLATTEN_MIN = 15 * 60 + 45 // 15:45 ET — stop entering, flatten
 const HEARTBEAT_MS = 10 * 60000 // one info heartbeat per 10 idle minutes
 
 // Task 89 — the PINNED trade mode of a run row (legacy rows default to
-// 'paper' — algos always refused to start in live mode). A run orders against
-// THIS account forever; the user's Settings → tradeMode flip never migrates it.
+// 'paper' — v2.4.0 unlocked live starts; rows created before it were
+// paper-only). A run orders against THIS account forever; the user's
+// Settings → tradeMode flip never migrates it.
 const runModeOf = (m: string | null | undefined): TradeMode => (m === 'live' ? 'live' : 'paper')
 
 /** Task 89 — running-run cap per user: each run is a 15s engine cycle issuing
@@ -456,7 +457,8 @@ async function cycle(runId: string) {
     const tfSec = TIMEFRAMES[tf].seconds
     // Task 89 — PINNED mode (was resolveTradeMode at every cycle: flipping
     // Settings → tradeMode mid-run used to silently migrate a paper-tuned
-    // algo onto the live account, bypassing the live-mode start refusals).
+    // algo onto the live account; v2.4.0 removed the start-time refusals but
+    // the pin itself stays — a run never changes account mid-life).
     const mode: TradeMode = runModeOf(run.mode)
     const st = (run.state && typeof run.state === 'object' ? run.state : {}) as AlgoState
 
@@ -1183,16 +1185,22 @@ async function sentimentEntryOk(
   }
   if (!snap) {
     if (memo.none !== barTime) {
-      await log(runId, run.userId, 'info', `Sentiment gate: no snapshot for ${run.symbol} yet — entry allowed (run a sentiment scan from the Chart's Sentiment panel to arm the gate)`)
+      await log(runId, run.userId, 'info', `Sentiment gate: no snapshot for ${run.symbol} yet — entry allowed; pulling fresh news in the background (v2.7.0 auto-top-up)`)
       memo.none = barTime
     }
+    // v2.7.0 — the gate pulls its own data now: no snapshot → force a refresh
+    // (single-flight + TTL'd inside the engine) so the NEXT signal is judged
+    // on real news instead of quietly passing through forever
+    void refreshSymbolSentiment(run.symbol, true)
     return true
   }
   if (snap.stale) {
     if (memo.none !== barTime) {
-      await log(runId, run.userId, 'info', `Sentiment gate: snapshot stale (> ${Math.round(STALE_MS / 3600_000)}h) — entry allowed, rescan to re-arm`)
+      await log(runId, run.userId, 'info', `Sentiment gate: snapshot stale (> ${Math.round(STALE_MS / 3600_000)}h) — entry allowed; refreshing in the background (v2.7.0 auto-top-up)`)
       memo.none = barTime
     }
+    // v2.7.0 — TTL-respecting refresh so a quiet symbol's gate re-arms itself
+    void refreshSymbolSentiment(run.symbol)
     return true
   }
   const wantLong = side === 'buy'
@@ -1218,7 +1226,8 @@ export async function startAlgoRun(cfg: {
   userId: string
   symbol: string
   /** Task 89 — the Alpaca account this run trades on, pinned for its whole
-   *  life (start refuses live, so this is 'paper' today; omitted = paper) */
+   *  life (legacy rows default to 'paper'; v2.4.0 allows explicit 'live';
+   *  omitted = paper) */
   mode?: TradeMode
   timeframe: string
   strategy: AlgoStrategyId

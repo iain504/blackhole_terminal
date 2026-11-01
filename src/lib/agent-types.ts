@@ -23,6 +23,7 @@ export interface AgentSettings {
   maxPosPct: number // hard cap — max % of equity in ONE position (2..25)
   minScore: number // Calmar-score floor to qualify for the fleet (0..)
   maxTradesDay: number // per-run daily entry cap passed to the engine (1..10)
+  sentimentWeight: number // how hard news sentiment re-ranks the board (0..1)
   autoEngage: boolean // engage automatically once budget completes
   flattenOnStop: boolean // disengage flattens the fleet's positions
   mode: 'paper' | 'live' // broker account the fleet trades on
@@ -37,6 +38,7 @@ export const AGENT_SETTINGS_DEFAULTS: AgentSettings = {
   maxPosPct: 12,
   minScore: 0.1,
   maxTradesDay: 3,
+  sentimentWeight: 0.25,
   autoEngage: false,
   flattenOnStop: true,
   mode: 'paper',

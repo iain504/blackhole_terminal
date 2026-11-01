@@ -314,6 +314,7 @@ export default function AgentTab() {
             <NumberField label="Position cap (% equity)" value={settings.maxPosPct} min={2} max={25} step={1} onChange={(v) => setS({ maxPosPct: v })} />
             <NumberField label="Max trades / day" value={settings.maxTradesDay} min={1} max={10} step={1} onChange={(v) => setS({ maxTradesDay: v })} />
             <NumberField label="Min Calmar score" value={settings.minScore} min={0} max={5} step={0.05} onChange={(v) => setS({ minScore: v })} />
+            <NumberField label="Sentiment weight (news ×)" value={settings.sentimentWeight} min={0} max={1} step={0.05} onChange={(v) => setS({ sentimentWeight: v })} />
             <div className="flex items-end gap-4 pb-1">
               <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
                 <Switch checked={settings.includeCrypto} onCheckedChange={(v) => setS({ includeCrypto: v })} />

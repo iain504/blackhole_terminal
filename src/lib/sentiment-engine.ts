@@ -117,8 +117,9 @@ async function runScan(list: { symbol: string; isCrypto: boolean }[]): Promise<v
   } finally {
     scanState.running = false
     scanState.current = null
-    // v2.6.1 — journal hygiene after every sweep (best-effort)
+    // v2.7.0 — journal hygiene + history maturation after every sweep
     void pruneOldHeadlines()
+    void backfillSentimentHistory().catch(() => { /* best-effort */ })
   }
 }
 
@@ -170,6 +171,192 @@ async function processSymbol(symbol: string, isCryptoOverride?: boolean): Promis
 
   await upsertBucket(symbol)
   return { fetched: ingest.fetched, scored: pending.length }
+}
+
+// ---------------------------------------------------------------------------
+// v2.7.0 — On-demand refresh primitives (the deeper FSD wiring)
+//
+// The v2.5.0 pipeline READ sentiment but never pulled it: the autopilot's
+// blend only saw symbols the user had scanned by hand from the panel. Now
+// anything that needs sentiment can pull its own — bounded, single-flight
+// per symbol, TTL-throttled so Google News never sees a stampede.
+// ---------------------------------------------------------------------------
+
+const REFRESH_TTL_MS = 20 * 60 * 1000 // mirrors ingestSymbolNews' fetch TTL
+const refreshInFlight = new Set<string>()
+const refreshLastAttempt = new Map<string, number>()
+
+/** Refresh ONE symbol (ingest + score + bucket) — safe to fire-and-forget.
+ *  Returns false when skipped (already in flight, or fetched within the TTL
+ *  and `force` not set). */
+export async function refreshSymbolSentiment(symbol: string, force = false): Promise<boolean> {
+  const sym = symbol.trim().toUpperCase()
+  if (!sym) return false
+  if (refreshInFlight.has(sym)) return false
+  if (!force && Date.now() - (refreshLastAttempt.get(sym) ?? 0) < REFRESH_TTL_MS) return false
+  refreshInFlight.add(sym)
+  refreshLastAttempt.set(sym, Date.now())
+  try {
+    await processSymbol(sym, isCryptoSymbol(sym))
+    return true
+  } catch {
+    return false // a dead feed must never take the caller down
+  } finally {
+    refreshInFlight.delete(sym)
+  }
+}
+
+/** Refresh a list of symbols with a small concurrency pool (the autopilot's
+ *  pre-RANK top-up). Returns how many actually refreshed. */
+export async function topUpSentiment(symbols: { symbol: string; force?: boolean }[], conc = 6): Promise<number> {
+  let hits = 0
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < symbols.length) {
+      const item = symbols[cursor++]
+      if (!item) return
+      if (await refreshSymbolSentiment(item.symbol, item.force === true)) hits++
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(conc, symbols.length) }, worker))
+  return hits
+}
+
+/** Symbols whose latest snapshot is missing or older than `staleMs`. */
+export async function staleSentimentSymbols(symbols: string[], staleMs = 6 * 3600_000): Promise<string[]> {
+  const wanted = [...new Set(symbols.map((s) => s.trim().toUpperCase()).filter(Boolean))]
+  if (wanted.length === 0) return []
+  const cutoff = new Date(Date.now() - staleMs)
+  const rows = await db.sentimentScore.findMany({
+    where: { symbol: { in: wanted }, asOf: { gte: cutoff } },
+    select: { symbol: true },
+  })
+  const fresh = new Set(rows.map((r) => r.symbol))
+  return wanted.filter((s) => !fresh.has(s))
+}
+
+// Fleet refresher — a single 15-min heartbeat (per process) that keeps the
+// sentiment snapshots of RUNNING sentiment-gated algo runs fresh, so the
+// gate and the autopilot scoreboard never trade on day-old news. globalThis
+// guard: Next.js compiles this lib into multiple module instances; the flag
+// must be process-wide (same pattern as __ttAppSecret).
+const gRef = globalThis as typeof globalThis & { __ttFleetSentimentRefresher?: boolean }
+const FLEET_REFRESH_TICK_MS = 15 * 60 * 1000
+const FLEET_REFRESH_STALE_MS = 6 * 3600_000
+
+export function startFleetSentimentRefresher(): void {
+  if (gRef.__ttFleetSentimentRefresher) return
+  gRef.__ttFleetSentimentRefresher = true
+  const tick = async () => {
+    try {
+      const runs = await db.algoRun.findMany({
+        where: { status: 'running', sentimentGate: true },
+        select: { symbol: true },
+      })
+      if (runs.length === 0) return
+      const stale = await staleSentimentSymbols(runs.map((r) => r.symbol), FLEET_REFRESH_STALE_MS)
+      // bounded: at most 2 symbols per tick — refreshes take seconds and the
+      // next tick catches the rest
+      if (stale.length > 0) {
+        const hits = await topUpSentiment(stale.slice(0, 2).map((symbol) => ({ symbol })), 2)
+        if (hits > 0) console.log(`[sentiment] fleet refresher — ${hits} stale snapshot(s) refreshed (${stale.length} stale total)`)
+      }
+    } catch {
+      // best-effort maintenance — never crash a timer
+    }
+  }
+  setInterval(() => void tick(), FLEET_REFRESH_TICK_MS).unref?.()
+}
+
+// ---------------------------------------------------------------------------
+// v2.7.0 — History backfill (IC maturation)
+//
+// SentimentScore buckets are only written when a scan RUNS, so a young journal
+// has huge gaps and the IC / Rank-IC evaluation ("last bucket of each UTC day
+// vs next-day return") starves. The backfill rebuilds the hourly history from
+// the headline journal with the SAME weighting math as upsertBucket (recency
+// half-life × confidence, 72h aggregation window) — but age measured from the
+// BUCKET time and only headlines published ≤ bucket (strictly no lookahead).
+// Existing buckets are never overwritten — they are the live truth.
+// ---------------------------------------------------------------------------
+
+export async function backfillSentimentHistory(days = 10): Promise<{ symbols: number; buckets: number }> {
+  const since = new Date(Date.now() - Math.min(Math.max(days, 1), 30) * 86400_000)
+  const headlines = await db.sentimentHeadline.findMany({
+    where: { score: { not: null }, publishedAt: { not: null, gte: since } },
+    orderBy: [{ symbol: 'asc' }, { publishedAt: 'asc' }],
+    select: { symbol: true, score: true, confidence: true, publishedAt: true, engine: true },
+  })
+  if (headlines.length === 0) return { symbols: 0, buckets: 0 }
+
+  const bySymbol = new Map<string, typeof headlines>()
+  for (const h of headlines) {
+    const arr = bySymbol.get(h.symbol) ?? []
+    arr.push(h)
+    bySymbol.set(h.symbol, arr)
+  }
+
+  const HOUR = 3600_000
+  let created = 0
+  for (const [symbol, rows] of bySymbol) {
+    // existing buckets = truth + the momentum baseline
+    const existing = await db.sentimentScore.findMany({
+      where: { symbol },
+      orderBy: { asOf: 'asc' },
+      select: { bucket: true, score: true },
+    })
+    const have = new Map(existing.map((e) => [e.bucket, e.score]))
+
+    const startT = Math.floor(rows[0].publishedAt!.getTime() / HOUR) * HOUR
+    const endT = Math.floor(Date.now() / HOUR) * HOUR
+    let prevScore: number | null = null
+    for (let t = startT; t <= endT; t += HOUR) {
+      const bucket = hourBucket(new Date(t))
+      if (have.has(bucket)) {
+        prevScore = have.get(bucket) ?? prevScore
+        continue
+      }
+      let wSum = 0
+      let sSum = 0
+      let bull = 0
+      let bear = 0
+      let neutral = 0
+      const engineCount = new Map<string, number>()
+      for (const r of rows) {
+        const pt = r.publishedAt!.getTime()
+        if (pt > t || pt <= t - AGG_WINDOW_H * HOUR) continue
+        const score = r.score ?? 0
+        if (score > 0.15) bull++
+        else if (score < -0.15) bear++
+        else neutral++
+        if (r.engine) engineCount.set(r.engine, (engineCount.get(r.engine) ?? 0) + 1)
+        const ageH = Math.max(0, (t - pt) / HOUR)
+        const w = Math.pow(0.5, ageH / HALF_LIFE_H) * (0.5 + 0.5 * (r.confidence ?? 0.6))
+        wSum += w
+        sSum += w * score
+      }
+      const score = wSum > 0 ? sSum / wSum : 0
+      let engine = 'llm-finance-v1'
+      let best = -1
+      for (const [e, n] of engineCount) if (n > best) { best = n; engine = e }
+      try {
+        await db.sentimentScore.create({
+          data: {
+            symbol, bucket, asOf: new Date(t), score, bull, bear, neutral,
+            headlines: bull + bear + neutral,
+            momentum: prevScore == null ? null : score - prevScore,
+            engine,
+          },
+        })
+        created++
+        prevScore = score
+      } catch {
+        // unique race with a live scan — the existing row wins; momentum stays
+        // anchored to the previous computed bucket (best-effort is fine here)
+      }
+    }
+  }
+  return { symbols: bySymbol.size, buckets: created }
 }
 
 // ---------------------------------------------------------------------------

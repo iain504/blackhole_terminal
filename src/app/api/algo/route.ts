@@ -6,7 +6,8 @@ import { resolveTradeMode } from '@/lib/trading'
 import { hasAlpacaKeys } from '@/lib/alpaca'
 import { ensureAlgoEngines, startAlgoRun } from '@/lib/algo-engine'
 import {
-  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, type AlgoTimeframe,
+  isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, strategyLane, SWING_TFS, DAY_TFS,
+  type AlgoTimeframe,
 } from '@/lib/algo-strategies'
 import { ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
 import { clampAtrMult } from '@/lib/atr'
@@ -186,6 +187,22 @@ export async function POST(req: NextRequest) {
     // mechanics, decision rules byte-mirroring the backtest's swing branches,
     // deep per-params bar window). Both lanes start like any other run.
     const strategy = body.strategy
+    // v2.7.0 — lane⇔timeframe consistency (mirrors the backtest route): a
+    // swing strategy on a day timeframe (or vice-versa) is a config mistake
+    // — the UI re-grounds the TF on lane switch, raw API callers now get the
+    // same 400 instead of silently running a nonsense ladder.
+    const lane = strategyLane(strategy)
+    const tfOk = lane === 'swing'
+      ? (SWING_TFS as readonly string[]).includes(tf)
+      : (DAY_TFS as readonly string[]).includes(tf)
+    if (!tfOk) {
+      return NextResponse.json(
+        { error: lane === 'swing'
+          ? `Swing strategy "${strategy}" requires a swing timeframe (1h / 4h / 1D) — got ${tf}`
+          : `Day strategy "${strategy}" requires a day timeframe (1m / 5m / 15m) — got ${tf}` },
+        { status: 400 },
+      )
+    }
     const qty = Number(body?.qty)
     if (!Number.isFinite(qty) || qty <= 0 || qty > 1_000_000) {
       return NextResponse.json({ error: 'qty must be a positive number' }, { status: 400 })

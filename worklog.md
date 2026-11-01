@@ -4131,3 +4131,48 @@ in real time; AAPL feed clean (11h→6d, no stale items); NVDA API feed now
 all inside the 10-day window; tooltips verified ("Nov 1, 2026, 9:49 AM");
 market leaderboard renders; lint clean; dev.log free of errors. Purge
 verified: 90→74 rows, oldest 2026-10-20. Stamped v2.6.1+221.
+
+## v2.7.0 — three-fer: live-swing close-out · deeper FSD sentiment wiring · IC maturation (2026-11-01)
+
+**1) Live Swing — verified unblocked, gap closed.** Recon confirmed v2.3.0/v2.4.0
+did the real work (route 400s gone, engine evaluates the HTF ladder live, UI
+offers swing TFs, autopilot engages swing candidates). Remaining debt closed:
+POST /api/algo now enforces lane⇔timeframe consistency (mirrors the backtest
+route) — swing strategy on 1m/5m/15m or day strategy on 1h/4h/1D returns 400
+with the exact offending combo, raw API callers get the same guard the UI's
+re-grounding gave; three stale algo-engine comments ("algos always refused to
+start in live", "bypassing the start refusals", "start refuses live") rewritten
+to the v2.4.0 truth.
+
+**2) FSD sentiment — deeper wiring, three new layers.** (a) `sentimentWeight`
+(0..1, default 0.25) is a first-class mission parameter: sanitized in
+startAgentScan + updateAgentSettings, editable via a new "Sentiment weight
+(news ×)" field, and the RANK blend message reports the live weight. (b)
+SENTIMENT TOP-UP: the pipeline no longer hopes the user scanned by hand —
+before blending, the top of the board (topTune-clamped 12..24, score-desc,
+skipping already-fresh symbols) gets an inline ingest+score pass through the
+new topUpSentiment pool (conc 6), with SENTIMENT phase touch + brain-feed
+events. (c) Self-refreshing gate + fleet heartbeat: sentimentEntryOk now
+pulls its own news when the snapshot is missing (force) or stale (TTL'd) —
+fire-and-forget, single-flight per symbol — and a 15-min fleet refresher
+(globalThis-guarded, started on first agent/sentiment API touch) refreshes
+stale (>6h) snapshots of RUNNING sentiment-gated runs, 2 symbols per tick.
+
+**3) IC maturation — history backfill.** SentimentScore buckets only existed
+for hours when a scan ran, so the IC / Rank-IC evaluation starved on a young
+journal. backfillSentimentHistory(days=10) rebuilds the hourly history from
+the headline journal with the SAME weighting math as upsertBucket (18h
+half-life × confidence, 72h window) but age measured from the BUCKET time and
+only headlines published ≤ bucket (strictly no lookahead); existing buckets
+are never overwritten and momentum chains through them. Wired into every scan
+finally-block and POST /api/sentiment {action:'backfill', days?}.
+
+Verification: lint clean; tsc errors all pre-exist outside touched files.
+E2E agent-browser: backfill created 626 buckets / 4 symbols; NVDA history now
+a continuous 48-point series (sparkline renders "sentiment · last 48h"); IC
+computes — symbols 4, pairs 16, per-symbol Rank-IC AAPL −0.80 / SPCX −0.20 /
+NVDA −0.40 / BTC +0.50 (cross-sectional stays honestly null until ≥5 symbols
+share a day — the note says so); lane guard live: swing-pullback@5m → 400,
+bb-reversion@1h → 400, swing-pullback@1h → passes guard, blocked only by the
+no-keys check; agent tab renders the weight field (0.25 default) and marks
+unsaved on change. Stamped v2.7.0+222.

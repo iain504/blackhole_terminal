@@ -9,7 +9,8 @@ import { requireUser } from '@/lib/auth'
 import { readJson, handleError } from '@/lib/api-helpers'
 import {
   startSentimentScan, getScanState, getSentimentSummary,
-  getSentimentHistory, getHeadlines,
+  getSentimentHistory, getHeadlines, backfillSentimentHistory,
+  startFleetSentimentRefresher,
 } from '@/lib/sentiment-engine'
 
 export const dynamic = 'force-dynamic'
@@ -17,6 +18,8 @@ export const dynamic = 'force-dynamic'
 export async function GET(req: NextRequest) {
   try {
     await requireUser()
+    // v2.7.0 — panel traffic bootstraps the fleet refresher (globalThis-guarded)
+    startFleetSentimentRefresher()
     const sp = req.nextUrl.searchParams
     const symbol = (sp.get('symbol') || '').trim().toUpperCase() || null
     const scope = sp.get('scope') === 'market' ? 'market' : 'symbol'
@@ -40,16 +43,23 @@ export async function GET(req: NextRequest) {
 }
 
 interface SentimentPostBody {
-  action?: 'scan'
+  action?: 'scan' | 'backfill'
   symbols?: string[]
+  days?: number
 }
 
 export async function POST(req: NextRequest) {
   try {
     await requireUser()
     const body = await readJson<SentimentPostBody>(req)
+    // v2.7.0 — IC maturation: rebuild the hourly bucket history from the
+    // headline journal (create-only; live buckets are never overwritten)
+    if (body?.action === 'backfill') {
+      const res = await backfillSentimentHistory(body.days ?? 10)
+      return NextResponse.json({ ok: true, ...res })
+    }
     if (body?.action !== 'scan') {
-      return NextResponse.json({ error: 'Unknown action — use { action: "scan" }' }, { status: 400 })
+      return NextResponse.json({ error: 'Unknown action — use { action: "scan" } or { action: "backfill" }' }, { status: 400 })
     }
     const res = await startSentimentScan(body.symbols)
     if (!res.started && res.state.running) {
