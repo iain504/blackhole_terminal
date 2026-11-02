@@ -29,7 +29,17 @@ import { useToast } from '@/hooks/use-toast'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
   Activity, TrendingUp, Crosshair, Gauge, CircleDollarSign, Zap, Globe2,
+  TriangleAlert,
 } from 'lucide-react'
+
+// v2.7.5 — which broker lanes the account can actually ENGAGE with. The
+// fleet places real paper/live orders, so the server refuses ENGAGE without
+// Alpaca keys — and every platform DB reset wipes the saved ones together
+// with the account. Mirrors the server's mode-strict resolution:
+//   paper lane ← paper pair OR legacy single pair OR env-shared keys
+//   live lane  ← live pair only
+// Advisory only — the server side stays the single source of truth.
+type BrokerAvail = { paper: boolean; live: boolean }
 
 const STATUS_META: Record<string, { label: string; cls: string; dot: string }> = {
   scanning: { label: 'SCANNING', cls: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10', dot: 'bg-cyan-400' },
@@ -76,6 +86,34 @@ export default function AgentTab() {
   const [busy, setBusy] = useState<string | null>(null)
   const [confirmEngage, setConfirmEngage] = useState(false)
   const [confirmDisengage, setConfirmDisengage] = useState(false)
+  const [broker, setBroker] = useState<BrokerAvail | null>(null)
+
+  // v2.7.5 — fetch key availability so the Command deck can warn BEFORE a
+  // scan is burned on an account that cannot engage. Re-fetched on mount and
+  // whenever the session changes state (keys may have just been added in
+  // Settings → Broker).
+  const loadBroker = useCallback(async () => {
+    try {
+      const res = await fetch('/api/settings', { cache: 'no-store' })
+      if (!res.ok) return
+      const j = (await res.json()) as {
+        alpaca?: {
+          paper?: { secretSet?: boolean }
+          live?: { secretSet?: boolean }
+          legacy?: { secretSet?: boolean }
+          serverKeysPresent?: boolean
+        }
+      }
+      setBroker({
+        paper: Boolean(j.alpaca?.paper?.secretSet || j.alpaca?.legacy?.secretSet || j.alpaca?.serverKeysPresent),
+        live: Boolean(j.alpaca?.live?.secretSet),
+      })
+    } catch {
+      // banner is advisory — a failed probe just hides it
+    }
+  }, [])
+
+  useEffect(() => { void loadBroker() }, [loadBroker])
 
   const session = data?.session ?? null
   const candidates = data?.candidates ?? []
@@ -92,6 +130,17 @@ export default function AgentTab() {
   // display locks to the server's truth and the switch disables.
   const modeLocked = engaged || inFlight
   const mode = ((modeLocked ? session?.settings?.mode : settings.mode) === 'live' ? 'live' : 'paper') as 'live' | 'paper'
+
+  // v2.7.5 — keys can be added mid-session in Settings → Broker: re-probe
+  // availability whenever the session state changes (idle → ready matters
+  // most, that is the moment ENGAGE becomes possible).
+  const brokerStatusRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (brokerStatusRef.current !== status) {
+      brokerStatusRef.current = status
+      void loadBroker()
+    }
+  }, [status, loadBroker])
 
   // ---- poll the agent state (3s) ----
   const load = useCallback(async () => {
@@ -354,6 +403,27 @@ export default function AgentTab() {
         {/* launch / engage deck */}
         <div className="flex flex-col gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
           <div className="text-sm font-semibold text-zinc-200">Command deck</div>
+          {/* v2.7.5 — broker-readiness banner: ENGAGE is refused without Alpaca
+              keys (the fleet places real orders), and platform DB resets wipe
+              the saved ones with the account. Warn BEFORE the scan, not after. */}
+          {!engaged && broker && !(mode === 'live' ? broker.live : broker.paper) && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+              <div className="flex-1 text-xs leading-relaxed text-amber-200">
+                ENGAGE is refused without Alpaca <span className="font-bold">{mode.toUpperCase()}</span> keys — this
+                account has none (platform DB resets clear saved keys). Add them in Settings → Broker, then relaunch
+                the scan.
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 shrink-0 border-amber-500/40 px-2 text-[11px] text-amber-200 hover:bg-amber-500/15"
+                onClick={() => window.dispatchEvent(new CustomEvent('tt:open-settings'))}
+              >
+                Open Settings
+              </Button>
+            </div>
+          )}
           {!inFlight && status !== 'engaged' && (
             <Button
               className="h-14 bg-gradient-to-r from-cyan-500 via-violet-500 to-fuchsia-500 text-sm font-bold tracking-wide text-white shadow-[0_0_24px_rgba(139,92,246,0.35)] transition hover:brightness-110"

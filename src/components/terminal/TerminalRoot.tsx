@@ -80,6 +80,15 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     await Promise.all([store.loadWatchlists(), store.loadAlerts(), store.loadStrategies()])
   }, [])
 
+  // v2.7.5 — deep link from tabs: AgentTab's broker banner (and future
+  // surfaces) can pop the settings dialog without prop drilling through the
+  // tab shell. Lightweight DOM event — dialog state stays local here.
+  useEffect(() => {
+    const open = () => setSettingsOpen(true)
+    window.addEventListener('tt:open-settings', open)
+    return () => window.removeEventListener('tt:open-settings', open)
+  }, [])
+
   // Session check on mount
   useEffect(() => {
     if (meFetched.current) return
