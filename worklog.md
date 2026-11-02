@@ -4256,3 +4256,35 @@ only supervises modes WITH Alpaca keys (Task 36/37 mode-strict) — the fresh
 sandbox account has none, so the NotifyState row stays empty here by design;
 the changed write path is exercised on the full server where pairs are
 resumed from existing NotifyState rows at boot.
+
+## v2.7.3 — global 401 watcher: no more ghost terminal on session death
+
+User report: "Launch Full Scan button show Unauthorized."
+
+Investigation: the sandbox DB had been wiped by the platform AGAIN (10:59,
+second time today) with a dev-server restart — which regenerated the master
+app secret (app-secret resolves env → DB → generate+persist; fresh empty DB =
+fresh secret). Every pre-wipe session cookie (HMAC-signed with the old
+secret) instantly died. The user re-registered (`akin`) but any terminal tab
+opened before the wipe stayed as a GHOST: the auth gate only runs at page
+load (/api/auth/me), so client-side state kept rendering every panel while
+each API call 401ed — clicking LAUNCH FULL SCAN just toasted "Unauthorized"
+with no way out except a manual hard refresh. Server-side auth itself was
+verified end-to-end healthy: a crafted token from the CURRENT DB secret +
+user id → /api/agent 200, and a full curl login flow (PUT register → ticket
+→ TOTP verify → Set-Cookie) → fresh cookie → /api/agent 200.
+
+Fix (src/lib/client-auth.ts + TerminalRoot): a single window.fetch wrapper
+(installed once, process-wide via a globalThis guard) watches same-origin
+/api/* responses; any 401 outside /api/auth/* (auth routes own their error
+UX — a wrong password must not trigger this) invokes the registered handler.
+TerminalRoot registers one that clears the zustand user (flips the UI to
+AuthForms) and toasts "Session expired — sign in again". The AgentTab's 15s
+poll now acts as the self-healing detector: a dead session surfaces the login
+screen within seconds instead of an endless Unauthorized loop.
+
+E2E (deterministic wipe simulation): logged in as a probe user, opened the
+Agent tab, DELETEd the user row out from under the live session (exactly the
+platform-wipe failure mode — no restart needed), clicked LAUNCH FULL SCAN →
+401 → the terminal flipped to the login screen immediately. Probe account
+removed afterwards; the user's `akin` account untouched. Lint clean.

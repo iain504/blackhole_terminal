@@ -32,6 +32,7 @@ import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
 import { onConnectChange, type StreamStatus } from '@/lib/stream-client'
 import { applyUiTheme, fetchServerUiTheme, getUiTheme, useUiTheme } from '@/lib/ui-theme'
+import { installUnauthorizedWatcher, setUnauthorizedHandler } from '@/lib/client-auth'
 import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
 import { APP_VERSION } from '@/generated/version'
@@ -102,6 +103,24 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       setHydrated(true)
     })()
   }, [setUser, setHydrated, loadUserData])
+
+  // v2.7.3 — global 401 watcher: if the server-side session dies under an
+  // OPEN terminal (platform DB wipe / secret rotation on restart / expiry),
+  // flip back to the login screen with a toast instead of leaving a ghost tab
+  // where every action (LAUNCH FULL SCAN included) just toasts "Unauthorized".
+  useEffect(() => {
+    installUnauthorizedWatcher()
+    setUnauthorizedHandler(() => {
+      if (!useTerminal.getState().user) return // auth screen already shown
+      setUser(null)
+      toast({
+        title: 'Session expired',
+        description: 'Your session is no longer valid on the server — sign in again.',
+        variant: 'destructive',
+      })
+    })
+    return () => setUnauthorizedHandler(undefined)
+  }, [setUser, toast])
 
   // Autosave layout every 5s when dirty (Task 16 #3); Task 4-c adds
   // baseUpdatedAt + 409 convergence when another tab saved first.
