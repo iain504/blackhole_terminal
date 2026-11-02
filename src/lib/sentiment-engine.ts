@@ -52,12 +52,19 @@ export function sentimentUniverse(): { symbol: string; isCrypto: boolean }[] {
 
 /** Kick off a background scan. `symbols` filters/limits the universe; a small
  *  list (≤3, e.g. the Chart sidebar's per-symbol rescan) runs inline so the
- *  caller gets fresh data on the same request. Returns false when busy. */
+ *  caller gets fresh data on the same request. Returns false when busy.
+ *  v2.7.1 — single-flight is now real: the inline path used to bypass the
+ *  running check, so a sidebar rescan could overlap a full sweep (two runScan
+ *  bodies trampling one scanState + racing backfills → (symbol,bucket)
+ *  unique-constraint storms in the log). */
 export async function startSentimentScan(
   symbols?: string[],
 ): Promise<{ started: boolean; inline: boolean; state: SentimentScanState }> {
   const list = resolveUniverse(symbols)
   if (list.length === 0) {
+    return { started: false, inline: false, state: getScanState() }
+  }
+  if (scanState.running) {
     return { started: false, inline: false, state: getScanState() }
   }
   if (list.length <= 3) {
@@ -66,9 +73,6 @@ export async function startSentimentScan(
       await runScan(list)
     } catch { /* state carries the error */ }
     return { started: true, inline: true, state: getScanState() }
-  }
-  if (scanState.running) {
-    return { started: false, inline: false, state: getScanState() }
   }
   // background path — the UI polls /api/sentiment/state
   void runScan(list).catch(() => { /* state carries the error */ })
@@ -280,7 +284,25 @@ export function startFleetSentimentRefresher(): void {
 // Existing buckets are never overwritten — they are the live truth.
 // ---------------------------------------------------------------------------
 
-export async function backfillSentimentHistory(days = 10): Promise<{ symbols: number; buckets: number }> {
+// v2.7.1 — single-flight across the whole process: the sweep's finally-block
+// and POST {action:'backfill'} (or two overlapping sweeps from before the
+// inline guard) could both run the rebuild and race the same hour buckets.
+// globalThis-stored: Next compiles this lib into multiple module instances.
+const gBf = globalThis as typeof globalThis & {
+  __ttSentimentBackfill?: Promise<{ symbols: number; buckets: number }>
+}
+
+/** Rebuild missing hourly buckets from the journal — create-only, single-flight. */
+export function backfillSentimentHistory(days = 10): Promise<{ symbols: number; buckets: number }> {
+  if (gBf.__ttSentimentBackfill) return gBf.__ttSentimentBackfill
+  const job = backfillSentimentHistoryRun(days).finally(() => {
+    gBf.__ttSentimentBackfill = undefined
+  })
+  gBf.__ttSentimentBackfill = job
+  return job
+}
+
+async function backfillSentimentHistoryRun(days = 10): Promise<{ symbols: number; buckets: number }> {
   const since = new Date(Date.now() - Math.min(Math.max(days, 1), 30) * 86400_000)
   const headlines = await db.sentimentHeadline.findMany({
     where: { score: { not: null }, publishedAt: { not: null, gte: since } },
@@ -340,19 +362,31 @@ export async function backfillSentimentHistory(days = 10): Promise<{ symbols: nu
       let best = -1
       for (const [e, n] of engineCount) if (n > best) { best = n; engine = e }
       try {
-        await db.sentimentScore.create({
-          data: {
+        // v2.7.1 — create-only upsert (update: {}) instead of create(): the
+        // old create() tripped the (symbol,bucket) unique key whenever a live
+        // scan's upsertBucket landed between our findMany snapshot and this
+        // write — every collision spammed prisma:error even though the catch
+        // swallowed it. The native INSERT … ON CONFLICT upsert is atomic, so
+        // the race can no longer error, and existing rows are still never
+        // overwritten (empty update = live truth wins).
+        const row = await db.sentimentScore.upsert({
+          where: { symbol_bucket: { symbol, bucket } },
+          create: {
             symbol, bucket, asOf: new Date(t), score, bull, bear, neutral,
             headlines: bull + bear + neutral,
             momentum: prevScore == null ? null : score - prevScore,
             engine,
           },
+          update: {},
         })
-        created++
-        prevScore = score
+        if (!have.has(bucket)) created++
+        // chain momentum from the row that ACTUALLY exists — if a live scan
+        // already wrote this bucket, its score (not our recomputed one) is the
+        // truth the next bucket's delta must measure against
+        prevScore = row.score
       } catch {
-        // unique race with a live scan — the existing row wins; momentum stays
-        // anchored to the previous computed bucket (best-effort is fine here)
+        // best-effort maintenance (disk-full etc.) — a single bucket must not
+        // kill the rebuild
       }
     }
   }

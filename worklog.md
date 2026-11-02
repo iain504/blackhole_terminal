@@ -4176,3 +4176,40 @@ share a day — the note says so); lane guard live: swing-pullback@5m → 400,
 bb-reversion@1h → 400, swing-pullback@1h → passes guard, blocked only by the
 no-keys check; agent tab renders the weight field (0.25 default) and marks
 unsaved on change. Stamped v2.7.0+222.
+
+## v2.7.1 — sentiment (symbol,bucket) unique-constraint storm fix
+
+User report: server log flooded with `prisma:error · Invalid
+prisma.sentimentScore.create() invocation: Unique constraint failed on the
+fields: (symbol,bucket)` — several per second during scans.
+
+Root cause chain (three layers deep, all fixed):
+1. **Inline scan bypassed single-flight.** startSentimentScan's ≤3-symbol
+   inline path (Chart sidebar per-symbol rescan) never checked
+   scanState.running, so a sidebar rescan could overlap a full background
+   sweep — two runScan bodies trampling one shared scanState AND both
+   finally-blocks firing backfillSentimentHistory concurrently.
+2. **Backfill was not single-flight.** Two overlapping rebuilds iterate the
+   same symbol's missing hour buckets at once.
+3. **create() instead of upsert.** backfillSentimentHistory wrote buckets
+   with db.sentimentScore.create() guarded only by a pre-loop findMany
+   snapshot — any live upsertBucket landing between snapshot and write trips
+   the (symbol,bucket) unique key. The catch swallowed the error but
+   Prisma's log:['error'] emitter still printed every collision.
+
+Fixes (all in sentiment-engine.ts):
+- startSentimentScan: the running guard now runs BEFORE the inline branch —
+  scans are truly single-flight; a busy sweep refuses extra scans (route
+  already maps that to a 409).
+- backfillSentimentHistory: single-flight via a globalThis-stored promise
+  (Next compiles libs into multiple module instances — same pattern as the
+  fleet refresher). Concurrent callers share one rebuild.
+- bucket writes: create() → upsert({ update: {} }) — a native
+  INSERT … ON CONFLICT that is atomic, can never trip the unique key, and
+  the empty update keeps the create-only contract (existing live buckets are
+  never overwritten). prevScore now chains from the RETURNED row's score, so
+  momentum stays anchored to the row that actually exists even when a live
+  scan won the race.
+
+No schema change, no behavior change for reads; the 626-bucket history and
+IC evaluation are unaffected (verified below).
