@@ -4325,7 +4325,7 @@ removed afterwards; the user's `akin` account untouched. Lint clean.
 - E2E (probe probe_ab831, API + browser): API — start 202 → abort WITHOUT sessionId → 200 {"ok":true} (was 400) → poll → status stopped / phase ABORTED / event "Pipeline aborted by user."; browser — LAUNCH FULL SCAN → Abort scan clicked mid-flight (103/112 scanned, results-store reuse visible: 'BTC/USD … · from results store') → NO error toast, UI returns to idle (LAUNCH FULL SCAN), zero console errors, screenshot captured. Probe + session rows deleted (users table empty). Lint clean.
 - Note: raw bun scripts importing src/lib/totp must await resolveAppSecret() first (appSecretSync throws pre-boot; decrypt()'s try/catch swallows it into null) — cost a few probe iterations, not an app bug (server paths boot-init the secret via instrumentation).
 
-## 2026-11-02 ~20:20 — v2.8.2: FSD layout overflow + FSD tab on mobile (`<hash>`, re-stamp `<stamp>`)
+## 2026-11-02 ~20:20 — v2.8.2: FSD layout overflow + FSD tab on mobile (`7d38bd5`, re-stamp `1af89d7`)
 
 - User report (2 items): (1) "The FSD layout overflow. it over the layer of the bottom" (2) "Mobile view does not have FSD tab page."
 - Root 1 (desktop overflow): AgentTab's root was `min-h-full` — unbounded height inside `main` (flex-1 min-h-0 in the h-screen overflow-hidden shell). Taller-than-viewport content spilled below <main> and painted OVER the translucent footer bar; the inner panel is `relative z-10` so it won the stacking contest (footer bg is /60, content showed through/over it). Measured pre-fix: main scrollHeight 727 vs clientHeight 693, overflow visible, spill painted across footer top 767.
