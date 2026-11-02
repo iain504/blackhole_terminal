@@ -22,6 +22,7 @@ import { StrategyDrawer } from './StrategyDrawer'
 import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'
 import { BellRing, Clock, Home, Keyboard, Loader2, Settings2 } from 'lucide-react'
+import { useFleetPresence } from '@/hooks/use-fleet-presence'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -461,7 +462,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
       {/* regular-session open/close splash (v1.87.0) — above every dialog */}
       <SessionSplash />
       {/* footer stays glued to bottom on short viewports */}
-      <footer className="mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
+      <footer className="relative mt-auto flex items-center justify-between border-t border-zinc-800/80 bg-zinc-900/60 px-3 py-1 text-[11px] text-zinc-500">
         <span className="flex min-w-0 items-center">
           {onExit && (
             <button
@@ -480,6 +481,9 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
           </span>
         </span>
         <span className="flex items-center gap-3">
+          {/* v2.8.3 — running rainbow + FSD chip while the fleet is ENGAGED:
+              visible from every tab, click opens the autopilot tab */}
+          <FleetRunChip />
           <span className="hidden sm:inline">2FA-protected · layout auto-saves every 5s</span>
           {footerChristmas && <span title="Christmas theme" aria-hidden>🎄</span>}
           <AppVersion />
@@ -487,6 +491,35 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
         </span>
       </footer>
     </div>
+  )
+}
+
+// v2.8.3 — bottom-bar FSD notification. While the fleet is ENGAGED the footer
+// grows a running-rainbow strip along its top edge and a pulsing "● FSD" chip;
+// clicking the chip jumps to the autopilot tab (adds one if none exists).
+// The rainbow is visible from EVERY tab — the user should never have to wonder
+// whether the autopilot is still trading. Powered by useFleetPresence
+// (instant tt:fleet-state broadcasts from AgentTab + a 15s lightweight poll).
+function FleetRunChip() {
+  const engaged = useFleetPresence()
+  const tabs = useTerminal((s) => s.tabs)
+  const setActiveTab = useTerminal((s) => s.setActiveTab)
+  const addTab = useTerminal((s) => s.addTab)
+  if (!engaged) return null
+  const agentTab = tabs.find((t) => t.type === 'agent')
+  return (
+    <>
+      <div className="fsd-rainbow-strip absolute inset-x-0 top-0 h-[3px]" aria-hidden="true" />
+      <button
+        onClick={() => (agentTab ? setActiveTab(agentTab.id) : addTab('agent'))}
+        title="FSD fleet is trading — open the 智慧體 tab"
+        aria-label="FSD fleet running — open the autopilot tab"
+        className="fsd-live-chip"
+      >
+        <span className="fsd-live-dot" aria-hidden="true" />
+        <span className="fsd-live-chip-text font-mono text-[9px] tracking-widest">FSD</span>
+      </button>
+    </>
   )
 }
 

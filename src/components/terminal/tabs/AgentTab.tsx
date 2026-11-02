@@ -201,6 +201,12 @@ export default function AgentTab() {
       if (seq !== seqRef.current) return
       setData(json)
       setLoadError(null)
+      // v2.8.3 — broadcast engagement to the global chrome (footer / mobile
+      // bottom nav): the "running rainbow" reacts instantly while this tab is
+      // open, instead of waiting for the chrome's own 15s backstop poll.
+      window.dispatchEvent(
+        new CustomEvent('tt:fleet-state', { detail: { engaged: json.session?.status === 'engaged' } }),
+      )
       // sync the form from the session ONCE (never stomp user edits)
       if (!syncedRef.current && json.session?.settings) {
         syncedRef.current = true
@@ -653,12 +659,12 @@ export default function AgentTab() {
                 )}>
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-bold text-zinc-100">{r.symbol}</span>
-                    <Badge variant="outline" className="h-4 border-zinc-700 px-1 text-[9px] text-zinc-400">{r.timeframe.toUpperCase()}</Badge>
+                    <Badge variant="outline" className="h-4 border-zinc-700 px-1 text-[9px] text-zinc-400">{(r.timeframe ?? '—').toUpperCase()}</Badge>
                     <span className="text-[11px] text-zinc-400">{ALGO_STRATEGIES[r.strategy as keyof typeof ALGO_STRATEGIES]?.name ?? r.strategy}</span>
                     <span className="ml-auto font-mono text-[11px] text-zinc-500">×{r.qty}</span>
                     <span className={cn('rounded px-1.5 py-0.5 text-[9px] font-bold tracking-wider',
                       r.status === 'running' ? 'bg-fuchsia-500/20 text-fuchsia-300' : 'bg-zinc-700/40 text-zinc-400')}>
-                      {r.status === 'running' ? 'TRADING' : r.status.toUpperCase()}
+                      {r.status === 'running' ? 'TRADING' : (r.status ?? '').toUpperCase()}
                     </span>
                   </div>
                   {pos && (
@@ -721,7 +727,7 @@ export default function AgentTab() {
                         {c.symbol}
                         {c.isCrypto && <Badge variant="outline" className="ml-1 h-3.5 border-amber-600/40 px-1 text-[8px] text-amber-300">C</Badge>}
                       </td>
-                      <td className="px-3 py-1.5 text-zinc-400">{c.tf.toUpperCase()}</td>
+                      <td className="px-3 py-1.5 text-zinc-400">{(c.tf ?? '?').toUpperCase()}</td>
                       <td className="px-3 py-1.5 text-zinc-300">
                         {ALGO_STRATEGIES[c.strategy]?.name ?? c.strategy}
                         <span className={cn('ml-1 text-[9px] font-bold uppercase', c.lane === 'swing' ? 'text-violet-400' : 'text-cyan-500')}>{c.lane}</span>

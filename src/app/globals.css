@@ -641,3 +641,79 @@ html.theme-day .lp-root .border-white\/5 {
 .agent-scroll::-webkit-scrollbar-track { background: transparent; }
 .agent-scroll::-webkit-scrollbar-thumb { background: rgb(124 77 255 / 0.35); border-radius: 999px; }
 .agent-scroll::-webkit-scrollbar-thumb:hover { background: rgb(124 77 255 / 0.6); }
+
+/* ===========================================================================
+   FSD RUNNING indicator for the bottom bars (v2.8.3).
+   While the fleet is ENGAGED the desktop footer and the mobile bottom nav
+   grow a thin "running rainbow" strip along their top edge, and the FSD
+   entry gets a live treatment (gradient text + hue-cycling icon, pulsing
+   chip dot). Same palette / cadence as .agent-rainbow-frame so the whole
+   chrome reads as one system. Visible from EVERY tab — the point is that
+   the user never has to wonder whether the autopilot is still trading.
+   Disabled (static) under prefers-reduced-motion.
+   =========================================================================== */
+@keyframes fsd-rainbow-run {
+  from { background-position: 0% 50%; }
+  to { background-position: 200% 50%; }
+}
+.fsd-rainbow-strip {
+  background: linear-gradient(
+    90deg,
+    #ff2d55, #ff9500, #ffe600, #34ff6a, #00e5ff, #7c4dff, #ff2d95, #ff2d55
+  );
+  background-size: 50% 100%;
+  animation: fsd-rainbow-run 2.4s linear infinite;
+  filter: saturate(1.35);
+  pointer-events: none;
+}
+/* footer chip — "● FSD" with a pulsing dot and gradient letters */
+.fsd-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 1px 7px;
+  border: 1px solid rgb(124 77 255 / 0.5);
+  background: rgb(124 77 255 / 0.08);
+  transition: transform 120ms ease, background 120ms ease;
+}
+.fsd-live-chip:hover { transform: scale(1.06); background: rgb(124 77 255 / 0.16); }
+.fsd-live-chip-text {
+  background: linear-gradient(
+    90deg,
+    #ff2d55, #ff9500, #ffe600, #34ff6a, #00e5ff, #7c4dff, #ff2d95, #ff2d55
+  );
+  background-size: 50% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: fsd-rainbow-run 2.4s linear infinite;
+  font-weight: 700;
+}
+.fsd-live-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #34ff6a;
+  box-shadow: 0 0 6px rgb(52 255 106 / 0.8);
+}
+@keyframes fsd-live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.65); }
+}
+.fsd-live-dot { animation: fsd-live-pulse 1.2s ease-in-out infinite; }
+/* mobile bottom-nav FSD entry: hue-cycling icon + gradient label */
+@keyframes fsd-hue-cycle {
+  to { filter: hue-rotate(360deg); }
+}
+.fsd-nav-live svg {
+  color: #d946ef;
+  animation: fsd-hue-cycle 3s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fsd-rainbow-strip,
+  .fsd-live-chip-text,
+  .fsd-nav-live svg { animation: none; }
+  .fsd-live-dot { animation: none; }
+}
+

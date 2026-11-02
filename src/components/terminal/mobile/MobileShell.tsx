@@ -20,6 +20,7 @@ import CalendarTab from '../tabs/CalendarTab'
 import AlgoTab from '../tabs/AlgoTab'
 import AgentTab from '../tabs/AgentTab'
 import { ConsoleDrawer } from '../ConsoleDrawer'
+import { useFleetPresence } from '@/hooks/use-fleet-presence'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import {
@@ -89,6 +90,9 @@ export function MobileShell({
   const alerts = useTerminal((s) => s.alerts)
   const strategies = useTerminal((s) => s.strategies)
   const selectSymbol = useTerminal((s) => s.selectSymbol)
+  // v2.8.3 — running-rainbow on the bottom nav while the FSD fleet trades
+  // (strip along the nav's top edge + live treatment on the FSD entry)
+  const fleetEngaged = useFleetPresence()
   const activeAlerts = alerts.filter((a) => a.status === 'active').length
   const armedStrategies = strategies.filter((r) => r.status === 'armed').length
 
@@ -258,11 +262,15 @@ export function MobileShell({
       {/* ---- fixed bottom tab bar (clone of the dump's 觀察清單/圖表/… nav) ---- */}
       <nav
         aria-label="Mobile sections"
-        className="shrink-0 border-t border-zinc-800 bg-zinc-900/95 pb-[env(safe-area-inset-bottom,0px)] backdrop-blur"
+        className="relative shrink-0 border-t border-zinc-800 bg-zinc-900/95 pb-[env(safe-area-inset-bottom,0px)] backdrop-blur"
       >
+        {/* v2.8.3 — running rainbow while the FSD fleet is ENGAGED (every tab) */}
+        {fleetEngaged && <div className="fsd-rainbow-strip absolute inset-x-0 top-0 z-10 h-[3px]" aria-hidden="true" />}
         <div className="flex items-stretch">
           {NAV.map(({ id, label, icon: Icon }) => {
             const isActive = view === id || (view === 'tool' && id === 'menu')
+            // v2.8.3 — the FSD entry itself goes live while the fleet trades
+            const fsdLive = fleetEngaged && id === 'agent'
             return (
               <button
                 key={id}
@@ -271,10 +279,11 @@ export function MobileShell({
                 className={cn(
                   'flex min-h-[56px] min-w-0 flex-1 flex-col items-center justify-center gap-0.5 overflow-hidden px-0.5 py-1.5 text-[10px] font-medium transition-colors active:bg-zinc-800/60',
                   isActive ? 'text-emerald-400' : 'text-zinc-500',
+                  fsdLive && 'fsd-nav-live',
                 )}
               >
                 <Icon className="h-5 w-5 shrink-0" aria-hidden />
-                <span className="max-w-full truncate">{label}</span>
+                <span className={cn('max-w-full truncate', fsdLive && 'fsd-live-chip-text')}>{label}</span>
               </button>
             )
           })}
