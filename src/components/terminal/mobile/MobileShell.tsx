@@ -18,16 +18,19 @@ import ReportTab from '../tabs/ReportTab'
 import HeatmapTab from '../tabs/HeatmapTab'
 import CalendarTab from '../tabs/CalendarTab'
 import AlgoTab from '../tabs/AlgoTab'
+import AgentTab from '../tabs/AgentTab'
 import { ConsoleDrawer } from '../ConsoleDrawer'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import {
   Bookmark, CandlestickChart, Layers, ChartColumnBig, Menu as MenuIcon,
   Settings2, BellRing, Bot, Flame, CalendarDays, LogOut, Home,
-  ChevronLeft, ChevronRight, ShieldCheck, Rocket, LayoutGrid,
+  ChevronLeft, ChevronRight, ShieldCheck, Rocket, LayoutGrid, Sparkles,
 } from 'lucide-react'
 
-type MobileView = 'watchlist' | 'chart' | 'grid' | 'trades' | 'report' | 'menu' | 'tool' | 'algo'
+// v2.8.2 — 'agent' (FSD 智慧體 autopilot) joins as a first-class view; it was
+// desktop-only before, so a phone had no path to the full-scan/engage UI.
+type MobileView = 'watchlist' | 'chart' | 'grid' | 'trades' | 'report' | 'menu' | 'tool' | 'algo' | 'agent'
 type ToolTab = 'heatmap' | 'calendar' | 'algo'
 
 const TOOL_TITLES: Record<ToolTab, string> = {
@@ -44,10 +47,13 @@ const VIEW_KEY = 'tt:mobileView'
 // before; the full GridTab mission-control (monitor / stop / edit / export /
 // import-start) now renders as a first-class tab next to Chart.
 const NAV: { id: Exclude<MobileView, 'tool'>; label: string; icon: typeof Bookmark }[] = [
-  { id: 'watchlist', label: 'Watchlist', icon: Bookmark },
+  // 'Watch' not 'Watchlist' — 8 tabs × ~49px each on a 390px phone; the long
+  // label truncated. Icon (bookmark) + position keep it unmistakable.
+  { id: 'watchlist', label: 'Watch', icon: Bookmark },
   { id: 'chart', label: 'Chart', icon: CandlestickChart },
   { id: 'grid', label: 'Grid', icon: LayoutGrid },
   { id: 'algo', label: 'Algo', icon: Rocket },
+  { id: 'agent', label: 'FSD', icon: Sparkles },
   { id: 'trades', label: 'Trades', icon: Layers },
   { id: 'report', label: 'Report', icon: ChartColumnBig },
   { id: 'menu', label: 'Menu', icon: MenuIcon },
@@ -71,7 +77,7 @@ export function MobileShell({
     if (typeof window === 'undefined') return 'watchlist'
     try {
       const v = localStorage.getItem(VIEW_KEY)
-      if (v && ['watchlist', 'chart', 'grid', 'algo', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
+      if (v && ['watchlist', 'chart', 'grid', 'algo', 'agent', 'trades', 'report', 'menu'].includes(v)) return v as MobileView
     } catch {
       /* private mode */
     }
@@ -163,7 +169,7 @@ export function MobileShell({
         {/* first-class Algo tab — same workspace the Menu row opens, rendered
             directly (AlgoTab scrolls itself: flex-1 + overflow-y-auto) */}
         {view === 'algo' && (
-          <div className="min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col">
             <AlgoTab />
           </div>
         )}
@@ -173,8 +179,18 @@ export function MobileShell({
             export-import (import can START a grid without the chart tool).
             Creation via the chart's two-click Grid tool stays desktop-only. */}
         {view === 'grid' && (
-          <div className="min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col">
             <GridTab />
+          </div>
+        )}
+
+        {/* first-class FSD tab (v2.8.2) — the 智慧體 autopilot workspace:
+            full scan / abort / ranked board / engage-disengage. AgentTab's
+            root scrolls itself (flex-1 + overflow-y-auto), so the wrapper
+            must be a flex column for flex-1 to bite. */}
+        {view === 'agent' && (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <AgentTab />
           </div>
         )}
 
@@ -218,6 +234,7 @@ export function MobileShell({
               {menuRow('Settings', Settings2, onOpenSettings)}
               {menuRow('Alerts', BellRing, onOpenAlerts, { badge: activeAlerts, badgeClass: 'border-amber-500/40 text-amber-400' })}
               {menuRow('Strategy orders', Bot, onOpenStrategies, { badge: armedStrategies, badgeClass: 'border-violet-500/40 text-violet-400' })}
+              {menuRow('FSD Autopilot (智慧體)', Sparkles, () => go('agent'))}
               {menuRow('Algo Trading', Rocket, () => { setToolTab('algo'); go('tool') })}
               {menuRow('Grid Trading', LayoutGrid, () => go('grid'))}
               {menuRow('Heat Map', Flame, () => { setToolTab('heatmap'); go('tool') })}

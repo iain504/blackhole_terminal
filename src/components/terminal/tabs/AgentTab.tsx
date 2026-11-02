@@ -777,7 +777,11 @@ export default function AgentTab() {
   )
 
   return (
-    <div className="min-h-full bg-zinc-950 p-1 md:p-2">
+    // v2.8.2 — self-scrolling bounded root (AlgoTab pattern). min-h-full let
+    // the content grow past <main> and paint OVER the translucent footer bar
+    // (inner is relative z-10, so it won the stacking contest); h-bounded +
+    // overflow-y-auto keeps the footer visible and scrolls the tab instead.
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto terminal-scroll bg-zinc-950 p-1 md:p-2">
       {engaged ? (
         // RAINBOW FSD HALO — spins while the fleet trades
         <div className="agent-rainbow-frame agent-rainbow-glow">
