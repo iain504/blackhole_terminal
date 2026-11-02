@@ -1,6 +1,6 @@
 'use client';
 
-// Global 401 watcher (v2.7.3).
+// Global 401 watcher (v2.7.3, SSR-safe since v2.7.4).
 //
 // Problem it fixes: the auth gate only runs at page load (/api/auth/me). When
 // the server-side session dies UNDER an open terminal — platform DB wipe,
@@ -15,23 +15,36 @@
 // registered handler. TerminalRoot registers one that clears the zustand user
 // (flips the UI to AuthForms) and toasts, so the user lands on the login
 // screen with an explanation instead of a broken terminal.
+//
+// v2.7.4: `window` must NEVER be touched at module-evaluation time. 'use
+// client' does not opt out of SSR — client components are still evaluated on
+// the server for the initial HTML, where `window` is undefined, and a
+// top-level access crashed every GET / with ReferenceError → 500. All access
+// is now resolved lazily at call time (event/request handlers always run in
+// a real browser).
 
-const g = window as typeof window & {
+type G = typeof window & {
   __tt401PatchedFetch?: typeof fetch
   __tt401Handler?: () => void
 }
 
+function browserGlobal(): G | undefined {
+  return typeof window === 'undefined' ? undefined : (window as G)
+}
+
 /** Register the handler invoked on a session-death 401. Idempotent per mount. */
 export function setUnauthorizedHandler(cb: (() => void) | undefined): void {
-  g.__tt401Handler = cb
+  const g = browserGlobal()
+  if (g) g.__tt401Handler = cb
 }
 
 /** Patch window.fetch once so every component's fetch is watched for free. */
 export function installUnauthorizedWatcher(): void {
-  if (typeof window === 'undefined' || g.__tt401PatchedFetch) return
-  const prev = window.fetch.bind(window)
+  const g = browserGlobal()
+  if (!g || g.__tt401PatchedFetch) return
+  const prev = g.fetch.bind(g)
   g.__tt401PatchedFetch = prev
-  window.fetch = async (input, init) => {
+  g.fetch = async (input, init) => {
     const res = await prev(input, init)
     try {
       const url =
