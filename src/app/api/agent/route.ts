@@ -72,14 +72,19 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, sessionId: res.sessionId }, { status: 202 })
     }
 
+    // v2.8.1 — ABORT is user-scoped (kills whatever pipeline this account has
+    // running) and its handler never reads a sessionId, but the gate below
+    // demanded one for every non-start action — so the Abort Scan button always
+    // died with 400 "sessionId is required". Handle abort BEFORE that gate.
+    if (action === 'abort') {
+      const ok = await abortAgentScan(user.id)
+      return NextResponse.json(ok ? { ok: true } : { error: 'No running pipeline' }, { status: ok ? 200 : 409 })
+    }
+
     const sessionId = String(body?.sessionId ?? '')
     if (!sessionId) return NextResponse.json({ error: 'sessionId is required' }, { status: 400 })
 
     switch (action) {
-      case 'abort': {
-        const ok = await abortAgentScan(user.id)
-        return NextResponse.json(ok ? { ok: true } : { error: 'No running pipeline' }, { status: ok ? 200 : 409 })
-      }
       case 'engage': {
         // v2.6.1 — the dialog sends the current settings form: apply it first
         // (re-sizes the budget, persists the mode flip) so a paper/live change

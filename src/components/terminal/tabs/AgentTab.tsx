@@ -383,8 +383,10 @@ export default function AgentTab() {
             <div className="h-full rounded-full bg-gradient-to-r from-cyan-400 via-violet-500 to-fuchsia-500 transition-all duration-500"
               style={{ width: `${Math.max(2, (session?.progress ?? 0) * 100)}%` }} />
           </div>
+          {/* v2.8.1 — abort is user-scoped server-side; sessionId is sent when
+              available but no longer required (it used to 400 without one). */}
           <Button size="sm" variant="outline" className="mt-2 h-7 border-rose-500/40 text-xs text-rose-300 hover:bg-rose-500/10"
-            onClick={() => void post({ action: 'abort' }, 'Abort signalled')} disabled={busy === 'abort'}>
+            onClick={() => void post({ action: 'abort', sessionId: session?.id }, 'Abort signalled')} disabled={busy === 'abort'}>
             <Square className="h-3 w-3" /> Abort scan
           </Button>
         </div>
