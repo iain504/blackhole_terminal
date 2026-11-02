@@ -107,6 +107,9 @@ export interface AgentStats {
   fleetFailed: number
   startedAt: string
   finishedAt: string | null
+  // v2.8.0 — how many (symbol × lane) results were reused from the persistent
+  // AgentScanCache store (incremental rerun / crash resume); absent pre-2.8.0
+  reused?: number
 }
 
 export interface AgentEventDto {

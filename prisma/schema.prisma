@@ -598,3 +598,39 @@ model SentimentScore {
   @@index([symbol, asOf])
   @@index([asOf])
 }
+
+// v2.8.0 — persistent FSD scan-result store. One row per (symbol, lane):
+// the best sweep row of the last full scan + its tuning outcome. The scan
+// pipeline reuses fresh rows (< SCAN_CACHE_FRESH_MS) verbatim, so reruns
+// after a crash/restart resume where the previous run stopped and daily
+// rescans cost seconds instead of the full bars+sweep+tune tour. Rows with
+// strategy='none' are NEGATIVE results (swept clean) — cached too so reruns
+// skip those symbols as well. `engine` is the pipeline fingerprint: bump it
+// whenever sweep behavior changes to invalidate the whole store at once.
+// Tiny by design (~250 rows) — the disk hog is NOT this table (see the
+// /api/agent/storage route for what actually eats the volume).
+model AgentScanCache {
+  symbol        String
+  lane          String // 'day' | 'swing'
+  engine        String // pipeline fingerprint, e.g. 'v1'
+  isCrypto      Boolean
+  tf            String
+  strategy      String // AlgoStrategyId, or 'none' for a swept-clean symbol
+  params        Json?
+  metrics       Json? // BacktestMetrics of the best sweep row
+  oos           Json? // SweepOos of the best sweep row
+  score         Float?
+  boundary      Boolean @default(false)
+  bars          Int     @default(0)
+  coveredDays   Int     @default(0)
+  tunedStrategy String?
+  tunedParams   Json?
+  tunedTpPct    Float?
+  tunedSlPct    Float?
+  tunedScore    Float? // Calmar score of the tuned best (replays the beat-the-sweep decision)
+  tunedMetrics  Json? // BacktestMetrics of the tuned best
+  computedAt    DateTime
+  updatedAt     DateTime @updatedAt
+
+  @@id([symbol, lane])
+}

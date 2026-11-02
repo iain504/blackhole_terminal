@@ -29,7 +29,7 @@ import { useToast } from '@/hooks/use-toast'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
   Activity, TrendingUp, Crosshair, Gauge, CircleDollarSign, Zap, Globe2,
-  TriangleAlert,
+  TriangleAlert, HardDrive,
 } from 'lucide-react'
 
 // v2.7.5 — which broker lanes the account can actually ENGAGE with. The
@@ -48,7 +48,7 @@ const STATUS_META: Record<string, { label: string; cls: string; dot: string }> =
   budget: { label: 'SIZING', cls: 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10', dot: 'bg-emerald-400' },
   ready: { label: 'READY', cls: 'text-emerald-300 border-emerald-400/50 bg-emerald-500/10', dot: 'bg-emerald-400' },
   engaged: { label: 'ENGAGED', cls: 'text-fuchsia-300 border-fuchsia-500/50 bg-fuchsia-500/10', dot: 'bg-fuchsia-400' },
-  stopped: { label: 'DISENGAGED', cls: 'text-zinc-300 border-zinc-600/60 bg-zinc-700/20', dot: 'bg-zinc-400' },
+  stopped: { label: 'STOPPED', cls: 'text-zinc-300 border-zinc-600/60 bg-zinc-700/20', dot: 'bg-zinc-400' },
   error: { label: 'FAILED', cls: 'text-rose-300 border-rose-500/50 bg-rose-500/10', dot: 'bg-rose-400' },
 }
 
@@ -141,6 +141,55 @@ export default function AgentTab() {
       void loadBroker()
     }
   }, [status, loadBroker])
+
+  // v2.8.0 — a parked board (disengaged fleet) can be re-engaged instantly;
+  // the scan button relabels to make the fresh-scan choice explicit.
+  const parkedBoard = status === 'ready' && !!session?.phase?.startsWith('PARKED')
+
+  // ---- server storage card (v2.8.0) ----
+  type StorageReport = {
+    disk: {
+      free: { bytes: number | null; human: string | null }
+      total: { bytes: number | null; human: string | null }
+      db: { bytes: number | null; human: string | null }
+      wal: { bytes: number | null; human: string | null }
+      path: string
+    }
+    tables: { key: string; label: string; rows: number; hint: string }[]
+  }
+  const [storage, setStorage] = useState<StorageReport | null>(null)
+  const [storageOpen, setStorageOpen] = useState(false)
+  const [storageBusy, setStorageBusy] = useState<string | null>(null)
+  const [storageMsg, setStorageMsg] = useState('')
+
+  const loadStorage = useCallback(async () => {
+    try {
+      const res = await fetch('/api/agent/storage', { cache: 'no-store' })
+      if (!res.ok) return
+      setStorage((await res.json()) as StorageReport)
+    } catch { /* card is advisory */ }
+  }, [])
+
+  useEffect(() => {
+    if (storageOpen) void loadStorage()
+  }, [storageOpen, loadStorage])
+
+  const storageAction = async (action: string) => {
+    setStorageBusy(action)
+    setStorageMsg('')
+    try {
+      const res = await fetch('/api/agent/storage', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action }),
+      })
+      const j = (await res.json().catch(() => ({}))) as { message?: string; error?: string }
+      setStorageMsg(res.ok ? (j.message ?? 'Done') : (j.error ?? `HTTP ${res.status}`))
+      if (res.ok) await loadStorage()
+    } catch (e) {
+      setStorageMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setStorageBusy(null)
+    }
+  }
 
   // ---- poll the agent state (3s) ----
   const load = useCallback(async () => {
@@ -431,7 +480,7 @@ export default function AgentTab() {
               disabled={busy === 'start' || data?.jobRunning}
             >
               <Rocket className="mr-2 h-5 w-5" />
-              {data?.jobRunning ? 'PIPELINE RUNNING…' : 'LAUNCH FULL SCAN'}
+              {data?.jobRunning ? 'PIPELINE RUNNING…' : parkedBoard ? 'LAUNCH FRESH SCAN' : 'LAUNCH FULL SCAN'}
             </Button>
           )}
           {status === 'ready' && (
@@ -440,7 +489,11 @@ export default function AgentTab() {
               onClick={() => setConfirmEngage(true)}
               disabled={busy === 'engage'}
             >
-              <Play className="mr-2 h-5 w-5" /> ENGAGE FLEET {mode === 'live' ? '· LIVE' : '· PAPER'}
+              {/* v2.8.0 — a disengaged session parks at READY: the board is
+                  still sized and live, so this button restarts the fleet
+                  instantly (no full re-scan needed). */}
+              <Play className="mr-2 h-5 w-5" />
+              {session?.phase?.startsWith('PARKED') ? 'RE-ENGAGE FLEET' : 'ENGAGE FLEET'} {mode === 'live' ? '· LIVE' : '· PAPER'}
             </Button>
           )}
           {engaged && session && (
@@ -458,7 +511,91 @@ export default function AgentTab() {
             <StatChip label="Tuned" value={stats ? `${stats.tuned}/${stats.tuneTotal}` : '—'} icon={<BrainCircuit className="h-3 w-3 text-violet-300" />} />
             <StatChip label="Fleet" value={stats && engaged ? `${stats.fleetStarted}` : `${selectedCount}`} icon={<Rocket className="h-3 w-3 text-fuchsia-300" />} />
           </div>
+          {parkedBoard && (
+            <div className="rounded-lg border border-zinc-700/60 bg-zinc-800/40 p-2.5 text-[11px] leading-relaxed text-zinc-400">
+              Score board parked from the last fleet run — RE-ENGAGE restarts the engines instantly, no scan needed.
+              The board refreshes when you launch a fresh scan.
+            </div>
+          )}
         </div>
+      </section>
+
+      {/* ---------------- server storage (v2.8.0) ---------------- */}
+      <section className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+        <button
+          type="button"
+          className="flex w-full items-center justify-between gap-2 text-left"
+          onClick={() => setStorageOpen((v) => !v)}
+          aria-expanded={storageOpen}
+        >
+          <span className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
+            <HardDrive className="h-4 w-4 text-zinc-400" /> Server storage
+          </span>
+          <span className="text-[11px] font-normal text-zinc-500">
+            {storage?.disk.db.human
+              ? `DB ${storage.disk.db.human}${storage.disk.wal.human ? ` · WAL ${storage.disk.wal.human}` : ''}${storage.disk.free.human ? ` · ${storage.disk.free.human} free` : ''}`
+              : 'show usage'}
+          </span>
+        </button>
+        {storageOpen && (
+          <div className="mt-3 space-y-3">
+            <div className="grid gap-1.5 text-[11px]">
+              {(storage?.tables ?? []).map((t) => (
+                <div key={t.key} className="flex items-center justify-between gap-2 rounded-md bg-zinc-800/40 px-2.5 py-1.5">
+                  <span className="text-zinc-300">
+                    {t.label}
+                    {t.hint ? <span className="ml-2 text-zinc-600">{t.hint}</span> : null}
+                  </span>
+                  <span className="font-mono text-zinc-400">{t.rows.toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                className="h-8 border-emerald-500/40 bg-emerald-500/15 text-xs text-emerald-200 hover:bg-emerald-500/25"
+                variant="outline"
+                disabled={storageBusy != null}
+                onClick={() => void storageAction('vacuum')}
+              >
+                {storageBusy === 'vacuum' ? 'REBUILDING…' : 'Reclaim space (VACUUM)'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 border-zinc-700 text-xs text-zinc-300 hover:bg-zinc-800"
+                disabled={storageBusy != null}
+                onClick={() => void storageAction('purge-bars')}
+              >
+                {storageBusy === 'purge-bars' ? 'PURGING…' : 'Purge bar cache'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 border-zinc-700 text-xs text-zinc-300 hover:bg-zinc-800"
+                disabled={storageBusy != null}
+                onClick={() => void storageAction('purge-logs')}
+              >
+                {storageBusy === 'purge-logs' ? 'PURGING…' : 'Purge old logs'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 border-zinc-700 text-xs text-zinc-300 hover:bg-zinc-800"
+                disabled={storageBusy != null}
+                onClick={() => void storageAction('purge-kronos')}
+              >
+                {storageBusy === 'purge-kronos' ? 'PURGING…' : 'Purge old forecasts'}
+              </Button>
+            </div>
+            {storageMsg && <div className="rounded-md bg-zinc-800/60 p-2 text-[11px] text-zinc-300">{storageMsg}</div>}
+            <p className="text-[10px] leading-relaxed text-zinc-600">
+              SQLite keeps deleted rows inside the file until VACUUM rebuilds it — reclaim space after big purges.
+              The FSD results store is tiny and makes the next scan fast; leave it alone. Container stdout logs live
+              outside the database — cap them with docker logging limits (max-size) on the host.
+            </p>
+          </div>
+        )}
       </section>
 
       {/* ---------------- budget strip ---------------- */}

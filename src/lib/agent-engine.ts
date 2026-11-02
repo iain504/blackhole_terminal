@@ -42,6 +42,7 @@ import {
   AGENT_SETTINGS_DEFAULTS, type AgentCandidate, type AgentSettings,
   type AgentSessionStatus, type AgentStats, type AgentBudget, type AgentRunRow,
 } from '@/lib/agent-types'
+import type { BacktestMetrics, SweepOos } from '@/lib/backtest'
 
 const SCAN_DAY_TF: AlgoTimeframe = '15m'
 const SCAN_SWING_TF: AlgoTimeframe = '1h'
@@ -61,7 +62,100 @@ const HEAP_ABORT = 0.78
 const MAX_EVENTS = 400
 const MIN_POS_NOTIONAL = 10 // a planned position below $10 is dust — skipped
 
-type ScanRow = { symbol: string; isCrypto: boolean; row: SweepRow; tf: AlgoTimeframe; lane: 'day' | 'swing'; bars: number; coveredDays: number }
+// v2.8.0 — persistent scan-result store (AgentScanCache table).
+//
+// The full scan is the longest, most expensive operation in the app (100+
+// symbols × 2 lanes × deep bars + full-catalog sweeps + optimizer grids).
+// Every (symbol, lane) result lands in the store the moment it is computed,
+// which gives three properties the user asked for:
+//   1. PERSISTENCE — results survive process restarts and DB sessions.
+//   2. INCREMENTAL RERUN — a relaunch (after a crash, an abort or a fresh
+//      day) recomputes ONLY symbols that are missing or stale; everything
+//      fresh is reused verbatim, so a crash-resume costs seconds.
+//   3. AGE REFRESH — rows older than SCAN_CACHE_FRESH_MS are stale and get
+//      recomputed on the next run (the market moved; the backtest follows).
+// Bump SCAN_CACHE_ENGINE whenever sweep behavior changes (strategy catalog,
+// costs, lane windows) — it invalidates the whole store in one move.
+const SCAN_CACHE_ENGINE = 'v1'
+const SCAN_CACHE_FRESH_MS = 24 * 60 * 60 * 1000 // results refresh when older than 24h
+
+type CacheRow = Awaited<ReturnType<typeof db.agentScanCache.findUnique>>
+
+type ScanRow = { symbol: string; isCrypto: boolean; row: SweepRow; tf: AlgoTimeframe; lane: 'day' | 'swing'; bars: number; coveredDays: number; cached?: NonNullable<CacheRow> }
+
+/** Fresh (symbol, lane) cache row, or null when missing/stale/other-engine. */
+async function loadFreshCache(symbol: string, lane: 'day' | 'swing'): Promise<CacheRow> {
+  try {
+    const row = await db.agentScanCache.findUnique({ where: { symbol_lane: { symbol, lane } } })
+    if (!row || row.engine !== SCAN_CACHE_ENGINE) return null
+    if (Date.now() - row.computedAt.getTime() > SCAN_CACHE_FRESH_MS) return null
+    return row
+  } catch {
+    return null // cache must never break the scan
+  }
+}
+
+/** Rebuild the pipeline's ScanRow from a positive cache row (null for the 'none' sentinel). */
+function cachedToScanRow(c: NonNullable<CacheRow>, symbol: string, isCrypto: boolean): ScanRow | null {
+  if (c.strategy === 'none' || c.score == null || !c.metrics || !c.params) return null
+  return {
+    symbol,
+    isCrypto,
+    row: {
+      strategy: c.strategy as ScanRow['row']['strategy'],
+      params: c.params as Record<string, number>,
+      score: c.score,
+      metrics: c.metrics as BacktestMetrics,
+      oos: (c.oos as SweepOos | null) ?? null,
+      boundary: c.boundary,
+    },
+    tf: c.tf as ScanRow['tf'],
+    lane: c.lane as ScanRow['lane'],
+    bars: c.bars,
+    coveredDays: c.coveredDays,
+  }
+}
+
+/** Persist one (symbol, lane) outcome — positive best-row or the 'none' sentinel. */
+async function writeCacheRow(symbol: string, isCrypto: boolean, lane: 'day' | 'swing', tf: AlgoTimeframe, best: SweepRow | null, bars: number, coveredDays: number): Promise<void> {
+  const base = {
+    engine: SCAN_CACHE_ENGINE, isCrypto, tf,
+    strategy: best ? best.strategy : 'none',
+    params: (best ? best.params : null) as object | null,
+    metrics: (best ? best.metrics : null) as object | null,
+    oos: (best?.oos ?? null) as object | null,
+    score: best ? best.score : null,
+    boundary: best?.boundary === true,
+    bars, coveredDays,
+    // a fresh sweep invalidates the previous tuning outcome
+    tunedStrategy: null, tunedParams: null, tunedTpPct: null, tunedSlPct: null, tunedMetrics: null,
+    computedAt: new Date(),
+  }
+  try {
+    await db.agentScanCache.upsert({
+      where: { symbol_lane: { symbol, lane } },
+      create: { symbol, lane, ...base },
+      update: base,
+    })
+  } catch { /* cache write failures never break the scan */ }
+}
+
+/** Persist the tuning outcome of one cached (symbol, lane) row. */
+async function writeCacheTuned(symbol: string, lane: 'day' | 'swing', strategy: string, tp: number | null, sl: number | null, params: Record<string, number> | null, metrics: BacktestMetrics | null, score: number | null): Promise<void> {
+  try {
+    await db.agentScanCache.update({
+      where: { symbol_lane: { symbol, lane } },
+      data: {
+        tunedStrategy: strategy,
+        tunedParams: (params ?? null) as object | null,
+        tunedTpPct: tp,
+        tunedSlPct: sl,
+        tunedScore: score,
+        tunedMetrics: (metrics ?? null) as object | null,
+      },
+    })
+  } catch { /* cache write failures never break the scan */ }
+}
 
 // ---------------------------------------------------------------------------
 // session/job registry (single-flight per user, survives HMR via globalThis)
@@ -195,6 +289,16 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
   try {
     await ev(sessionId, userId, 'info',
       `Autopilot engaged — scanning ${scanTotal} symbols (${AGENT_US_100.length} US high-VOL${settings.includeCrypto ? ' + crypto majors' : ''}) · tune top ${settings.topTune} · fleet ${settings.topN} slots`)
+    // v2.8.0 — surface how much of this run the results store will absorb
+    try {
+      const freshRows = await db.agentScanCache.count({
+        where: { engine: SCAN_CACHE_ENGINE, computedAt: { gt: new Date(Date.now() - SCAN_CACHE_FRESH_MS) } },
+      })
+      if (freshRows > 0) {
+        await ev(sessionId, userId, 'scan',
+          `Results store — ${freshRows} fresh (symbol × lane) row(s) will be REUSED (freshness 24h). A rerun after a crash/restart resumes where the last scan stopped.`)
+      }
+    } catch { /* informational only */ }
     await touch({ universe: { us: AGENT_US_100, crypto: settings.includeCrypto }, stats })
 
     // ---------------- phase 1 — SCAN ----------------
@@ -210,6 +314,19 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
         for (const lane of ['day', 'swing'] as const) {
           const tf = lane === 'day' ? SCAN_DAY_TF : SCAN_SWING_TF
           const days = Math.min(lane === 'day' ? SCAN_DAY_DAYS : SCAN_SWING_DAYS, algoMaxDays(tf, isCrypto))
+          // v2.8.0 — results store first: a fresh (symbol, lane) row is reused
+          // verbatim (crash resume / incremental rerun); the 'none' sentinel
+          // (swept clean) is reused too, so reruns skip those symbols as well
+          const cached = await loadFreshCache(symbol, lane)
+          if (cached) {
+            const reused = cachedToScanRow(cached, symbol, isCrypto)
+            if (reused) {
+              scanRows.push({ ...reused, cached })
+              added++
+              stats.reused = (stats.reused ?? 0) + 1
+            }
+            continue // positive row reused, or negative 'none' sentinel — either way done
+          }
           const hist = await fetchBacktestBars(symbol, tf, userId, days)
           if (!hist.ok || !hist.bars || hist.bars.length < 80) continue
           const bars = hist.bars
@@ -219,9 +336,12 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
             lane, minTrades: SWEEP_MIN_TRADES, topX: SWEEP_TOP_X,
             maxCombosPerStrategy: SWEEP_MAX_COMBOS, oosFraction: SWEEP_OOS,
           })
-          const best = sweep.rows.find((r) => Number.isFinite(r.score) && r.score > 0)
+          const best = sweep.rows.find((r) => Number.isFinite(r.score) && r.score > 0) ?? null
+          const covered = Math.max(1, Math.round((Date.now() / 1000 - bars[0].time) / 86400))
+          // persist the outcome the moment it exists — a crash/rescan resumes from here
+          await writeCacheRow(symbol, isCrypto, lane, tf, best, series.n, covered)
           if (best) {
-            scanRows.push({ symbol, isCrypto, row: best, tf, lane, bars: series.n, coveredDays: Math.max(1, Math.round((Date.now() / 1000 - bars[0].time) / 86400)) })
+            scanRows.push({ symbol, isCrypto, row: best, tf, lane, bars: series.n, coveredDays: covered })
             added++
           }
         }
@@ -255,7 +375,7 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
       if (added > 0) {
         const last = scanRows[scanRows.length - 1]
         await ev(sessionId, userId, 'scan',
-          `${symbol} → ${ALGO_STRATEGIES[last.row.strategy].name} @ ${last.tf} (${last.lane}) · score ${pct(last.row.score, 2)} · net ${pct(last.row.metrics.netPct, 1)}% · ${last.row.metrics.trades} trades${last.row.oos && last.row.oos.netPct > 0 ? ` · OOS +${pct(last.row.oos.netPct, 1)}%` : ''}`)
+          `${symbol} → ${ALGO_STRATEGIES[last.row.strategy].name} @ ${last.tf} (${last.lane}) · score ${pct(last.row.score, 2)} · net ${pct(last.row.metrics.netPct, 1)}% · ${last.row.metrics.trades} trades${last.row.oos && last.row.oos.netPct > 0 ? ` · OOS +${pct(last.row.oos.netPct, 1)}%` : ''}${last.cached ? ' · from results store' : ''}`)
       }
     }
 
@@ -269,7 +389,7 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
     const tunePool = scanRows.slice(0, Math.max(4, Math.min(40, settings.topTune)))
     stats.tuneTotal = tunePool.length
     await touch({ status: 'tuning', phase: `TUNE 0/${tunePool.length}`, stats })
-    await ev(sessionId, userId, 'info', `Scan complete — ${scanRows.length}/${scanTotal} symbols produced positive-score setups. Tuning the top ${tunePool.length}.`)
+    await ev(sessionId, userId, 'info', `Scan complete — ${scanRows.length}/${scanTotal} symbols produced positive-score setups (${stats.reused ?? 0} lane result(s) reused from the store). Tuning the top ${tunePool.length}.`)
 
     const candidates: AgentCandidate[] = []
     for (let i = 0; i < tunePool.length; i++) {
@@ -277,7 +397,33 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
       const t = tunePool[i]
       const cand = sweepRowToCandidate(t, null)
       const mem = memoryGuard(HEAP_ABORT)
-      if (mem.ok) {
+      // v2.8.0 — tuning reuse: the store remembers the tuned outcome per
+      // (symbol, lane). When the sweep row is unchanged, the optimizer grid
+      // (up to 160 combos × prepareSeries) is skipped entirely and the tuned
+      // params/exit legs/metrics replay from the store.
+      const ct = t.cached
+      const tunedReusable =
+        ct && ct.tunedStrategy === t.row.strategy &&
+        ct.tunedParams != null && ct.tunedMetrics != null &&
+        ct.tunedTpPct != null && ct.tunedSlPct != null && ct.tunedScore != null
+      if (tunedReusable) {
+        const tp = { ...(ct.tunedParams as Record<string, number>) }
+        const tpV = Number(tp.tpValue)
+        const slV = Number(tp.slValue)
+        delete tp.tpValue
+        delete tp.slValue
+        cand.params = tp
+        cand.tpPct = ct.tunedTpPct as number
+        cand.slPct = ct.tunedSlPct as number
+        cand.score = pct(ct.tunedScore as number, 3)
+        const tm = ct.tunedMetrics as BacktestMetrics
+        cand.netPct = pct(tm.netPct)
+        cand.winRate = pct(tm.winRate, 1)
+        cand.pf = pct(tm.profitFactor)
+        cand.maxDDPct = pct(tm.maxDrawdownPct)
+        cand.trades = tm.trades
+        cand.tuned = true
+      } else if (mem.ok) {
         try {
           const days = Math.min(t.lane === 'day' ? SCAN_DAY_DAYS : SCAN_SWING_DAYS, algoMaxDays(t.tf, t.isCrypto))
           const hist = await fetchBacktestBars(t.symbol, t.tf, userId, days)
@@ -302,16 +448,23 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
               cand.pf = pct(opt.best.metrics.profitFactor)
               cand.maxDDPct = pct(opt.best.metrics.maxDrawdownPct)
               cand.trades = opt.best.metrics.trades
+              // v2.8.0 — store the winning tune so future runs skip this grid
+              void writeCacheTuned(t.symbol, t.lane, t.row.strategy,
+                Number.isFinite(tpV) && tpV > 0 ? tpV : null,
+                Number.isFinite(slV) && slV > 0 ? slV : null,
+                bp, opt.best.metrics, opt.best.score)
             }
             cand.tuned = true
           }
         } catch { /* keep the raw sweep row when tuning fails */ }
+      } else {
+        cand.tuned = false
       }
       candidates.push(cand)
       stats.tuned = i + 1
-      await touch({ phase: `TUNE ${i + 1}/${tunePool.length} · ${t.symbol}`, progress: 0.55 + 0.25 * ((i + 1) / tunePool.length), stats })
+      await touch({ phase: `TUNE ${i + 1}/${tunePool.length} · ${t.symbol}${tunedReusable ? ' · store' : ''}`, progress: 0.55 + 0.25 * ((i + 1) / tunePool.length), stats })
       await ev(sessionId, userId, 'tune',
-        `${t.symbol} tuned — score ${cand.score} · TP ${cand.tpPct}% / SL ${cand.slPct}% · net ${cand.netPct}% · PF ${cand.pf} · DD ${cand.maxDDPct}%`)
+        `${t.symbol} tuned${tunedReusable ? ' (from results store)' : ''} — score ${cand.score} · TP ${cand.tpPct}% / SL ${cand.slPct}% · net ${cand.netPct}% · PF ${cand.pf} · DD ${cand.maxDDPct}%`)
     }
 
     // ---------------- phase 3 — RANKING ----------------
@@ -584,6 +737,10 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
   }
 
   const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
+  // v2.8.0 — a re-engage (parked → ready → engage) must not carry the OLD
+  // run ids: startAlgoRun mints fresh engines and overwrites started slots,
+  // but failed slots would keep pointing at their previous stopped run.
+  for (const c of candidates) c.runId = null
   const selected = candidates.filter((c) => c.selected && (c.allocQty ?? 0) > 0 && !c.skipReason)
   if (selected.length === 0) {
     const msg = 'No sized fleet slots — every candidate skipped (budget/quote). Nothing to engage.'
@@ -684,8 +841,12 @@ export async function disengageAgent(userId: string, sessionId: string, flatten:
       await ev(sessionId, userId, 'error', `${c.symbol} stop FAILED — ${e instanceof Error ? e.message : String(e)}`)
     }
   }
-  await db.agentSession.update({ where: { id: sessionId }, data: { status: 'stopped', phase: 'DISENGAGED' } })
-  await ev(sessionId, userId, 'info', `Autopilot DISENGAGED — ${stopped} engine(s) stopped. Rainbow parked.`)
+  // v2.8.0 — disengage parks the session instead of killing it: status goes
+  // back to READY with the score board intact, so RE-ENGAGE restarts the
+  // fleet instantly (no full re-scan) and the board also survives server
+  // restarts. 'stopped' stays reserved for user-aborted pipelines.
+  await db.agentSession.update({ where: { id: sessionId }, data: { status: 'ready', phase: 'PARKED — READY TO RE-ENGAGE' } })
+  await ev(sessionId, userId, 'info', `Autopilot DISENGAGED — ${stopped} engine(s) stopped. Score board parked — press RE-ENGAGE to restart the fleet, or launch a fresh scan.`)
   return { ok: true, stopped }
 }
 
@@ -752,7 +913,7 @@ export async function getAgentState(userId: string): Promise<{
     if (!job || job.sessionId !== session.id) {
       await db.agentSession.update({
         where: { id: session.id },
-        data: { status: 'error', phase: 'INTERRUPTED', error: 'Pipeline interrupted by a server restart — run a new scan.' },
+        data: { status: 'error', phase: 'INTERRUPTED', error: 'Pipeline interrupted by a server restart — launch a new scan; finished symbol results were saved to the store and will be reused.' },
       }).catch(() => {})
       session.status = 'error'
       session.phase = 'INTERRUPTED'
