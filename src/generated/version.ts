@@ -3,12 +3,12 @@
 // base = package.json version · build = git commit count · sha = HEAD.
 export const APP_VERSION = {
   base: '2.7.5',
-  build: 232,
-  sha: '49d8223',
+  build: 233,
+  sha: '5bb289c',
   branch: 'main',
-  commitDate: '2026-11-02T15:35:27Z',
-  full: '2.7.5+232.49d8223',
-  display: 'v2.7.5+232',
+  commitDate: '2026-11-02T18:12:13Z',
+  full: '2.7.5+233.5bb289c',
+  display: 'v2.7.5+233',
 } as const
 
 export type AppVersion = typeof APP_VERSION
