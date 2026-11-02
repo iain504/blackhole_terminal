@@ -6,10 +6,33 @@ const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
 }
 
+/**
+ * v2.7.2 — append engine-level tuning params to the SQLite URL.
+ *
+ * The production entrypoint rewrites DATABASE_URL to a bare `file:…` URL, so
+ * Prisma's defaults applied — including socket_timeout ≈5s. That clashed with
+ * the WAL pragma below: busy_timeout=5000 makes SQLite legitimately WAIT up
+ * to 5s for the write lock (grid engine, alerts supervisor, fill-notifier and
+ * API traffic all share one file), and the engine socket timeout fired FIRST
+ * → "Socket timeout (the database failed to respond to a query within the
+ * configured timeout)" on the full server. socket_timeout=15 gives the
+ * 5s busy wait headroom instead of racing it.
+ */
+function tunedDatabaseUrl(raw: string | undefined): string | undefined {
+  if (!raw || !raw.startsWith('file:')) return raw
+  const [base, existingQuery] = raw.split('?')
+  const params = new URLSearchParams(existingQuery ?? '')
+  if (!params.has('socket_timeout')) params.set('socket_timeout', '15')
+  const qs = params.toString()
+  return qs ? `${base}?${qs}` : base
+}
+
 function createClient(): PrismaClient {
   // Per-query logging floods dev.log — enable explicitly with DEBUG_DB=1.
+  const url = tunedDatabaseUrl(process.env.DATABASE_URL)
   const client = new PrismaClient({
     log: process.env.DEBUG_DB === '1' ? ['query'] : ['error', 'warn'],
+    ...(url ? { datasourceUrl: url } : {}),
   })
   // SQLite tuning (once per client): WAL = concurrent readers don't block the
   // writer; busy_timeout avoids spurious "database is locked" errors under the
@@ -107,6 +130,25 @@ export function isDiskFullError(e: unknown): boolean {
     m.includes('disk is full') ||
     m.includes('insertion failed because database is full') ||
     (m.includes('error code 13') && m.includes('full'))
+  )
+}
+
+/**
+ * v2.7.2 — true for TRANSIENT SQLite contention errors that a short retry can
+ * clear: the engine socket timeout (a >busy_timeout write-lock wait that used
+ * to surface as "Socket timeout …") and the classic SQLITE_BUSY lock errors.
+ * Deliberately message-based like isDiskFullError: the connector surfaces
+ * these as raw connector errors, not typed Prisma errors.
+ */
+export function isTransientDbError(e: unknown): boolean {
+  const msg = e instanceof Error ? `${e.message}` : typeof e === 'string' ? e : ''
+  if (!msg) return false
+  const m = msg.toLowerCase()
+  return (
+    m.includes('socket timeout') ||
+    m.includes('timed out') ||
+    (m.includes('database') && m.includes('locked')) ||
+    m.includes('sqlite_busy')
   )
 }
 

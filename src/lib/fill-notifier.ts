@@ -14,7 +14,7 @@
 // Telegram is not configured — so enabling it later never replays history.
 // The FIRST run only takes a baseline snapshot (no notification burst).
 import { Prisma } from '@prisma/client'
-import { db } from '@/lib/db'
+import { db, isTransientDbError } from '@/lib/db'
 import { decrypt } from '@/lib/crypt'
 import { sendTelegram } from '@/lib/api-helpers'
 import { getClosedOrders, getPositions, TradingOrder, TradingPosition, TradeMode } from '@/lib/trading'
@@ -195,21 +195,34 @@ async function runCycle(userId: string, mode: TradeMode): Promise<void> {
       .sort((a, b) => b.at - a.at)
       .slice(0, SEEN_CAP)
 
-    await db.notifyState.upsert({
-      where: { userId_mode: { userId, mode } },
-      create: {
-        userId,
-        mode,
-        lastRunAt: new Date(),
-        positions: snapshot as unknown as Prisma.InputJsonValue,
-        seen: mergedSeen as unknown as Prisma.InputJsonValue,
-      },
-      update: {
-        lastRunAt: new Date(),
-        positions: snapshot as unknown as Prisma.InputJsonValue,
-        seen: mergedSeen as unknown as Prisma.InputJsonValue,
-      },
-    })
+    // v2.7.2 — the cursor write is the cycle's only commit point; under write
+    // contention (grid engine + alerts supervisor + API traffic share the one
+    // SQLite file) it used to die with a bare "Socket timeout" every so often.
+    // A short retry clears the transient waits; if it STILL fails the cursor
+    // simply doesn't advance and the next cycle re-scans with a wider window
+    // (`seen` dedupes) — the pipeline is self-healing by design.
+    const writeState = {
+      lastRunAt: new Date(),
+      positions: snapshot as unknown as Prisma.InputJsonValue,
+      seen: mergedSeen as unknown as Prisma.InputJsonValue,
+    }
+    let lastErr: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await db.notifyState.upsert({
+          where: { userId_mode: { userId, mode } },
+          create: { userId, mode, ...writeState },
+          update: writeState,
+        })
+        lastErr = null
+        break
+      } catch (err) {
+        lastErr = err
+        if (!isTransientDbError(err) || attempt === 3) break
+        await new Promise((r) => setTimeout(r, 300 * attempt))
+      }
+    }
+    if (lastErr) throw lastErr
   } catch (e) {
     console.warn('[notify] fill-notifier cycle failed:', e instanceof Error ? e.message : e)
   }

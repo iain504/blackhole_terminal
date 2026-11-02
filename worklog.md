@@ -4213,3 +4213,46 @@ Fixes (all in sentiment-engine.ts):
 
 No schema change, no behavior change for reads; the 626-bucket history and
 IC evaluation are unaffected (verified below).
+
+## v2.7.2 — full-server SQLite "Socket timeout" (notifyState.upsert) fix
+
+User report: "Launch Full Server show server unexpected error" + server log
+showing `prisma.notifyState.upsert() · Socket timeout (the database failed to
+respond to a query within the configured timeout)` on the fill-notifier cycle
+(~4.5 min after a clean compose boot; DB 87 MB, 2 (user,mode) pairs resumed,
+grid engine 5s + alerts supervisor 15s + notifier 15s + API traffic all on the
+one SQLite file).
+
+Root cause — a timeout-race between two layers:
+- db.ts sets `PRAGMA busy_timeout=5000`, so SQLite legitimately WAITS up to 5s
+  for the write lock under contention.
+- The production docker-entrypoint rewrites DATABASE_URL to a bare `file:…`
+  URL → Prisma engine defaults applied, including socket_timeout ≈5s — so the
+  engine timeout fired FIRST whenever the busy wait ran long, surfacing as
+  "Socket timeout" instead of a quick, retryable SQLITE_BUSY.
+The fill-notifier pipeline itself is self-healing by design (the cursor only
+advances on a successful upsert; a failed cycle re-scans a wider window next
+tick with `seen` dedupe) — the harm was notification delay + log noise, plus
+any same-moment API request could trip the same engine timeout (likely the
+"unexpected error" the launch UI showed).
+
+Fixes:
+- db.ts: tunedDatabaseUrl() appends `socket_timeout=15` to the SQLite
+  DATABASE_URL at client construction (datasourceUrl override) — dev and the
+  standalone container both pick it up without touching compose/env; the 5s
+  busy wait now has headroom instead of racing a 5s engine timeout.
+- db.ts: new isTransientDbError() — recognises socket-timeout / timed-out /
+  database-locked / SQLITE_BUSY as retryable (message-based, like
+  isDiskFullError, because the connector surfaces these untyped).
+- fill-notifier.ts: the cursor upsert retries up to 3× (300/600ms backoff) on
+  transient errors before giving up; a final failure still just skips the
+  cursor advance and the next cycle self-heals.
+
+Verification: dev reboot with the tuned URL — Prisma accepts the param, boot
+clean, reads + writes verified through the new client (MSFT inline scan → 26
+headlines, 1 bucket, score 0.69; positions route 200), zero
+socket-timeout/prisma-error lines in dev.log; lint clean. Note: the notifier
+only supervises modes WITH Alpaca keys (Task 36/37 mode-strict) — the fresh
+sandbox account has none, so the NotifyState row stays empty here by design;
+the changed write path is exercised on the full server where pairs are
+resumed from existing NotifyState rows at boot.
