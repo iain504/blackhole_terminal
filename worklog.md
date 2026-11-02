@@ -4335,7 +4335,7 @@ removed afterwards; the user's `akin` account untouched. Lint clean.
   Mobile specifics: view wrapper is `flex min-h-0 flex-1 flex-col` (needed for AgentTab's flex-1 root to bite — block wrapper would reproduce the same spill); NAV grew to 8 tabs → 'Watchlist' label shortened to 'Watch' (8×~49px on 390px; truncated at 10px font). Algo/Grid wrappers got the same flex-col hardening (latent spill: AlgoTab measured sh 1945 in ch 758, now properly bounded + internal scroll).
 - E2E (probe_m842, agent-browser): desktop 1440×800 — FSD tab: pre-fix screenshot shows brain/ops cards running under the footer; post-fix geometry + scrolled-to-bottom screenshot clean. Mobile 390×844 — FSD in bottom nav, opens, deep-scroll reaches Fleet operations with nav pinned (bottom=844=vh); Menu row round-trip ✓; 360×740 — zero truncated labels, nav bottom=740. Algo bounded ✓. Probe deleted (users table empty). Lint clean.
 
-## 2026-11-02 ~20:30 — v2.8.3: running-rainbow FSD notification on the bottom bars (`<hash>`, re-stamp `<stamp>`)
+## 2026-11-02 ~20:30 — v2.8.3: running-rainbow FSD notification on the bottom bars (`fb0760f`, re-stamp `6bdbf21`)
 
 - User request: "The running rainbow should also appear at the bottom bar to notify user FSD is running."
 - Design: while the fleet is ENGAGED, the desktop footer AND the mobile bottom nav grow a 3px running-rainbow strip along their top edge (same palette/cadence as the tab's .agent-rainbow-frame halo) — visible from EVERY tab, which is the whole point. Plus: desktop footer gains a pulsing "● FSD" chip that CLICK-NAVIGATES to the autopilot tab (activates it, or adds one if none); the mobile nav's FSD entry goes live (hue-cycling icon + animated gradient label). All disabled under prefers-reduced-motion.
