@@ -28,6 +28,11 @@ export interface AgentSettings {
   // before sizing (RISK_OFF halves the deployable budget) and arm the per-entry
   // regime gate on every fleet run (new longs blocked while RISK_OFF)
   regimeGate: boolean
+  // v2.11.0 — Earnings gate: pull each candidate's next consensus report date
+  // (Yahoo calendarEvents); reports within 5 days dampen the score ×0.85 and
+  // every fleet run arms the per-entry earnings gate (new longs blocked inside
+  // the 2-day pre-report window)
+  earningsGate: boolean
   autoEngage: boolean // engage automatically once budget completes
   flattenOnStop: boolean // disengage flattens the fleet's positions
   mode: 'paper' | 'live' // broker account the fleet trades on
@@ -44,6 +49,7 @@ export const AGENT_SETTINGS_DEFAULTS: AgentSettings = {
   maxTradesDay: 3,
   sentimentWeight: 0.25,
   regimeGate: true,
+  earningsGate: true,
   autoEngage: false,
   flattenOnStop: true,
   mode: 'paper',
@@ -64,6 +70,14 @@ export interface AgentCandidate {
   // (score = scoreBase × (1 + 0.25 × sent); null when never scanned/stale)
   scoreBase?: number | null
   sent?: number | null
+  // v2.11.0 — Earnings awareness: the symbol's next consensus report (Yahoo
+  // calendarEvents) annotated at ranking. earningsFlag 'warn' = inside the 5d
+  // window (score ×0.85), 'block' = inside the 2d window (score ×0.85 AND the
+  // fleet's entry gate refuses new longs through the report). null = crypto
+  // or no trustworthy date (gate fails open).
+  earningsAt?: string | null // ISO instant of the report estimate
+  earningsDays?: number | null // calendar days until the report (0 = today)
+  earningsFlag?: 'warn' | 'block' | null
   netPct: number
   winRate: number
   pf: number

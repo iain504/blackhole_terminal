@@ -303,6 +303,14 @@ model AlgoRun {
   // crypto is exempt (its own 24/7 tape). UNKNOWN/stale regime fails open.
   // Armed by the autopilot on every fleet run; standalone Algo runs default off.
   regimeGate   Boolean   @default(false)
+  // v2.11.0 — Earnings gate: the one calendar event a backtest can never see.
+  // While the symbol's next consensus report (Yahoo calendarEvents) sits
+  // inside the 2-day pre-report window (through the report day itself), the
+  // engine blocks NEW LONG entries — a report re-prices a stock in a single
+  // gap. Shorts/inverse setups stay live, crypto is exempt (no earnings) and
+  // a missing/failed date FAILS OPEN. Armed by the autopilot; standalone
+  // Algo runs default off.
+  earningsGate Boolean   @default(false)
   // 'running' | 'stopped'
   status       String    @default("running")
   state        Json?

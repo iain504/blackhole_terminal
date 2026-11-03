@@ -27,6 +27,7 @@ import { TIMEFRAMES, isCryptoSymbol, type Bar, type Timeframe } from '@/lib/mark
 import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
 import { sentimentForSymbol, refreshSymbolSentiment, STALE_MS } from '@/lib/sentiment-engine'
 import { getRegimeSnapshot } from '@/lib/regime-engine'
+import { getEarningsEvent, earningsLabel } from '@/lib/earnings'
 import { isAlgoStrategyId, normalizeAlgoParams, strategyLane, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 // v2.3.0 — swing lane live unlock: the HTF ladder evaluated from the closed-bar
 // window every cycle (see swing-eval.ts for the parity contract with the
@@ -97,6 +98,10 @@ interface AlgoRunRow {
   kronosGate: boolean
   // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
   sentimentGate: boolean
+  // v2.10.0 — US-tape regime gate (new longs blocked while RISK_OFF)
+  regimeGate: boolean
+  // v2.11.0 — Earnings gate (new longs blocked inside the pre-report window)
+  earningsGate: boolean
   status: string
   state: unknown
 }
@@ -854,6 +859,10 @@ async function cycle(runId: string) {
           // v2.10.0 — the US-tape regime gate; the helper journaled the reason
           // (RISK_OFF tape blocks NEW LONGS on non-crypto runs — shorts/inverse
           // setups stay live, crypto rides its own tape, UNKNOWN fails open)
+        } else if (run.earningsGate && !(await earningsEntryOk(runId, run, res.entry.side, bars[lastClosedIdx].time, log))) {
+          // v2.11.0 — the earnings gate; the helper journaled the reason
+          // (BUY refused inside the 2-day pre-report window — shorts/inverse
+          // setups stay live, crypto has no earnings, unknown dates fail open)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
           // resolve % legs — and Risk-Money sizing — against the live quote.
@@ -1271,6 +1280,54 @@ async function regimeEntryOk(
   return false
 }
 
+// ---------------------------------------------------------------------------
+// v2.11.0 — Earnings entry gate (run.earningsGate). The one calendar event a
+// backtest can never see: an earnings report re-prices a stock in a single
+// overnight gap no stop-loss can bridge. While the symbol's next consensus
+// report (Yahoo calendarEvents, cached server-side) sits inside the 2-day
+// pre-report window — through the report day itself, BMO or AMC — NEW LONG
+// entries are refused. Shorts/inverse setups stay live (post-report drift is
+// theirs to take), crypto runs are exempt (no earnings calendar), and a
+// missing/failed date FAILS OPEN — a calendar gap must never brick trading,
+// same discipline as the sentiment + regime gates. The date cache (12h/3h
+// TTL + single-flight) makes this near-free on the 15s cycle.
+// ---------------------------------------------------------------------------
+const earningsLogMemo = new Map<string, { block?: number; none?: number }>()
+
+async function earningsEntryOk(
+  runId: string,
+  run: AlgoRunRow,
+  side: 'buy' | 'sell',
+  barTime: number,
+  log: (runId: string, userId: string, level: 'info' | 'signal' | 'trade' | 'error', message: string) => Promise<void>,
+): Promise<boolean> {
+  if (isCryptoSymbol(run.symbol)) return true // crypto has no earnings calendar
+  // gap risk is long-side: a pre-report short is a deliberate play, not a trap
+  if (side !== 'buy') return true
+  const memo = earningsLogMemo.get(runId) ?? {}
+  earningsLogMemo.set(runId, memo)
+  let ev: Awaited<ReturnType<typeof getEarningsEvent>> | null = null
+  try {
+    ev = await getEarningsEvent(run.symbol)
+  } catch {
+    ev = null // read hiccup → pass, never brick trading on the gate path
+  }
+  if (!ev || !ev.known) {
+    if (memo.none !== barTime) {
+      await log(runId, run.userId, 'info', `Earnings gate: no earnings date for ${run.symbol} — entry allowed (gate fails open)`)
+      memo.none = barTime
+    }
+    return true
+  }
+  if (!ev.inBlock) return true // outside the window — stand down silently
+  if (memo.block !== barTime) {
+    await log(runId, run.userId, 'info',
+      `Signal suppressed (earnings gate): BUY — ${run.symbol} reports ${earningsLabel(ev.daysAway)} (est. ${new Date(ev.atMs ?? 0).toISOString().slice(0, 10)}); new longs pause through the report — already-open positions ride with their stops`)
+    memo.block = barTime
+  }
+  return false
+}
+
 /** Create a run row (and start its engine — unless `opts.autostart === false`,
  *  Task 79: importing a STOPPED config creates the run paused so trading only
  *  begins when the user explicitly presses Start). */
@@ -1312,6 +1369,9 @@ export async function startAlgoRun(cfg: {
   // v2.10.0 — US-tape regime gate (new longs blocked while RISK_OFF). Optional:
   // only the autopilot arms it; standalone Algo runs default off.
   regimeGate?: boolean
+  // v2.11.0 — earnings gate (new longs blocked inside the 2-day pre-report
+  // window). Optional: only the autopilot arms it; standalone runs default off.
+  earningsGate?: boolean
 }, opts?: { autostart?: boolean }) {
   const autostart = opts?.autostart !== false
   const run = await db.algoRun.create({
@@ -1347,6 +1407,7 @@ export async function startAlgoRun(cfg: {
       kronosGate: cfg.kronosGate === true,
       sentimentGate: cfg.sentimentGate === true,
       regimeGate: cfg.regimeGate === true,
+      earningsGate: cfg.earningsGate === true,
       status: autostart ? 'running' : 'stopped',
       ...(autostart ? {} : { stoppedAt: new Date() }),
       state: {} as unknown as object,
@@ -1356,7 +1417,7 @@ export async function startAlgoRun(cfg: {
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', autostart
-    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.regimeGate ? ' · regime gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.regimeGate ? ' · regime gate' : ''}${cfg.earningsGate ? ' · earnings gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
     : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.regimeGate ? ' · regime gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
   if (autostart) startEngine(run.id)
   return run
@@ -1402,6 +1463,8 @@ export interface AlgoRunConfigPatch {
   sentimentGate: boolean
   // v2.10.0 — optional: absent = leave the stored value untouched
   regimeGate?: boolean
+  // v2.11.0 — optional: absent = leave the stored value untouched
+  earningsGate?: boolean
 }
 
 export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPatch) {
@@ -1484,6 +1547,7 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
   if (run.requireNewSignal !== patch.requireNewSignal) diffs.push(`fresh-signal ${run.requireNewSignal ? 'ON' : 'OFF'} → ${patch.requireNewSignal ? 'ON' : 'OFF'}`)
   if (run.kronosGate !== patch.kronosGate) diffs.push(`Kronos AI gate ${run.kronosGate ? 'ON' : 'OFF'} → ${patch.kronosGate ? 'ON' : 'OFF'}`)
   if (run.sentimentGate !== patch.sentimentGate) diffs.push(`sentiment gate ${run.sentimentGate ? 'ON' : 'OFF'} → ${patch.sentimentGate ? 'ON' : 'OFF'}`)
+  if (patch.earningsGate !== undefined && run.earningsGate !== patch.earningsGate) diffs.push(`earnings gate ${run.earningsGate ? 'ON' : 'OFF'} → ${patch.earningsGate ? 'ON' : 'OFF'}`)
   for (const k of Object.keys(nextParams)) {
     if (prevParams[k] !== nextParams[k]) diffs.push(`${k} ${prevParams[k]} → ${nextParams[k]}`)
   }
@@ -1522,6 +1586,8 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       // field (the Algo settings dialog sends a full patch without it; only an
       // explicit true/false moves it, e.g. a future UI toggle or config import)
       ...(patch.regimeGate === undefined ? {} : { regimeGate: patch.regimeGate === true }),
+      // v2.11.0 — same clobber-protection for the earnings gate
+      ...(patch.earningsGate === undefined ? {} : { earningsGate: patch.earningsGate === true }),
       state: st as unknown as object,
     },
   })

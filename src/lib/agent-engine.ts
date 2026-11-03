@@ -38,6 +38,9 @@ import { startAlgoRun, stopAlgoRun, ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-eng
 import { getSentimentSummary, topUpSentiment, startFleetSentimentRefresher } from '@/lib/sentiment-engine'
 import { getRegimeSnapshot } from '@/lib/regime-engine'
 import type { RegimeSnapshot } from '@/lib/regime-types'
+import {
+  getEarningsBatch, earningsLabel, EARNINGS_BLOCK_DAYS, EARNINGS_WARN_DAYS, EARNINGS_SCORE_MULT,
+} from '@/lib/earnings'
 import { costsFor } from '@/lib/algo-reco'
 import { agentUniverse, AGENT_US_100 } from '@/lib/agent-universe'
 import {
@@ -535,6 +538,50 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
       await ev(sessionId, userId, 'warn', 'Sentiment blend skipped (engine unavailable) — ranking on pure backtest scores.')
     }
 
+    // ---------------- phase 3.2 — EARNINGS AWARENESS (v2.11.0) ----------------
+    // The one calendar event a backtest can never see: an earnings report
+    // re-prices a stock in a single overnight gap no stop-loss can bridge.
+    // When the gate is armed, every board symbol's next consensus report date
+    // (Yahoo calendarEvents — cached 12h/3h + single-flight) is pulled and
+    // annotated onto the row:
+    //   • within 5d  → score × 0.85 (de-ranks, does not delete — the setup may
+    //     still be the best thing on the board)
+    //   • within 2d  → the fleet's per-entry earnings gate will refuse NEW
+    //     longs through the report day (already-open positions ride through)
+    // Crypto has no calendar and a missing/failed date fails open — no data,
+    // no dampening. The annotation travels with the session, so the score
+    // board shows an E·Nd badge and ENGAGE journals the calendar risk.
+    if (settings.earningsGate) {
+      try {
+        await touch({ phase: 'EARNINGS', progress: 0.81, stats })
+        const board = candidates.slice(0, 40)
+        const evBy = await getEarningsBatch(board.map((c) => c.symbol))
+        const flagged: string[] = []
+        for (const c of board) {
+          const evItem = evBy.get(c.symbol.toUpperCase())
+          if (!evItem || !evItem.known) continue
+          c.earningsAt = new Date(evItem.atMs as number).toISOString()
+          c.earningsDays = evItem.daysAway
+          if (!evItem.inWarn) {
+            c.earningsFlag = null
+            continue
+          }
+          c.earningsFlag = evItem.inBlock ? 'block' : 'warn'
+          c.score = Math.round(c.score * EARNINGS_SCORE_MULT * 1000) / 1000
+          flagged.push(`${c.symbol} ${earningsLabel(evItem.daysAway)}${evItem.inBlock ? ' · gated' : ''}`)
+        }
+        if (flagged.length > 0) {
+          await ev(sessionId, userId, 'rank',
+            `Earnings scan — ${flagged.length}/${board.length} setups report within ${EARNINGS_WARN_DAYS}d: ${flagged.slice(0, 5).join(' · ')}${flagged.length > 5 ? ` · +${flagged.length - 5} more` : ''} — scores ×${EARNINGS_SCORE_MULT}, new longs pause inside the ${EARNINGS_BLOCK_DAYS}-day report window`)
+        } else {
+          await ev(sessionId, userId, 'info',
+            `Earnings scan — 0/${board.length} setups report within ${EARNINGS_WARN_DAYS}d; the entry earnings gate stays quiet (and fails open when a date is unknown).`)
+        }
+      } catch {
+        await ev(sessionId, userId, 'warn', 'Earnings scan skipped (calendar unavailable) — no dampening applied, the entry gate will fail open.')
+      }
+    }
+
     candidates.sort((a, b) => {
       const ao = a.oosNetPct != null && a.oosNetPct > 0 ? 1 : 0
       const bo = b.oosNetPct != null && b.oosNetPct > 0 ? 1 : 0
@@ -722,6 +769,8 @@ export async function startAgentScan(userId: string, rawSettings: Partial<AgentS
   settings.sentimentWeight = Math.min(1, Math.max(0, Number.isFinite(settings.sentimentWeight) ? settings.sentimentWeight : 0.25))
   // v2.10.0 — the US-tape regime gate is armed by default (opt-OUT)
   settings.regimeGate = settings.regimeGate !== false
+  // v2.11.0 — the earnings gate is armed by default (opt-OUT)
+  settings.earningsGate = settings.earningsGate !== false
   settings.mode = settings.mode === 'live' ? 'live' : 'paper'
 
   const session = await db.agentSession.create({
@@ -790,6 +839,18 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
     } catch { /* regime is advisory here — the entry gate fails open */ }
   }
 
+  // v2.11.0 — journal the calendar risk the board already priced in: a slot
+  // inside the warn window gets one line (watch the gap if a fill lands the
+  // day before); inside the block window the per-entry earnings gate will
+  // hold its BUYs until the report passes.
+  if (settings.earningsGate !== false) {
+    const flagged = selected.filter((c) => c.earningsFlag === 'block' || c.earningsFlag === 'warn')
+    for (const c of flagged.slice(0, 6)) {
+      await ev(sessionId, userId, 'warn',
+        `${c.symbol} — ${earningsLabel(c.earningsDays)} (est. ${c.earningsAt ? c.earningsAt.slice(0, 10) : 'date unknown'})${c.earningsFlag === 'block' ? ' · the earnings gate pauses new BUYs through the report' : ' · a fill here rides INTO the report — gap risk owned by the stop'}`)
+    }
+  }
+
   const running = await db.algoRun.count({ where: { userId, status: 'running' } })
   let slots = Math.max(0, ALGO_MAX_RUNNING_RUNS - running)
   let started = 0
@@ -834,6 +895,9 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
         // v2.10.0 — and the US-tape regime gate (opt-out in mission parameters):
         // new longs are refused while SPY/QQQ/UVXY read risk-off
         regimeGate: settings.regimeGate !== false,
+        // v2.11.0 — and the earnings gate (opt-out in mission parameters):
+        // new longs are refused inside the 2-day pre-report window
+        earningsGate: settings.earningsGate !== false,
       }, { autostart: true })
       c.runId = run.id
       slots--
@@ -911,6 +975,8 @@ export async function updateAgentSettings(userId: string, sessionId: string, pat
   // v2.10.0 — regime gate armed by default (opt-out); a manual re-size also
   // re-reads the tape so the deployable multiplier tracks the CURRENT regime
   settings.regimeGate = settings.regimeGate !== false
+  // v2.11.0 — earnings gate armed by default (opt-out)
+  settings.earningsGate = settings.earningsGate !== false
   let regimeMult = 1
   if (settings.regimeGate) {
     try {

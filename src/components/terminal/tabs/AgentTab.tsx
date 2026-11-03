@@ -31,7 +31,7 @@ import { useToast } from '@/hooks/use-toast'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
   Activity, TrendingUp, Crosshair, Gauge, CircleDollarSign, Zap, Globe2,
-  TriangleAlert, HardDrive, ShieldCheck, CircleHelp,
+  TriangleAlert, HardDrive, ShieldCheck, CircleHelp, CalendarClock,
 } from 'lucide-react'
 
 // v2.7.5 — which broker lanes the account can actually ENGAGE with. The
@@ -485,6 +485,13 @@ export default function AgentTab() {
                 <Switch checked={settings.regimeGate !== false} onCheckedChange={(v) => setS({ regimeGate: v })} />
                 <ShieldCheck className="h-3.5 w-3.5 text-emerald-300" /> US regime gate
               </label>
+              <label
+                className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300"
+                title="Pulls each candidate's next earnings date (Yahoo consensus): a report within 5 days dampens the score ×0.85, and fleet entries refuse NEW longs inside the 2-day pre-report window (crypto exempt, unknown dates fail open)."
+              >
+                <Switch checked={settings.earningsGate !== false} onCheckedChange={(v) => setS({ earningsGate: v })} />
+                <CalendarClock className="h-3.5 w-3.5 text-amber-300" /> Earnings gate
+              </label>
             </div>
             <div className="flex flex-wrap items-end gap-x-4 gap-y-2 pb-1">
               <label
@@ -799,6 +806,21 @@ export default function AgentTab() {
                       <td className="px-3 py-1.5 font-bold text-zinc-100">
                         {c.symbol}
                         {c.isCrypto && <Badge variant="outline" className="ml-1 h-3.5 border-amber-600/40 px-1 text-[8px] text-amber-300">C</Badge>}
+                        {/* v2.11.0 — earnings calendar risk: E·Nd badge when the
+                            next consensus report sits inside the warn (5d) or
+                            block (2d) window; the full story is in the title */}
+                        {c.earningsFlag && c.earningsDays != null && (
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              'ml-1 h-3.5 px-1 text-[8px] font-bold',
+                              c.earningsFlag === 'block' ? 'border-rose-500/50 text-rose-300' : 'border-amber-600/40 text-amber-300',
+                            )}
+                            title={`Reports earnings ${c.earningsAt ? c.earningsAt.slice(0, 10) : 'soon'} (est.) — score damped ×0.85 inside the 5-day window;${c.earningsFlag === 'block' ? ' inside the 2-day window the fleet\'s earnings gate also REFUSES new longs through the report.' : ' the entry gate arms only inside 2 days.'}`}
+                          >
+                            E·{c.earningsDays}d
+                          </Badge>
+                        )}
                       </td>
                       <td className="px-3 py-1.5 text-zinc-400">{(c.tf ?? '?').toUpperCase()}</td>
                       <td className="px-3 py-1.5 text-zinc-300">
