@@ -34,10 +34,11 @@ export async function POST(req: Request) {
     if (password.length < 8) {
       return NextResponse.json({ error: 'Password must be at least 8 characters' }, { status: 400 })
     }
-    // First-run bootstrap (Task 9-j) folded into the shared gate (Task 9-k):
-    // open when ALLOW_REGISTRATION=true, or while the user table is empty so a
-    // sanitized publish reset can always create its FIRST account. Rate
-    // limiting above caps abuse of the bootstrap window.
+    // First-run bootstrap (Task 9-j, restored v2.11.1) lives INSIDE the shared
+    // gate: open when ALLOW_REGISTRATION=true, or while the user table is
+    // empty so a fresh deployment / sanitized publish reset can always create
+    // its FIRST account. Rate limiting above caps abuse of the bootstrap
+    // window; it shuts forever once one account exists.
     if (!(await registrationOpen())) {
       log.warn('auth_register_rejected', { ip, reason: 'closed' })
       return NextResponse.json({ error: 'Registration is disabled' }, { status: 403 })
