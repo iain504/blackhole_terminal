@@ -22,9 +22,11 @@ BLACKHOLE Terminal is a full trading workstation you can run on your own machine
 - **Watchlists, quotes and news** side panels
 - **Order entry** with brackets / OCO / OTO and stop-loss management against **Alpaca** (paper trading recommended)
 - **An algo engine** that runs your strategy rules live (start / stop / per-run settings) with Telegram fill notifications
+- **FSD Autopilot (智慧體)** — one-click fleet scanner that backtests your strategies across a watchlist, ranks the survivors and engages the best ones as a managed fleet; runs are resumable, abortable, disk-pressure aware, and ship a storage manager (per-table usage + purge + VACUUM with pre-flight disk checks). Visible from any tab via the running-rainbow footer indicator; full tab on desktop **and** mobile
 - **Backtesting** — single runs, parameter optimization and "test all strategies" sweeps, plus watchlist-driven *Recommended Setups*
 - **Economic calendar with alarms, heat map, positions, strategy orders and a report tab**
 - **Real-time streaming** for crypto (Binance, keyless) and US equities (Alpaca), multiplexed over a single websocket per account
+- **An interactive landing page** — three.js bright-sky scene with a flying roadster (drag to orbit, click to boost) and a **real Binance BTC/USD chart** (public keyless klines, 1H–1W, cached server-side with an honest fallback badge)
 
 Everything is stored locally in a single SQLite file. No cloud, no telemetry, no fabricated prices — symbols without a live upstream simply don't stream.
 
@@ -230,6 +232,15 @@ docker compose up -d --build
 
 Two services, both `restart: unless-stopped`, health-checked, and the **stream sidecar auto-starts** with the stack: `app` on **:3000** (SQLite bind-mounted at `./db`) and `stream` on **:3030** (socket.io). Secrets are read from the repo-root `.env` (`AUTH_SECRET` / `APP_ENCRYPTION_SECRET` are required). Schema is applied on every boot by the entrypoint's `prisma db push` — set `DB_PUSH_ACCEPT_DATA_LOSS=1` only if you knowingly ship destructive schema changes.
 
+**Clean the build cache after every rebuild** — BuildKit layer cache accumulates forever, and it is the #1 disk hog on a rebuild-heavy host (15.48 GB of cache was measured next to 3.7 GB of actual images). One command after each build:
+
+```bash
+scripts/docker-clean-cache.sh          # prune build cache, keep the newest 2 GB
+scripts/docker-clean-cache.sh full     # drop it all (images/containers/volumes kept)
+```
+
+Set-and-forget alternative: a GC policy in `/etc/docker/daemon.json` → `{"builder":{"gc":{"enabled":true,"defaultKeepStorage":"2GB"}}}` + `systemctl restart docker`. See also `docs/PRODUCTION_CHECKLIST.md` §3b for the full "Docker ate 20 GB" runbook (container json logs, Docker.raw/ext4.vhdx compaction).
+
 > **Troubleshooting — `Module not found: Can't resolve '@/lib/auth'` (or similar `@/lib/...` imports) during the image build**: your local copy of the repository is incomplete — typically a stale ZIP downloaded before the latest commits, a partially extracted archive, or a subset of folders copied out of it. Verify `src/lib` exists in the folder you build from (`ls src/lib` — ~48 files), then re-download the **current** ZIP from GitHub (green **Code** button → **Download ZIP**) or `git clone https://github.com/iain504/blackhole_terminal.git` (username + a PAT as the password), and run `docker compose up -d --build` from the repo root (the folder that contains `docker-compose.yml`). The Dockerfile fails fast with this exact diagnosis when the build context is missing `src/lib`.
 
 ### Option B — Render.com (free tier)
@@ -294,6 +305,7 @@ Then `systemctl enable --now blackhole blackhole-stream` and put Caddy/nginx in 
 | `bun run db:push` | Apply `prisma/schema.prisma` to the SQLite file |
 | `bun run db:generate` | Regenerate the Prisma client |
 | `bun run lint` | ESLint (API routes enforce extra strictness: no implicit `any`) |
+| `scripts/docker-clean-cache.sh` | Prune Docker **build cache** only (images/containers/volumes kept) — run after every rebuild |
 | `bun scripts/rotate-secrets.mjs --auth` / `--encryption` / `--all` | Rotate secrets — re-encrypts every stored credential, updates `.env` + DB master row (`--dry-run` to preview) |
 
 ## Troubleshooting
@@ -304,6 +316,7 @@ Then `systemctl enable --now blackhole blackhole-stream` and put Caddy/nginx in 
 - **SQLite file created in the wrong place** → `DATABASE_URL` must be an absolute `file:` path (see Quick start).
 - **Heavy backtest sweeps on a small VPS** → sweeps are heap-guarded and will return a polite *503 / retry* rather than die; give the Node process ~2 GB (`NODE_OPTIONS=--max-old-space-size=1800`) for comfortable use. Recommended-setups refresh sweeps **your watchlist** (max 10 symbols × 3 timeframes).
 - **Port 3000 busy** → `PORT=3001 bun run dev` won't help the dev script (it pins 3000); stop the other process or edit `package.json`.
+- **Docker "created" a 20 GB file / disk full on the host** → 99% of the time it is BuildKit build cache, the container's json stdout log, or the Docker VM disk image (which never shrinks from inside). Diagnose + fix: `docs/PRODUCTION_CHECKLIST.md` §3b; the in-app FSD → Server storage card handles the database side (purges + pre-flight-checked VACUUM).
 
 ## Security notes
 

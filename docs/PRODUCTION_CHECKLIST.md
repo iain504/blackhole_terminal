@@ -63,6 +63,7 @@ The in-app **Server storage → Reclaim space (VACUUM)** only rebuilds `custom.d
 
 - [ ] `bun run build` — standalone output (`.next/standalone` + static/public copy); `bun run start` — serves it (`PORT` env to override). systemd unit pair in the README.
 - [ ] Or Docker Compose: `docker compose up -d --build`. Services: `app` on :3000 (volume `./db:/app/db`), `stream` (socket.io sidecar from `mini-services/stream-service`) on :3030; both `restart: unless-stopped`. Stream auto-starts with compose — **intentional** (per review) so the health `stream: up` check works out of the box.
+- [ ] **After EVERY build, clean the build cache** — `scripts/docker-clean-cache.sh` (v2.9.0). Every `--build` leaves BuildKit layer cache that accumulates forever: **15.48 GB** of build cache was measured on a host whose active images totalled just 3.7 GB (db volume 39 MB). The script prunes cache only — images, containers and volumes are kept (`docker builder prune -f --keep-storage=2gb`; pass `full` to drop everything). Set-and-forget alternative: a GC policy in `/etc/docker/daemon.json` → `{"builder":{"gc":{"enabled":true,"defaultKeepStorage":"2GB"}}}`.
 
 ## 5. Reverse proxy
 

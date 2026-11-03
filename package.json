@@ -1,6 +1,6 @@
 {
   "name": "blackhole_terminal",
-  "version": "2.8.4",
+  "version": "2.9.0",
   "private": true,
   "scripts": {
     "predev": "bun scripts/stamp-version.mjs",
@@ -67,6 +67,7 @@
     "sonner": "^2.0.6",
     "tailwind-merge": "^3.3.1",
     "tailwindcss-animate": "^1.0.7",
+    "three": "^0.187.0",
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.18",
     "zod": "^4.0.2",
@@ -77,6 +78,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/three": "^0.187.0",
     "eslint": "^9",
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",

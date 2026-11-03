@@ -1,13 +1,28 @@
 'use client'
 
-// BLACKHOLE Terminal landing page — dark hero, live ticker strip, stats, status bar.
-// Reference style: blackhole art + candlesticks, blue CTA, subtle grid background.
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import Image from 'next/image'
+// BLACKHOLE Terminal landing page — v2.9.0: interactive three.js hero (bright
+// sky + flying roadster), live ticker strip, REAL Binance BTC/USD chart
+// section, stats, status bar. The 3D scene is client-only (dynamic, ssr:false).
+import { useCallback, useEffect, useState } from 'react'
+import dynamic from 'next/dynamic'
 import { motion } from 'framer-motion'
 import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'
 import { useIsClient, useUiTheme } from '@/lib/ui-theme'
 import { APP_VERSION } from '@/generated/version'
+import { BtcChart } from './BtcChart'
+
+// three.js is heavy and WebGL needs the real DOM — load it client-side only,
+// with a bright-sky gradient placeholder so the panel never flashes dark.
+const SkyScene = dynamic(() => import('./SkyScene'), {
+  ssr: false,
+  loading: () => (
+    <div
+      aria-hidden
+      className="h-full w-full animate-pulse"
+      style={{ background: 'linear-gradient(to top, #dff0fd 0%, #8ec3ee 45%, #2f7fd4 100%)' }}
+    />
+  ),
+})
 
 interface TickerState {
   symbol: string
@@ -44,6 +59,10 @@ export function LandingPage({ onLaunch }: { onLaunch: () => void }) {
         <NavBar onLaunch={onLaunch} onLatency={onLatency} christmas={christmas} />
         <main className="flex-1">
           <Hero onLaunch={onLaunch} christmas={christmas} />
+          {/* v2.9.0 — REAL Binance BTC/USD chart (public keyless feed) */}
+          <section id="markets" className="mx-auto w-full max-w-[1400px] scroll-mt-20 px-4 pb-14 sm:px-6 lg:px-10">
+            <BtcChart />
+          </section>
         </main>
         <StatusBar latency={latency} />
       </div>
@@ -246,38 +265,76 @@ function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolea
           </a>
         </div>
 
-        <dl id="markets" className="mt-12 grid max-w-lg grid-cols-3 gap-6 sm:gap-10">
+        <dl className="mt-12 grid max-w-lg grid-cols-3 gap-6 sm:gap-10">
           <Stat label="24h Volume" value="$2.1B" />
           <Stat label="Active Traders" value="12.4k" />
           <Stat label="Open Interest" value="$540M" />
         </dl>
       </motion.div>
 
-      {/* right — hero art */}
+      {/* right — v2.9.0 hero art: interactive three.js bright sky + flying car
+          (replaces the static black-hole render; live BTC chip stays) */}
       <motion.div
         initial={{ opacity: 0, scale: 0.985 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.6, ease: 'easeOut', delay: 0.08 }}
-        className="relative aspect-[7/4] w-full overflow-hidden rounded-xl border border-white/10 bg-zinc-900 shadow-2xl shadow-black/60"
+        className="relative aspect-[7/5] w-full overflow-hidden rounded-xl border border-white/10 bg-gradient-to-b from-sky-300 to-sky-600 shadow-2xl shadow-black/60 lg:aspect-[7/4]"
       >
-        <Image
-          src="/hero-blackhole.png"
-          alt="Black hole with orange accretion swirl, blue gravitational grid and candlestick chart"
-          fill
-          priority
-          sizes="(max-width: 1024px) 100vw, 55vw"
-          className="object-cover"
-        />
-        {/* mini chart overlay card */}
-        <div className="absolute bottom-3 right-3 rounded-lg border border-white/10 bg-zinc-950/85 px-3 py-2 backdrop-blur-sm sm:bottom-4 sm:right-4">
-          <div className="flex items-center gap-1.5 text-[11px] leading-none">
-            <span className="font-semibold text-orange-400">BTC/USD</span>
-            <span className="text-zinc-500">• 1m • Vol 1.24K</span>
-          </div>
-          <MiniSparkline />
-        </div>
+        <SkyScene />
+        <LiveBtcChip />
       </motion.div>
     </section>
+  )
+}
+
+/* ------------------------------- live btc chip --------------------------- */
+
+// Small real-price badge over the 3D panel — same public route as the big
+// chart, lighter payload (50 × 1h candles), 45s cadence, tab-hidden safe.
+function LiveBtcChip() {
+  const [s, setS] = useState<{ price: number; changePct: number } | null>(null)
+  useEffect(() => {
+    let alive = true
+    const go = async () => {
+      try {
+        const res = await fetch('/api/landing/btc?tf=1h&limit=50', { cache: 'no-store' })
+        if (!res.ok || !alive) return
+        const j = (await res.json()) as { price?: number; changePct?: number }
+        if (alive && Number.isFinite(j.price)) setS({ price: j.price as number, changePct: j.changePct ?? 0 })
+      } catch {
+        /* keep last value */
+      }
+    }
+    void go()
+    const t = setInterval(() => {
+      if (!document.hidden) void go()
+    }, 45_000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [])
+  const up = (s?.changePct ?? 0) >= 0
+  return (
+    <div className="absolute bottom-3 right-3 rounded-lg border border-white/20 bg-black/45 px-3 py-2 backdrop-blur-md">
+      <div className="flex items-center gap-1.5 text-[10px] leading-none text-zinc-300">
+        <span className="relative flex h-1.5 w-1.5" aria-hidden>
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+        </span>
+        <span className="font-semibold text-white">BTC/USD</span>
+        <span className="text-zinc-400">· Binance live</span>
+      </div>
+      <div className="mt-1 font-mono text-sm font-bold tabular-nums text-white">
+        {s ? `$${s.price.toLocaleString('en-US', { maximumFractionDigits: 0 })}` : '—'}
+        {s && (
+          <span className={`ml-1.5 text-[11px] font-semibold ${up ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {up ? '+' : ''}
+            {s.changePct.toFixed(2)}%
+          </span>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -292,6 +349,9 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 /* ------------------------------ mini sparkline ---------------------------- */
 
+// v2.9.0 — MiniSparkline (fake seeded candles) retired: the hero panel is the
+// three.js sky scene now and the REAL Binance chart lives in #markets below.
+// mulberry32 stays — Snowfall still needs its seeded RNG.
 function mulberry32(seed: number) {
   return () => {
     seed |= 0
@@ -300,44 +360,6 @@ function mulberry32(seed: number) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
-}
-
-function MiniSparkline() {
-  const candles = useMemo(() => {
-    const rnd = mulberry32(20240613)
-    const out: { o: number; c: number; h: number; l: number }[] = []
-    let price = 20
-    for (let i = 0; i < 30; i++) {
-      const drift = i > 20 ? 1.1 : 0.15
-      const o = price
-      const c = Math.max(4, Math.min(40, o + (rnd() - 0.42) * 5 + drift))
-      const h = Math.max(o, c) + rnd() * 2.2
-      const l = Math.min(o, c) - rnd() * 2.2
-      out.push({ o, c, h: Math.min(42, h), l: Math.max(1, l) })
-      price = c
-    }
-    return out
-  }, [])
-
-  const w = 132
-  const step = w / candles.length
-  return (
-    <svg width={w} height={40} viewBox={`0 0 ${w} 40`} className="mt-1.5 block" aria-hidden>
-      {candles.map((k, i) => {
-        const x = i * step + step / 2
-        const up = k.c >= k.o
-        const color = up ? '#fb923c' : '#3b82f6'
-        const top = Math.min(k.o, k.c)
-        const h = Math.max(1.4, Math.abs(k.c - k.o))
-        return (
-          <g key={i}>
-            <line x1={x} y1={40 - k.h} x2={x} y2={40 - k.l} stroke={color} strokeWidth={0.8} opacity={0.75} />
-            <rect x={x - step * 0.3} y={40 - top - h} width={step * 0.6} height={h} fill={color} rx={0.5} />
-          </g>
-        )
-      })}
-    </svg>
-  )
 }
 
 /* -------------------------------- status bar ------------------------------ */
