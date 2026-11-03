@@ -10,6 +10,10 @@ import { ExternalLink, Newspaper } from 'lucide-react'
 export function NewsPanel({ symbol }: { symbol: string }) {
   const [scope, setScope] = useState<'symbol' | 'all'>('symbol')
   const [data, setData] = useState<{ key: string; news: NewsItem[] }>({ key: '', news: [] })
+  // v2.11.2 — honest failure: a failed fetch (offline blip, 401, 5xx) used to
+  // leave the panel on "Loading news…" forever; surface it + offer a retry.
+  const [failed, setFailed] = useState(false)
+  const [retryTick, setRetryTick] = useState(0)
   const key = `${symbol}|${scope}`
   const loading = data.key !== key
 
@@ -19,12 +23,19 @@ export function NewsPanel({ symbol }: { symbol: string }) {
       try {
         const q = scope === 'symbol' ? `symbol=${encodeURIComponent(symbol)}` : 'symbol=ALL'
         const res = await fetch(`/api/market/news?${q}&limit=30`)
-        if (!res.ok || !alive) return
+        if (!alive) return
+        if (!res.ok) {
+          setFailed(true)
+          return
+        }
         const json = await res.json()
         if (alive) {
+          setFailed(false)
           setData({ key, news: (json.news as NewsItem[]) || [] })
         }
-      } catch { /* offline */ }
+      } catch {
+        if (alive) setFailed(true)
+      }
     }
     fetchNews()
     const timer = setInterval(fetchNews, 60000)
@@ -32,7 +43,7 @@ export function NewsPanel({ symbol }: { symbol: string }) {
       alive = false
       clearInterval(timer)
     }
-  }, [key, scope, symbol])
+  }, [key, scope, symbol, retryTick])
 
   const news = data.news
 
@@ -58,15 +69,30 @@ export function NewsPanel({ symbol }: { symbol: string }) {
         ))}
       </div>
       <div className="min-h-0">
-        {loading && <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Loading news…</p>}
+        {loading && failed && (
+          <div className="px-2 py-6 text-center text-[11px] text-zinc-500">
+            <Newspaper className="mx-auto mb-1 h-4 w-4" />
+            Couldn&apos;t load news for <span className="text-zinc-300">{scope === 'symbol' ? symbol : 'all markets'}</span>.
+            <button
+              onClick={() => setRetryTick((t) => t + 1)}
+              className="ml-1.5 rounded border border-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-300 transition-colors hover:bg-zinc-800"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+        {loading && !failed && <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Loading news…</p>}
         {!loading && news.length === 0 && (
           <div className="px-2 py-6 text-center text-[11px] text-zinc-500">
             <Newspaper className="mx-auto mb-1 h-4 w-4" />
             No news found
           </div>
         )}
-        {/* single column: one card per row */}
-        <ul className="divide-y divide-zinc-800/50">
+        {/* v2.11.2 — gate the list on the loaded key: while a new symbol/scope
+            is loading (or failed) the PREVIOUS pair's list must not stay
+            visible underneath — same discipline as the Sentiment panel. */}
+        {!loading && (
+          <ul className="divide-y divide-zinc-800/50">
           {news.map((n) => (
             <li key={n.id}>
               <a
@@ -99,7 +125,8 @@ export function NewsPanel({ symbol }: { symbol: string }) {
               </a>
             </li>
           ))}
-        </ul>
+          </ul>
+        )}
       </div>
     </div>
   )

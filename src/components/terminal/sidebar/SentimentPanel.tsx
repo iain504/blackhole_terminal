@@ -10,6 +10,14 @@
 //   AGENT_US_100 + crypto majors), strongest sentiment first.
 // A rescan button drives POST /api/sentiment {action:'scan'} — a single
 // symbol scores inline (~seconds), the full universe sweeps in background.
+// v2.11.2 — focus-sync honesty: the header chips follow the focused pane
+// instantly, but the body states (summary/history/headlines) are fetched.
+// On a latency-bearing server an in-flight response for the OLD symbol (60s
+// poll tick, 3s sweep poll) can land AFTER the new symbol's response and
+// overwrite the panel — "the news doesn't change when I focus another
+// pane". Guard: a generation counter drops any non-newest response, an
+// AbortController cancels the superseded request, and a loadedKey gate
+// renders Loading/Error for the current symbol instead of stale data.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -31,23 +39,53 @@ export function SentimentPanel({ symbol }: { symbol: string }) {
   const [ic, setIc] = useState<SentimentIcResult | null>(null)
   const [icLoading, setIcLoading] = useState(false)
 
+  // The panel body may only ever show data for the symbol/scope pair currently
+  // in the header chips. While loadedKey !== dataKey the body renders Loading
+  // (or Error) — never the previous symbol's data under the new chip.
+  const dataKey = `${scope}|${symbol}`
+  const [loadedKey, setLoadedKey] = useState('')
+  const [errorKey, setErrorKey] = useState<string | null>(null)
+  const reqGen = useRef(0)
+  const abortRef = useRef<AbortController | null>(null)
+
   const load = useCallback(async () => {
+    const gen = ++reqGen.current
+    abortRef.current?.abort() // a superseded in-flight request is dead weight
+    const ac = new AbortController()
+    abortRef.current = ac
+    const q = new URLSearchParams({ scope, symbol, hours: '48', headlines: '25' })
     try {
-      const q = new URLSearchParams({ scope, symbol, hours: '48', headlines: '25' })
-      const res = await fetch(`/api/sentiment?${q}`)
-      if (!res.ok) return
+      const res = await fetch(`/api/sentiment?${q}`, { signal: ac.signal })
+      if (gen !== reqGen.current) return // superseded — never write state
+      if (!res.ok) {
+        setErrorKey(dataKey)
+        return
+      }
       const j = await res.json()
+      if (gen !== reqGen.current) return
       setSummary((j.summary as SentimentSymbolSummary[]) ?? [])
       setHistory((j.history as HistoryPoint[]) ?? [])
       setHeadlines((j.headlines as SentimentHeadlineDto[]) ?? [])
       setState((j.state as SentimentScanState) ?? null)
-    } catch { /* offline */ }
-  }, [scope, symbol])
+      setLoadedKey(dataKey)
+      setErrorKey(null)
+    } catch (e) {
+      // AbortError = a newer request superseded this one — not an error.
+      if (gen !== reqGen.current || (e as Error)?.name === 'AbortError') return
+      setErrorKey(dataKey)
+    }
+  }, [scope, symbol, dataKey])
 
   useEffect(() => {
+    // new symbol/scope → stale data out, honest loading state in
+    setLoadedKey('')
+    setErrorKey(null)
     load()
     const timer = setInterval(load, 60_000)
-    return () => clearInterval(timer)
+    return () => {
+      reqGen.current++ // in-flight responses from this instance can no longer write
+      clearInterval(timer)
+    }
   }, [load])
 
   // poll faster while a background sweep is running
@@ -88,6 +126,7 @@ export function SentimentPanel({ symbol }: { symbol: string }) {
 
   const me = summary[0]
   const fmt = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`
+  const bodyStale = loadedKey !== dataKey
 
   return (
     <div className="flex flex-col">
@@ -128,7 +167,22 @@ export function SentimentPanel({ symbol }: { symbol: string }) {
         </div>
       </div>
 
-      {scope === 'symbol' ? (
+      {errorKey === dataKey && bodyStale ? (
+        <div className="px-3 py-6 text-center text-[11px] text-zinc-500">
+          <BrainCircuit className="mx-auto mb-1.5 h-5 w-5 text-zinc-600" />
+          Couldn&apos;t load sentiment for <span className="text-zinc-300">{symbol}</span>.
+          <button
+            onClick={() => load()}
+            className="ml-1.5 rounded border border-zinc-700 px-1.5 py-0.5 text-[10px] text-zinc-300 transition-colors hover:bg-zinc-800"
+          >
+            Retry
+          </button>
+        </div>
+      ) : bodyStale ? (
+        // header chips moved to a new symbol/scope — never render the previous
+        // pair's fetched data underneath them
+        <div className="px-3 py-6 text-center text-[11px] text-zinc-500">Loading sentiment…</div>
+      ) : scope === 'symbol' ? (
         <SymbolView
           symbol={symbol}
           me={me}
