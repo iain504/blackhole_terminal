@@ -4371,3 +4371,12 @@ removed afterwards; the user's `akin` account untouched. Lint clean.
 - Full chart removed: the `#markets` section (v2.9.0 `BtcChart.tsx`, lightweight-charts 1H–1W) is GONE from the landing page and the component file deleted. The REAL Binance data survives in the small live chip pinned over the photo (`LiveBtcChip`, same public /api/landing/btc route — 50×1h candles, 45s cadence, stale-serve; route + its honest fallback badge kept untouched).
 - README feature bullet updated (interactive three.js + chart → fast static F1 photo hero + live BTC price chip).
 - E2E (agent-browser): desktop 1440×900 — hero photo renders crisply, BTC chip shows REAL Binance price ($77,032 live), chart section absent, status bar v2.9.1+248; Launch Terminal → #terminal sign-in gate works; back → landing; "Markets" link → #markets anchor on hero; mobile 390×844 — photo stacks cleanly with chip visible, footer sticks to the bottom, zero horizontal overflow; `agent-browser errors`/console clean; lint clean.
+
+---
+
+## 2026-11-03 ~12:05 — v2.9.2: hero photo reframed — wide top-down Singapore-GP night aerial (`9374557`, re-stamp `2.9.2+250.48c2ea8`)
+
+- User: "wider shot, like the singapore grad pix. top down."
+- New AI-generated hero `public/hero-f1-aerial.png` (1344×768, desktop 7:4): straight bird's-eye view of a whole floodlit night street circuit — red F1 car mid-drift through the esses with a huge curling tire-smoke plume, glowing LED track edges, red/white kerbs, city lights at the frame edges (replaces the v2.9.1 front-on day shot). Found the hard way that replacing `public/hero-f1.png` in place keeps serving the OLD image (next/image + browser treat the URL as immutable) — fix is a NEW filename, so the asset is `hero-f1-aerial.png` and the component src/alt/comments updated (alt now describes the Singapore-style night aerial).
+- README feature bullet updated (top-down aerial, Singapore GP style).
+- E2E (agent-browser): desktop 1440×900 — aerial renders, BTC chip real ($77,200 live), status bar v2.9.2+250; mobile 390×844 — photo fills the panel, chip + sticky footer correct; `agent-browser errors` clean; lint clean.

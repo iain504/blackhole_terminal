@@ -1,9 +1,10 @@
 'use client'
 
-// BLACKHOLE Terminal landing page — v2.9.1: back to a STATIC photo hero
-// (professional F1 car racing and drifting on track) after the v2.9.0
-// three.js detour; the full-width BTC chart section at the bottom was removed
-// too. What stays live: the nav ticker strip and the small Binance BTC chip
+// BLACKHOLE Terminal landing page — v2.9.2: back to a STATIC photo hero
+// (wide top-down aerial of an F1 car drifting on a floodlit night street
+// circuit, Singapore GP style) after the v2.9.0 three.js detour; the
+// full-width BTC chart section at the bottom was removed in v2.9.1 too.
+// What stays live: the nav ticker strip and the small Binance BTC chip
 // pinned over the photo (public /api/landing/btc route, cached server-side).
 import { useCallback, useEffect, useState } from 'react'
 import Image from 'next/image'
@@ -259,7 +260,8 @@ function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolea
         </dl>
       </motion.div>
 
-      {/* right — v2.9.1 hero art: STATIC professional F1 drifting photo
+      {/* right — v2.9.2 hero art: STATIC wide top-down aerial of an F1 car
+          drifting on a floodlit night street circuit (Singapore GP style)
           (no WebGL, no 3D bundle; the live Binance BTC chip stays) */}
       <motion.div
         initial={{ opacity: 0, scale: 0.985 }}
@@ -268,8 +270,8 @@ function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolea
         className="relative aspect-[7/5] w-full overflow-hidden rounded-xl border border-white/10 bg-zinc-900 shadow-2xl shadow-black/60 lg:aspect-[7/4]"
       >
         <Image
-          src="/hero-f1.png"
-          alt="Red Formula 1 car drifting through a corner at speed, tire smoke and sparks trailing on the track"
+          src="/hero-f1-aerial.png"
+          alt="Top-down aerial night view of a red Formula 1 car drifting through a floodlit street circuit, Singapore Grand Prix style, tire smoke trailing across the track"
           fill
           priority
           sizes="(min-width: 1024px) 55vw, 100vw"

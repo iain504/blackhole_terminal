@@ -26,7 +26,7 @@ BLACKHOLE Terminal is a full trading workstation you can run on your own machine
 - **Backtesting** — single runs, parameter optimization and "test all strategies" sweeps, plus watchlist-driven *Recommended Setups*
 - **Economic calendar with alarms, heat map, positions, strategy orders and a report tab**
 - **Real-time streaming** for crypto (Binance, keyless) and US equities (Alpaca), multiplexed over a single websocket per account
-- **A fast, static landing page** — professional F1 racing photo hero (car drifting on track, no WebGL/3D bundle) with a **live Binance BTC/USD price chip** (public keyless klines route, cached server-side with an honest fallback)
+- **A fast, static landing page** — professional F1 racing hero photo (top-down aerial of a car drifting on a floodlit night street circuit, Singapore GP style; no WebGL/3D bundle) with a **live Binance BTC/USD price chip** (public keyless klines route, cached server-side with an honest fallback)
 
 Everything is stored locally in a single SQLite file. No cloud, no telemetry, no fabricated prices — symbols without a live upstream simply don't stream.
 
