@@ -1,28 +1,16 @@
 'use client'
 
-// BLACKHOLE Terminal landing page — v2.9.0: interactive three.js hero (bright
-// sky + flying roadster), live ticker strip, REAL Binance BTC/USD chart
-// section, stats, status bar. The 3D scene is client-only (dynamic, ssr:false).
+// BLACKHOLE Terminal landing page — v2.9.1: back to a STATIC photo hero
+// (professional F1 car racing and drifting on track) after the v2.9.0
+// three.js detour; the full-width BTC chart section at the bottom was removed
+// too. What stays live: the nav ticker strip and the small Binance BTC chip
+// pinned over the photo (public /api/landing/btc route, cached server-side).
 import { useCallback, useEffect, useState } from 'react'
-import dynamic from 'next/dynamic'
+import Image from 'next/image'
 import { motion } from 'framer-motion'
 import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'
 import { useIsClient, useUiTheme } from '@/lib/ui-theme'
 import { APP_VERSION } from '@/generated/version'
-import { BtcChart } from './BtcChart'
-
-// three.js is heavy and WebGL needs the real DOM — load it client-side only,
-// with a bright-sky gradient placeholder so the panel never flashes dark.
-const SkyScene = dynamic(() => import('./SkyScene'), {
-  ssr: false,
-  loading: () => (
-    <div
-      aria-hidden
-      className="h-full w-full animate-pulse"
-      style={{ background: 'linear-gradient(to top, #dff0fd 0%, #8ec3ee 45%, #2f7fd4 100%)' }}
-    />
-  ),
-})
 
 interface TickerState {
   symbol: string
@@ -57,12 +45,11 @@ export function LandingPage({ onLaunch }: { onLaunch: () => void }) {
       {christmas && <Snowfall />}
       <div className="relative z-10 flex min-h-screen flex-col">
         <NavBar onLaunch={onLaunch} onLatency={onLatency} christmas={christmas} />
+        {/* v2.9.1 — the full BTC chart section (#markets) that lived under the
+            hero in v2.9.0 is gone; the hero carries the anchor now so the nav
+            "Markets" link still lands somewhere sensible. */}
         <main className="flex-1">
           <Hero onLaunch={onLaunch} christmas={christmas} />
-          {/* v2.9.0 — REAL Binance BTC/USD chart (public keyless feed) */}
-          <section id="markets" className="mx-auto w-full max-w-[1400px] scroll-mt-20 px-4 pb-14 sm:px-6 lg:px-10">
-            <BtcChart />
-          </section>
         </main>
         <StatusBar latency={latency} />
       </div>
@@ -218,7 +205,7 @@ function Ticker({ ticker }: { ticker: TickerState }) {
 
 function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolean }) {
   return (
-    <section className="mx-auto grid w-full max-w-[1400px] grid-cols-1 items-center gap-10 px-4 pb-10 pt-10 sm:px-6 lg:min-h-[calc(100vh-6.5rem)] lg:grid-cols-[1.05fr_1.2fr] lg:gap-14 lg:px-10 lg:pb-16 lg:pt-20">
+    <section id="markets" className="mx-auto grid w-full max-w-[1400px] scroll-mt-20 grid-cols-1 items-center gap-10 px-4 pb-10 pt-10 sm:px-6 lg:min-h-[calc(100vh-6.5rem)] lg:grid-cols-[1.05fr_1.2fr] lg:gap-14 lg:px-10 lg:pb-16 lg:pt-20">
       {/* left */}
       <motion.div
         initial={{ opacity: 0, y: 14 }}
@@ -272,15 +259,24 @@ function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolea
         </dl>
       </motion.div>
 
-      {/* right — v2.9.0 hero art: interactive three.js bright sky + flying car
-          (replaces the static black-hole render; live BTC chip stays) */}
+      {/* right — v2.9.1 hero art: STATIC professional F1 drifting photo
+          (no WebGL, no 3D bundle; the live Binance BTC chip stays) */}
       <motion.div
         initial={{ opacity: 0, scale: 0.985 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.6, ease: 'easeOut', delay: 0.08 }}
-        className="relative aspect-[7/5] w-full overflow-hidden rounded-xl border border-white/10 bg-gradient-to-b from-sky-300 to-sky-600 shadow-2xl shadow-black/60 lg:aspect-[7/4]"
+        className="relative aspect-[7/5] w-full overflow-hidden rounded-xl border border-white/10 bg-zinc-900 shadow-2xl shadow-black/60 lg:aspect-[7/4]"
       >
-        <SkyScene />
+        <Image
+          src="/hero-f1.png"
+          alt="Red Formula 1 car drifting through a corner at speed, tire smoke and sparks trailing on the track"
+          fill
+          priority
+          sizes="(min-width: 1024px) 55vw, 100vw"
+          className="object-cover"
+        />
+        {/* bottom fade so the photo blends into the dark page */}
+        <div aria-hidden className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/45 to-transparent" />
         <LiveBtcChip />
       </motion.div>
     </section>
@@ -289,8 +285,8 @@ function Hero({ onLaunch, christmas }: { onLaunch: () => void; christmas: boolea
 
 /* ------------------------------- live btc chip --------------------------- */
 
-// Small real-price badge over the 3D panel — same public route as the big
-// chart, lighter payload (50 × 1h candles), 45s cadence, tab-hidden safe.
+// Small real-price badge over the photo — same public route as the retired
+// v2.9.0 chart, lighter payload (50 × 1h candles), 45s cadence, tab-hidden safe.
 function LiveBtcChip() {
   const [s, setS] = useState<{ price: number; changePct: number } | null>(null)
   useEffect(() => {
@@ -349,8 +345,8 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 /* ------------------------------ mini sparkline ---------------------------- */
 
-// v2.9.0 — MiniSparkline (fake seeded candles) retired: the hero panel is the
-// three.js sky scene now and the REAL Binance chart lives in #markets below.
+// MiniSparkline (fake seeded candles) retired in v2.9.0, the three.js sky
+// scene followed in v2.9.1 — the hero is a static F1 photo now.
 // mulberry32 stays — Snowfall still needs its seeded RNG.
 function mulberry32(seed: number) {
   return () => {
