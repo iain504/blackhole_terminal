@@ -151,7 +151,7 @@ export default function AgentTab() {
     disk: {
       free: { bytes: number | null; human: string | null }
       total: { bytes: number | null; human: string | null }
-      db: { bytes: number | null; human: string | null }
+      db: { bytes: number | null; human: string | null; reclaimable?: { bytes: number | null; human: string | null } | null }
       wal: { bytes: number | null; human: string | null }
       path: string
     }
@@ -547,6 +547,15 @@ export default function AgentTab() {
         </button>
         {storageOpen && (
           <div className="mt-3 space-y-3">
+            {/* v2.8.4 — freelist diagnostic: says BEFORE the rebuild whether
+                VACUUM can free anything at all (≈0 ⇒ the space is in the
+                container log / host Docker disk image, not the db). */}
+            {storage?.disk.db.reclaimable?.bytes ? (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-[11px] leading-relaxed text-amber-200">
+                ~{storage.disk.db.reclaimable.human} of free pages sit inside the db file — "Reclaim space" rebuilds
+                the file to return them to the disk.
+              </div>
+            ) : null}
             <div className="grid gap-1.5 text-[11px]">
               {(storage?.tables ?? []).map((t) => (
                 <div key={t.key} className="flex items-center justify-between gap-2 rounded-md bg-zinc-800/40 px-2.5 py-1.5">
@@ -599,8 +608,10 @@ export default function AgentTab() {
             {storageMsg && <div className="rounded-md bg-zinc-800/60 p-2 text-[11px] text-zinc-300">{storageMsg}</div>}
             <p className="text-[10px] leading-relaxed text-zinc-600">
               SQLite keeps deleted rows inside the file until VACUUM rebuilds it — reclaim space after big purges.
-              The FSD results store is tiny and makes the next scan fast; leave it alone. Container stdout logs live
-              outside the database — cap them with docker logging limits (max-size) on the host.
+              The FSD results store is tiny and makes the next scan fast; leave it alone. VACUUM only rebuilds the db
+              file INSIDE the container — it can never shrink the container stdout log or the Docker VM disk image on
+              the host (Docker.raw / ext4.vhdx keep their high-water mark until pruned/compacted: docker system prune,
+              docker builder prune).
             </p>
           </div>
         )}

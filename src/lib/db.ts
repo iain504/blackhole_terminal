@@ -153,17 +153,95 @@ export function isTransientDbError(e: unknown): boolean {
 }
 
 /**
+ * v2.8.4 — result row of `PRAGMA wal_checkpoint(...)`. SQLite does NOT raise
+ * an error when the checkpoint cannot take the lock: it returns busy=1 and
+ * silently does nothing. The old boolean helper (which ignored the row) used
+ * to report success while a ballooned WAL survived the "truncate" untouched —
+ * one of the reasons the storage card's shrink seemed to free no space.
+ */
+export interface WalCheckpointResult {
+  /** 1 = checkpoint was a no-op (another pooled connection pins the WAL) */
+  busy: number
+  /** WAL pages before the checkpoint */
+  log: number
+  /** pages actually folded back into the main db */
+  checkpointed: number
+}
+
+/**
+ * v2.8.4 — busy-aware checkpoint with bounded retries. Other Prisma pool
+ * connections (grid engine, agent engine, API readers) pin the WAL with read
+ * snapshots; a single TRUNCATE attempt usually comes back busy=1, so retry a
+ * few times on a short delay before giving up. Returns null only when the
+ * pragma itself fails.
+ */
+export async function checkpointWalDetailed(
+  mode: 'passive' | 'truncate' = 'truncate',
+  attempts = 3,
+  delayMs = 400,
+): Promise<WalCheckpointResult | null> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const rows = (await db.$queryRawUnsafe(`PRAGMA wal_checkpoint(${mode.toUpperCase()});`)) as Array<
+        Partial<WalCheckpointResult>
+      >
+      const row = rows?.[0]
+      if (!row) return null
+      const res: WalCheckpointResult = {
+        busy: Number(row.busy ?? 0),
+        log: Number(row.log ?? 0),
+        checkpointed: Number(row.checkpointed ?? 0),
+      }
+      if (!res.busy || i === attempts - 1) return res
+      await new Promise((r) => setTimeout(r, delayMs))
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/**
  * WAL checkpoint (TRUNCATE) — folds the write-ahead log back into the main db
  * file and truncates it to zero. During heavy scan bursts the WAL can balloon;
  * a periodic checkpoint keeps the on-disk footprint tight (the db itself is
  * tiny — it's the WAL + logs that eat a small volume).
  */
 export async function checkpointWal(mode: 'passive' | 'truncate' = 'truncate'): Promise<boolean> {
+  const r = await checkpointWalDetailed(mode)
+  return r != null && !r.busy
+}
+
+export interface SqlitePageStats {
+  pageSize: number
+  pageCount: number
+  /** pages that hold deleted rows, waiting for VACUUM to release them */
+  freelistPages: number
+  /** freelistPages × pageSize — the bytes VACUUM can actually reclaim */
+  freelistBytes: number
+}
+
+/**
+ * v2.8.4 — how many bytes INSIDE the main db file are free pages. Zero
+ * freelist on a multi-GB file proves the space is NOT in the database — it is
+ * the container stdout log or the host's Docker VM disk image, which no
+ * in-app shrink can touch. This turns "Reclaim space did nothing" into a
+ * diagnosable answer instead of a blind button.
+ */
+export async function sqlitePageStats(): Promise<SqlitePageStats | null> {
   try {
-    await db.$queryRawUnsafe(`PRAGMA wal_checkpoint(${mode.toUpperCase()});`)
-    return true
+    const [ps, pc, fl] = await Promise.all([
+      db.$queryRawUnsafe<Array<{ page_size: number }>>('PRAGMA page_size;'),
+      db.$queryRawUnsafe<Array<{ page_count: number }>>('PRAGMA page_count;'),
+      db.$queryRawUnsafe<Array<{ freelist_count: number }>>('PRAGMA freelist_count;'),
+    ])
+    const pageSize = Number(ps?.[0]?.page_size ?? 0)
+    const pageCount = Number(pc?.[0]?.page_count ?? 0)
+    const freelistPages = Number(fl?.[0]?.freelist_count ?? 0)
+    if (!pageSize || !pageCount) return null
+    return { pageSize, pageCount, freelistPages, freelistBytes: pageSize * freelistPages }
   } catch {
-    return false
+    return null
   }
 }
 

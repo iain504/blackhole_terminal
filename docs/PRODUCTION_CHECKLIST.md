@@ -46,6 +46,19 @@ Pre-launch gates for a self-hosted deployment. Stack: Next.js 16 standalone (Bun
 - [ ] File permissions: `chmod 700 db && chmod 600 db/custom.db*`.
 - [ ] Backup story: stop app (and stream) → copy the file. SQLite keeps uncheckpointed frames in WAL sidecars — copy all of `custom.db`, `custom.db-wal`, `custom.db-shm`, or checkpoint first with `sqlite3 db/custom.db 'PRAGMA wal_checkpoint(TRUNCATE);'`. Restore = stop → copy back → start. Schedule it (cron) and test one restore.
 
+### 3b. Disk pressure & "Docker created a 20 GB file" (v2.8.4)
+
+The in-app **Server storage → Reclaim space (VACUUM)** only rebuilds `custom.db` **inside the container**. It can never shrink these host-side files — find which one is big before blaming the db:
+
+- [ ] **Identify the hog** (run on the docker host):
+  - Linux: `docker system df -v` · `du -ah /var/lib/docker 2>/dev/null | sort -rh | head -20`
+  - macOS Docker Desktop: `~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw` (sparse — compare with `du -h`, not `ls -lh`)
+  - Windows/WSL2: `%LOCALAPPDATA%\Docker\wsl\*\ext4.vhdx`
+- [ ] **Container stdout log** (`/var/lib/docker/containers/<id>/<id>-json.log`): unbounded when the container was started with plain `docker run` (compose caps it at 3×10 MB since v2.5.1). A disk-full write-storm spams prisma errors and can eat gigabytes fast. Immediate relief: `truncate -s 0 <…>-json.log`. Permanent: recreate via `docker compose up -d --build` (or add the same `logging:` block to your `docker run`).
+- [ ] **Docker VM disk image** (Docker.raw / ext4.vhdx): grows to the high-water mark of everything ever written and **never shrinks from inside** — even after VACUUM or `docker system prune`. Reclaim: Docker Desktop → Troubleshoot → **Clean / Purge data** (or newer builds compact automatically); WSL2: `wsl --shutdown` then `Optimize-VHD -Path … -Mode Full` (admin PowerShell) or `diskpart` → `compact vdisk`.
+- [ ] **Build cache**: every `--build` leaves layers — `docker builder prune -f` routinely frees tens of GB on a machine that rebuilds often.
+- [ ] Then, in-app: FSD tab → Server storage → the card shows **free disk, db/WAL sizes and the reclaimable freelist**. VACUUM pre-flights and refuses with exact numbers (HTTP 507) when the volume is too full to rebuild safely; purge buttons drop the bar cache / old logs / old forecasts first.
+
 ## 4. Build & run
 
 - [ ] `bun run build` — standalone output (`.next/standalone` + static/public copy); `bun run start` — serves it (`PORT` env to override). systemd unit pair in the README.
