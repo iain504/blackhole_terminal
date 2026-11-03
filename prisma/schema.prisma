@@ -35,6 +35,26 @@ model Layout {
   updatedAt DateTime @updatedAt
 }
 
+// v2.9.3 — device awareness: one row per (account, browser). The deviceId is a
+// client-generated persistent UUID (localStorage) — browsers never expose MAC
+// addresses, so this + a UA-derived friendly name (editable) is the identity.
+// currentTab/openTabs are the LIVE tab state reported by the 30s heartbeat.
+model Device {
+  id         String   @id @default(cuid())
+  userId     String
+  deviceId   String
+  name       String
+  kind       String   @default("desktop") // desktop | tablet | mobile
+  ua         String?
+  currentTab String?
+  openTabs   Json?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @updatedAt
+
+  @@unique([userId, deviceId])
+  @@index([userId, lastSeenAt])
+}
+
 model Drawing {
   id        String   @id @default(cuid())
   userId    String

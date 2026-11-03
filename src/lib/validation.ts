@@ -159,3 +159,20 @@ export const layoutPutSchema = z.object({
   // ISO timestamp of the client's base revision (optimistic concurrency)
   baseUpdatedAt: z.string().nullish().transform((v) => v ?? undefined),
 })
+
+// ---- device awareness (v2.9.3) ----------------------------------------------
+
+export const deviceHeartbeatSchema = z.object({
+  // client-generated persistent UUID (localStorage) — MAC is not reachable
+  deviceId: z.string().min(8, 'deviceId too short').max(64),
+  name: z.string().min(1, 'name required').max(40, 'Name too long (max 40 chars)'),
+  kind: z.enum(['desktop', 'tablet', 'mobile']),
+  ua: z.string().max(200).optional(),
+  currentTab: z.string().max(48).nullish(),
+  openTabs: z.array(z.string().max(48)).max(12).optional(),
+})
+
+export const deviceRenameSchema = z.object({
+  deviceId: z.string().min(8).max(64),
+  name: z.string().min(1, 'name required').max(40, 'Name too long (max 40 chars)'),
+})

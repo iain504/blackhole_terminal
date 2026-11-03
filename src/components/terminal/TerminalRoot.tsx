@@ -33,6 +33,7 @@ import { fmtPrice } from '@/lib/market-types'
 import { ttLog } from '@/lib/console-log'
 import { onConnectChange, type StreamStatus } from '@/lib/stream-client'
 import { applyUiTheme, fetchServerUiTheme, getUiTheme, useUiTheme } from '@/lib/ui-theme'
+import { useDeviceHeartbeat } from '@/lib/device'
 import { installUnauthorizedWatcher, setUnauthorizedHandler } from '@/lib/client-auth'
 import { cn } from '@/lib/utils'
 import { ConsoleDrawer } from './ConsoleDrawer'
@@ -61,6 +62,9 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   const meFetched = useRef(false)
   // Task 28 — small festive flourish in the terminal footer while Christmas is on
   const footerChristmas = useUiTheme() === 'christmas'
+  // v2.9.3 — device awareness: this browser registers under the account and
+  // keeps /api/devices posted with the live tab state (no-op while logged out).
+  useDeviceHeartbeat()
 
   const loadUserData = useCallback(async (u: SessionUser) => {
     const store = useTerminal.getState()

@@ -25,6 +25,7 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
+import { DevicesCard } from '@/components/terminal/DevicesCard'
 import { useToast } from '@/hooks/use-toast'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
@@ -616,6 +617,9 @@ export default function AgentTab() {
           </div>
         )}
       </section>
+
+      {/* ---------------- devices (v2.9.3) ---------------- */}
+      <DevicesCard />
 
       {/* ---------------- budget strip ---------------- */}
       {budget && (
