@@ -23,9 +23,10 @@ import { closePositionFull, getAccount, getPositions, placeOrderWithExits, trade
 import { ensureCryptoOcoSupervisor } from '@/lib/trading'
 import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { sessionOf, etDateKey, etMinutesOfDay, RTH_START_MIN } from '@/lib/sessions'
-import { TIMEFRAMES, type Bar, type Timeframe } from '@/lib/market-types'
+import { TIMEFRAMES, isCryptoSymbol, type Bar, type Timeframe } from '@/lib/market-types'
 import { kronosGateCheck, KRONOS_GATE_THRESHOLD } from '@/lib/kronos'
 import { sentimentForSymbol, refreshSymbolSentiment, STALE_MS } from '@/lib/sentiment-engine'
+import { getRegimeSnapshot } from '@/lib/regime-engine'
 import { isAlgoStrategyId, normalizeAlgoParams, strategyLane, ALGO_STRATEGIES, riskBudgetUsd, riskMoneyLabel, riskSizedQty, type AlgoStrategyId, type AlgoTimeframe } from '@/lib/algo-strategies'
 // v2.3.0 — swing lane live unlock: the HTF ladder evaluated from the closed-bar
 // window every cycle (see swing-eval.ts for the parity contract with the
@@ -849,6 +850,10 @@ async function cycle(runId: string) {
           // v2.5.0 — the Market sentiment gate; the helper journaled the reason
           // (fresh bearish news against a BUY / bullish against a SELL — stale
           // or missing snapshots pass through, the gate never bricks a symbol)
+        } else if (run.regimeGate && !(await regimeEntryOk(runId, run, res.entry.side, bars[lastClosedIdx].time, log))) {
+          // v2.10.0 — the US-tape regime gate; the helper journaled the reason
+          // (RISK_OFF tape blocks NEW LONGS on non-crypto runs — shorts/inverse
+          // setups stay live, crypto rides its own tape, UNKNOWN fails open)
         } else {
           await log(runId, run.userId, 'signal', `${res.entry.side.toUpperCase()} signal — ${res.entry.reason}`)
           // resolve % legs — and Risk-Money sizing — against the live quote.
@@ -1219,6 +1224,53 @@ async function sentimentEntryOk(
   return false
 }
 
+// ---------------------------------------------------------------------------
+// v2.10.0 — Market regime entry gate (run.regimeGate). The top-down overlay
+// the sentiment gate never claimed to be: while the US TAPE reads RISK_OFF
+// (UVXY above its 20-DMA, or QQQ below a falling 50-DMA — see regime-engine)
+// NEW LONG entries are refused on non-crypto runs. Shorts/inverse setups stay
+// live (a risk-off tape is when they earn their keep) and crypto runs are
+// exempt — BTC trades its own 24/7 tape, not the Nasdaq's. An UNKNOWN or
+// stale regime FAILS OPEN (entry allowed): a bad read never bricks trading,
+// same discipline as the sentiment gate. The snapshot is 15-min cached
+// server-side, so this adds no feed weight to the 15s cycle.
+// ---------------------------------------------------------------------------
+const regimeLogMemo = new Map<string, { block?: number; pass?: number; unknown?: number }>()
+
+async function regimeEntryOk(
+  runId: string,
+  run: AlgoRunRow,
+  side: 'buy' | 'sell',
+  barTime: number,
+  log: (runId: string, userId: string, level: 'info' | 'signal' | 'trade' | 'error', message: string) => Promise<void>,
+): Promise<boolean> {
+  // crypto answers to its own tape, never to the Nasdaq's
+  if (isCryptoSymbol(run.symbol)) return true
+  // risk-off pauses NEW LONGS only — shorts/inverse signals trade through
+  if (side !== 'buy') return true
+  const memo = regimeLogMemo.get(runId) ?? {}
+  regimeLogMemo.set(runId, memo)
+  let snap: Awaited<ReturnType<typeof getRegimeSnapshot>> | null = null
+  try {
+    snap = await getRegimeSnapshot(run.userId)
+  } catch {
+    snap = null // read hiccup → pass, never brick trading on the gate path
+  }
+  if (!snap || snap.regime === 'UNKNOWN' || snap.stale) {
+    if (memo.unknown !== barTime) {
+      await log(runId, run.userId, 'info', 'Regime gate: US tape state UNKNOWN/stale — entry allowed (gate fails open)')
+      memo.unknown = barTime
+    }
+    return true
+  }
+  if (snap.regime !== 'RISK_OFF') return true // RISK_ON / NEUTRAL — stand down silently
+  if (memo.block !== barTime) {
+    await log(runId, run.userId, 'info', `Signal suppressed (regime gate): BUY — US tape RISK_OFF (${snap.reasons.slice(0, 2).join(' · ')}); new longs pause until the regime lifts (shorts stay live)`)
+    memo.block = barTime
+  }
+  return false
+}
+
 /** Create a run row (and start its engine — unless `opts.autostart === false`,
  *  Task 79: importing a STOPPED config creates the run paused so trading only
  *  begins when the user explicitly presses Start). */
@@ -1257,6 +1309,9 @@ export async function startAlgoRun(cfg: {
   kronosGate: boolean
   // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
   sentimentGate: boolean
+  // v2.10.0 — US-tape regime gate (new longs blocked while RISK_OFF). Optional:
+  // only the autopilot arms it; standalone Algo runs default off.
+  regimeGate?: boolean
 }, opts?: { autostart?: boolean }) {
   const autostart = opts?.autostart !== false
   const run = await db.algoRun.create({
@@ -1291,6 +1346,7 @@ export async function startAlgoRun(cfg: {
       requireNewSignal: cfg.requireNewSignal,
       kronosGate: cfg.kronosGate === true,
       sentimentGate: cfg.sentimentGate === true,
+      regimeGate: cfg.regimeGate === true,
       status: autostart ? 'running' : 'stopped',
       ...(autostart ? {} : { stoppedAt: new Date() }),
       state: {} as unknown as object,
@@ -1300,8 +1356,8 @@ export async function startAlgoRun(cfg: {
     ? `risk ${cfg.riskBasis === 'pct' ? `${cfg.riskMoneyPct}% of equity` : `$${cfg.riskMoney}`}/trade`
     : `qty ${cfg.qty}`
   await log(run.id, cfg.userId, 'info', autostart
-    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
-    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
+    ? `Run started — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.regimeGate ? ' · regime gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''}`
+    : `Run created STOPPED (imported config) — ${ALGO_STRATEGIES[cfg.strategy].name} · ${cfg.symbol} ${cfg.timeframe} · ${sizing}${cfg.rthOnly ? ' · RTH only' : ''}${cfg.flattenEod ? ' · EOD flatten' : ''}${cfg.cooldownMin > 0 ? ` · cooldown ${cfg.cooldownMin}m` : ''}${cfg.requireNewSignal ? ' · fresh-signal re-entry' : ''}${cfg.kronosGate ? ' · Kronos AI gate' : ''}${cfg.sentimentGate ? ' · sentiment gate' : ''}${cfg.regimeGate ? ' · regime gate' : ''}${cfg.trailMode === 'pct' && cfg.trailArmPct != null && cfg.trailGivePct != null ? ` · trail +${cfg.trailArmPct}%→-${cfg.trailGivePct}%` : ''} — press Start to begin trading`)
   if (autostart) startEngine(run.id)
   return run
 }
@@ -1344,6 +1400,8 @@ export interface AlgoRunConfigPatch {
   kronosGate: boolean
   // v2.5.0 — Market sentiment gate (entries must not fight the news crowd)
   sentimentGate: boolean
+  // v2.10.0 — optional: absent = leave the stored value untouched
+  regimeGate?: boolean
 }
 
 export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPatch) {
@@ -1460,6 +1518,10 @@ export async function updateAlgoRunConfig(runId: string, patch: AlgoRunConfigPat
       requireNewSignal: patch.requireNewSignal,
       kronosGate: patch.kronosGate === true,
       sentimentGate: patch.sentimentGate === true,
+      // v2.10.0 — regime gate is NOT clobbered by callers that don't know the
+      // field (the Algo settings dialog sends a full patch without it; only an
+      // explicit true/false moves it, e.g. a future UI toggle or config import)
+      ...(patch.regimeGate === undefined ? {} : { regimeGate: patch.regimeGate === true }),
       state: st as unknown as object,
     },
   })

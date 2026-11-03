@@ -297,6 +297,12 @@ model AlgoRun {
   // a SELL while sentiment ≥ +0.30. Stale snapshots (> 12h) pass through so
   // the gate degrades gracefully instead of bricking quiet symbols.
   sentimentGate Boolean   @default(false)
+  // v2.10.0 — Market regime gate: while the US tape reads RISK_OFF (UVXY
+  // above its 20-DMA, or QQQ below a falling 50-DMA) the engine blocks NEW
+  // LONG entries on non-crypto runs; shorts/inverse setups stay live and
+  // crypto is exempt (its own 24/7 tape). UNKNOWN/stale regime fails open.
+  // Armed by the autopilot on every fleet run; standalone Algo runs default off.
+  regimeGate   Boolean   @default(false)
   // 'running' | 'stopped'
   status       String    @default("running")
   state        Json?

@@ -36,6 +36,8 @@ import {
 } from '@/lib/algo-strategies'
 import { startAlgoRun, stopAlgoRun, ALGO_MAX_RUNNING_RUNS } from '@/lib/algo-engine'
 import { getSentimentSummary, topUpSentiment, startFleetSentimentRefresher } from '@/lib/sentiment-engine'
+import { getRegimeSnapshot } from '@/lib/regime-engine'
+import type { RegimeSnapshot } from '@/lib/regime-types'
 import { costsFor } from '@/lib/algo-reco'
 import { agentUniverse, AGENT_US_100 } from '@/lib/agent-universe'
 import {
@@ -545,12 +547,34 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
     const top3 = ranked.slice(0, 3).map((c) => `#${c.rank} ${c.symbol} (${c.score})`).join(' · ')
     await ev(sessionId, userId, 'rank', `Score board published — ${ranked.length} qualified setups. Podium: ${top3}`)
 
+    // ---------------- phase 3.5 — MARKET REGIME (v2.10.0 top-down overlay) ----
+    // The board above is bottom-up (per-symbol backtest × news). Before sizing,
+    // the engine now also reads the US TAPE: SPY/QQQ trend + UVXY vol. In
+    // RISK_OFF the deployable budget is halved (fewer/smaller slots) and every
+    // fleet run arms the per-entry regime gate so live BUYs are blocked while
+    // the tape stays risk-off. A failed/stale read degrades to ×1 + a warn —
+    // a bad regime read never rescues or kills a scan by itself.
+    let regimeSnap: RegimeSnapshot | null = null
+    if (settings.regimeGate) {
+      try {
+        await touch({ phase: 'REGIME', progress: 0.85, stats })
+        regimeSnap = await getRegimeSnapshot(userId)
+        await ev(sessionId, userId, 'info',
+          `US tape regime: ${regimeSnap.regime}${regimeSnap.stale ? ' (STALE — gates will fail open)' : ''} — ${regimeSnap.reasons.slice(0, 3).join(' · ')}`)
+      } catch {
+        regimeSnap = null
+        await ev(sessionId, userId, 'warn', 'US tape regime read failed — budget unscaled, the entry regime gate will fail open.')
+      }
+    }
+    // RISK_OFF halves the deployable budget (mixed tape trades full size)
+    const REGIME_DEPLOY_MULT = settings.regimeGate && regimeSnap && !regimeSnap.stale && regimeSnap.regime === 'RISK_OFF' ? 0.5 : 1
+
     // ---------------- phase 4 — BUDGET (buying power sizing) ----------------
-    const budget = await computeBudget(userId, settings, ranked, sessionId)
+    const budget = await computeBudget(userId, settings, ranked, sessionId, REGIME_DEPLOY_MULT)
     if (budget) {
       await touch({ status: 'budget', phase: 'BUDGET', progress: 0.92, budget, candidates: ranked, stats })
       await ev(sessionId, userId, 'budget',
-        `Account ${budget.mode.toUpperCase()} — equity $${budget.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })} · buying power $${budget.buyingPower.toLocaleString(undefined, { maximumFractionDigits: 2 })} · deployable $${budget.deployable.toLocaleString(undefined, { maximumFractionDigits: 0 })} · per-slot $${budget.perSlot.toLocaleString(undefined, { maximumFractionDigits: 0 })}`)
+        `Account ${budget.mode.toUpperCase()} — equity $${budget.equity.toLocaleString(undefined, { maximumFractionDigits: 2 })} · buying power $${budget.buyingPower.toLocaleString(undefined, { maximumFractionDigits: 2 })} · deployable $${budget.deployable.toLocaleString(undefined, { maximumFractionDigits: 0 })} · per-slot $${budget.perSlot.toLocaleString(undefined, { maximumFractionDigits: 0 })}${REGIME_DEPLOY_MULT !== 1 ? ` · regime ${regimeSnap?.regime} — deployable × ${REGIME_DEPLOY_MULT}` : ''}`)
       if (budget.fleetNotional > 0) {
         await ev(sessionId, userId, 'budget', `Fleet sized — ${ranked.filter((c) => c.selected && (c.allocQty ?? 0) > 0).length} slots × ≈$${(budget.fleetNotional / Math.max(1, ranked.filter((c) => c.selected && (c.allocQty ?? 0) > 0).length)).toLocaleString(undefined, { maximumFractionDigits: 0 })} notional each (risk ${settings.riskPerTradePct}%/trade, position cap ${settings.maxPosPct}% equity)`)
       }
@@ -593,6 +617,7 @@ async function runPipeline(sessionId: string, userId: string, settings: AgentSet
 /** Live account snapshot → per-slot sizing over the ranked board. */
 async function computeBudget(
   userId: string, settings: AgentSettings, ranked: AgentCandidate[], sessionId: string,
+  regimeMult = 1, // v2.10.0 — the market-regime deployable multiplier (RISK_OFF → 0.5)
 ): Promise<AgentBudget | null> {
   const mode = settings.mode
   // getAccount wraps the broker payload: { data: TradingAccount | null, status }
@@ -602,7 +627,10 @@ async function computeBudget(
   const equity = Number(acct.equity)
   const buyingPower = Number(acct.buying_power)
   if (!(equity > 0) || !(buyingPower > 0)) return null
-  const deployable = buyingPower * (settings.deployCapPct / 100)
+  // v2.10.0 — the deployable cap now carries the regime multiplier: a risk-off
+  // tape halves what the fleet may deploy BEFORE per-slot math happens, so the
+  // sizing (not just the entry gate) respects the top-down overlay
+  const deployable = buyingPower * (settings.deployCapPct / 100) * regimeMult
   const eligible = ranked.filter((c) => c.score >= settings.minScore && c.score > 0)
   const fleetCount = Math.min(settings.topN, eligible.length)
   const perSlot = fleetCount > 0 ? deployable / fleetCount : deployable
@@ -692,6 +720,8 @@ export async function startAgentScan(userId: string, rawSettings: Partial<AgentS
   settings.maxTradesDay = Math.min(10, Math.max(1, Math.round(settings.maxTradesDay)))
   // v2.7.0 — sentiment blend weight is user-tunable now
   settings.sentimentWeight = Math.min(1, Math.max(0, Number.isFinite(settings.sentimentWeight) ? settings.sentimentWeight : 0.25))
+  // v2.10.0 — the US-tape regime gate is armed by default (opt-OUT)
+  settings.regimeGate = settings.regimeGate !== false
   settings.mode = settings.mode === 'live' ? 'live' : 'paper'
 
   const session = await db.agentSession.create({
@@ -748,6 +778,18 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
     return { ok: false, started: 0, failed: 0, error: msg }
   }
 
+  // v2.10.0 — journal the tape at engage so the event feed records WHAT THE
+  // FLEET WAS TRADING INTO. The per-entry regime gate enforces this live:
+  // while the tape reads RISK_OFF, fleet runs refuse NEW LONG entries (shorts
+  // and crypto stay live; UNKNOWN/stale fails open).
+  if (settings.regimeGate !== false) {
+    try {
+      const r = await getRegimeSnapshot(userId)
+      await ev(sessionId, userId, 'info',
+        `US tape at engage: ${r.regime}${r.stale ? ' (stale — gates fail open)' : ''} — ${r.reasons.slice(0, 2).join(' · ')}${r.regime === 'RISK_OFF' ? ' · fleet longs are gated until this lifts' : ''}`)
+    } catch { /* regime is advisory here — the entry gate fails open */ }
+  }
+
   const running = await db.algoRun.count({ where: { userId, status: 'running' } })
   let slots = Math.max(0, ALGO_MAX_RUNNING_RUNS - running)
   let started = 0
@@ -789,6 +831,9 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
         // v2.5.0 — the autopilot ALWAYS arms the sentiment gate: fleet entries
         // must not fight fresh news (the ranking already blended sentiment in)
         sentimentGate: true,
+        // v2.10.0 — and the US-tape regime gate (opt-out in mission parameters):
+        // new longs are refused while SPY/QQQ/UVXY read risk-off
+        regimeGate: settings.regimeGate !== false,
       }, { autostart: true })
       c.runId = run.id
       slots--
@@ -863,10 +908,20 @@ export async function updateAgentSettings(userId: string, sessionId: string, pat
   settings.minScore = Math.max(0, settings.minScore)
   // v2.7.0 — sentiment blend weight is user-tunable now
   settings.sentimentWeight = Math.min(1, Math.max(0, Number.isFinite(settings.sentimentWeight) ? settings.sentimentWeight : 0.25))
+  // v2.10.0 — regime gate armed by default (opt-out); a manual re-size also
+  // re-reads the tape so the deployable multiplier tracks the CURRENT regime
+  settings.regimeGate = settings.regimeGate !== false
+  let regimeMult = 1
+  if (settings.regimeGate) {
+    try {
+      const r = await getRegimeSnapshot(userId)
+      if (!r.stale && r.regime === 'RISK_OFF') regimeMult = 0.5
+    } catch { /* fail open — unscaled */ }
+  }
   settings.mode = settings.mode === 'live' ? 'live' : 'paper'
 
   const candidates = (session.candidates as unknown as AgentCandidate[] | null) ?? []
-  const budget = await computeBudget(userId, settings, candidates, sessionId)
+  const budget = await computeBudget(userId, settings, candidates, sessionId, regimeMult)
   await db.agentSession.update({
     where: { id: sessionId },
     data: { settings: settings as unknown as object, candidates: candidates as unknown as object, budget: (budget ?? undefined) as object | undefined },

@@ -25,12 +25,13 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { cn } from '@/lib/utils'
+import type { RegimeSnapshot, RegimeState } from '@/lib/regime-types'
 import { DevicesCard } from '@/components/terminal/DevicesCard'
 import { useToast } from '@/hooks/use-toast'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
   Activity, TrendingUp, Crosshair, Gauge, CircleDollarSign, Zap, Globe2,
-  TriangleAlert, HardDrive,
+  TriangleAlert, HardDrive, ShieldCheck, CircleHelp,
 } from 'lucide-react'
 
 // v2.7.5 — which broker lanes the account can actually ENGAGE with. The
@@ -57,6 +58,17 @@ const EVENT_CLS: Record<string, string> = {
   scan: 'text-cyan-300', tune: 'text-violet-300', rank: 'text-amber-300',
   budget: 'text-emerald-300', trade: 'text-fuchsia-300', warn: 'text-yellow-300',
   error: 'text-rose-400', info: 'text-zinc-400',
+}
+
+// v2.10.0 — the US-tape regime chip (SPY/QQQ trend + UVXY vol, 15-min cached
+// server-side). Advisory here — the ENFORCERS live server-side: the pipeline
+// halves the deployable budget in RISK_OFF and the per-entry regime gate
+// blocks fleet BUYs while the tape stays risk-off.
+const REGIME_META: Record<RegimeState, { label: string; cls: string }> = {
+  RISK_ON: { label: 'RISK ON', cls: 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10' },
+  NEUTRAL: { label: 'NEUTRAL', cls: 'text-amber-300 border-amber-500/40 bg-amber-500/10' },
+  RISK_OFF: { label: 'RISK OFF', cls: 'text-rose-300 border-rose-500/50 bg-rose-500/10' },
+  UNKNOWN: { label: 'NO TAPE DATA', cls: 'text-zinc-400 border-zinc-600/60 bg-zinc-700/20' },
 }
 
 const money = (v: number | null | undefined, dp = 0) =>
@@ -88,6 +100,9 @@ export default function AgentTab() {
   const [confirmEngage, setConfirmEngage] = useState(false)
   const [confirmDisengage, setConfirmDisengage] = useState(false)
   const [broker, setBroker] = useState<BrokerAvail | null>(null)
+  // v2.10.0 — the US-tape regime chip. 5-min poll (the server snapshot itself
+  // is 15-min cached); a failed probe just hides the chip, never blocks UI.
+  const [regime, setRegime] = useState<RegimeSnapshot | null>(null)
 
   // v2.7.5 — fetch key availability so the Command deck can warn BEFORE a
   // scan is burned on an account that cannot engage. Re-fetched on mount and
@@ -115,6 +130,22 @@ export default function AgentTab() {
   }, [])
 
   useEffect(() => { void loadBroker() }, [loadBroker])
+
+  const loadRegime = useCallback(async () => {
+    try {
+      const res = await fetch('/api/agent/regime', { cache: 'no-store' })
+      if (!res.ok) return
+      setRegime((await res.json()) as RegimeSnapshot)
+    } catch {
+      // the chip is advisory — a failed probe just leaves the last state up
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadRegime()
+    const t = setInterval(() => { void loadRegime() }, 5 * 60 * 1000)
+    return () => clearInterval(t)
+  }, [loadRegime])
 
   const session = data?.session ?? null
   const candidates = data?.candidates ?? []
@@ -340,6 +371,26 @@ export default function AgentTab() {
               {sMeta.label}
             </span>
           )}
+          {regime && (
+            <span
+              title={[
+                ...regime.reasons,
+                regime.barsAsOf ? `Daily bars as of ${regime.barsAsOf}${regime.stale ? ' · STALE — gates fail open' : ''}` : null,
+              ].filter(Boolean).join('\n')}
+              className={cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-bold tracking-wider', REGIME_META[regime.regime].cls)}
+            >
+              {regime.regime === 'RISK_ON' ? (
+                <TrendingUp className="h-3 w-3" />
+              ) : regime.regime === 'RISK_OFF' ? (
+                <TriangleAlert className="h-3 w-3" />
+              ) : regime.regime === 'UNKNOWN' ? (
+                <CircleHelp className="h-3 w-3" />
+              ) : (
+                <Activity className="h-3 w-3" />
+              )}
+              {REGIME_META[regime.regime].label}
+            </span>
+          )}
           <span className={cn(
             'rounded-full border px-2.5 py-1 text-[11px] font-bold tracking-wider',
             mode === 'live' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300' : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300',
@@ -422,13 +473,20 @@ export default function AgentTab() {
             <NumberField label="Max trades / day" value={settings.maxTradesDay} min={1} max={10} step={1} onChange={(v) => setS({ maxTradesDay: v })} />
             <NumberField label="Min Calmar score" value={settings.minScore} min={0} max={5} step={0.05} onChange={(v) => setS({ minScore: v })} />
             <NumberField label="Sentiment weight (news ×)" value={settings.sentimentWeight} min={0} max={1} step={0.05} onChange={(v) => setS({ sentimentWeight: v })} />
-            <div className="flex items-end gap-4 pb-1">
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-2 pb-1">
               <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
                 <Switch checked={settings.includeCrypto} onCheckedChange={(v) => setS({ includeCrypto: v })} />
                 <Globe2 className="h-3.5 w-3.5 text-amber-300" /> Crypto majors
               </label>
+              <label
+                className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300"
+                title="Reads the US tape (QQQ/SPY 50-DMA trend + UVXY vol): RISK OFF halves the deployable budget and blocks new longs on fleet entries — shorts and crypto stay live, an unknown tape fails open."
+              >
+                <Switch checked={settings.regimeGate !== false} onCheckedChange={(v) => setS({ regimeGate: v })} />
+                <ShieldCheck className="h-3.5 w-3.5 text-emerald-300" /> US regime gate
+              </label>
             </div>
-            <div className="flex items-end gap-4 pb-1">
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-2 pb-1">
               <label
                 className={cn('flex items-center gap-2 text-xs text-zinc-300', !modeLocked && 'cursor-pointer')}
                 title={modeLocked ? 'Mode is locked while the fleet is scanning or engaged' : 'PAPER = simulated orders · LIVE = real orders on your Alpaca account'}
