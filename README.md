@@ -247,11 +247,25 @@ Set-and-forget alternative: a GC policy in `/etc/docker/daemon.json` → `{"buil
 
 The repo ships a Blueprint (`render.yaml`) — Dashboard → **New + → Blueprint → pick this repo → Apply**, then paste your Alpaca paper keys in the Environment tab. Render builds the same Dockerfile, injects `PORT`, generates stable `AUTH_SECRET` / `APP_ENCRYPTION_SECRET` once (`generateValue`), and health-checks `/api/health`. Bun runs JavaScriptCore (the V8-style heap flag is ignored), so JSC is steered via `BUN_JSC_forceRamSize` and the memory guard also watches **process RSS** against a 460MB ceiling — heavy analytics return the polite 503 before the 512MB free container gets silently OOM-killed.
 
-Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite file resets on every deploy/restart — persistence needs `plan: starter` + the commented disk block), **spin-down** after 15 idle minutes (grid/algo engines tick in-process, so they pause while asleep), and **no stream sidecar** (the terminal runs over REST polling; the Live chip shows amber). Always-on + persistence = `plan: starter` + disk.
+Free-tier trade-offs (details in `render.yaml`): **ephemeral disk** (the SQLite file resets on every deploy/restart — persistence needs `plan: starter` + the commented disk block) and **spin-down** after 15 idle minutes (grid/algo engines tick in-process, so they pause while asleep). Since v2.12.0 the Blueprint builds `Dockerfile.hosted` — the stream sidecar + Caddy edge are baked into the same container — so **live ticks DO work** on Render's single port; on the free tier they still stop while the service is asleep. Always-on + persistence = `plan: starter` + disk.
 
 **Troubleshooting — Prisma `Error code 14: Unable to open the database file`**: your Render service has a `DATABASE_URL` pointing outside the container (e.g. a dev path like `file:/home/z/my-project/db/custom.db`). The entrypoint self-heals since Task 13 (falls back to `file:/app/db/custom.db` with a loud boot log), but the clean fix is to delete the `DATABASE_URL` env var in the Render dashboard — the image default is identical — or set it to `file:/app/db/custom.db`, then redeploy. On Render, `DATABASE_URL` must always live under `/app`.
 
 **Created the service manually (not via Blueprint)?** Later `render.yaml` changes do NOT apply to it — env vars must be maintained in the dashboard's Environment tab. The free-tier memory hardening expects: `MEM_RSS_CEILING_MB=460`, `BUN_JSC_forceRamSize=268435456`, `NODE_OPTIONS=--max-old-space-size=256` (or delete the service and re-apply the Blueprint). The boot log prints one `[mem] rss … · heap …` line every 30s — a climbing RSS curve that ends in `[mem] RSS … reached the … ceiling — exiting` is the memory diagnosis; a bare 502 with a flat RSS curve points at the Render dashboard's Events/Metrics instead.
+
+### Option B2 — Fly.io / Railway (hosted one-container, live ticks)
+
+One container = Caddy edge + Next app + stream sidecar (`Dockerfile.hosted`), SQLite on a persistent volume, one routable port, engines always-on. Full runbook — first deploy, secrets, volume, updates, backups — in [`DEPLOY.md`](DEPLOY.md).
+
+```bash
+# Fly.io (recommended) — fly.toml included; a real always-on VM (~£4–6/mo)
+fly launch --no-deploy --copy-config
+fly volumes create blackhole_db --size 1 --region lhr
+fly secrets set AUTH_SECRET=<hex> APP_ENCRYPTION_SECRET=<hex> ALLOW_REGISTRATION=true
+fly deploy
+```
+
+Railway: connect the repo (it reads `railway.json`), add a volume mounted at `/app/db`, set the same variables, deploy.
 
 ### Option C — systemd
 

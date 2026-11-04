@@ -1,0 +1,55 @@
+# BLACKHOLE Terminal — hosted single-container edge (Fly.io / Render / Railway).
+#
+# One public port (the platform's $PORT) fronting BOTH in-container services:
+#   /socket.io/*  and  …XTransformPort=3030  →  stream sidecar  127.0.0.1:3030
+#   everything else                        →  Next app         127.0.0.1:3000
+#
+# The browser's stream client (src/lib/stream-client.ts) connects with
+# `io('/?XTransformPort=3030')`, which lands on the wire as
+#   GET /socket.io/?EIO=4&transport=websocket&XTransformPort=3030
+# so BOTH matchers below catch it (path match is the primary, query match is
+# belt-and-braces for older client builds). Caddy terminates nothing here —
+# it is a pure L7 reverse proxy and passes websocket upgrades through
+# untouched (Fly/Render/Railway edges do TLS in front of us).
+#
+# $EDGE_PORT is exported by deploy/start-hosted.sh (defaults to 8080).
+# Same-origin cookies just work — no CORS anywhere.
+:{$EDGE_PORT:8080} {
+	@stream_path path /socket.io/*
+	@stream_query query XTransformPort=3030
+
+	encode zstd gzip
+
+	header X-Content-Type-Options "nosniff"
+	header Referrer-Policy "strict-origin-when-cross-origin"
+
+	handle @stream_path {
+		reverse_proxy 127.0.0.1:3030 {
+			# socket.io long-polling responses must flush immediately
+			flush_interval -1
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle @stream_query {
+		reverse_proxy 127.0.0.1:3030 {
+			flush_interval -1
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

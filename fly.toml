@@ -1,0 +1,52 @@
+# BLACKHOLE Terminal — Fly.io config (hosted one-container deploy).
+#
+# One machine = Caddy edge + Next app + stream sidecar (see Dockerfile.hosted),
+# with the SQLite database on a persistent Fly volume. The grid/algo engines
+# tick IN-PROCESS, so the machine must stay awake — auto_stop is disabled and
+# one machine is kept running at all times (this is a paid always-on VM, not
+# the free-allowance era).
+#
+# First deploy (from a full clone of this repo):
+#   fly auth login
+#   fly launch --no-deploy --copy-config        # reads this file, asks app name
+#   fly volumes create blackhole_db --size 1 --region <your primary_region>
+#   fly secrets set AUTH_SECRET=$(bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))") \
+#                   APP_ENCRYPTION_SECRET=$(same) \
+#                   ALLOW_REGISTRATION=true
+#   fly deploy
+#
+# Full runbook + Render/Railway alternatives: DEPLOY.md
+
+app = "blackhole-terminal"
+primary_region = "lhr" # London — change to your closest region BEFORE first deploy
+
+[build]
+  dockerfile = "Dockerfile.hosted"
+
+[env]
+  # DATABASE_URL defaults to file:/app/db/custom.db (the volume mount below) —
+  # no need to set it. Secrets (AUTH_SECRET / APP_ENCRYPTION_SECRET) and
+  # ALLOW_REGISTRATION go in via `fly secrets set`, never in this file.
+
+[mounts]
+  source = "blackhole_db"
+  destination = "/app/db"
+
+[http_service]
+  internal_port = 8080 # the Caddy edge inside the container (start-hosted.sh)
+  force_https = true
+  auto_stop_machines = false # engines tick in-process — the VM must not sleep
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "60s" # covers boot-time prisma db push
+    method = "GET"
+    path = "/api/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb" # app + stream + edge share one cgroup; 512mb works but is tight

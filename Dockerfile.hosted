@@ -1,0 +1,107 @@
+# BLACKHOLE Terminal — HOSTED one-container image (Fly.io / Render / Railway).
+#
+# Everything the compose stack splits across two containers, fused into ONE
+# routable container (PaaS platforms expose a single port per service):
+#
+#   ┌─ container ──────────────────────────────────────────────┐
+#   │  Caddy edge :$EDGE_PORT   ← the platform routes here     │
+#   │    ├─ /*            → Next app      :3000                │
+#   │    └─ /socket.io/*  → stream sidecar :3030               │
+#   │  SQLite volume at /app/db (prisma db push on every boot) │
+#   └──────────────────────────────────────────────────────────┘
+#
+# Stages 1-3 below are byte-identical to ./Dockerfile (keep in sync!) — only
+# the runner differs: it adds the stream sidecar, the Caddy binary and
+# deploy/start-hosted.sh as the entrypoint. Full runbook: DEPLOY.md.
+#
+# Bun is PINNED to the 1.3 line for the same reason as ./Dockerfile (the
+# floating oven/bun:1 tag shipped 1.4.4 mid-flight; validated on 1.3.x).
+# Caddy is pinned to a fixed release for reproducible builds.
+
+# ---- deps: install + prisma client (cached until lockfile/schema change) ----
+FROM oven/bun:1.3 AS deps
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY prisma ./prisma
+RUN bun install --frozen-lockfile
+RUN bunx prisma generate
+
+# ---- prisma-cli: production-only tree for the boot-time `prisma db push` -----
+FROM oven/bun:1.3 AS prisma-cli
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY prisma ./prisma
+RUN bun install --frozen-lockfile --production
+
+# ---- build: next build (standalone) + static asset copy ----------------------
+FROM oven/bun:1.3 AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+# Source-completeness guard (same rationale as ./Dockerfile v1.80.2).
+RUN test -f src/lib/auth.ts && test -f prisma/schema.prisma \
+  || (echo "" \
+   && echo "ERROR: the Docker build context is INCOMPLETE — src/lib (or prisma/) is missing." \
+   && echo "Fix: build from a full git clone of the repository root:" \
+   && echo "  fly deploy   /   render blueprint   /   railway up" \
+   && exit 1)
+RUN bun run build
+
+# ---- stream: the socket.io sidecar + its production bun deps -----------------
+FROM oven/bun:1.3 AS stream
+WORKDIR /svc
+COPY mini-services/stream-service/package.json ./
+RUN bun install
+COPY mini-services/stream-service/ ./
+
+# ---- runner: standalone app + prisma CLI + stream + Caddy edge ---------------
+FROM oven/bun:1.3 AS runner
+WORKDIR /app
+# TARGETARCH is auto-set by BuildKit (amd64/arm64); default covers legacy builders.
+ARG TARGETARCH=amd64
+ARG CADDY_VERSION=2.10.0
+ENV NODE_ENV=production \
+    PORT=3000 \
+    DATABASE_URL=file:/app/db/custom.db
+
+# Full production node_modules first (Prisma CLI closure base), then the
+# standalone bundle OVER it — next's traced subset wins on overlap.
+COPY --from=prisma-cli /app/node_modules ./node_modules
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+COPY --from=build /app/public ./public
+# Schema for the entrypoint's `prisma db push`.
+COPY prisma ./prisma
+# Build-time smoke test: the CLI closure must be complete (see ./Dockerfile).
+RUN bunx prisma -v > /dev/null 2>&1
+
+# Stream sidecar (socket.io :3030) — bun deps already installed in its stage.
+COPY --from=stream /svc /svc
+
+# Caddy edge: single pinned static binary (no apt, no distro drift). Downloaded
+# with bun itself — the image has no curl. `caddy validate` at build time means
+# a broken edge config fails the BUILD, never a 3am boot.
+RUN bun -e "const u='https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_'+(process.env.TARGETARCH||'amd64')+'.tar.gz'; fetch(u).then(async r => { if (!r.ok) throw new Error('caddy download failed: '+r.status+' '+u); await Bun.write('/tmp/caddy.tgz', r) })" \
+  && tar -xzf /tmp/caddy.tgz -C /tmp caddy \
+  && mv /tmp/caddy /usr/local/bin/caddy && chmod +x /usr/local/bin/caddy && rm -f /tmp/caddy.tgz \
+  && caddy version
+COPY deploy/Caddyfile.hosted /etc/caddy/Caddyfile.hosted
+RUN EDGE_PORT=8080 caddy validate --config /etc/caddy/Caddyfile.hosted > /dev/null \
+  && echo "[hosted] Caddyfile validated"
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY deploy/start-hosted.sh /usr/local/bin/start-hosted.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/start-hosted.sh
+
+# The SQLite file lives on a volume — never bake it into the image.
+RUN mkdir -p /app/db
+VOLUME ["/app/db"]
+
+EXPOSE 8080
+# Probes the FULL path: platform edge port → Caddy → app /api/health (which
+# itself reports the stream sidecar's state in its payload).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD bun -e "fetch('http://127.0.0.1:'+(process.env.EDGE_PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["/usr/local/bin/start-hosted.sh"]

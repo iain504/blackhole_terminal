@@ -4,10 +4,14 @@
 #   Dashboard → New + → Blueprint → pick iain504/blackhole-terminal → Apply
 # Everything below is the app web service only. Deploy story:
 #
-#   • runtime: docker — builds the repo Dockerfile (multi-stage bun, Next
-#     standalone, boot-time `prisma db push` via docker-entrypoint.sh).
-#   • PORT — Render injects it and the standalone server binds it (the
-#     Dockerfile/entrypoint already honor $PORT), so no port config needed.
+#   • runtime: docker — builds Dockerfile.hosted (multi-stage bun, Next
+#     standalone, boot-time `prisma db push` via docker-entrypoint.sh). Since
+#     v2.12.0 that image is the SINGLE-CONTAINER hosted build: the stream
+#     sidecar (socket.io) and a Caddy edge are baked in, so live ticks work on
+#     Render's one public $PORT — no second service, no extra port.
+#   • PORT — Render injects it and start-hosted.sh binds the Caddy edge to it
+#     (the Next app is re-pointed to its internal :3000 behind the edge), so
+#     no port config needed.
 #   • AUTH_SECRET / APP_ENCRYPTION_SECRET use generateValue: Render mints a
 #     random 24-char value ONCE and keeps it stable across every later deploy
 #     — exactly what the encryption-at-rest design needs (a rotating key
@@ -34,17 +38,17 @@
 #      NOT being managed. Always-on needs plan: starter.
 #   3. 750 instance-hours/month shared across free services — one
 #      always-on-ish web service fits; two would not.
-#   4. The stream sidecar (socket.io :3030) is deliberately NOT deployed: the
-#      browser client connects via the sandbox gateway path
-#      (/?XTransformPort=3030) and the free pool can't spare a second
-#      always-on service. Without it the terminal works over REST polling —
-#      the Live chip shows amber "Reconnecting" and live-tick streaming is
-#      simply absent. Grid/algo engines are server-side and unaffected.
+#   4. Live ticks now ship in the container (Dockerfile.hosted): Caddy fronts
+#      the app (:3000) and the stream sidecar (:3030) behind Render's single
+#      $PORT, and /api/health rides the same edge. WebSockets are supported by
+#      Render's router. On the FREE tier the stream still dies with the
+#      spin-down (caveat 2) — an always-on starter plan keeps it live.
 
 services:
   - type: web
     name: blackhole-terminal
     runtime: docker
+    dockerfilePath: Dockerfile.hosted
     plan: free
     region: frankfurt # pick the region closest to you at apply time
     branch: main

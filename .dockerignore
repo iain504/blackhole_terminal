@@ -21,6 +21,11 @@ agent-ctx
 .zscripts
 docs
 README.md
+DEPLOY.md
+fly.toml
+railway.json
+render.yaml
+worklog.md
 
 # editor / platform
 .vscode
