@@ -1,6 +1,12 @@
 'use client'
 
 // Terminal root: auth gate, tab bar, 5s layout autosave, alert engine polling.
+// v2.11.3 — the 8 non-chart tabs are code-split via next/dynamic: only the
+// chart workspace + shell ship in the initial bundle (before this, ALL tab
+// code — recharts via ReportTab, the 1.5k-line PositionsTab, etc. — loaded
+// up front even for a user who never opens them). ChartWorkspace stays
+// static: it IS the default view, a skeleton flash there would hurt UX.
+import dynamic from 'next/dynamic'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, SessionUser, Alert } from '@/store/terminal'
 import AuthForms from '@/components/auth/AuthForms'
@@ -10,14 +16,22 @@ import { ChartWorkspace } from './ChartWorkspace'
 import { MobileShell } from './mobile/MobileShell'
 import { SessionSplash } from './SessionSplash'
 import { useIsMobile } from '@/hooks/use-mobile'
-import CalendarTab from './tabs/CalendarTab'
-import HeatmapTab from './tabs/HeatmapTab'
-import PositionsTab from './tabs/PositionsTab'
-import StrategyTab from './tabs/StrategyTab'
-import ReportTab from './tabs/ReportTab'
-import AlgoTab from './tabs/AlgoTab'
-import GridTab from './tabs/GridTab'
-import AgentTab from './tabs/AgentTab'
+
+const TabFallback = () => (
+  <div className="flex h-[60vh] items-center justify-center text-zinc-500" role="status" aria-live="polite">
+    <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+    <span className="sr-only">Loading tab…</span>
+  </div>
+)
+
+const CalendarTab = dynamic(() => import('./tabs/CalendarTab'), { ssr: false, loading: TabFallback })
+const HeatmapTab = dynamic(() => import('./tabs/HeatmapTab'), { ssr: false, loading: TabFallback })
+const PositionsTab = dynamic(() => import('./tabs/PositionsTab'), { ssr: false, loading: TabFallback })
+const StrategyTab = dynamic(() => import('./tabs/StrategyTab'), { ssr: false, loading: TabFallback })
+const ReportTab = dynamic(() => import('./tabs/ReportTab'), { ssr: false, loading: TabFallback })
+const AlgoTab = dynamic(() => import('./tabs/AlgoTab'), { ssr: false, loading: TabFallback })
+const GridTab = dynamic(() => import('./tabs/GridTab'), { ssr: false, loading: TabFallback })
+const AgentTab = dynamic(() => import('./tabs/AgentTab'), { ssr: false, loading: TabFallback })
 import { StrategyDrawer } from './StrategyDrawer'
 import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'

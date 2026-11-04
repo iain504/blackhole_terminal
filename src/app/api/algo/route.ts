@@ -5,6 +5,7 @@ import { readJson, handleError } from '@/lib/api-helpers'
 import { resolveTradeMode } from '@/lib/trading'
 import { hasAlpacaKeys } from '@/lib/alpaca'
 import { ensureAlgoEngines, startAlgoRun } from '@/lib/algo-engine'
+import { cachedJson } from '@/lib/api-cache'
 import {
   isAlgoStrategyId, ALGO_TIMEFRAMES, SYMBOL_RE, strategyLane, SWING_TFS, DAY_TFS,
   type AlgoTimeframe,
@@ -88,43 +89,52 @@ export function toDto(r: {
 }
 
 // GET /api/algo — all runs + their recent logs (also resumes crashed engines)
+//
+// v2.11.3 — TTL-cached per user (3s): every chart pane's glow poll used to
+// run this endpoint (3 sequential queries incl. 600 log rows) every 5s per
+// pane. The Prisma middleware (src/lib/db.ts) busts the cache on ANY write to
+// AlgoRun/AlgoLog/StrategyRule, so starts/stops/engine state writes always
+// surface within the 3s window.
 export async function GET() {
   try {
     const user = await requireUser()
     await ensureAlgoEngines(user.id)
-    const rows = await db.algoRun.findMany({ where: { userId: user.id }, orderBy: { createdAt: 'desc' }, take: 50 })
-    // strategy-drawer rules ride along (Task 70-c) so the "export ALL" file can
-    // include every StrategyRule of the user without a second endpoint
-    const rules = await db.strategyRule.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        symbol: true, kind: true, condition: true, level: true, timeframe: true,
-        params: true, action: true, qty: true, tpMode: true, tpValue: true,
-        slMode: true, slValue: true, repeat: true, status: true,
-      },
-    })
-    const logs = await db.algoLog.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 600,
-    })
-    const byRun = new Map<string, AlgoRunDto['logs']>()
-    for (const l of logs) {
-      const list = byRun.get(l.runId) ?? []
-      if (list.length < 100) {
-        list.push({ id: l.id, level: l.level, message: l.message, createdAt: l.createdAt.toISOString() })
-        byRun.set(l.runId, list)
+    const payload = await cachedJson(`algo:${user.id}`, 3_000, async () => {
+      const rows = await db.algoRun.findMany({ where: { userId: user.id }, orderBy: { createdAt: 'desc' }, take: 50 })
+      // strategy-drawer rules ride along (Task 70-c) so the "export ALL" file can
+      // include every StrategyRule of the user without a second endpoint
+      const rules = await db.strategyRule.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          symbol: true, kind: true, condition: true, level: true, timeframe: true,
+          params: true, action: true, qty: true, tpMode: true, tpValue: true,
+          slMode: true, slValue: true, repeat: true, status: true,
+        },
+      })
+      const logs = await db.algoLog.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 600,
+      })
+      const byRun = new Map<string, AlgoRunDto['logs']>()
+      for (const l of logs) {
+        const list = byRun.get(l.runId) ?? []
+        if (list.length < 100) {
+          list.push({ id: l.id, level: l.level, message: l.message, createdAt: l.createdAt.toISOString() })
+          byRun.set(l.runId, list)
+        }
       }
-    }
-    const mode = await resolveTradeMode(user.id)
-    const configured = await hasAlpacaKeys(user.id)
-    return NextResponse.json({
-      runs: rows.map((r) => toDto(r, (byRun.get(r.id) ?? []).slice().reverse())),
-      rules,
-      mode,
-      configured,
+      const mode = await resolveTradeMode(user.id)
+      const configured = await hasAlpacaKeys(user.id)
+      return {
+        runs: rows.map((r) => toDto(r, (byRun.get(r.id) ?? []).slice().reverse())),
+        rules,
+        mode,
+        configured,
+      }
     })
+    return NextResponse.json(payload)
   } catch (e) {
     return handleError(e)
   }

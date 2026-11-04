@@ -22,6 +22,7 @@ import {
   type IndicatorSettings, type LinePoint,
 } from '@/lib/indicators'
 import { cn } from '@/lib/utils'
+import { subscribeGlow, type GlowAlgoRow } from '@/lib/glow-client'
 import { chartBg, chartVar, UI_THEME_CHANGE_EVENT } from '@/lib/ui-theme'
 import type { KronosForecastResult, KronosStatus } from '@/lib/kronos-types'
 import { Button } from '@/components/ui/button'
@@ -54,20 +55,9 @@ const FIB_LEVELS = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
 /** Slim grid-row shape for the chart overlay (Task 10-b). Only the fields the
  * price-line renderer needs; slBasis/tpBasis are optional API strings
  * ('price' | 'percent') added by the backend in Task 10-a. */
-interface GridOverlayRow {
-  id: string
-  symbol: string
-  status: string
-  lowerPrice: number
-  upperPrice: number
-  levels?: number[]
-  maxSL: number | null
-  maxTP: number | null
-  slBasis?: string | null
-  tpBasis?: string | null
-  /** Task 10-g — 'both' | 'buy' | 'sell' (absent reads as 'both') */
-  direction?: string | null
-}
+// v2.11.3 — GridOverlayRow moved to src/lib/glow-client.ts (GlowGridRow) so
+// the shared glow poller and the pane share one definition. Algo glow rows
+// are GlowAlgoRow.
 
 /** '#10b981' → '16 185 129' — the space-separated triplet the glow CSS var
  *  consumes (rgb(var(--glow-rgb) / a)); null on a malformed hex. */
@@ -3915,29 +3905,18 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   }, [tradeMarkersOn, symbol, tf, chartType, themeRev])
 
   // ---------- grid trades overlay + live-grid glow (Task 10-b / 10-d) ----------
-  // Poll lifecycle: ALWAYS on while the panel is mounted (the boundary glow
-  // must know about active grids even when the line overlay is off) — fetch
-  // GET /api/grid immediately and every 5s; any non-OK response (401 logged
-  // out, offline 4xx, 5xx) simply clears the snapshot → nothing renders, never
-  // a toast or a crash. Two effects so the poll keeps running regardless of
-  // chart recreation.
+  // v2.11.3 — the per-pane 5s /api/grid + /api/algo pollers moved into ONE
+  // shared, refcounted poller (src/lib/glow-client.ts): an 8-pane grid used to
+  // fire ~3.2 req/s of duplicate requests; now every pane subscribes to the
+  // same 5s snapshot (server side both GETs are additionally TTL-cached 3s).
+  // Contract unchanged: fetch immediately, silent-failure, boundary glow stays
+  // live even when the line overlay is off.
+  const [algoGlowRows, setAlgoGlowRows] = useState<GlowAlgoRow[] | null>(null)
   useEffect(() => {
-    let cancelled = false
-    const fetchGrids = async () => {
-      try {
-        const res = await fetch('/api/grid')
-        if (!res.ok) { if (!cancelled) setGridOverlayData(null); return }
-        const json = (await res.json().catch(() => null)) as { grids?: GridOverlayRow[] } | null
-        if (!cancelled) setGridOverlayData(Array.isArray(json?.grids) ? json.grids : null)
-      } catch { /* offline — keep the last snapshot */ }
-    }
-    void fetchGrids()
-    const t = setInterval(() => { void fetchGrids() }, 5000)
-    return () => {
-      cancelled = true
-      clearInterval(t)
-      setGridOverlayData(null)
-    }
+    return subscribeGlow((s) => {
+      setGridOverlayData(s.grids)
+      setAlgoGlowRows(s.algos)
+    })
   }, [])
 
   // Boundary glow: does the CHARTED symbol have an active grid right now?
@@ -3948,35 +3927,6 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       gridOverlayData.some((g) => g.status === 'active' && normSym(String(g.symbol || '')) === normSym(symbol)),
     [gridOverlayData, symbol],
   )
-
-  // ---- Task 10-g — algo-run glow + user-configured glow colors ----
-  // Minimal algo poll (same 5s cadence, same silent-failure contract as the
-  // grid poll): the glow only needs { id, symbol, status } per run.
-  const [algoGlowRows, setAlgoGlowRows] = useState<{ id: string; symbol: string; status: string }[] | null>(null)
-  useEffect(() => {
-    let cancelled = false
-    const fetchAlgos = async () => {
-      try {
-        const res = await fetch('/api/algo')
-        if (!res.ok) { if (!cancelled) setAlgoGlowRows(null); return }
-        const json = (await res.json().catch(() => null)) as { runs?: { id?: unknown; symbol?: unknown; status?: unknown }[] } | null
-        if (!cancelled) {
-          setAlgoGlowRows(
-            Array.isArray(json?.runs)
-              ? json!.runs!.map((r) => ({ id: String(r?.id ?? ''), symbol: String(r?.symbol ?? ''), status: String(r?.status ?? '') }))
-              : null,
-          )
-        }
-      } catch { /* offline — keep the last snapshot */ }
-    }
-    void fetchAlgos()
-    const t = setInterval(() => { void fetchAlgos() }, 5000)
-    return () => {
-      cancelled = true
-      clearInterval(t)
-      setAlgoGlowRows(null)
-    }
-  }, [])
 
   // Glow colors from Settings (grid / algo, hex). Fetched once + on every
   // settings save. Deliberately does NOT bump settingsVer — a color tweak

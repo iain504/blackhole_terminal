@@ -9,6 +9,7 @@
 //   → ENGAGE spawns real algo engines → rainbow frame spins while the fleet
 //   trades → live ops cards stream every move.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import { ALGO_STRATEGIES } from '@/lib/algo-strategies'
 import {
   AGENT_SETTINGS_DEFAULTS, type AgentCandidate, type AgentSettings,
@@ -253,20 +254,20 @@ export default function AgentTab() {
 
   useEffect(() => {
     void load()
-    const t = setInterval(() => void load(), 3000)
-    return () => clearInterval(t)
+    // v2.11.3 — the 3s brain poll is the heaviest cadence in the terminal;
+    // paused while the tab is hidden (one refresh on return)
+    return visibleAwareInterval(() => void load(), 3000)
   }, [load])
 
   // ---- live positions for the engaged fleet (15s) ----
   useEffect(() => {
     if (!engaged) return
-    let alive = true
     const pull = async () => {
       try {
         const res = await fetch('/api/trading/positions', { cache: 'no-store' })
         if (!res.ok) return
         const json = await res.json()
-        if (!alive || !Array.isArray(json.positions)) return
+        if (!Array.isArray(json.positions)) return
         const map: Record<string, PositionRow> = {}
         for (const p of json.positions) {
           map[p.symbol as string] = p as PositionRow
@@ -275,8 +276,8 @@ export default function AgentTab() {
       } catch { /* transient */ }
     }
     void pull()
-    const t = setInterval(() => void pull(), 15_000)
-    return () => { alive = false; clearInterval(t) }
+    // v2.11.3 — paused while the tab is hidden (one refresh on return)
+    return visibleAwareInterval(() => void pull(), 15_000)
   }, [engaged])
 
   // autoscroll the brain feed

@@ -1,13 +1,17 @@
 import { NextResponse } from 'next/server'
-import { getQuotes } from '@/lib/alpaca'
+import { getQuotes, hasAlpacaKeys } from '@/lib/alpaca'
 import { getSessionUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
+import { cachedJson } from '@/lib/api-cache'
 import { US_HEAT_GROUPS, CRYPTO_UNIVERSE, HeatGroup, HeatSymbol } from '@/lib/market-types'
 
 // GET /api/market/heatmap — % change for US stock groups + crypto.
 // Symbols with NO quote data (dead feed / unknown ticker) return
 // { symbol, pct: null, price: null } so the client renders them as visibly
 // empty ("–" + muted tooltip) instead of a fake-flat 0% market.
+//
+// v2.11.3 — TTL-cached (60s, matching the client's poll cadence): the 82-symbol
+// universe used to fan out ~4-5 upstream HTTP calls per request on every poll.
 export async function GET() {
   try {
     const user = await getSessionUser()
@@ -15,7 +19,10 @@ export async function GET() {
       ...US_HEAT_GROUPS.flatMap((g) => g.symbols),
       ...CRYPTO_UNIVERSE,
     ]
-    const { quotes, demo } = await getQuotes(allSymbols, user?.id)
+    const keyed = user ? await hasAlpacaKeys(user.id) : false
+    const { quotes, demo } = await cachedJson(`hm:${keyed ? 'k' : 'n'}`, 60_000, () =>
+      getQuotes(allSymbols, user?.id),
+    )
     const bySymbol = new Map(quotes.map((q) => [q.symbol, q]))
     const tileFor = (s: string): HeatSymbol => {
       const q = bySymbol.get(s)

@@ -7,6 +7,7 @@
 // delete / export-import setups / export-import ALL setups as a bundle).
 // Polls every 5s like the Algo tab.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import {
   LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
   Download, Upload, Copy, Sparkles, Pause, Play,
@@ -159,8 +160,8 @@ export default function GridTab() {
 
   useEffect(() => {
     void load()
-    const t = setInterval(() => void load(), 5000)
-    return () => clearInterval(t)
+    // v2.11.3 — paused while the tab is hidden (one refresh on return)
+    return visibleAwareInterval(() => void load(), 5000)
   }, [load])
 
   const openDetails = async (id: string) => {

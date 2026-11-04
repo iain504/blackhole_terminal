@@ -1,6 +1,7 @@
 import { PrismaClient } from '@prisma/client'
 import { statfsSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { bustApiCache } from '@/lib/api-cache'
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
@@ -44,6 +45,35 @@ function createClient(): PrismaClient {
     client.$queryRawUnsafe('PRAGMA busy_timeout=5000;').catch(() => {})
   } catch {
     // ignore — pragmas are best-effort
+  }
+  // v2.11.3 — auto-invalidate the /api/grid + /api/algo response caches on ANY
+  // write to the tables those endpoints read. One middleware covers every
+  // writer (mutation routes, grid/algo engines, maintenance prunes, scripts) —
+  // engine fills and state rewrites included — so a cached GET can never serve
+  // data older than the 3s TTL after a mutation. The check is a Set.has on a
+  // string per query: negligible against SQLite round-trips. Never throws.
+  try {
+    const CACHED_WRITE_MODELS = new Set(['GridTrade', 'GridFill', 'AlgoRun', 'AlgoLog', 'StrategyRule'])
+    client.$use(async (params, next) => {
+      const result = await next(params)
+      try {
+        if (params.model && CACHED_WRITE_MODELS.has(params.model)) {
+          const a = params.action
+          if (
+            a === 'create' || a === 'createMany' || a === 'update' || a === 'updateMany' ||
+            a === 'upsert' || a === 'delete' || a === 'deleteMany'
+          ) {
+            bustApiCache('grid:')
+            bustApiCache('algo:')
+          }
+        }
+      } catch {
+        // cache hygiene must never break a query result
+      }
+      return result
+    })
+  } catch {
+    // middleware is best-effort — the TTL is the ultimate bound anyway
   }
   return client
 }

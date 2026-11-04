@@ -16,6 +16,7 @@
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, Loader2, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -418,12 +419,14 @@ export default function PositionsTab() {
 
   useEffect(() => {
     void refresh()
-    const timer = setInterval(() => void refresh(), 10000)
+    // v2.11.3 — the heaviest poll in the terminal (positions + history × 2
+    // modes) is paused while the tab is hidden, with one refresh on return
+    const stopPoll = visibleAwareInterval(() => void refresh(), 10000)
     const onChanged = () => void refresh()
     window.addEventListener('tt:positions-changed', onChanged)
     window.addEventListener('tt:settings-changed', onChanged)
     return () => {
-      clearInterval(timer)
+      stopPoll()
       window.removeEventListener('tt:positions-changed', onChanged)
       window.removeEventListener('tt:settings-changed', onChanged)
     }

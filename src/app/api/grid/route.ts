@@ -10,6 +10,7 @@ import {
   startGridTrade, ensureGridEngine, computeGridStats, validateGridConfig,
   isGridSpacing, isGridDirection, parseGridState, findConflictingGrid, type GridSpacing,
 } from '@/lib/grid-engine'
+import { cachedJson } from '@/lib/api-cache'
 import { TIMEFRAMES } from '@/lib/market-types'
 
 export const dynamic = 'force-dynamic'
@@ -188,31 +189,39 @@ export function toDto(row: {
 }
 
 // GET /api/grid — every grid (all statuses, newest first) + live stats
+//
+// v2.11.3 — TTL-cached per user (3s): every chart pane used to poll this
+// endpoint every 5s independently (8-pane grid ⇒ the full findMany + 2000-fill
+// stats pass ran ~1.6×/s). The Prisma middleware (src/lib/db.ts) busts the
+// cache on ANY write to GridTrade/GridFill, so mutations and engine fills
+// never serve a stale snapshot beyond the 3s window.
 export async function GET() {
   try {
     const user = await requireUser()
     ensureGridEngine() // resume active grids after a server restart
-    const rows = await db.gridTrade.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+    const payload = await cachedJson(`grid:${user.id}`, 3_000, async () => {
+      const rows = await db.gridTrade.findMany({
+        where: { userId: user.id },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      })
+      const fills = rows.length
+        ? await db.gridFill.findMany({
+            where: { userId: user.id, gridTradeId: { in: rows.map((r) => r.id) } },
+            orderBy: { ts: 'desc' },
+            take: 2000,
+            select: { gridTradeId: true, side: true, reason: true, levelIndex: true, price: true, qty: true, pnl: true },
+          })
+        : []
+      const byGrid = new Map<string, typeof fills>()
+      for (const f of fills) {
+        const list = byGrid.get(f.gridTradeId) ?? []
+        list.push(f)
+        byGrid.set(f.gridTradeId, list)
+      }
+      return { grids: rows.map((r) => toDto(r, computeGridStats(r, byGrid.get(r.id) ?? []))) }
     })
-    const fills = rows.length
-      ? await db.gridFill.findMany({
-          where: { userId: user.id, gridTradeId: { in: rows.map((r) => r.id) } },
-          orderBy: { ts: 'desc' },
-          take: 2000,
-          select: { gridTradeId: true, side: true, reason: true, levelIndex: true, price: true, qty: true, pnl: true },
-        })
-      : []
-    const byGrid = new Map<string, typeof fills>()
-    for (const f of fills) {
-      const list = byGrid.get(f.gridTradeId) ?? []
-      list.push(f)
-      byGrid.set(f.gridTradeId, list)
-    }
-    const grids = rows.map((r) => toDto(r, computeGridStats(r, byGrid.get(r.id) ?? [])))
-    return NextResponse.json({ grids })
+    return NextResponse.json(payload)
   } catch (e) {
     return handleError(e)
   }

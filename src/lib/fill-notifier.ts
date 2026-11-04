@@ -23,6 +23,12 @@ const CYCLE_MS = 15000
 const FILL_LOOKBACK_MS = 60_000 // re-scan window; `seen` guards duplicates
 const SEEN_TTL_MS = 24 * 60 * 60 * 1000
 const SEEN_CAP = 400
+// v2.11.3 — idle teardown: the watcher is kicked by client-polled routes, so
+// no kick for 5 minutes means no terminal is open — stop the timer entirely
+// instead of running broker scans forever for a logged-out / deleted user.
+// The next kick re-registers it (baseline behavior: cursor state lives in
+// NotifyState, so a stop/start never replays notifications).
+const IDLE_TEARDOWN_MS = 5 * 60_000
 
 interface PosSnapshotEntry {
   side: string
@@ -49,6 +55,20 @@ function supervisedSet(): Set<string> {
   return g.__ttFillNotified
 }
 
+/** v2.11.3 — last client activity per (user|mode), for the idle teardown. */
+function kickMap(): Map<string, number> {
+  const g = globalThis as { __ttFillKicks?: Map<string, number> }
+  if (!g.__ttFillKicks) g.__ttFillKicks = new Map<string, number>()
+  return g.__ttFillKicks
+}
+
+/** v2.11.3 — live interval handles per (user|mode), so idle teardown can stop them. */
+function timerMap(): Map<string, ReturnType<typeof setInterval>> {
+  const g = globalThis as { __ttFillTimers?: Map<string, ReturnType<typeof setInterval>> }
+  if (!g.__ttFillTimers) g.__ttFillTimers = new Map<string, ReturnType<typeof setInterval>>()
+  return g.__ttFillTimers
+}
+
 const esc = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 const fmtQty = (n: number): string => String(parseFloat(n.toFixed(8)))
@@ -70,11 +90,13 @@ function orderRole(o: TradingOrder): string {
 
 export function ensureFillNotifier(userId: string, mode: TradeMode): void {
   const key = `${userId}|${mode}`
+  kickMap().set(key, Date.now()) // every call is fresh evidence of an open terminal
   if (supervisedSet().has(key)) return
   supervisedSet().add(key)
   const timer = setInterval(() => {
     void runCycle(userId, mode)
   }, CYCLE_MS)
+  timerMap().set(key, timer)
   // never keep the process alive just for the notifier
   if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
     ;(timer as { unref: () => void }).unref()
@@ -83,6 +105,19 @@ export function ensureFillNotifier(userId: string, mode: TradeMode): void {
 }
 
 async function runCycle(userId: string, mode: TradeMode): Promise<void> {
+  // v2.11.3 — idle teardown: no terminal has polled positions for 5 minutes →
+  // stop the timer and forget the supervision (the next kick restarts us; the
+  // NotifyState cursor means a stop/start cycle never replays history).
+  const key = `${userId}|${mode}`
+  const lastKick = kickMap().get(key) ?? 0
+  if (Date.now() - lastKick > IDLE_TEARDOWN_MS) {
+    const t = timerMap().get(key)
+    if (t) clearInterval(t)
+    timerMap().delete(key)
+    supervisedSet().delete(key)
+    console.log(`[notify] fill-notifier idle >5min — watcher stopped (${mode})`)
+    return
+  }
   try {
     const state = await db.notifyState.findUnique({ where: { userId_mode: { userId, mode } } })
     const prevPositions = (state?.positions ?? null) as Record<string, PosSnapshotEntry> | null

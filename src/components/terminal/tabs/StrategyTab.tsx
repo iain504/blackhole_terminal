@@ -11,6 +11,7 @@
 //        orderId) plus the full fire log
 // Complements the 🤖 StrategyDrawer, which creates/arms the rules.
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import {
   Bot, ChevronDown, ChevronRight, Loader2, RefreshCw, CheckCircle2, XCircle, Wrench,
 } from 'lucide-react'
@@ -109,11 +110,12 @@ export default function StrategyTab() {
 
   useEffect(() => {
     void load()
-    const timer = setInterval(() => void load(), 20000) // matches the strategy check cadence
+    // v2.11.3 — paused while the tab is hidden (one refresh on return)
+    const stopPoll = visibleAwareInterval(() => void load(), 20000) // matches the strategy check cadence
     const onChanged = () => void load()
     window.addEventListener('tt:positions-changed', onChanged)
     return () => {
-      clearInterval(timer)
+      stopPoll()
       window.removeEventListener('tt:positions-changed', onChanged)
     }
   }, [load])

@@ -184,6 +184,8 @@ model StrategyFireLog {
 
   @@index([userId, ruleId])
   @@index([userId, createdAt])
+  // v2.11.3 — index-backed retention prune (runDbMaintenance scans by createdAt)
+  @@index([createdAt])
 }
 
 // Economic-calendar event alarms. Events have no stable id upstream, so the
@@ -457,6 +459,10 @@ model GridFill {
 
   @@index([gridTradeId, ts])
   @@index([userId])
+  // v2.11.3 — the 10s positions console filters {userId, orderId not null}
+  // ordered by ts desc (was a full per-user scan + sort on every poll); also
+  // index-backs any userId+ts windowing
+  @@index([userId, ts])
 }
 
 // Task 18 — one Auto Grid watchlist scan ('scan' = analyze only, the report
@@ -476,6 +482,8 @@ model GridAutoRun {
   createdAt DateTime @default(now())
 
   @@index([userId, createdAt])
+  // v2.11.3 — index-backed retention prune + the 14d sweep in /api/grid/auto
+  @@index([createdAt])
 }
 
 // Task 9-j — per-install master secret store. The platform publish pipeline
@@ -537,6 +545,8 @@ model KronosForecast {
   @@unique([symbol, tf, barTime, horizonBars])
   @@index([userId, madeAt])
   @@index([symbol, tf, realizedClose])
+  // v2.11.3 — index-backed retention prune (runDbMaintenance scans by madeAt)
+  @@index([madeAt])
 }
 
 // v2.4.0 — Nebula Autopilot (智慧體): the FSD-style fleet manager. One row per

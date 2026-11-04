@@ -14,6 +14,7 @@
 //     (metrics, equity curve, trade list) and grid-searches parameter
 //     ranges with one-click "apply best to run setup".
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import {
   Rocket, RefreshCw, Play, Square, Trash2, ChevronDown, ChevronRight,
   CircleAlert, CircleCheck, Zap, Info, Ban, FlaskConical, Download, Upload, Settings2,
@@ -163,8 +164,8 @@ export default function AlgoTab() {
 
   useEffect(() => {
     void load()
-    const t = setInterval(() => void load(), 5000)
-    return () => clearInterval(t)
+    // v2.11.3 — paused while the tab is hidden (one refresh on return)
+    return visibleAwareInterval(() => void load(), 5000)
   }, [load])
 
   // keep each run's log pinned to the newest line
