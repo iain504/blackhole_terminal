@@ -25,15 +25,18 @@
 
 type G = typeof window & {
   __tt401PatchedFetch?: typeof fetch
-  __tt401Handler?: () => void
+  __tt401Handler?: (url: string) => void
 }
 
 function browserGlobal(): G | undefined {
   return typeof window === 'undefined' ? undefined : (window as G)
 }
 
-/** Register the handler invoked on a session-death 401. Idempotent per mount. */
-export function setUnauthorizedHandler(cb: (() => void) | undefined): void {
+/** Register the handler invoked on a session-death 401. Idempotent per mount.
+ *  v2.12.2 — the handler receives the failing request URL: a hosted deployment
+ *  that bounces the user to the login screen seconds after sign-in used to be
+ *  undiagnosable ("which endpoint 401'd?"). The toast/console now name it. */
+export function setUnauthorizedHandler(cb: ((url: string) => void) | undefined): void {
   const g = browserGlobal()
   if (g) g.__tt401Handler = cb
 }
@@ -54,7 +57,8 @@ export function installUnauthorizedWatcher(): void {
             ? input.url
             : String((input as { url?: string })?.url ?? '')
       if (res.status === 401 && url.includes('/api/') && !url.includes('/api/auth/')) {
-        g.__tt401Handler?.()
+        console.warn('[tt] 401 from', url, '— firing session-expired handler')
+        g.__tt401Handler?.(url)
       }
     } catch {
       // the watcher must never break the caller's response handling

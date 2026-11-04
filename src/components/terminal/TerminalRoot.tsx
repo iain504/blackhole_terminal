@@ -136,14 +136,18 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   // OPEN terminal (platform DB wipe / secret rotation on restart / expiry),
   // flip back to the login screen with a toast instead of leaving a ghost tab
   // where every action (LAUNCH FULL SCAN included) just toasts "Unauthorized".
+  // v2.12.2 — the toast + console name the ENDPOINT that 401'd (hosted
+  // deployments were undiagnosable: "logged out after 2 seconds" with no clue
+  // which request killed the session).
   useEffect(() => {
     installUnauthorizedWatcher()
-    setUnauthorizedHandler(() => {
+    setUnauthorizedHandler((url) => {
+      console.error('[tt] session-expired: 401 from', url)
       if (!useTerminal.getState().user) return // auth screen already shown
       setUser(null)
       toast({
         title: 'Session expired',
-        description: 'Your session is no longer valid on the server — sign in again.',
+        description: `Server rejected the session (401 from ${url.replace(location.origin, '')}) — sign in again.`,
         variant: 'destructive',
       })
     })

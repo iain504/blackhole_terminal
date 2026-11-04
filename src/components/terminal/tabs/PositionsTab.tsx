@@ -392,11 +392,15 @@ export default function PositionsTab() {
         // crowded out by the 150-trade default window
         const res = await fetch(`/api/trading/history?mode=${mode}&limit=${histQuery ? 300 : 150}${histQuery ? `&${histQuery}` : ''}`)
         const json = await res.json().catch(() => null)
+        // v2.12.2 — the route now reports an engaged Alpaca 401 breaker as a
+        // 200 + authError BODY (a raw HTTP 401 tripped the client's global
+        // session watcher and logged the user out). The amber banner must
+        // render from the body on BOTH status paths.
+        const authError = (json?.authError ?? null) as HistoryData['authError'] | null
         if (!res.ok) {
           // v1.95.0 — never render a silent empty list: a rejected-key 401
           // carries an actionable authError, anything else stays a visible
           // per-mode error line above the table
-          const authError = (json?.authError ?? null) as HistoryData['authError'] | null
           return {
             trades: [],
             configured: true,
@@ -405,7 +409,13 @@ export default function PositionsTab() {
             authError: authError ?? undefined,
           }
         }
-        return { trades: (json.trades || []) as ClosedTrade[], configured: json.configured !== false, loaded: true }
+        return {
+          trades: (json.trades || []) as ClosedTrade[],
+          configured: json.configured !== false,
+          loaded: true,
+          error: authError ? undefined : ((json?.error as string) || undefined),
+          authError: authError ?? undefined,
+        }
       } catch {
         return { trades: [], configured: true, loaded: true, error: 'network error' }
       }

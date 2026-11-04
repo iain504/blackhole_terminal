@@ -37,18 +37,23 @@ export async function GET(req: Request) {
       // this shape (same contract as /api/trading/positions). A history that
       // silently rendered empty while a real account had closed trades was
       // exactly the "my closed trade is missing" report.
+      // v2.12.2 — but as a 200 + authError BODY, NOT an HTTP 401: the client's
+      // global 401 watcher treats any non-auth /api/* 401 as SESSION DEATH and
+      // logs the user out — upstream Alpaca key rejection must never kill the
+      // terminal session. PositionsTab reads authError from the 200 body.
       if (r.status === 401) {
         const retryInSec = Math.ceil(authBackoffMsLeft(user.id, mode) / 1000)
         return NextResponse.json(
           {
-            error: r.error || 'Alpaca rejected the saved keys',
+            mode,
+            trades: [],
+            configured: true,
             authError: {
               mode,
               retryInSec,
               message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — trade history for this account is unavailable until the keys are fixed.`,
             },
           },
-          { status: 401 },
         )
       }
       return NextResponse.json({ error: r.error || 'Closed orders fetch failed' }, { status: r.status || 502 })

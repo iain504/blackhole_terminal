@@ -12,44 +12,45 @@
 # it is a pure L7 reverse proxy and passes websocket upgrades through
 # untouched (Fly/Render/Railway edges do TLS in front of us).
 #
+# trusted_proxies private_ranges (v2.12.2): the platform's router (Render's
+# 10.x, Fly's fd00::/8, Railway's 172.x) is a TRUSTED proxy, so its injected
+# X-Forwarded-Proto flows through to the app UNMOLESTED. Without this, Caddy
+# overwrites X-Forwarded-Proto with the scheme of its own plain-HTTP listener
+# ("http"), the app never learns the browser is on TLS, and the session cookie
+# is set without the Secure flag — the first domino of the hosted
+# "sign in → logged out seconds later" report. It also restores per-client
+# X-Forwarded-For chains (rate limiting keys on the REAL visitor IP, not the
+# platform router's shared internal IP).
+#
 # $EDGE_PORT is exported by deploy/start-hosted.sh (defaults to 8080).
 # Same-origin cookies just work — no CORS anywhere.
 :{$EDGE_PORT:8080} {
-	@stream_path path /socket.io/*
-	@stream_query query XTransformPort=3030
+        @stream_path path /socket.io/*
+        @stream_query query XTransformPort=3030
 
-	encode zstd gzip
+        encode zstd gzip
 
-	header X-Content-Type-Options "nosniff"
-	header Referrer-Policy "strict-origin-when-cross-origin"
+        header X-Content-Type-Options "nosniff"
+        header Referrer-Policy "strict-origin-when-cross-origin"
 
-	handle @stream_path {
-		reverse_proxy 127.0.0.1:3030 {
-			# socket.io long-polling responses must flush immediately
-			flush_interval -1
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        handle @stream_path {
+                reverse_proxy 127.0.0.1:3030 {
+                        trusted_proxies private_ranges
+                        # socket.io long-polling responses must flush immediately
+                        flush_interval -1
+                }
+        }
 
-	handle @stream_query {
-		reverse_proxy 127.0.0.1:3030 {
-			flush_interval -1
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        handle @stream_query {
+                reverse_proxy 127.0.0.1:3030 {
+                        trusted_proxies private_ranges
+                        flush_interval -1
+                }
+        }
 
-	handle {
-		reverse_proxy 127.0.0.1:3000 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        handle {
+                reverse_proxy 127.0.0.1:3000 {
+                        trusted_proxies private_ranges
+                }
+        }
 }

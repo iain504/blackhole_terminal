@@ -39,6 +39,24 @@ export async function GET(req: Request) {
     if (!r.data) {
       // no keys configured is a quiet no-op for the poller
       if (isNoKeysError(r.error)) return NextResponse.json({ mode, fills: [], configured: false })
+      // v2.12.2 — an engaged Alpaca 401 breaker must NOT surface as a raw HTTP
+      // 401: the ROOT-LEVEL fill poller (2.5s after login, then every 12s)
+      // runs through the client's global 401 watcher, so an upstream keys
+      // rejection used to log the user out of the TERMINAL seconds after
+      // sign-in — the exact "auto logout in 2 seconds" hosted report. Mirror
+      // the positions route instead: 200 + structured authError, which the
+      // poller ignores and Settings renders as the amber keys banner.
+      if (r.status === 401) {
+        return NextResponse.json({
+          mode,
+          fills: [],
+          configured: true,
+          authError: {
+            mode,
+            message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — fill notifications and chart markers are paused until the keys are fixed (Settings → API keys).`,
+          },
+        })
+      }
       return NextResponse.json({ error: r.error || 'Fills fetch failed' }, { status: r.status || 502 })
     }
     // A failed fetch (401/403, network) resolves to an error OBJECT — only a
