@@ -125,6 +125,9 @@ Railway bills per-second usage; an always-on shared vCPU lands around $5/mo.
 
 ## Ops notes
 
+- **HTTP 502 right after a healthy deploy log?** Check the boot line `▲ Next.js` → `Local:`. If it shows the **container hostname** instead of `0.0.0.0`, the standalone server bound the Docker-injected `HOSTNAME` — unreachable by the platform router (classic standalone-in-Docker pitfall). Fixed since **v2.12.1** (`ENV HOSTNAME=0.0.0.0` in both Dockerfiles) — deploy latest commit. An older Render service may also be building the **original Dockerfile** (no `[hosted]` boot lines, no stream): switch it to the single-container image via *Settings → Build → Dockerfile Path → `Dockerfile.hosted`*, then *Manual Deploy → Clear build cache & deploy*.
+- **`Environment variable not found: DATABASE_URL` blocks inside the BUILD phase** (before "Generating static pages") are harmless build-worker noise from the instrumentation hook and are skipped entirely since v2.12.1. The same error **at runtime/boot** is real: `DATABASE_URL` must point inside the container (`file:/app/db/custom.db`).
+
 - **Health:** `/api/health` rides the edge and reports app + stream state.
 - **Logs:** `fly logs` / Render Logs tab / `railway logs` — entrypoint prints
   `DATABASE_URL`, db-push result, and each process start.

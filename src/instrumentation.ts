@@ -25,6 +25,14 @@ export async function register(): Promise<void> {
 
   if (process.env.NEXT_RUNTIME !== 'nodejs') return // edge: nothing to boot
 
+  // v2.12.1 — `next build` ALSO invokes this hook inside its build workers
+  // (Next 15+), where DATABASE_URL does not exist: every boot step (db pragmas,
+  // maintenance prunes, engine resume) fail-open and spam ~20 prisma:error
+  // "Environment variable not found" blocks into the build log — harmless but
+  // they read as fatal deploy errors (twice mistaken for THE deploy failure).
+  // Real boots (`next start` / standalone / dev) set no build phase.
+  if (process.env.NEXT_PHASE === 'phase-production-build') return
+
   try {
     const { bootNode } = await import('./instrumentation-node')
     await bootNode()

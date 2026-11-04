@@ -58,8 +58,14 @@ RUN bun run build
 # ---- runner: standalone server + prisma CLI for the boot-time db push --------
 FROM oven/bun:1.3 AS runner
 WORKDIR /app
+# HOSTNAME=0.0.0.0 — CRITICAL on PaaS (Render/Fly/Railway): Docker injects
+# HOSTNAME=<container-hostname> and Next's standalone server binds THAT instead
+# of 0.0.0.0 → the platform router connects and gets connection-refused → HTTP
+# 502 while the app itself is perfectly healthy. Same fix as Vercel's official
+# Docker example.
 ENV NODE_ENV=production \
     PORT=3000 \
+    HOSTNAME=0.0.0.0 \
     DATABASE_URL=file:/app/db/custom.db
 
 # Full production node_modules first (Prisma CLI closure base), then the

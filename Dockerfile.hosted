@@ -63,6 +63,7 @@ ARG TARGETARCH=amd64
 ARG CADDY_VERSION=2.10.0
 ENV NODE_ENV=production \
     PORT=3000 \
+    HOSTNAME=0.0.0.0 \
     DATABASE_URL=file:/app/db/custom.db
 
 # Full production node_modules first (Prisma CLI closure base), then the

@@ -24,6 +24,10 @@ set -u
 EDGE_PORT="${PORT:-8080}"
 export EDGE_PORT
 export PORT=3000
+# Belt & braces: the image sets ENV HOSTNAME=0.0.0.0 (standalone-in-Docker bind
+# fix — see Dockerfile.hosted); re-assert it so children can never inherit the
+# container's auto HOSTNAME from a rebuilt/patched base.
+export HOSTNAME=0.0.0.0
 export NODE_ENV=production
 
 echo "[hosted] edge :${EDGE_PORT} → app :3000 + stream :3030 (db: ${DATABASE_URL:-<entrypoint default>})"
