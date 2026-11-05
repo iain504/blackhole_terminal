@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/chart'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { ListChecks, RefreshCw, Scale, Target, Timer, TrendingUp } from 'lucide-react'
 import { ClosedTrade, fmtHeldDuration } from '@/lib/market-types'
 import { cn } from '@/lib/utils'
@@ -802,7 +803,7 @@ function ReportHeader({
           aria-label="Refresh report"
           title="Refresh report"
         >
-          <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
+          {refreshing ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
         </Button>
       </div>
     </header>

@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Check, Download, FileJson, KeyRound, Loader2, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
+import { AlertTriangle, Check, Download, FileJson, KeyRound, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
+import { TaijiSpinner } from '@/components/theme/TaoistLoader';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -515,7 +516,7 @@ export default function SettingsDialog({
             <div className="flex items-center gap-2">
               <Palette className="h-4 w-4 text-emerald-400" />
               <h3 className="text-sm font-semibold text-zinc-100">Appearance</h3>
-              {savingTheme && <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" aria-label="Saving theme" />}
+              {savingTheme && <TaijiSpinner className="h-3.5 w-3.5 text-zinc-500" aria-label="Saving theme" />}
             </div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {UI_THEMES.map((t) => {
@@ -567,7 +568,7 @@ export default function SettingsDialog({
               <h3 className="text-sm font-semibold text-zinc-100">
                 Alpaca API keys
               </h3>
-              {loading && <Loader2 className="h-4 w-4 animate-spin text-zinc-500" />}
+              {loading && <TaijiSpinner className="h-4 w-4 text-zinc-500" />}
               {state?.tradeMode && (
                 <Badge
                   className={
@@ -652,7 +653,7 @@ export default function SettingsDialog({
                 disabled={testingPaper || saving}
                 className="w-fit border-emerald-900/70 bg-zinc-950 text-emerald-300 hover:bg-zinc-900 hover:text-emerald-200"
               >
-                {testingPaper ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                {testingPaper ? <TaijiSpinner className="h-4 w-4" /> : <PlugZap className="h-4 w-4" />}
                 Test paper key
               </Button>
             </div>
@@ -715,7 +716,7 @@ export default function SettingsDialog({
                 disabled={testingLive || saving}
                 className="w-fit border-amber-900/70 bg-zinc-950 text-amber-300 hover:bg-zinc-900 hover:text-amber-200"
               >
-                {testingLive ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                {testingLive ? <TaijiSpinner className="h-4 w-4" /> : <PlugZap className="h-4 w-4" />}
                 Test live key
               </Button>
             </div>
@@ -855,7 +856,7 @@ export default function SettingsDialog({
                   disabled={testingTelegram || saving}
                   className="shrink-0 border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
                 >
-                  {testingTelegram && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {testingTelegram && <TaijiSpinner className="h-4 w-4" />}
                   Send test message
                 </Button>
               </div>
@@ -948,7 +949,7 @@ export default function SettingsDialog({
                 disabled={exporting || importing}
                 className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
               >
-                {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                {exporting ? <TaijiSpinner className="h-4 w-4" /> : <Download className="h-4 w-4" />}
                 Export config file
               </Button>
               <Button
@@ -958,7 +959,7 @@ export default function SettingsDialog({
                 disabled={exporting || importing}
                 className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
               >
-                {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {importing ? <TaijiSpinner className="h-4 w-4" /> : <Upload className="h-4 w-4" />}
                 Import config file
               </Button>
               <input
@@ -996,7 +997,7 @@ export default function SettingsDialog({
                 disabled={loading || saving}
                 className="bg-emerald-600 text-white hover:bg-emerald-500"
               >
-                {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                {saving && <TaijiSpinner className="h-4 w-4" />}
                 Save
               </Button>
             </div>

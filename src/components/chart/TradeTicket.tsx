@@ -4,7 +4,8 @@
 // Market/limit entries with optional SL/TP (bracket for stocks; split exits for
 // crypto) and trailing-stop exits for stocks.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Loader2, X, GripVertical } from 'lucide-react'
+import { X, GripVertical } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -834,7 +835,7 @@ export function TradeTicket({
           side === 'buy' ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-600 text-white hover:bg-rose-500',
         )}
       >
-        {submitting && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}
+        {submitting && <TaijiSpinner className="mr-1 h-3.5 w-3.5" />}
         {trailActive
           ? `🎯 Trailing stop ${side.toUpperCase()} ${qty || '—'} ${symbol} · ${mode}`
           : `${side === 'buy' ? 'Buy' : 'Sell'} ${qty || '—'} ${symbol} · ${mode}`}

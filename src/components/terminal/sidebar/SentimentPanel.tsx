@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import {
   Activity, BrainCircuit, ExternalLink, RefreshCw, TrendingDown, TrendingUp,
 } from 'lucide-react'
@@ -162,7 +163,7 @@ export function SentimentPanel({ symbol }: { symbol: string }) {
             onClick={() => (scope === 'symbol' ? rescan([symbol]) : rescan(undefined))}
             aria-label={scope === 'symbol' ? `Rescan sentiment for ${symbol}` : 'Scan market sentiment'}
           >
-            <RefreshCw className={cn('h-3 w-3', (scanning || state?.running) && 'animate-spin')} />
+            {(scanning || state?.running) ? <TaijiSpinner className="h-3 w-3" /> : <RefreshCw className="h-3 w-3" />}
           </Button>
         </div>
       </div>
@@ -181,7 +182,10 @@ export function SentimentPanel({ symbol }: { symbol: string }) {
       ) : bodyStale ? (
         // header chips moved to a new symbol/scope — never render the previous
         // pair's fetched data underneath them
-        <div className="px-3 py-6 text-center text-[11px] text-zinc-500">Loading sentiment…</div>
+        <div className="flex items-center justify-center gap-2 px-3 py-6 text-center text-[11px] text-zinc-500">
+          <TaijiSpinner className="h-3 w-3" aria-hidden />
+          Loading sentiment…
+        </div>
       ) : scope === 'symbol' ? (
         <SymbolView
           symbol={symbol}

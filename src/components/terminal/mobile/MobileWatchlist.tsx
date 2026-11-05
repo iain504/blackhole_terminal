@@ -20,9 +20,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  Plus, Ellipsis, Pencil, Trash2, FolderPlus, Loader2, ChevronUp, ChevronDown, Search,
-} from 'lucide-react'
+import { Plus, Ellipsis, Pencil, Trash2, FolderPlus, ChevronUp, ChevronDown, Search } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 
 const isSep = (s: string) => s.startsWith('#')
 
@@ -432,7 +431,7 @@ export function MobileWatchlist({ onOpenChart }: { onOpenChart: (symbol: string)
               className="h-11 border-zinc-800 bg-zinc-950 pl-8 text-base"
               aria-label="Symbol to add"
             />
-            {suggLoading && <Loader2 className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-zinc-600" />}
+            {suggLoading && <TaijiSpinner className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-600" />}
           </div>
           {sugg.length > 0 && (
             <div className="max-h-56 overflow-y-auto terminal-scroll rounded-lg border border-zinc-800 bg-zinc-950" role="listbox" aria-label="Symbol suggestions">

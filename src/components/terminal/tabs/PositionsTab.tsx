@@ -17,7 +17,8 @@
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
-import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, Loader2, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -617,7 +618,7 @@ export default function PositionsTab() {
             </Badge>
           ))}
           <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={() => void refresh()} aria-label="Refresh positions">
-            <RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />
+            {refreshing ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
         </div>
       </div>
@@ -700,7 +701,7 @@ export default function PositionsTab() {
                       </span>
                     </>
                   ) : (
-                    <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading positions…</span>
+                    <span className="inline-flex items-center gap-2"><TaijiSpinner className="h-4 w-4" /> Loading positions…</span>
                   )}
                 </td>
               </tr>
@@ -778,7 +779,7 @@ export default function PositionsTab() {
                       onClick={() => setConfirmCloseRow(r)}
                       aria-label={`Close ${r.mode} position ${r.pos.tradeSymbol}`}
                     >
-                      {closing === key ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Close position'}
+                      {closing === key ? <TaijiSpinner className="h-3 w-3" /> : 'Close position'}
                     </Button>
                   </td>
                 </tr>
@@ -891,7 +892,7 @@ export default function PositionsTab() {
                       onClick={() => void cancelPending(mode, p.orderId, `${p.side} ${p.type} ${p.symbol}`)}
                       aria-label={`Cancel pending ${p.side} ${p.type} ${p.symbol}`}
                     >
-                      {canceling === p.orderId ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Cancel'}
+                      {canceling === p.orderId ? <TaijiSpinner className="h-3 w-3" /> : 'Cancel'}
                     </Button>
                   </td>
                 </tr>
@@ -1052,7 +1053,7 @@ export default function PositionsTab() {
                 <tr>
                   <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
                     {!history.paper.loaded && !history.live.loaded ? (
-                      <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Loading trade history…</span>
+                      <span className="inline-flex items-center gap-2"><TaijiSpinner className="h-4 w-4" /> Loading trade history…</span>
                     ) : histSymNorm ? (
                       `No closed trades match “${histSymbol.trim()}” — clear the symbol filter to see everything.`
                     ) : history.paper.configured === false && history.live.configured === false ? (
@@ -1301,7 +1302,7 @@ function PendingPriceCell({ mode, p, field, onSaved }: {
         disabled={busy}
         aria-label="Apply price"
       >
-        {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+        {busy ? <TaijiSpinner className="h-3 w-3" /> : 'OK'}
       </button>
       <button className="text-[10px] text-zinc-500 hover:text-zinc-300" onClick={() => setOpen(false)} aria-label="Cancel edit">
         ✕
@@ -1457,7 +1458,7 @@ function AddExitCell({ mode, tradeSymbol, kind, side, basis, onAdded }: {
             disabled={busy}
             aria-label={`Apply ${kind.toUpperCase()}`}
           >
-            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+            {busy ? <TaijiSpinner className="h-3 w-3" /> : 'OK'}
           </button>
           <button
             className="text-[10px] text-zinc-500 hover:text-zinc-300"
@@ -1511,7 +1512,7 @@ function AddExitCell({ mode, tradeSymbol, kind, side, basis, onAdded }: {
             disabled={busy || !canSubmit}
             aria-label={`Apply ${kind.toUpperCase()}`}
           >
-            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : 'OK'}
+            {busy ? <TaijiSpinner className="h-3 w-3" /> : 'OK'}
           </button>
         </>
       )}

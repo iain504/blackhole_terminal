@@ -38,7 +38,8 @@
 //   every advisor-made line (meta.auto === 'advisor*') — user drawings
 //   untouched.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Loader2, X, Sparkles, Eraser, RefreshCw, Lightbulb, Radar, GripVertical, Ban, CheckCircle2, Clock3 } from 'lucide-react'
+import { X, Sparkles, Eraser, RefreshCw, Lightbulb, Radar, GripVertical, Ban, CheckCircle2, Clock3 } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -952,7 +953,7 @@ export function TradeAdvisor({
         onClick={() => void analyze()}
         className="mt-2 h-7 w-full gap-1 bg-amber-500 px-2 text-[11px] font-semibold text-zinc-950 hover:bg-amber-400"
       >
-        {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : planView ? <RefreshCw className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}
+        {busy ? <TaijiSpinner className="h-3 w-3" /> : planView ? <RefreshCw className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}
         {busy ? 'Analyzing…' : planView ? 'Re-analyze' : planMode === 'day' ? 'Analyze day plan' : 'Analyze & arm monitor'}
       </Button>
       {err && (
@@ -1096,7 +1097,7 @@ export function TradeAdvisor({
               planView.side === 'long' ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-600 text-white hover:bg-rose-500',
             )}
           >
-            {submitting && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}
+            {submitting && <TaijiSpinner className="mr-1 h-3.5 w-3.5" />}
             Submit LIMIT {planView.side === 'long' ? 'buy' : 'sell'} {qty || '—'} {symbol} · GTC
           </Button>
         </div>
@@ -1130,7 +1131,7 @@ export function TradeAdvisor({
                 className="rounded border border-rose-500/40 px-1.5 py-0.5 text-[9px] font-semibold text-rose-400 transition-colors hover:bg-rose-500/10 disabled:opacity-50"
                 aria-label="Cancel the advisor order"
               >
-                {cancelling && <Loader2 className="mr-0.5 inline h-2.5 w-2.5 animate-spin" />}
+                {cancelling && <TaijiSpinner className="mr-0.5 inline h-2.5 w-2.5" />}
                 Cancel order
               </button>
             )}

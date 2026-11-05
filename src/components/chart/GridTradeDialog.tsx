@@ -18,10 +18,8 @@
 // config over 7/30/90/365 days and renders stat tiles + a P/L sparkline +
 // a collapsible fills table. The dialog is draggable by its header (Task 10-b).
 import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  LayoutGrid, TriangleAlert, GripHorizontal, FlaskConical, Loader2, ChevronDown, CircleAlert,
-  FileUp, Sparkles,
-} from 'lucide-react'
+import { LayoutGrid, TriangleAlert, GripHorizontal, FlaskConical, ChevronDown, CircleAlert, FileUp, Sparkles } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -1239,7 +1237,7 @@ export default function GridTradeDialog({
               disabled={optRunning || !qtyOk}
               onClick={() => void runOptimize()}
             >
-              {optRunning ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <Sparkles className="h-3 w-3" aria-hidden />}
+              {optRunning ? <TaijiSpinner className="h-3 w-3" aria-hidden /> : <Sparkles className="h-3 w-3" aria-hidden />}
               Optimize range
             </Button>
             {!qtyOk && <span className="text-[10px] text-zinc-600">valid quantity required</span>}
@@ -1277,7 +1275,7 @@ export default function GridTradeDialog({
               disabled={btRunning || btBlockReason != null}
               onClick={() => void runBacktest()}
             >
-              {btRunning ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
+              {btRunning ? <TaijiSpinner className="h-3 w-3" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
               Run backtest
             </Button>
             {btBlockReason && <span className="text-[10px] text-zinc-600">{btBlockReason}</span>}

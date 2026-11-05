@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -445,7 +446,7 @@ export default function AlgoTab() {
           </Button>
         )}
         <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={() => void load()} aria-label="Refresh algo runs">
-          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+          {loading ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
         </Button>
       </div>
 
@@ -836,7 +837,7 @@ export default function AlgoTab() {
                       : undefined}
               onClick={() => void start()}
             >
-              {starting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+              {starting ? <TaijiSpinner className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
               Start algo run
             </Button>
 

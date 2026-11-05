@@ -22,6 +22,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { getDeviceId, setDeviceNameOverride } from '@/lib/device'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 
 interface DeviceRow {
   deviceId: string
@@ -272,7 +273,10 @@ export function DevicesCard() {
             </p>
           )}
           {devices === null && (
-            <p className="px-1 py-2 text-[11px] text-zinc-600">Loading devices…</p>
+            <p className="flex items-center gap-2 px-1 py-2 text-[11px] text-zinc-600">
+              <TaijiSpinner className="h-3 w-3" aria-hidden />
+              Loading devices…
+            </p>
           )}
 
           <p className="px-1 pt-1 text-[10px] leading-relaxed text-zinc-600">

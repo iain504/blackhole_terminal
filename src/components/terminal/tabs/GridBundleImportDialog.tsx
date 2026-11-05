@@ -4,7 +4,8 @@
 // single Task 10-f setup file, or a raw JSON array) → per-item validity preview
 // → one POST /api/grid/bulk creates every valid grid → per-item results.
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Loader2, Upload, FileJson, Check, X, LayoutGrid } from 'lucide-react'
+import { Upload, FileJson, Check, X, LayoutGrid } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
@@ -229,7 +230,7 @@ export default function GridBundleImportDialog({
               disabled={importing || validSetups.length === 0}
               onClick={() => void runImport()}
             >
-              {importing && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}
+              {importing && <TaijiSpinner className="h-3.5 w-3.5" aria-hidden />}
               Import {validSetups.length} setup{validSetups.length === 1 ? '' : 's'}
             </Button>
           )}

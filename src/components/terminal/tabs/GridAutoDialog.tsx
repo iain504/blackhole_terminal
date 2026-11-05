@@ -10,7 +10,8 @@
 // a $400 stock than a $4 stock). The report shows the resolved qty + the
 // money behind per symbol; the start batch is capped at 100% of equity.
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Loader2, Play, ScanSearch, Sparkles, Info, CircleAlert, History } from 'lucide-react'
+import { Play, ScanSearch, Sparkles, Info, CircleAlert, History } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { useShallow } from 'zustand/react/shallow'
 import { useTerminal } from '@/store/terminal'
 import { Button } from '@/components/ui/button'
@@ -408,7 +409,7 @@ export default function GridAutoDialog({
             onClick={() => void scan()}
             disabled={scanning || !watchlistId}
           >
-            {scanning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ScanSearch className="h-3.5 w-3.5" />}
+            {scanning ? <TaijiSpinner className="h-3.5 w-3.5" /> : <ScanSearch className="h-3.5 w-3.5" />}
             {scanning ? 'Scanning…' : `Scan ${watchlists.find((w) => w.id === watchlistId)?.name ?? 'watchlist'}`}
           </Button>
           {report && (
@@ -531,7 +532,7 @@ export default function GridAutoDialog({
               onClick={() => void startSelected()}
               disabled={starting || startableCount === 0}
             >
-              {starting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+              {starting ? <TaijiSpinner className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
               Start {startableCount || ''} grid{startableCount === 1 ? '' : 's'}
             </Button>
           </div>

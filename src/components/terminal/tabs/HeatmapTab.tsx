@@ -13,6 +13,7 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { useTerminal } from '@/store/terminal'
 import { FilterMultiSelect } from './FilterMultiSelect'
 
@@ -418,7 +419,7 @@ export default function HeatmapTab() {
             disabled={loading}
             className="h-7 gap-1.5 border-zinc-800 bg-zinc-900 px-2.5 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
           >
-            <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            {loading ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
             Refresh
           </Button>
         </div>
@@ -461,7 +462,7 @@ export default function HeatmapTab() {
               onClick={load}
               className="h-8 gap-1.5 border-zinc-800 bg-zinc-900 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100"
             >
-              <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+              {loading ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
               Retry
             </Button>
           </div>

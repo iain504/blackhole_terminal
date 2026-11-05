@@ -13,10 +13,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
 import {
-  Bot, ChevronDown, ChevronRight, Loader2, RefreshCw, CheckCircle2, XCircle, Wrench,
+  Bot, ChevronDown, ChevronRight, RefreshCw, CheckCircle2, XCircle, Wrench,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { useToast } from '@/hooks/use-toast'
 import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
 import {
@@ -241,7 +242,7 @@ export default function StrategyTab() {
             onClick={() => void load()}
             aria-label="Refresh strategy details"
           >
-            <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+            {loading ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
           </Button>
         </div>
       </div>

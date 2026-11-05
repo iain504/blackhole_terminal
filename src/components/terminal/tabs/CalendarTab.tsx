@@ -5,6 +5,7 @@ import { AlertTriangle, Bell, RefreshCw, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { cn } from '@/lib/utils'
 import { FilterMultiSelect } from './FilterMultiSelect'
 
@@ -420,7 +421,7 @@ export default function CalendarTab() {
           title="Refresh (fetches the latest ForexFactory data)"
           className="size-7 text-zinc-400 hover:text-zinc-100"
         >
-          <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} aria-hidden="true" />
+          {loading ? <TaijiSpinner className="size-3.5" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
         </Button>
       </header>
 
@@ -491,9 +492,14 @@ export default function CalendarTab() {
         aria-label="Economic events list"
         tabIndex={0}
       >
-        {/* Loading skeleton (only when there is no data yet) */}
+        {/* Loading skeleton (only when there is no data yet) — v2.12.16:
+            an ink 太極 presides over the pulse rows (道家 loading scene) */}
         {loading && !hasData && !error && (
           <div className="p-3" aria-hidden="true">
+            <div className="mb-3 flex items-center justify-center gap-2 text-zinc-500">
+              <TaijiSpinner className="h-4 w-4" />
+              <span className="lp-kai text-[11px] tracking-[0.3em]">觀曆中</span>
+            </div>
             <Skeleton className="mb-3 h-4 w-44" />
             <div className="space-y-2.5">
               {Array.from({ length: 9 }).map((_, i) => (

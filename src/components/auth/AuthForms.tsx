@@ -8,17 +8,8 @@
 // Settings → Backup & Restore instead.
 
 import { useEffect, useRef, useState } from 'react';
-import {
-  ArrowLeft,
-  BarChart3,
-  Check,
-  Copy,
-  DatabaseBackup,
-  FolderOpen,
-  Loader2,
-  ShieldCheck,
-  TriangleAlert,
-} from 'lucide-react';
+import { ArrowLeft, BarChart3, Check, Copy, DatabaseBackup, FolderOpen, ShieldCheck, TriangleAlert } from 'lucide-react';
+import { TaijiSpinner } from '@/components/theme/TaoistLoader';
 import { Button } from '@/components/ui/button';
 import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp';
 import { Input } from '@/components/ui/input';
@@ -470,7 +461,7 @@ export default function AuthForms({
                 disabled={loading}
                 className="mt-1 w-full bg-emerald-600 text-white hover:bg-emerald-500"
               >
-                {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {loading && <TaijiSpinner className="h-4 w-4" />}
                 Continue
               </Button>
             </>
@@ -541,7 +532,7 @@ export default function AuthForms({
                 disabled={loading || code.length !== 6}
                 className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
               >
-                {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {loading && <TaijiSpinner className="h-4 w-4" />}
                 Create account
               </Button>
             </>
@@ -577,7 +568,7 @@ export default function AuthForms({
                 disabled={loading || code.length !== 6}
                 className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
               >
-                {loading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {loading && <TaijiSpinner className="h-4 w-4" />}
                 Verify
               </Button>
             </>
@@ -635,7 +626,7 @@ export default function AuthForms({
 
             {restorePhase === 'check' && (
               <div className="flex items-center gap-2 py-2 text-sm text-zinc-400">
-                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                <TaijiSpinner className="h-4 w-4" aria-hidden />
                 Checking availability…
               </div>
             )}
@@ -694,7 +685,7 @@ export default function AuthForms({
                   className="w-full bg-emerald-600 text-white hover:bg-emerald-500"
                   onClick={() => void handleRestoreSubmit()}
                 >
-                  {restoreBusy ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <DatabaseBackup className="h-4 w-4" aria-hidden />}
+                  {restoreBusy ? <TaijiSpinner className="h-4 w-4" aria-hidden /> : <DatabaseBackup className="h-4 w-4" aria-hidden />}
                   Restore backup
                 </Button>
               </div>

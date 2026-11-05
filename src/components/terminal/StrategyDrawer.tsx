@@ -9,7 +9,8 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useToast } from '@/hooks/use-toast'
-import { Bot, Loader2, Zap, AlertTriangle } from 'lucide-react'
+import { Bot, Zap, AlertTriangle } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { cn } from '@/lib/utils'
 import { ttLog } from '@/lib/console-log'
 import { fmtAtrExit, ATR_TF_OPTIONS } from '@/lib/atr-client'
@@ -576,7 +577,7 @@ export function StrategyDrawer({ onClose }: { onClose: () => void }) {
               acctMode === 'live' ? 'bg-amber-600 hover:bg-amber-500' : 'bg-violet-600 hover:bg-violet-500',
             )}
           >
-            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : acctMode === 'live' ? '🤖 Arm on LIVE' : '🤖 Arm strategy'}
+            {creating ? <TaijiSpinner className="h-3 w-3" /> : acctMode === 'live' ? '🤖 Arm on LIVE' : '🤖 Arm strategy'}
           </Button>
         </div>
 

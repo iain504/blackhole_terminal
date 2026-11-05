@@ -8,10 +8,8 @@
 // Polls every 5s like the Algo tab.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
-import {
-  LayoutGrid, RefreshCw, Square, Trash2, Info, Loader2, CircleAlert, Pencil,
-  Download, Upload, Copy, Sparkles, Pause, Play,
-} from 'lucide-react'
+import { LayoutGrid, RefreshCw, Square, Trash2, Info, CircleAlert, Pencil, Download, Upload, Copy, Sparkles, Pause, Play } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { useShallow } from 'zustand/react/shallow'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -353,7 +351,7 @@ export default function GridTab() {
           Import setup
         </Button>
         <Button variant="ghost" size="icon" className="h-7 w-7 text-zinc-400 hover:text-zinc-100" onClick={() => void load()} aria-label="Refresh grid trades">
-          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+          {loading ? <TaijiSpinner className="h-3.5 w-3.5" /> : <RefreshCw className="h-3.5 w-3.5" />}
         </Button>
       </div>
 
@@ -517,7 +515,7 @@ export default function GridTab() {
                         onClick={() => void pauseResume(g, 'pause')}
                         title="Suspend this grid — the engine freezes it (no orders, no guard checks) until you resume"
                       >
-                        {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Pause className="h-3 w-3" />} Suspend
+                        {busyId === g.id ? <TaijiSpinner className="h-3 w-3" /> : <Pause className="h-3 w-3" />} Suspend
                       </Button>
                     )}
                     {isPaused && (
@@ -527,7 +525,7 @@ export default function GridTab() {
                         onClick={() => void pauseResume(g, 'resume')}
                         title="Resume this suspended grid — the next engine tick continues with its open lots intact"
                       >
-                        {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />} Resume
+                        {busyId === g.id ? <TaijiSpinner className="h-3 w-3" /> : <Play className="h-3 w-3" />} Resume
                       </Button>
                     )}
                     {(isActive || isPaused || (g.status === 'error' && openLotsG > 0)) && (
@@ -539,7 +537,7 @@ export default function GridTab() {
                           ? 'Retry the close — the close qty is sized from the live broker balance (fees can make it smaller than the tracked lots)'
                           : 'Stop this grid (respects its close-on-stop setting)'}
                       >
-                        {busyId === g.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Square className="h-3 w-3" />} Stop
+                        {busyId === g.id ? <TaijiSpinner className="h-3 w-3" /> : <Square className="h-3 w-3" />} Stop
                       </Button>
                     )}
                     {!isActive && !(g.status === 'error' && openLotsG > 0) && (

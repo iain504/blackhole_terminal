@@ -807,6 +807,14 @@ html.theme-day .ink-backdrop { display: none; }
   font-family: var(--font-brush), var(--font-kai), serif;
   font-weight: 400;
 }
+/* v2.12.16 — the kai face without the display sizing (loading labels, chips).
+   NOTE: font-weight is NOT decorative — with a byte-identical declaration set
+   to .lp-root, LightningCSS dedupes this whole rule away (served CSS drops
+   it); the extra property breaks the exact-match merge. */
+.lp-kai {
+  font-family: var(--font-kai), var(--font-geist-sans), ui-sans-serif, system-ui, serif;
+  font-weight: 400;
+}
 .lp-vertical {
   writing-mode: vertical-rl;
   letter-spacing: 0.35em;
@@ -853,5 +861,50 @@ html.theme-day .ink-backdrop { display: none; }
     opacity: 1;
     filter: blur(0);
     transform: translateY(0);
+  }
+}
+
+/* ===========================================================================
+   v2.12.16 — 道家 loading 動畫 (Taoist loading animations)
+   - .tt-taiji-rot — the ink 太極 spins at an unhurried 1.8 s (道法自然 —
+     loading should breathe, not panic like lucide's 1 s whirr). The rotation
+     lives on an inner <g> (transform-box: fill-box) so host positioning
+     classes like top-1/2 -translate-y-1/2 on the <svg> keep working.
+   - .tt-taiji-rot-slow — boot emblem taiji, 2.8 s ceremonial pace.
+   - .tt-bagua-rot — 先天八卦 trigram ring counter-rotates over 46 s.
+   - .tt-dot — the 啟動中 ellipsis breathes dot by dot.
+   =========================================================================== */
+@media (prefers-reduced-motion: no-preference) {
+  .tt-taiji-rot {
+    animation: tt-rot-cw 1.8s linear infinite;
+  }
+  .tt-taiji-rot-slow {
+    animation: tt-rot-cw 2.8s linear infinite;
+  }
+  .tt-bagua-rot {
+    animation: tt-rot-ccw 46s linear infinite;
+  }
+  .tt-dot {
+    animation: tt-dot-breathe 1.4s ease-in-out infinite;
+  }
+}
+@keyframes tt-rot-cw {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes tt-rot-ccw {
+  to {
+    transform: rotate(-360deg);
+  }
+}
+@keyframes tt-dot-breathe {
+  0%,
+  60%,
+  100% {
+    opacity: 0.2;
+  }
+  30% {
+    opacity: 1;
   }
 }

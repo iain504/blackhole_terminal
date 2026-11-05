@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -918,7 +919,7 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                   title={ctaDisabled && ctaBlocker ? ctaBlocker : `Runs the full ${LEVEL_META[level].label} pipeline: fetch → prepare → … → golden result`}
                   onClick={() => onRun(LEVEL_META[level].mode)}
                 >
-                  {running ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+                  {running ? <TaijiSpinner className="h-4 w-4" /> : <Rocket className="h-4 w-4" />}
                   Run head-to-end
                 </Button>
                 <span className="text-[10px] leading-snug text-zinc-500">
@@ -1039,7 +1040,7 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                       disabled={running || props.activeRanges.length === 0 || allIssues.length > 0}
                       onClick={() => onOptimize()}
                     >
-                      {busy === 'optimize' ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Wand2 className="h-3.5 w-3.5" />}
+                      {busy === 'optimize' ? <TaijiSpinner className="h-3.5 w-3.5" /> : <Wand2 className="h-3.5 w-3.5" />}
                       Run optimizer
                     </Button>
                   </div>

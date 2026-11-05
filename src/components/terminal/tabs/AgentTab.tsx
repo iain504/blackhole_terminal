@@ -29,6 +29,7 @@ import { cn } from '@/lib/utils'
 import type { RegimeSnapshot, RegimeState } from '@/lib/regime-types'
 import { DevicesCard } from '@/components/terminal/DevicesCard'
 import { useToast } from '@/hooks/use-toast'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import {
   Sparkles, Radar, BrainCircuit, Trophy, Wallet, Rocket, Square, Play, Trash2,
   Activity, TrendingUp, Crosshair, Gauge, CircleDollarSign, Zap, Globe2,
@@ -433,7 +434,7 @@ export default function AgentTab() {
           <div className="agent-scanline pointer-events-none absolute inset-y-0 left-0 w-1/3" />
           <div className="mb-2 flex items-center justify-between text-xs">
             <span className="inline-flex items-center gap-1.5 font-medium text-zinc-300">
-              <Radar className="h-3.5 w-3.5 animate-spin text-cyan-300" style={{ animationDuration: '3s' }} />
+              <TaijiSpinner className="h-3.5 w-3.5 text-cyan-300" />
               {session?.phase || 'WORKING'}
             </span>
             <span className="font-mono text-zinc-500">{Math.round((session?.progress ?? 0) * 100)}%</span>

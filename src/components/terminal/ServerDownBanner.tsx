@@ -16,6 +16,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 
 const SIDE_CAR_Q = '?XTransformPort=3030'
 
@@ -98,7 +99,7 @@ export function ServerDownBanner() {
     >
       {phase === 'restarting' ? (
         <>
-          <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-red-300 border-t-transparent" aria-hidden />
+          <TaijiSpinner className="h-3 w-3 text-red-300" />
           <span className="font-medium">Restarting the terminal server… this takes up to ~40s. The page reloads itself when it&apos;s back.</span>
         </>
       ) : phase === 'sidecar-down' ? (

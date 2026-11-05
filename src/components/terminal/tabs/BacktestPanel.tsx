@@ -30,6 +30,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useToast } from '@/hooks/use-toast'
@@ -1171,7 +1172,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                       title="Re-run the EXACT same config with every regime gate forced off — the honest baseline that quantifies what the gates removed"
                       onClick={() => void runGateAb()}
                     >
-                      {abBusy ? <RefreshCw className="h-3 w-3 animate-spin" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
+                      {abBusy ? <TaijiSpinner className="h-3 w-3" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
                       A/B: gates off
                     </Button>
                   )}
@@ -1240,7 +1241,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                   title="Replay the EXACT same window with the trailing exit forced off — the honest 'before' that quantifies what the trail changed"
                   onClick={() => void runTrailAb()}
                 >
-                  {trailAbBusy ? <RefreshCw className="h-3 w-3 animate-spin" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
+                  {trailAbBusy ? <TaijiSpinner className="h-3 w-3" aria-hidden /> : <FlaskConical className="h-3 w-3" aria-hidden />}
                   A/B: trail off
                 </Button>
               </div>
@@ -1845,7 +1846,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
                 disabled={recoJob?.running === true}
                 title="Re-run the sweep matrix over your watchlist symbols × 3 timeframes on fresh bars (a few minutes) — the list updates in place when it lands"
               >
-                <RefreshCw className={cn('h-3 w-3', recoJob?.running && 'animate-spin')} aria-hidden />
+                {recoJob?.running ? <TaijiSpinner className="h-3 w-3" aria-hidden /> : <RefreshCw className="h-3 w-3" aria-hidden />}
                 {recoJob?.running ? `Sweeping ${recoJob.done}/${recoJob.total}` : 'Refresh'}
               </Button>
               <Button

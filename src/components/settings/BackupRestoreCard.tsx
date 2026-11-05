@@ -13,15 +13,8 @@
 // that warns when it appears blocked.
 
 import { useRef, useState } from 'react';
-import {
-  DatabaseBackup,
-  Download,
-  FileJson,
-  FolderOpen,
-  Loader2,
-  RotateCcw,
-  Upload,
-} from 'lucide-react';
+import { DatabaseBackup, Download, FileJson, FolderOpen, RotateCcw, Upload } from 'lucide-react';
+import { TaijiSpinner } from '@/components/theme/TaoistLoader';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
@@ -330,7 +323,7 @@ export default function BackupRestoreCard() {
             disabled={exporting || importing}
             className="border-zinc-800 bg-zinc-950 text-zinc-200 hover:bg-zinc-800 hover:text-zinc-100"
           >
-            {exporting ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Download className="h-4 w-4" aria-hidden />}
+            {exporting ? <TaijiSpinner className="h-4 w-4" aria-hidden /> : <Download className="h-4 w-4" aria-hidden />}
             Export backup
           </Button>
           <Button
@@ -506,7 +499,7 @@ export default function BackupRestoreCard() {
                     disabled={importing || !pasteText.trim()}
                     onClick={confirmPaste}
                   >
-                    {importing ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Upload className="h-4 w-4" aria-hidden />}
+                    {importing ? <TaijiSpinner className="h-4 w-4" aria-hidden /> : <Upload className="h-4 w-4" aria-hidden />}
                     Review &amp; restore
                   </Button>
                 </DialogFooter>
@@ -547,7 +540,7 @@ export default function BackupRestoreCard() {
                   void runRestore();
                 }}
               >
-                {importing ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : null}
+                {importing ? <TaijiSpinner className="h-4 w-4" aria-hidden /> : null}
                 Replace &amp; restore
               </AlertDialogAction>
             </AlertDialogFooter>

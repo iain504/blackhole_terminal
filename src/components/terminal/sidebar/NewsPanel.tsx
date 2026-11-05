@@ -6,6 +6,7 @@ import { NewsItem } from '@/lib/market-types'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { ExternalLink, Newspaper } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 
 export function NewsPanel({ symbol }: { symbol: string }) {
   const [scope, setScope] = useState<'symbol' | 'all'>('symbol')
@@ -81,7 +82,12 @@ export function NewsPanel({ symbol }: { symbol: string }) {
             </button>
           </div>
         )}
-        {loading && !failed && <p className="px-2 py-6 text-center text-[11px] text-zinc-500">Loading news…</p>}
+        {loading && !failed && (
+          <p className="flex items-center justify-center gap-2 px-2 py-6 text-center text-[11px] text-zinc-500">
+            <TaijiSpinner className="h-3 w-3" aria-hidden />
+            Loading news…
+          </p>
+        )}
         {!loading && news.length === 0 && (
           <div className="px-2 py-6 text-center text-[11px] text-zinc-500">
             <Newspaper className="mx-auto mb-1 h-4 w-4" />

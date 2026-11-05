@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react'
 import { RefreshCw, Settings2, TriangleAlert } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -604,7 +605,7 @@ export default function AlgoRunSettingsDialog({
                   : undefined}
             onClick={() => void save()}
           >
-            {saving ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Settings2 className="h-3 w-3" />}
+            {saving ? <TaijiSpinner className="h-3 w-3" /> : <Settings2 className="h-3 w-3" />}
             Save settings
           </Button>
         </DialogFooter>

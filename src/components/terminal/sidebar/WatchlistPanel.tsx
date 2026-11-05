@@ -22,7 +22,8 @@ import {
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Loader2, Pencil, GripVertical, FolderPlus } from 'lucide-react'
+import { Plus, MoreVertical, Trash2, ChevronUp, ChevronDown, Palette, X, Tag, Pencil, GripVertical, FolderPlus } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 
 const LIST_COLORS = ['#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4', '#e879f9', '#f4f4f5']
 
@@ -500,7 +501,7 @@ export function WatchlistPanel() {
                 className="h-6 border-zinc-800 bg-zinc-950 pr-6 text-[11px]"
               />
               {suggLoading && (
-                <Loader2 className="absolute right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 animate-spin text-zinc-600" />
+                <TaijiSpinner className="absolute right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-zinc-600" />
               )}
               {suggOpen && sugg.length > 0 && (
                 <div
@@ -753,7 +754,7 @@ export function WatchlistPanel() {
               onClick={() => void submitRename()}
             >
               <span className="flex items-center gap-1.5">
-                {renaming && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {renaming && <TaijiSpinner className="h-3.5 w-3.5" />}
                 Save name
               </span>
             </Button>

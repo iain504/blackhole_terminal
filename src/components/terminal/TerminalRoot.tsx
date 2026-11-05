@@ -16,10 +16,12 @@ import { ChartWorkspace } from './ChartWorkspace'
 import { MobileShell } from './mobile/MobileShell'
 import { SessionSplash } from './SessionSplash'
 import { useIsMobile } from '@/hooks/use-mobile'
+import { TaijiSpinner, TaoistBootLoader } from '@/components/theme/TaoistLoader'
 
+// v2.12.16 — tab code-split fallback: an ink 太極 instead of the lucide whirr.
 const TabFallback = () => (
   <div className="flex h-[60vh] items-center justify-center text-zinc-500" role="status" aria-live="polite">
-    <Loader2 className="h-5 w-5 animate-spin" aria-hidden />
+    <TaijiSpinner className="h-5 w-5" aria-hidden />
     <span className="sr-only">Loading tab…</span>
   </div>
 )
@@ -35,7 +37,7 @@ const AgentTab = dynamic(() => import('./tabs/AgentTab'), { ssr: false, loading:
 import { StrategyDrawer } from './StrategyDrawer'
 import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'
-import { BellRing, Clock, Home, Keyboard, Loader2, Settings2 } from 'lucide-react'
+import { BellRing, Clock, Home, Keyboard, Settings2 } from 'lucide-react'
 import { useFleetPresence } from '@/hooks/use-fleet-presence'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -416,13 +418,32 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
     }
   }, [user, toast])
 
+  // v2.12.16 — the boot 畫面 is now a Taoist loading scene: the 八卦 wheel
+  // around a turning 太極, a 道德經 line in the brush face, the whole frame
+  // inked in (lp-ink-in) over the faint mountain painting (bg /85 lets the
+  // InkBackdrop through — the splash is no longer an opaque wall).
   if (!hydrated) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-zinc-400">
-        <div className="flex items-center gap-3 text-sm">
-          <Loader2 className="h-5 w-5 animate-spin" />
-          Loading TradeTerminal…
+      <div className="relative z-10 flex min-h-screen flex-col items-center justify-center gap-8 bg-zinc-950/85 px-6 text-center">
+        <div className="lp-ink-in flex flex-col items-center gap-7">
+          <TaoistBootLoader className="h-28 w-28 text-zinc-300 sm:h-32 sm:w-32" />
+          <div className="flex items-center gap-3">
+            <p className="lp-brush text-[1.7rem] leading-snug tracking-[0.12em] text-zinc-100 sm:text-3xl">
+              執古之道，以御今之有
+            </p>
+            <span className="lp-seal h-6 w-6 shrink-0 text-[11px]" aria-hidden>
+              道
+            </span>
+          </div>
+          <p className="text-[11px] tracking-[0.42em] text-zinc-500">道德經 ‧ 十四章</p>
+          <p className="flex items-center gap-1.5 text-xs tracking-[0.32em] text-zinc-500">
+            終端啟動中
+            <span className="tt-dot" aria-hidden>·</span>
+            <span className="tt-dot" style={{ animationDelay: '200ms' }} aria-hidden>·</span>
+            <span className="tt-dot" style={{ animationDelay: '400ms' }} aria-hidden>·</span>
+          </p>
         </div>
+        <span className="sr-only">Loading TradeTerminal…</span>
       </div>
     )
   }
@@ -995,7 +1016,7 @@ function AlertsDrawer({ onClose }: { onClose: () => void }) {
             size="sm" disabled={!formValid || creating} onClick={() => void create()}
             className="mt-2 h-7 w-full bg-amber-500 text-xs text-zinc-950 hover:bg-amber-400"
           >
-            {creating ? <Loader2 className="h-3 w-3 animate-spin" /> : '🔔 Create alarm'}
+            {creating ? <TaijiSpinner className="h-3 w-3" /> : '🔔 Create alarm'}
           </Button>
         </div>
 

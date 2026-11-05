@@ -6,7 +6,8 @@
 //  - an equity curve from Alpaca's /v2/account/portfolio/history with
 //    Hour / Day / Week / Month / Year ranges and a paper/live toggle
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Loader2, RefreshCw, Settings2 } from 'lucide-react'
+import { RefreshCw, Settings2 } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog'
@@ -234,7 +235,7 @@ export default function AccountOverview() {
               onClick={refreshAll}
               aria-label="Refresh account and equity data"
             >
-              <RefreshCw className={cn('h-3 w-3', refreshing && 'animate-spin')} />
+              {refreshing ? <TaijiSpinner className="h-3 w-3" /> : <RefreshCw className="h-3 w-3" />}
             </Button>
           </div>
         </div>
@@ -295,7 +296,7 @@ function AccountCard({ mode, state }: { mode: Mode; state: ModeState }) {
 
       {!state.loaded ? (
         <div className="flex h-[86px] items-center justify-center text-zinc-600">
-          <Loader2 className="h-4 w-4 animate-spin" />
+          <TaijiSpinner className="h-4 w-4" />
         </div>
       ) : !a ? (
         <div className="flex h-[86px] flex-col justify-center text-[11px] text-zinc-600">
@@ -461,7 +462,7 @@ function EquityChart({ points, loaded, error, range }: {
     <div className="relative min-h-[132px] flex-1" ref={ref}>
       {!loaded ? (
         <div className="flex h-full min-h-[132px] items-center justify-center text-zinc-600">
-          <Loader2 className="h-4 w-4 animate-spin" />
+          <TaijiSpinner className="h-4 w-4" />
         </div>
       ) : n === 0 ? (
         <div className="flex h-full min-h-[132px] flex-col items-center justify-center px-4 text-center text-[11px] text-zinc-600">

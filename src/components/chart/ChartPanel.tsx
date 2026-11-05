@@ -33,12 +33,8 @@ import { Switch } from '@/components/ui/switch'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useToast } from '@/hooks/use-toast'
 import { Slider } from '@/components/ui/slider'
-import {
-  MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2,
-  ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, Loader2, BellPlus,
-  Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb,
-  LayoutGrid, Grid3x3, Layers, Tag,
-} from 'lucide-react'
+import { MousePointer2, Minus, ArrowUpDown, TrendingUp, Ruler, Eye, EyeOff, Trash2, ChevronDown, CandlestickChart as CandleIcon, LineChart as LineIcon, BellPlus, Briefcase, Sigma, Square, Type, Sparkles, AlignHorizontalJustifyCenter, Lightbulb, LayoutGrid, Grid3x3, Layers, Tag } from 'lucide-react'
+import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { TradeAdvisor } from './TradeAdvisor'
@@ -4626,7 +4622,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                     disabled={srBusy}
                     onClick={() => void runAutoSr()}
                   >
-                    {srBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Sparkles className="h-3 w-3" />}
+                    {srBusy ? <TaijiSpinner className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}
                     {srBusy ? 'Analyzing…' : 'Draw S/R'}
                   </Button>
                 </div>
@@ -4914,7 +4910,7 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
       {/* loading overlay */}
       {loading && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-zinc-950/40">
-          <Loader2 className="h-6 w-6 animate-spin text-emerald-500" />
+          <TaijiSpinner className="h-6 w-6 text-emerald-500" />
         </div>
       )}
 
