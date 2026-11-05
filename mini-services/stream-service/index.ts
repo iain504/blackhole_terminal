@@ -1,7 +1,12 @@
 // stream-service — real-time price streaming for the trading terminal.
 //
 // Browser ──socket.io (path '/socket.io', port 3030, via Caddy ?XTransformPort=3030)──▶ this service
-//   ├─ CRYPTO: one shared Binance websocket (free, keyless) → 24h miniTicker ≈ 1 tick/s/symbol
+//   ├─ CRYPTO: keyed users stream the Alpaca v1beta3 crypto/us websocket (ONE per key —
+//   │          Alpaca's 1-connection limit applies PER FEED, so a key may hold both the
+//   │          stock and the crypto websocket). The shared Binance websocket (free,
+//   │          keyless) stays as the guest source + fallback where Binance is reachable.
+//   │          v2.12.8 rationale: Binance geo-blocks US datacenter hosts (Render →
+//   │          HTTP 451), so hosted crypto rows had NO live feed while stocks did.
 //   ├─ STOCKS: EXACTLY ONE Alpaca v2 iex websocket per account (Alpaca allows ONE concurrent
 //   │          market-data connection per key — a 2nd gets error 406/403 "connection limit
 //   │          exceeded"; the free plan also caps 30 subscribed symbols per websocket).
@@ -41,6 +46,10 @@ const NEXT_BASE = 'http://localhost:3000'
 const BINANCE_WS_BASES = ['wss://stream.binance.com:9443/ws', 'wss://data-stream.binance.vision/ws']
 let binanceBaseIdx = 0
 const ALPACA_WS = 'wss://stream.data.alpaca.markets/v2/iex'
+// v2.12.8 — crypto now streams from Alpaca too (its own single-slot feed):
+// keyed users get real-time crypto ticks from the same provider as their
+// stock ticks instead of depending on the geo-blocked Binance websocket.
+const ALPACA_CRYPTO_WS = 'wss://stream.data.alpaca.markets/v1beta3/crypto/us'
 const FLUSH_MS = 200 // per-symbol emit throttle → ≤5 msgs/s
 const KEY_CACHE_MS = 60_000
 const QUOTE_TIMEOUT_MS = 4000
@@ -419,6 +428,9 @@ interface AlpacaKeys {
   secret: string
 }
 interface AlpacaConn {
+  /** which feed this upstream serves — the two feeds have independent
+   *  1-connection-per-key slots, so a key may hold one of each. */
+  kind: 'stock' | 'crypto'
   keys: AlpacaKeys
   ws: WebSocket | null
   sockets: Set<Socket>
@@ -431,12 +443,13 @@ interface AlpacaConn {
   backoff: number
   reconnectTimer: ReturnType<typeof setTimeout> | null
 }
-const alpacaConns = new Map<string, AlpacaConn>() // keyId → conn
+const alpacaConns = new Map<string, AlpacaConn>() // keyId → STOCK conn (v2 iex feed)
+const alpacaCryptoConns = new Map<string, AlpacaConn>() // keyId → CRYPTO conn (v1beta3 feed)
 
 function alpacaConnect(conn: AlpacaConn) {
   if (conn.ws) return
   try {
-    const ws = new WebSocket(ALPACA_WS)
+    const ws = new WebSocket(conn.kind === 'crypto' ? ALPACA_CRYPTO_WS : ALPACA_WS)
     conn.ws = ws
     conn.authed = false
     let opened = false
@@ -490,9 +503,10 @@ function alpacaConnect(conn: AlpacaConn) {
             // connection at the same time, you may receive a 406 or 403."
             // Another client (or a stale process) holds the slot → do NOT
             // reconnect-spam. Cool down and retry quietly when it elapses.
+            // Per-FEED cooldown: a busy crypto slot must not suppress stocks.
             conn.failed = true
             conn.failedReason = 'slot'
-            slotCooldown.set(conn.keys.keyId, Date.now())
+            slotCooldown.set(slotKey(conn), Date.now())
             try { ws.close() } catch { /* noop */ }
           } else if (code === 407 || code === 409) {
             // subscription rate/symbol limit (free plan: 30 symbols/conn):
@@ -525,8 +539,12 @@ function alpacaSync(conn: AlpacaConn) {
   const ws = conn.ws
   if (!ws || ws.readyState !== WebSocket.OPEN || !conn.authed) return
   conn.wanted = new Set()
+  // each feed takes only its own symbols: stock conns aggregate the bound
+  // sockets' non-crypto wants, crypto conns their crypto wants
   for (const sock of conn.sockets) {
-    for (const s of socketSyms.get(sock) ?? []) if (!isCrypto(s)) conn.wanted.add(s)
+    for (const s of socketSyms.get(sock) ?? []) {
+      if (conn.kind === 'crypto' ? isCrypto(s) : !isCrypto(s)) conn.wanted.add(s)
+    }
   }
   // respect the per-connection symbol cap (free plan) — extra symbols stay
   // uncovered and simply do not stream (REST polling covers them)
@@ -534,7 +552,15 @@ function alpacaSync(conn: AlpacaConn) {
   const add = [...conn.wanted].filter((s) => !conn.subscribed.has(s)).slice(0, cap)
   const rem = [...conn.subscribed].filter((s) => !conn.wanted.has(s))
   if (add.length) {
-    ws.send(JSON.stringify({ action: 'listen', trades: add, quotes: add }))
+    // v2.12.8 — the two feeds speak DIFFERENT subscribe actions (probed live:
+    // pre-auth "subscribe" on crypto → 401 "not authenticated" i.e. parsed,
+    // while "listen" → 400 "invalid syntax"; stocks v2 is documented "listen"):
+    // crypto v1beta3 = "subscribe"/"unsubscribe", stocks v2 = "listen"/"unsubscribe".
+    ws.send(JSON.stringify(
+      conn.kind === 'crypto'
+        ? { action: 'subscribe', trades: add, quotes: add }
+        : { action: 'listen', trades: add, quotes: add },
+    ))
     for (const s of add) conn.subscribed.add(s)
   }
   if (rem.length) {
@@ -552,7 +578,7 @@ function teardownConn(conn: AlpacaConn) {
   conn.authed = false
   try { conn.ws?.close() } catch { /* noop */ }
   conn.ws = null
-  alpacaConns.delete(conn.keys.keyId)
+  ;(conn.kind === 'crypto' ? alpacaCryptoConns : alpacaConns).delete(conn.keys.keyId)
 }
 
 /**
@@ -562,7 +588,10 @@ function teardownConn(conn: AlpacaConn) {
  * connection slot — e.g. right after the user rotates their API keys).
  */
 function bindSocketToConn(socket: Socket, conn: AlpacaConn) {
-  for (const other of [...alpacaConns.values()]) {
+  // a socket binds to ONE upstream per feed kind — stock and crypto conns are
+  // independent (Alpaca's 1-connection limit applies per feed)
+  const sameKind = conn.kind === 'crypto' ? alpacaCryptoConns : alpacaConns
+  for (const other of [...sameKind.values()]) {
     if (other === conn) continue
     if (other.sockets.delete(socket) && other.sockets.size === 0) teardownConn(other)
   }
@@ -764,10 +793,14 @@ io.on('connection', (socket: Socket) => {
     acquire(syms)
     for (const s of syms) set.add(s)
 
-    // crypto → shared binance upstream
+    // crypto → the socket's Alpaca crypto upstream (v2.12.8, keyed users) —
+    // the shared Binance upstream stays subscribed as well (guest source +
+    // fallback wherever Binance is reachable; the flush map dedups by symbol)
     if (syms.some(isCrypto)) {
       if (!binanceWs) binanceConnect()
       else binanceSync()
+      const cconn = [...alpacaCryptoConns.values()].find((c) => c.sockets.has(socket))
+      if (cconn) alpacaSync(cconn)
     }
     // stocks → the socket's bound alpaca upstream (if any); without one the
     // symbols stay quiet (client-side REST polling is the fallback)
@@ -801,7 +834,7 @@ io.on('connection', (socket: Socket) => {
     if (set) for (const s of syms) set.delete(s)
     release(syms)
     binanceSync()
-    for (const conn of alpacaConns.values()) {
+    for (const conn of [...alpacaConns.values(), ...alpacaCryptoConns.values()]) {
       if (conn.sockets.has(socket)) alpacaSync(conn)
     }
   })
@@ -813,11 +846,11 @@ io.on('connection', (socket: Socket) => {
       release([...set])
       socketSyms.delete(socket)
     }
-    for (const conn of [...alpacaConns.values()]) {
+    for (const conn of [...alpacaConns.values(), ...alpacaCryptoConns.values()]) {
       conn.sockets.delete(socket)
       if (conn.sockets.size === 0) {
         // nobody bound → tear the upstream down (frees Alpaca's single
-        // connection slot for this account immediately)
+        // connection slot for this feed/account immediately)
         teardownConn(conn)
       } else alpacaSync(conn)
     }
@@ -836,18 +869,31 @@ io.on('connection', (socket: Socket) => {
   }
 
   // keys resolve asynchronously — bind the socket to its (single) Alpaca
-  // upstream when they arrive (until then its stock symbols do not stream)
+  // upstreams when they arrive (until then its symbols do not stream)
   void keysForCookie(cookieHeader).then((keys) => {
     console.log('[conn]', socket.id, 'keys:', Boolean(keys))
     if (!keys || keysFailedRecently(keys)) return
-    if (slotFailedRecently(keys)) {
-      console.log('[alpaca] connection slot busy for these keys — no stock upstream for now')
-      return
+    // stocks upstream (v2 iex feed — one websocket per key)
+    if (slotFailedRecently(keys, 'stock')) {
+      console.log('[alpaca] stock connection slot busy for these keys — no stock upstream for now')
+    } else {
+      const conn = getOrCreateAlpacaConn(keys, 'stock')
+      bindSocketToConn(socket, conn)
+      alpacaConnect(conn)
+      alpacaSync(conn)
     }
-    const conn = getOrCreateAlpacaConn(keys)
-    bindSocketToConn(socket, conn)
-    alpacaConnect(conn)
-    alpacaSync(conn)
+    // v2.12.8 — crypto upstream (v1beta3 crypto/us feed): Alpaca's one-
+    // connection limit applies PER FEED, so a second websocket per key is
+    // allowed and gives crypto real ticks on hosts Binance cannot reach
+    // (US datacenter deployments — the user report behind this change).
+    if (slotFailedRecently(keys, 'crypto')) {
+      console.log('[alpaca] crypto connection slot busy for these keys — no crypto upstream for now')
+    } else {
+      const cconn = getOrCreateAlpacaConn(keys, 'crypto')
+      bindSocketToConn(socket, cconn)
+      alpacaConnect(cconn)
+      alpacaSync(cconn)
+    }
   })
 })
 
@@ -857,11 +903,14 @@ function keysFailedRecently(keys: AlpacaKeys): boolean {
   return at != null && Date.now() - at < 10 * 60 * 1000
 }
 
-// 406/403 — another client holds Alpaca's single market-data connection slot.
-// Cool down instead of reconnect-spamming; retried automatically below.
+// 406/403 — another client holds the feed's single market-data connection
+// slot. Cool down instead of reconnect-spamming; retried automatically below.
 const slotCooldown = new Map<string, number>()
-function slotFailedRecently(keys: AlpacaKeys): boolean {
-  const at = slotCooldown.get(keys.keyId)
+/** cooldown is per FEED — the stock (iex) and crypto (v1beta3) slots fail
+ *  independently, and a busy crypto slot must not suppress stock streaming. */
+const slotKey = (conn: AlpacaConn) => `${conn.keys.keyId}|${conn.kind}`
+function slotFailedRecently(keys: AlpacaKeys, kind: 'stock' | 'crypto'): boolean {
+  const at = slotCooldown.get(`${keys.keyId}|${kind}`)
   return at != null && Date.now() - at < SLOT_COOLDOWN_MS
 }
 
@@ -869,7 +918,7 @@ function slotFailedRecently(keys: AlpacaKeys): boolean {
 // (e.g. a socket rebound to new keys would otherwise orphan the old conn and
 // eat the account's only connection slot).
 setInterval(() => {
-  for (const conn of [...alpacaConns.values()]) {
+  for (const conn of [...alpacaConns.values(), ...alpacaCryptoConns.values()]) {
     if (conn.sockets.size === 0) teardownConn(conn)
   }
 }, 30_000)
@@ -882,7 +931,7 @@ setInterval(() => {
       conn.failed &&
       conn.failedReason === 'slot' &&
       conn.sockets.size > 0 &&
-      Date.now() - (slotCooldown.get(conn.keys.keyId) ?? 0) >= SLOT_COOLDOWN_MS
+      Date.now() - (slotCooldown.get(slotKey(conn)) ?? 0) >= SLOT_COOLDOWN_MS
     ) {
       console.log('[alpaca] connection-slot cooldown elapsed — retrying')
       conn.failed = false
@@ -893,10 +942,12 @@ setInterval(() => {
   }
 }, 60_000)
 
-function getOrCreateAlpacaConn(keys: AlpacaKeys): AlpacaConn {
-  let conn = alpacaConns.get(keys.keyId)
+function getOrCreateAlpacaConn(keys: AlpacaKeys, kind: 'stock' | 'crypto'): AlpacaConn {
+  const map = kind === 'crypto' ? alpacaCryptoConns : alpacaConns
+  let conn = map.get(keys.keyId)
   if (!conn) {
     conn = {
+      kind,
       keys,
       ws: null,
       sockets: new Set(),
@@ -909,7 +960,8 @@ function getOrCreateAlpacaConn(keys: AlpacaKeys): AlpacaConn {
       backoff: 1000,
       reconnectTimer: null,
     }
-    alpacaConns.set(keys.keyId, conn)
+    map.set(keys.keyId, conn)
+    return conn
   }
   return conn
 }

@@ -4,6 +4,7 @@
 // deterministic demo simulator so the app always works — but the failure
 // REASON is surfaced so the UI can tell "no keys" apart from "keys rejected".
 import { db } from '@/lib/db'
+import type { Prisma } from '@prisma/client'
 import { decrypt, encrypt, maskKey } from '@/lib/crypt'
 import {
   Bar, Quote, NewsItem, MarkerData, Timeframe, TIMEFRAMES,
@@ -337,7 +338,6 @@ export async function migrateLegacyAlpacaKeys(userId: string): Promise<void> {
       s.alpacaLiveKeyIdEnc = encrypt(keyId)
       s.alpacaLiveSecretEnc = encrypt(secret)
     }
-    const { Prisma } = await import('@prisma/client')
     await db.user.update({
       where: { id: userId },
       data: { settings: s as unknown as Prisma.InputJsonValue },
@@ -930,10 +930,16 @@ export async function getQuotes(
   const quotes: Quote[] = []
   let lastStatus = 0
   let usedBinance = false
+  let usedAlpaca = false
+  const keys = await getAlpacaKeys(userId)
 
-  // Crypto first: Binance free 24h tickers, no API key — real crypto prices
-  // for logged-out visitors (missing symbols fall through to Alpaca/demo).
-  if (cryptos.length > 0) {
+  // v2.12.8 — KEYLESS deployments only: Binance free 24h tickers stay the
+  // primary crypto source when NO Alpaca keys resolve at all. With keys,
+  // crypto now rides Alpaca v1beta3 exactly like US stocks — the user report:
+  // BTC/USD had no price feed in the watchlist on the hosted deploy because
+  // Binance geo-blocks US datacenter IPs, so the old Binance-first path left
+  // crypto rows dead while stock rows streamed from Alpaca.
+  if (!keys && cryptos.length > 0) {
     const bq = await getBinanceQuotes(cryptos)
     if (bq.length > 0) {
       quotes.push(...bq)
@@ -941,16 +947,16 @@ export async function getQuotes(
     }
   }
 
-  // Anything Binance missed (or all stock symbols) via Alpaca — only when the
-  // user has keys; without keys non-crypto symbols stay on the simulator.
+  // Everything else via Alpaca (crypto snapshots included) — only when keys
+  // resolve; without keys non-crypto symbols stay on the simulator.
   const have = new Set(quotes.map((q) => q.symbol))
   const needStocks = stocks.filter((s) => !have.has(s))
-  const needCrypto = cryptos.filter((s) => !have.has(s))
+  const needCrypto = keys ? cryptos.filter((s) => !have.has(s)) : []
   const jobs: Promise<void>[] = []
 
-  if (needStocks.length > 0 || needCrypto.length > 0) {
-    const keys = await getAlpacaKeys(userId)
-    if (keys) {
+  if (keys && (needStocks.length > 0 || needCrypto.length > 0)) {
+    const beforeAlpaca = quotes.length
+    {
       for (let i = 0; i < needStocks.length; i += 30) {
         const chunk = needStocks.slice(i, i + 30)
         jobs.push((async () => {
@@ -989,6 +995,24 @@ export async function getQuotes(
       }
       await Promise.all(jobs)
     }
+    usedAlpaca = quotes.length > beforeAlpaca
+  }
+
+  // v2.12.8 — keyed users: Binance FALLBACK for whatever Alpaca didn't return
+  // (a pair Alpaca doesn't list / transient feed failure) when Binance IS
+  // reachable. On US-hosted servers (Render) Binance is geo-blocked and this
+  // simply returns nothing — Alpaca alone carries crypto instead of the rows
+  // going dead.
+  if (keys && cryptos.length > 0) {
+    const haveA = new Set(quotes.map((q) => q.symbol))
+    const missingCrypto = cryptos.filter((s) => !haveA.has(s))
+    if (missingCrypto.length > 0) {
+      const bq = await getBinanceQuotes(missingCrypto)
+      if (bq.length > 0) {
+        quotes.push(...bq)
+        usedBinance = true
+      }
+    }
   }
 
   // TRADING callers: never synthesize. Whatever real quotes landed (Binance /
@@ -1001,7 +1025,7 @@ export async function getQuotes(
     return {
       quotes,
       demo: false,
-      source: usedBinance ? (missing.length < symbols.length ? 'binance+alpaca' : 'binance') : 'alpaca',
+      source: usedBinance ? (usedAlpaca ? 'binance+alpaca' : 'binance') : 'alpaca',
       ...(missing.length > 0 ? { degraded: missing } : {}),
     }
   }
@@ -1021,7 +1045,9 @@ export async function getQuotes(
       simFilled = true
     }
   }
-  const source2 = usedBinance ? (simFilled ? 'binance+sim-fill' : 'binance') : simFilled ? 'alpaca+sim-fill' : 'alpaca'
+  const source2 = simFilled
+    ? (usedBinance ? 'binance+sim-fill' : 'alpaca+sim-fill')
+    : usedBinance && usedAlpaca ? 'binance+alpaca' : usedBinance ? 'binance' : 'alpaca'
   return { quotes, demo: false, source: source2 }
 }
 
