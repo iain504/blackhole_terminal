@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getAccount, resolveTradeMode, isTradeMode, isNoKeysError, TradingAccount } from '@/lib/trading'
+import { describeAlpacaKeys } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
 
 const num = (v: unknown): number | null => {
@@ -30,13 +31,16 @@ export async function GET(req: Request) {
     // the engaged breaker ({data:null,status:401,'auth-backoff:…'}) and the
     // live rejection ({data:<parsed 401 body>,status:401}).
     if (status === 401) {
+      // v2.12.4 — name the pair in the banner too: the user can compare the
+      // masked key id against their Alpaca dashboard without opening logs.
+      const keysDesc = await describeAlpacaKeys(user.id, mode)
       return NextResponse.json({
         mode: isTradeMode(searchParams.get('mode')) ? searchParams.get('mode') : mode,
         account: null,
         configured: true,
         authError: {
           mode,
-          message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — account snapshot is paused until the keys are fixed (Settings → API keys).`,
+          message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — account snapshot is paused until the keys are fixed (Settings → API keys). [using ${keysDesc}]`,
         },
       })
     }

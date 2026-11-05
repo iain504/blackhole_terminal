@@ -6,7 +6,7 @@ import {
 } from '@/lib/trading'
 import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
-import { hasAlpacaKeys } from '@/lib/alpaca'
+import { hasAlpacaKeys, describeAlpacaKeys } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
 import { db } from '@/lib/db'
 
@@ -189,7 +189,9 @@ export async function GET(req: Request) {
         ? {
             mode,
             retryInSec: Math.ceil(blockedMs / 1000),
-            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — an Alpaca key works on paper OR live, never both. Check Settings → API keys: the Paper and Live sections must each hold keys for their OWN account. Retrying automatically.`,
+            // v2.12.4 — banner names the exact pair in use (masked) so the
+            // user can compare it against the Alpaca dashboard directly.
+            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — an Alpaca key works on paper OR live, never both. Check Settings → API keys: the Paper and Live sections must each hold keys for their OWN account. Retrying automatically. [using ${await describeAlpacaKeys(user.id, mode)}]`,
           }
         : undefined
     // Task 37 — distinguish "keys rejected" (authError) from "no keys for this

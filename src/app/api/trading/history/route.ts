@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, resolveTradeMode, isNoKeysError, authBackoffMsLeft } from '@/lib/trading'
+import { describeAlpacaKeys } from '@/lib/alpaca'
 import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
 import { handleError } from '@/lib/api-helpers'
 
@@ -43,6 +44,7 @@ export async function GET(req: Request) {
       // terminal session. PositionsTab reads authError from the 200 body.
       if (r.status === 401) {
         const retryInSec = Math.ceil(authBackoffMsLeft(user.id, mode) / 1000)
+        const keysDesc = await describeAlpacaKeys(user.id, mode)
         return NextResponse.json(
           {
             mode,
@@ -51,7 +53,7 @@ export async function GET(req: Request) {
             authError: {
               mode,
               retryInSec,
-              message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — trade history for this account is unavailable until the keys are fixed.`,
+              message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — trade history for this account is unavailable until the keys are fixed. [using ${keysDesc}]`,
             },
           },
         )

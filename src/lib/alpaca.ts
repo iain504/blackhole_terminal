@@ -4,7 +4,7 @@
 // deterministic demo simulator so the app always works — but the failure
 // REASON is surfaced so the UI can tell "no keys" apart from "keys rejected".
 import { db } from '@/lib/db'
-import { decrypt, encrypt } from '@/lib/crypt'
+import { decrypt, encrypt, maskKey } from '@/lib/crypt'
 import {
   Bar, Quote, NewsItem, MarkerData, Timeframe, TIMEFRAMES,
   isCryptoSymbol,
@@ -194,6 +194,41 @@ export async function getAlpacaKeysForMode(
     }
   }
   return envAlpacaKeys()
+}
+
+/**
+ * v2.12.4 — HUMAN-READABLE identification of the key pair a mode WILL use:
+ * "paper pair PKab••••wxyz (from Settings)" / "env pair AK… (APCA_API_KEY_ID,
+ * shared broker)" / "env pair AK… — IGNORED: ALLOW_SHARED_BROKER is not true"
+ * / "no keys configured". Powers the broker-401 diagnostics (Render logs via
+ * tradeFetch's backoff line + the client authError banners) so a hosted
+ * deployment names the EXACT pair to compare against the Alpaca dashboard —
+ * the "Alpaca returns 401 on Render" report was undiagnosable between
+ * wrong-saved-keys / paper-key-in-live-slot / gated-env-keys before this.
+ * Key IDs are masked (first 4 + last 4) — safe for logs and banners.
+ */
+export async function describeAlpacaKeys(
+  userId: string | undefined,
+  mode: AlpacaKeyMode,
+): Promise<string> {
+  if (userId) {
+    const user = await db.user.findUnique({ where: { id: userId } })
+    const s = (user?.settings as UserSettings | null) || null
+    const own = pairFrom(s, mode)
+    if (own) return `${mode} pair ${maskKey(own.keyId)} (from Settings)`
+    if (mode === 'paper') {
+      const legacy = pairFrom(s, 'legacy')
+      if (legacy) return `legacy pair ${maskKey(legacy.keyId)} (from Settings)`
+    }
+  }
+  const envId = process.env.APCA_API_KEY_ID
+  const envSecret = process.env.APCA_API_SECRET_KEY
+  if (envId && envSecret) {
+    return sharedBrokerAllowed()
+      ? `env pair ${maskKey(envId)} (APCA_API_KEY_ID, shared broker)`
+      : `env pair ${maskKey(envId)} — IGNORED: ALLOW_SHARED_BROKER is not true`
+  }
+  return 'no keys configured'
 }
 
 /**

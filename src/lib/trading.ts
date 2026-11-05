@@ -18,6 +18,7 @@
 //   symbols keep it (BTC/USD).
 import { db } from './db'
 import { getAlpacaKeysForMode } from './alpaca'
+import { maskKey } from './crypt'
 
 export type TradeMode = 'paper' | 'live'
 
@@ -154,10 +155,12 @@ async function tradeFetch<T>(
         `Trading API HTTP ${res.status}`
       if (res.status === 401) {
         // ONE concise line when the breaker opens; short-circuited retries
-        // below stay completely silent (Task 36).
+        // below stay completely silent (Task 36). v2.12.4 — the line now names
+        // the EXACT pair in use (origin + masked key id) so a hosted deploy's
+        // logs identify which key to fix without guesswork.
         if (noteAuth401(userId, mode, path)) {
           console.error(
-            `Trading ${mode} ${path} -> 401: ${msg} — auth backoff ${AUTH_BACKOFF_MS / 1000}s engaged (check Settings → API keys / Trade mode)`,
+            `Trading ${mode} ${path} -> 401: ${msg} — auth backoff ${AUTH_BACKOFF_MS / 1000}s engaged (check Settings → API keys / Trade mode) [keys: ${keys.origin} ${maskKey(keys.keyId)}]`,
           )
         }
       } else {

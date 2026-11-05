@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, resolveTradeMode, isNoKeysError, TradingOrder } from '@/lib/trading'
+import { describeAlpacaKeys } from '@/lib/alpaca'
 
 import { handleError } from '@/lib/api-helpers'
 
@@ -47,13 +48,14 @@ export async function GET(req: Request) {
       // the positions route instead: 200 + structured authError, which the
       // poller ignores and Settings renders as the amber keys banner.
       if (r.status === 401) {
+        const keysDesc = await describeAlpacaKeys(user.id, mode)
         return NextResponse.json({
           mode,
           fills: [],
           configured: true,
           authError: {
             mode,
-            message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — fill notifications and chart markers are paused until the keys are fixed (Settings → API keys).`,
+            message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — fill notifications and chart markers are paused until the keys are fixed (Settings → API keys). [using ${keysDesc}]`,
           },
         })
       }
