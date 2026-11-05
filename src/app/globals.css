@@ -717,3 +717,75 @@ html.theme-day .lp-root .border-white\/5 {
   .fsd-live-dot { animation: none; }
 }
 
+
+/* ===========================================================================
+   v2.12.11 — Chinese ink-painting theme (dark grey & white, 雕 above the
+   mountains). A hand-drawn SVG backdrop fixed behind the whole app at z-0;
+   page roots sit at z-10 with translucent backgrounds so the painting shows
+   through without hurting data readability. The light "day" skin hides it.
+   =========================================================================== */
+.ink-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ink-moon {
+  position: absolute;
+  top: 7%;
+  left: 9%;
+  width: 21vmin;
+  height: 21vmin;
+  border-radius: 9999px;
+  background: radial-gradient(circle, rgb(255 255 255 / 0.08) 0%, rgb(255 255 255 / 0.025) 55%, transparent 72%);
+}
+.ink-eagle {
+  position: absolute;
+  top: 12%;
+  right: 12%;
+  width: clamp(96px, 14vw, 230px);
+  height: auto;
+  color: #d6d6dc;
+  opacity: 0.5;
+  transform: rotate(-7deg);
+  filter: drop-shadow(0 0 22px rgb(255 255 255 / 0.14));
+}
+/* the ink bleeding into the paper — a blurred offset echo of the eagle */
+.ink-eagle-wash {
+  opacity: 0.4;
+  transform: translate(3px, 3px);
+  filter: blur(4px);
+}
+.ink-mountains {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: min(46vh, 440px);
+}
+.ink-seal {
+  position: absolute;
+  right: clamp(14px, 3vw, 42px);
+  /* clear of the app status bars / mobile tab bar that hug the bottom edge */
+  bottom: clamp(46px, 7.5vh, 84px);
+  padding: 6px 7px;
+  border-radius: 4px;
+  background: #9e2b25;
+  color: #f3ede2;
+  font-family: ui-serif, Georgia, 'Songti SC', serif;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.8;
+  box-shadow: 0 1px 8px rgb(0 0 0 / 0.55);
+  user-select: none;
+}
+@media (max-width: 640px) {
+  .ink-eagle { top: 9%; right: 7%; width: 96px; opacity: 0.45; }
+  .ink-moon { width: 27vmin; height: 27vmin; top: 5%; left: 5%; }
+  .ink-mountains { height: 36vh; }
+  .ink-seal { font-size: 12px; padding: 4px 5px; }
+}
+/* the painting speaks dark grey & white — the light "day" skin hides it */
+html.theme-day .ink-backdrop { display: none; }

@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
+import { InkBackdrop } from "@/components/theme/InkBackdrop";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -51,6 +52,9 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-zinc-950 text-zinc-200`}
       >
+        {/* v2.12.11 — Chinese ink-painting backdrop: 雕 above misty mountains,
+            fixed behind every page at z-0 (page roots are z-10 translucent) */}
+        <InkBackdrop />
         {children}
         <Toaster />
       </body>

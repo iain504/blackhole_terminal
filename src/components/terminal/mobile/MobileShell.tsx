@@ -155,7 +155,7 @@ export function MobileShell({
   }
 
   return (
-    <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950 text-zinc-200">
+    <div className="relative z-10 flex h-[100dvh] flex-col overflow-hidden bg-zinc-950/95 text-zinc-200">
       {/* ---- full-screen views ---- */}
       <div className="flex min-h-0 flex-1 flex-col">
         {view === 'watchlist' && <MobileWatchlist onOpenChart={openChart} />}

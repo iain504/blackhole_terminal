@@ -429,7 +429,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-zinc-950">
+      <div className="relative z-10 min-h-screen bg-zinc-950/70">
         <AuthForms
           onAuthed={(u) => {
             setUser(u)
@@ -464,7 +464,7 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
   }
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-200">
+    <div className="relative z-10 flex h-screen flex-col overflow-hidden bg-zinc-950/95 text-zinc-200">
       <TabBar
         onOpenSettings={() => setSettingsOpen(true)}
         alertsOpen={alertsOpen}

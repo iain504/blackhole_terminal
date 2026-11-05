@@ -41,7 +41,7 @@ export function LandingPage({ onLaunch }: { onLaunch: () => void }) {
   const isClient = useIsClient()
   const christmas = isClient && uiTheme === 'christmas'
   return (
-    <div className="lp-root relative flex min-h-screen flex-col bg-[#08080b] text-zinc-100">
+    <div className="lp-root relative z-10 flex min-h-screen flex-col bg-[#08080b]/78 text-zinc-100">
       <GridBackdrop />
       {christmas && <Snowfall />}
       <div className="relative z-10 flex min-h-screen flex-col">
@@ -439,8 +439,10 @@ function GridBackdrop() {
           WebkitMaskImage: 'radial-gradient(ellipse 95% 85% at 50% 15%, black 25%, transparent 78%)',
         }}
       />
-      <div className="absolute inset-0 lp-glow-blue bg-[radial-gradient(ellipse_55%_45%_at_72%_38%,rgba(59,130,246,0.07),transparent_70%)]" />
-      <div className="absolute inset-0 lp-glow-orange bg-[radial-gradient(ellipse_45%_40%_at_75%_55%,rgba(249,115,22,0.05),transparent_70%)]" />
+      {/* v2.12.11 — ink theme: the blue/orange glows become neutral mist so
+          the painting (visible through the translucent root) stays grey/white */}
+      <div className="absolute inset-0 lp-glow-blue bg-[radial-gradient(ellipse_55%_45%_at_72%_38%,rgba(226,226,235,0.05),transparent_70%)]" />
+      <div className="absolute inset-0 lp-glow-orange bg-[radial-gradient(ellipse_45%_40%_at_75%_55%,rgba(205,205,214,0.04),transparent_70%)]" />
     </div>
   )
 }

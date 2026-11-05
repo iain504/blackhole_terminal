@@ -365,7 +365,7 @@ export default function AuthForms({
   const slotClass = 'h-10 w-10 border-zinc-800 bg-zinc-950 text-base text-zinc-100';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-zinc-950 p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-zinc-950/70 p-4">
       <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl">
         {/* Header */}
         <div className="flex flex-col items-center gap-2 px-8 pt-8 pb-5 text-center">
