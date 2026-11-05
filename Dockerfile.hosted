@@ -58,6 +58,15 @@ COPY mini-services/stream-service/ ./
 # ---- runner: standalone app + prisma CLI + stream + Caddy edge ---------------
 FROM oven/bun:1.3 AS runner
 WORKDIR /app
+# curl — the economic-calendar scraper fetches ForexFactory's page through it:
+# the page's bot check rejects Node/undici TLS fingerprints (403) while curl
+# passes. v2.12.10 patched ./Dockerfile but THIS file is what render.yaml
+# builds, so hosted production still had no curl and the page fallback 403'd
+# through native fetch. Installed here since v2.12.12; bin/curl-static in the
+# repo is the belt-and-braces fallback for any runtime without apt.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 # TARGETARCH is auto-set by BuildKit (amd64/arm64); default covers legacy builders.
 ARG TARGETARCH=amd64
 ARG CADDY_VERSION=2.10.0
@@ -74,6 +83,9 @@ COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
 # Schema for the entrypoint's `prisma db push`.
 COPY prisma ./prisma
+# Bundled static curl + CA bundle — the calendar scrape's fallback binary for
+# runtimes without a system curl (see src/lib/calendar.ts curlGet).
+COPY bin ./bin
 # Build-time smoke test: the CLI closure must be complete (see ./Dockerfile).
 RUN bunx prisma -v > /dev/null 2>&1
 

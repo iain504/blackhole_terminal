@@ -14,12 +14,17 @@
 // timezone (FF renders in the requester's IP-geolocated zone and embeds it as
 // timezone_name in the HTML; its day views group by that zone too). The page
 // sits behind a TLS-fingerprinting bot check that 403s server-side
-// fetch()/undici — but answers plain curl — so the scrape shells out to curl
-// (baked into the production image since v2.12.10; native fetch is the
-// in-code fallback if the binary is ever missing again).
+// fetch()/undici — but answers plain curl — so the scrape shells out to curl.
+// v2.12.12: the v2.12.10 apt install had landed in ./Dockerfile while
+// render.yaml actually builds Dockerfile.hosted, so hosted production STILL
+// had no curl and the page fallback 403'd through native fetch. Fixed there,
+// and the repo now also BUNDLES a static curl + CA set (bin/curl-static,
+// bin/cacert.pem) so the scrape passes the bot check on ANY runtime.
 // TIMEZONE: the XML feed's date/time tags are UTC (verified against the JSON
 // mirror's explicit offsets) — do NOT read them as New York wall time.
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { CalendarEvent } from './market-types'
 
 const XML_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.xml'
@@ -31,6 +36,21 @@ const UA = 'Mozilla/5.0 (compatible; TradeTerminal/1.0; +https://localhost)'
 // browser user-agent (the plain bot UA gets a degraded/blocked response).
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+
+// v2.12.12 — the scrape's curl, guaranteed: a statically-linked curl binary
+// (stunnel/static-curl release 8.23.0-1, sha256-verified, no libc deps) plus
+// the Mozilla CA bundle ship in the repo, so the FF page fetch passes its TLS
+// bot check even when the host has no system curl. The CA bundle is passed
+// explicitly (--cacert) so TLS trust never depends on distro packages either.
+const VENDORED_CURL = join(process.cwd(), 'bin', 'curl-static')
+const VENDORED_CA_BUNDLE = join(process.cwd(), 'bin', 'cacert.pem')
+let caBundleArgsCache: string[] | null = null // resolved once; [] when absent
+function caBundleArgs(): string[] {
+  if (caBundleArgsCache === null) {
+    caBundleArgsCache = existsSync(VENDORED_CA_BUNDLE) ? ['--cacert', VENDORED_CA_BUNDLE] : []
+  }
+  return caBundleArgsCache
+}
 
 // v2.12.10 — the mirrors 429 the shared Render egress IP for long stretches
 // (every tenant scraping the same feed). Exponential backoff so fresh tab
@@ -267,12 +287,13 @@ function instantInTz(day: string, hhmm: string, tz: string): string {
  * non-browser TLS fingerprints (server fetch → 403) while curl passes.
  * Resolves { status, body }; status comes from the trailing %{http_code}.
  */
-function curlExec(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
+function curlExec(bin: string, url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     execFile(
-      'curl',
+      bin,
       [
         '-sS', '--compressed', '--max-time', String(timeoutSec),
+        ...caBundleArgs(),
         '-w', '\n%{http_code}',
         '-H', `user-agent: ${BROWSER_UA}`,
         '-H', 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -309,26 +330,46 @@ function fetchGet(url: string, timeoutSec: number): Promise<{ status: number; bo
 }
 
 let curlMissing = false
+let curlBin: string | null = null // proven binary path; null until the first call
 
 /**
- * curl first; degrade to native fetch when the binary is absent (slim runner
- * images without curl used to kill the whole scrape with "Executable not
- * found in $PATH"). The FF bot check may still 403 the fetch fallback, but
- * the attempt costs nothing — and the production image now ships curl.
+ * curl first, ALWAYS. Resolution chain: system curl → the bundled static
+ * curl (bin/curl-static) → native fetch. The bundled binary exists exactly
+ * for the v2.12.12 production regression: the v2.12.10 apt install landed in
+ * ./Dockerfile while render.yaml builds Dockerfile.hosted, so hosted runs
+ * still had no curl and the page fallback 403'd through native fetch. The
+ * winner is cached so later calls spawn nothing extra.
  */
 async function curlGet(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
   if (curlMissing) return fetchGet(url, timeoutSec)
-  try {
-    return await curlExec(url, timeoutSec)
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (/ENOENT|not found/i.test(msg)) {
-      curlMissing = true
-      console.warn('Calendar: curl not available — page fetches degrade to native fetch')
-      return fetchGet(url, timeoutSec)
+  const candidates = curlBin
+    ? [curlBin]
+    : ['curl', ...(existsSync(VENDORED_CURL) ? [VENDORED_CURL] : [])]
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      const res = await curlExec(candidates[i], url, timeoutSec)
+      if (curlBin !== candidates[i]) {
+        curlBin = candidates[i]
+        if (candidates[i] !== 'curl') {
+          console.warn('Calendar: system curl unavailable — using bundled static curl (bin/curl-static)')
+        }
+      }
+      return res
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/ENOENT|EACCES|not found/i.test(msg)) {
+        // ENOENT = binary absent; EACCES = present but not executable (e.g.
+        // a noexec mount or a checkout that lost the exec bit) — either way
+        // try the next candidate.
+        if (i + 1 < candidates.length) continue // system curl absent — try the bundled one
+        curlMissing = true
+        console.warn('Calendar: curl not available — page fetches degrade to native fetch')
+        return fetchGet(url, timeoutSec)
+      }
+      throw e
     }
-    throw e
   }
+  return fetchGet(url, timeoutSec) // unreachable with a non-empty chain
 }
 
 /**
@@ -389,12 +430,13 @@ export function parseFfPageWeek(
 }
 
 /**
- * Fetch the whole-week page and parse it. This is the mirror-free fallback:
- * the schedule mirrors 429 the shared Render egress IP, but the page (fetched
- * via curl — the one FF channel that passes the bot check) carries the FULL
- * week — schedule AND already-published actuals — in one request.
+ * Fetch the whole-week page and parse it (exported for probes). This is the
+ * mirror-free fallback: the schedule mirrors 429 the shared Render egress IP,
+ * but the page (fetched via curl — the one FF channel that passes the bot
+ * check) carries the FULL week — schedule AND already-published actuals — in
+ * one request.
  */
-async function fetchPageWeek(): Promise<{
+export async function fetchPageWeek(): Promise<{
   events: CalendarEvent[]
   tz: string
   actuals: Record<string, string>

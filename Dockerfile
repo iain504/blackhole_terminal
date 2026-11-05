@@ -85,6 +85,9 @@ COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
 # Schema for the entrypoint's `prisma db push`.
 COPY prisma ./prisma
+# Bundled static curl + CA bundle — the calendar scrape's fallback binary for
+# runtimes without a system curl (see src/lib/calendar.ts curlGet).
+COPY bin ./bin
 # Build-time smoke test: if the CLI dependency closure is ever incomplete
 # again, the image build fails HERE — never again silently at boot.
 RUN bunx prisma -v > /dev/null 2>&1

@@ -23,6 +23,8 @@ node_modules
 # misc
 .DS_Store
 *.pem
+# EXCEPT the calendar scraper's bundled CA set (src/lib/calendar.ts --cacert)
+!bin/cacert.pem
 
 # debug
 npm-debug.log*
