@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import {
   getPositions, getOpenOrders, getClosedOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
-  TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft, isNoKeysError,
+  TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft, isNoKeysError, isKeysUnreadableError,
 } from '@/lib/trading'
 import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
@@ -152,7 +152,10 @@ export async function GET(req: Request) {
     // — repeating the raw "request is not authorized" string in `errors` on
     // every poll adds nothing. 'no-keys'/'no-live-keys' surface via
     // `keysMissing` (Task 37).
-    if (posRes.error && !isNoKeysError(posRes.error) && posRes.status !== 401) errors.push(posRes.error)
+    if (
+      posRes.error && !isNoKeysError(posRes.error) && posRes.status !== 401 &&
+      !isKeysUnreadableError(posRes.error)
+    ) errors.push(posRes.error)
 
     // A failed fetch (401 on live with paper-only keys, network error) returns
     // an error OBJECT — only treat real arrays as data or the .filter below
@@ -184,15 +187,26 @@ export async function GET(req: Request) {
     // all the honest answer is keysMissing, not a stale "401 rejected".
     const blockedMs = authBackoffMsLeft(user.id, mode)
     const saw401 = posRes.status === 401 || ordRes.status === 401 || closedRes.status === 401
+    // v2.12.6 — saved pair couldn't be decrypted (APP_ENCRYPTION_SECRET
+    // changed): its own banner — the re-save fix — never a silent env swap.
+    const sawUnreadable =
+      isKeysUnreadableError(posRes.error) || isKeysUnreadableError(ordRes.error) ||
+      isKeysUnreadableError(closedRes.error)
     const authError: AuthErrorInfo | undefined =
-      modeHasKeys && (blockedMs > 0 || saw401)
-        ? {
-            mode,
-            retryInSec: Math.ceil(blockedMs / 1000),
-            // v2.12.4 — banner names the exact pair in use (masked) so the
-            // user can compare it against the Alpaca dashboard directly.
-            message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — an Alpaca key works on paper OR live, never both. Check Settings → API keys: the Paper and Live sections must each hold keys for their OWN account. Retrying automatically. [using ${await describeAlpacaKeys(user.id, mode)}]`,
-          }
+      modeHasKeys && (blockedMs > 0 || saw401 || sawUnreadable)
+        ? sawUnreadable
+          ? {
+              mode,
+              retryInSec: Math.ceil(blockedMs / 1000),
+              message: `Your saved ${mode === 'live' ? 'LIVE' : 'Paper'} keys couldn't be decrypted — re-enter them in Settings → API keys and save again (this happens when the deployment's APP_ENCRYPTION_SECRET changed, e.g. after a redeploy without a stable secret). [using ${await describeAlpacaKeys(user.id, mode)}]`,
+            }
+          : {
+              mode,
+              retryInSec: Math.ceil(blockedMs / 1000),
+              // v2.12.4 — banner names the exact pair in use (masked) so the
+              // user can compare it against the Alpaca dashboard directly.
+              message: `Alpaca rejected your API keys (401)${mode === 'live' ? ' for LIVE trading' : ''} — an Alpaca key works on paper OR live, never both. Check Settings → API keys: the Paper and Live sections must each hold keys for their OWN account. Retrying automatically. [using ${await describeAlpacaKeys(user.id, mode)}]`,
+            }
         : undefined
     // Task 37 — distinguish "keys rejected" (authError) from "no keys for this
     // mode at all" so the UI can tell the user exactly what to add.

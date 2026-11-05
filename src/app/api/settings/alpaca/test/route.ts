@@ -56,8 +56,23 @@ export async function POST(req: Request) {
           ? (s.alpacaLiveSecretEnc as string | undefined)
           : ((s.alpacaPaperSecretEnc as string | undefined) ?? (s.alpacaSecretEnc as string | undefined))
       if (typeof kidEnc === 'string' && typeof secEnc === 'string') {
-        keyId = decrypt(kidEnc) || ''
-        secret = decrypt(secEnc) || ''
+        const k = decrypt(kidEnc)
+        const sc = decrypt(secEnc)
+        // v2.12.6 — ciphertext present but undecryptable (the deployment's
+        // APP_ENCRYPTION_SECRET changed, e.g. every redeploy on Render without
+        // a stable secret): "no keys saved" would be a lie — say re-save.
+        if (!k || !sc) {
+          const unreadable: AlpacaKeyCheck & { tested: 'typed' | 'stored' } = {
+            valid: false,
+            detected: null,
+            matchesMode: null,
+            tested,
+            message: `A ${mode === 'live' ? 'LIVE' : 'Paper'} key pair IS saved here but couldn't be decrypted — the deployment's APP_ENCRYPTION_SECRET changed. Re-enter the keys and Save again (Test proves them immediately).`,
+          }
+          return NextResponse.json(unreadable)
+        }
+        keyId = k
+        secret = sc
       }
     }
 

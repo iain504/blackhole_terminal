@@ -287,8 +287,12 @@ export async function getMarketHours(symbols: string[], userId?: string, modeIn?
   // session endpoints are account-agnostic — clock/calendar are identical on
   // both hosts).
   const strict = await getAlpacaKeysForMode(userId, mode)
-  const keys = strict ?? (await resolveAnyAlpacaKeys(userId))
-  const hostMode: TradeMode = strict ? mode : keys?.origin === 'live' ? 'live' : 'paper'
+  // v2.12.6 — an UNREADABLE saved pair (encryption secret changed) must not
+  // masquerade as usable keys with empty keyId/secret: treat it as absent so
+  // the session classifier falls back to any readable pair / local estimate.
+  const strictUsable = strict && !strict.unreadable ? strict : null
+  const keys = strictUsable ?? (await resolveAnyAlpacaKeys(userId))
+  const hostMode: TradeMode = strictUsable ? mode : keys?.origin === 'live' ? 'live' : 'paper'
   const nowSec = Date.now() / 1000
   const hours: MarketHoursResponse['hours'] = {}
 

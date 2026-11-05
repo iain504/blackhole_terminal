@@ -38,6 +38,10 @@ export type KeyOrigin = 'paper' | 'live' | 'legacy' | 'env'
 
 export interface AlpacaKeysWithOrigin extends AlpacaKeys {
   origin: KeyOrigin
+  /** v2.12.6 — the pair's ciphertext EXISTS but couldn't be decrypted (the
+   *  deployment's APP_ENCRYPTION_SECRET changed). keyId/secret are '' and the
+   *  caller MUST NOT fall back to env keys — surface the re-save error. */
+  unreadable?: true
 }
 
 /** Result of proving a key pair against BOTH trading hosts (Task 37). */
@@ -168,6 +172,18 @@ function pairFrom(
   return keyId && secret ? { keyId, secret } : null
 }
 
+/** v2.12.6 — ciphertext present for a pair slot (even if it no longer
+ *  decrypts). Distinguishes "user saved keys" from "user never saved keys" —
+ *  the difference between an actionable re-save error and a silent env-key
+ *  substitution. */
+function hasCipherPair(s: UserSettings | null, which: 'paper' | 'live' | 'legacy'): boolean {
+  const kidEnc =
+    which === 'live' ? s?.alpacaLiveKeyIdEnc : which === 'paper' ? s?.alpacaPaperKeyIdEnc : s?.alpacaKeyIdEnc
+  const secEnc =
+    which === 'live' ? s?.alpacaLiveSecretEnc : which === 'paper' ? s?.alpacaPaperSecretEnc : s?.alpacaSecretEnc
+  return typeof kidEnc === 'string' && typeof secEnc === 'string'
+}
+
 /**
  * Task 37 — MODE-STRICT key resolution for the Trading API. A saved key only
  * ever works on one host: paper keys → paper-api.alpaca.markets, live keys →
@@ -192,8 +208,27 @@ export async function getAlpacaKeysForMode(
       const legacy = pairFrom(s, 'legacy')
       if (legacy) return { ...legacy, origin: 'legacy' }
     }
+    // v2.12.6 — a saved pair EXISTS but couldn't be decrypted (the
+    // deployment's APP_ENCRYPTION_SECRET changed; on platforms that
+    // auto-generate it, every redeploy re-rolls it and every saved pair
+    // becomes unreadable). NEVER fall through to the operator's env keys:
+    // that silently substituted the env pair for whatever the user saved —
+    // the "whatever API key I input, it still uses the one in env" hosted
+    // report — and Task-37 mode-strictness died with it. Return the
+    // unreadable marker; tradeFetch turns it into an actionable re-save
+    // error and the routes render it as an authError banner.
+    if (hasCipherPair(s, mode) || (mode === 'paper' && hasCipherPair(s, 'legacy'))) {
+      return { keyId: '', secret: '', origin: mode, unreadable: true }
+    }
   }
-  return envAlpacaKeys()
+  // v2.12.6 — mode-strict honored for ENV keys too: envAlpacaKeys() used to
+  // hand the SAME pair to whichever mode asked, so a paper env key (PK…) hit
+  // the LIVE host and 401'd forever — the "Live is always 401" report. A
+  // PK-prefixed env key now honestly reports no-live-keys instead.
+  const env = envAlpacaKeys()
+  if (!env) return null
+  if (mode === 'live' && env.keyId.startsWith('PK')) return null
+  return env
 }
 
 /**
@@ -219,6 +254,10 @@ export async function describeAlpacaKeys(
     if (mode === 'paper') {
       const legacy = pairFrom(s, 'legacy')
       if (legacy) return `legacy pair ${maskKey(legacy.keyId)} (from Settings)`
+    }
+    // v2.12.6 — saved but unreadable (encryption secret changed)
+    if (hasCipherPair(s, mode) || (mode === 'paper' && hasCipherPair(s, 'legacy'))) {
+      return `${mode} pair saved but UNREADABLE — the deployment's encryption secret changed; re-save the pair in Settings → API keys`
     }
   }
   const envId = process.env.APCA_API_KEY_ID

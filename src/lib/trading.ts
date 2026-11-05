@@ -104,6 +104,13 @@ export function isNoKeysError(e: string | undefined | null): boolean {
   return e === 'no-keys' || e === 'no-live-keys'
 }
 
+/** v2.12.6 — 'keys-unreadable: …' token from tradeFetch: a pair IS saved but
+ *  couldn't be decrypted (the deployment's APP_ENCRYPTION_SECRET changed).
+ *  The routes surface it as an authError banner with the re-save fix. */
+export function isKeysUnreadableError(e: string | undefined | null): boolean {
+  return typeof e === 'string' && e.startsWith('keys-unreadable')
+}
+
 async function tradeFetch<T>(
   userId: string,
   mode: TradeMode,
@@ -117,6 +124,17 @@ async function tradeFetch<T>(
   const keys = await getAlpacaKeysForMode(userId, mode)
   if (!keys) {
     return { data: null, status: 0, error: mode === 'live' ? 'no-live-keys' : 'no-keys' }
+  }
+  // v2.12.6 — the user HAS a saved pair but it couldn't be decrypted (the
+  // deployment's APP_ENCRYPTION_SECRET changed). Fail with a distinct,
+  // actionable token — status 0 means NO 401 (no breaker, no logout) and NO
+  // silent env-key substitution.
+  if (keys.unreadable) {
+    return {
+      data: null,
+      status: 0,
+      error: `keys-unreadable: your saved ${mode} keys couldn't be decrypted — re-enter them in Settings → API keys and save again (this happens when the deployment's APP_ENCRYPTION_SECRET changed)`,
+    }
   }
   // Task 36 — a known-rejected key must not hammer Alpaca from every poller
   const backoffLeft = authBackoffMsLeft(userId, mode)

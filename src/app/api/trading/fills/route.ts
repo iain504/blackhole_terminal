@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode, isNoKeysError, TradingOrder } from '@/lib/trading'
+import { getClosedOrders, resolveTradeMode, isNoKeysError, isKeysUnreadableError, TradingOrder } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
 
 import { handleError } from '@/lib/api-helpers'
@@ -40,6 +40,20 @@ export async function GET(req: Request) {
     if (!r.data) {
       // no keys configured is a quiet no-op for the poller
       if (isNoKeysError(r.error)) return NextResponse.json({ mode, fills: [], configured: false })
+      // v2.12.6 — saved pair couldn't be decrypted: actionable re-save banner
+      // (never silent env substitution, never a raw 401).
+      if (isKeysUnreadableError(r.error)) {
+        const keysDesc = await describeAlpacaKeys(user.id, mode)
+        return NextResponse.json({
+          mode,
+          fills: [],
+          configured: true,
+          authError: {
+            mode,
+            message: `Your saved ${mode === 'live' ? 'LIVE' : 'Paper'} keys couldn't be decrypted — fill notifications and chart markers are paused until they are re-entered (Settings → API keys). [using ${keysDesc}]`,
+          },
+        })
+      }
       // v2.12.2 — an engaged Alpaca 401 breaker must NOT surface as a raw HTTP
       // 401: the ROOT-LEVEL fill poller (2.5s after login, then every 12s)
       // runs through the client's global 401 watcher, so an upstream keys

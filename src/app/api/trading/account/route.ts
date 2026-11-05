@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getAccount, resolveTradeMode, isTradeMode, isNoKeysError, TradingAccount } from '@/lib/trading'
+import { getAccount, resolveTradeMode, isTradeMode, isNoKeysError, isKeysUnreadableError, TradingAccount } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
 
@@ -45,6 +45,21 @@ export async function GET(req: Request) {
       })
     }
     if (!data) {
+      // v2.12.6 — saved pair couldn't be decrypted (APP_ENCRYPTION_SECRET
+      // changed): the "whatever key I input, it still uses the env one" case.
+      // Actionable re-save banner instead of a silent env substitution.
+      if (isKeysUnreadableError(error)) {
+        const keysDesc = await describeAlpacaKeys(user.id, mode)
+        return NextResponse.json({
+          mode: isTradeMode(searchParams.get('mode')) ? searchParams.get('mode') : mode,
+          account: null,
+          configured: true,
+          authError: {
+            mode,
+            message: `Your saved ${mode === 'live' ? 'LIVE' : 'Paper'} keys couldn't be decrypted — re-enter them in Settings → API keys and save again. [using ${keysDesc}]`,
+          },
+        })
+      }
       return NextResponse.json(
         { error: error || 'Trading API unavailable', mode, configured: !isNoKeysError(error) },
         { status: status || 502 },

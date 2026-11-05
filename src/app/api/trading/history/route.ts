@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode, isNoKeysError, authBackoffMsLeft } from '@/lib/trading'
+import { getClosedOrders, resolveTradeMode, isNoKeysError, isKeysUnreadableError, authBackoffMsLeft } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
 import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
 import { handleError } from '@/lib/api-helpers'
@@ -32,6 +32,20 @@ export async function GET(req: Request) {
       // no keys configured is a quiet empty state (same convention as fills)
       if (isNoKeysError(r.error)) {
         return NextResponse.json({ mode, trades: [], configured: false })
+      }
+      // v2.12.6 — saved pair couldn't be decrypted (APP_ENCRYPTION_SECRET
+      // changed): actionable re-save banner, never silent env substitution.
+      if (isKeysUnreadableError(r.error)) {
+        const keysDesc = await describeAlpacaKeys(user.id, mode)
+        return NextResponse.json({
+          mode,
+          trades: [],
+          configured: true,
+          authError: {
+            mode,
+            message: `Your saved ${mode === 'live' ? 'LIVE' : 'Paper'} keys couldn't be decrypted — trade history is unavailable until they are re-entered (Settings → API keys). [using ${keysDesc}]`,
+          },
+        })
       }
       // v1.95.0 — an engaged 401 breaker must be ACTIONABLE, not a bare 401:
       // the UI renders an amber "keys rejected — retry in N min" banner from
