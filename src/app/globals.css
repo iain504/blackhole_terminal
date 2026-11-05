@@ -789,3 +789,69 @@ html.theme-day .lp-root .border-white\/5 {
 }
 /* the painting speaks dark grey & white — the light "day" skin hides it */
 html.theme-day .ink-backdrop { display: none; }
+
+/* ===========================================================================
+   v2.12.15 — landing 道家風格 (Taoist brush typography + scroll framing)
+   - .lp-root switches the landing copy to 霞鶩文楷繁 (brush-pen kai, full
+     Traditional-Chinese coverage); the terminal UI keeps Geist/mono.
+   - .lp-brush — Ma Shan Zheng calligraphy display (titles, seals, quotes).
+   - .lp-vertical — vertical-rl 題跋 inscription (classical column).
+   - .lp-seal — cinnabar 印章 chip (朱砂, the single color accent of ink
+     painting) used for the painter's signature marks.
+   - .lp-scroll-frame — dark silk mounting (裱工) around the paper painting.
+   =========================================================================== */
+.lp-root {
+  font-family: var(--font-kai), var(--font-geist-sans), ui-sans-serif, system-ui, serif;
+}
+.lp-brush {
+  font-family: var(--font-brush), var(--font-kai), serif;
+  font-weight: 400;
+}
+.lp-vertical {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.35em;
+}
+.lp-seal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #a8402c;
+  color: #f6efe4;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1.5px rgba(246, 239, 228, 0.5), 0 1px 6px rgba(0, 0, 0, 0.45);
+  font-family: var(--font-brush), var(--font-kai), serif;
+  line-height: 1;
+  transform: rotate(-2deg);
+}
+.lp-scroll-frame {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 40%),
+    linear-gradient(180deg, #191920, #101014);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  box-shadow: 0 30px 70px -30px rgba(0, 0, 0, 0.85), 0 2px 8px rgba(0, 0, 0, 0.4);
+  padding: clamp(8px, 1.1vw, 14px);
+}
+.lp-scroll-inner {
+  border: 1px solid rgba(28, 24, 18, 0.5);
+  border-radius: 2px;
+  overflow: hidden;
+  background: #efe7d5; /* paper tone shows through while the PNG loads */
+}
+@media (prefers-reduced-motion: no-preference) {
+  .lp-ink-in {
+    animation: lp-ink-in 1.1s ease-out 0.15s both;
+  }
+}
+@keyframes lp-ink-in {
+  from {
+    opacity: 0;
+    filter: blur(7px);
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0);
+  }
+}

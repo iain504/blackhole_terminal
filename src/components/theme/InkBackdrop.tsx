@@ -1,13 +1,13 @@
 // v2.12.11 — global ink-painting backdrop (Chinese dark-grey & white theme).
 // Hand-drawn SVG, no raster assets: layered misty mountain ridges rising from
-// the bottom, one eagle (雕) soaring in the sky above the peaks, a faint moon
-// and a cinnabar seal stamp (the classical painter's signature). Fixed behind
-// the whole app at z-0; page roots sit at z-10 with translucent backgrounds so
-// the painting shows through without hurting text readability. Pure static
-// SVG — zero client JS, scales crisply on every screen. Hidden under the
-// light "day" skin (globals.css).
-
-const EAGLE_VIEW = '0 0 300 170'
+// the bottom, a faint moon and a cinnabar seal stamp (the classical painter's
+// signature). Fixed behind the whole app at z-0; page roots sit at z-10 with
+// translucent backgrounds so the painting shows through without hurting text
+// readability. Pure static SVG — zero client JS, scales crisply on every
+// screen. Hidden under the light "day" skin (globals.css).
+// v2.12.15 — 道家 pass: the eagle (雕) becomes a CRANE (仙鶴) — the Taoist
+// immortal's mount, a 長生/仙遊 symbol that fits the new Taoist landing — and
+// the seal re-stamps 雕 → 鶴. Class names unchanged (CSS untouched).
 
 export function InkBackdrop() {
   return (
@@ -15,22 +15,30 @@ export function InkBackdrop() {
       {/* moon wash — balances the eagle on the opposite side */}
       <div className="ink-moon" />
 
-      {/* the eagle, high above the ridgeline, gliding toward the frame */}
+      {/* the crane, high above the ridgeline, gliding toward the frame */}
       <svg
         className="ink-eagle"
         viewBox="0 0 300 170"
         role="presentation"
         focusable="false"
       >
-        {/* soft wash under-stroke (the ink bleeding into the paper) */}
-        <path d={INK_EAGLE_PATH} fill="currentColor" fillRule="evenodd" />
-        <path d={INK_EAGLE_PATH} fill="currentColor" fillRule="evenodd" className="ink-eagle-wash" />
-        {/* the far wing — a thinner sliver beneath the raised one */}
+        {/* the far wing — a faint sliver behind the raised one */}
         <path
-          d="M150,104 C182,88 222,72 256,64 C224,78 188,92 158,106 Z"
+          d="M158,74 C196,52 228,40 252,32 C230,46 198,62 170,80 Z"
           fill="currentColor"
-          opacity="0.55"
+          opacity="0.4"
         />
+        {/* near wing — soft wash under-stroke, then the ink body */}
+        <path d={INK_CRANE_WING} fill="currentColor" className="ink-eagle-wash" />
+        <path d={INK_CRANE_WING} fill="currentColor" />
+        {/* body with the fanned tail tuft */}
+        <path d={INK_CRANE_BODY} fill="currentColor" />
+        {/* extended neck (cranes fly neck-forward) + trailing legs */}
+        <path d="M84,100 C66,98 54,94 46,90" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" />
+        <path d="M148,108 L212,120 l10,3" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M158,105 L220,112 l9,2" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        {/* head + straight beak */}
+        <path d="M28,84 L46,78 L49,92 L37,93 Z" fill="currentColor" />
       </svg>
 
       {/* layered ridges with drifting mist */}
@@ -101,37 +109,39 @@ export function InkBackdrop() {
       </svg>
 
       {/* the painter's seal (印章) */}
-      <span className="ink-seal">雕</span>
+      <span className="ink-seal">鶴</span>
     </div>
   )
 }
 
 /**
- * Soaring eagle silhouette — SIDE PROFILE, gliding toward the left with one
- * large wing raised and swept back, second wing hinted beneath, hooked beak,
- * fanned tail. (The symmetric V-wing version read as a moth — side profile is
- * the classic, unambiguous eagle read.) Hand-tuned against the render.
+ * Gliding CRANE (仙鶴) — SIDE PROFILE, flying left like the old eagle: long
+ * straight neck extended forward, small head with a straight beak, one broad
+ * wing raised with scalloped primaries, second wing hinted behind, tail tuft
+ * and long thin legs trailing straight back (the classic immortal-crane
+ * flight read). Hand-tuned against the render.
  */
-const INK_EAGLE_PATH = [
-  // hooked beak + head (facing left)
-  'M40,104',
-  'C46,96 56,92 68,92', // beak underside → crown
-  'C86,90 102,93 116,98', // nape → shoulder
-  // raised wing — leading edge sweeping up to the wingtip
-  'C152,62 214,36 272,26',
-  'L288,22', // wingtip
+const INK_CRANE_WING = [
+  // shoulder at the body's top → leading edge up to the wingtip
+  'M108,94',
+  'C140,72 182,46 224,32',
+  'C242,26 258,23 270,23',
+  'L270,23',
   // trailing edge with primary-feather scallops coming back down
-  'L274,40 L282,44 L264,52 L270,58 L252,62 L256,70 L240,68 L243,76 L226,70 L228,78 L212,70',
-  // trailing edge to the body
-  'C198,78 184,84 172,87',
-  // back down to the tail base
-  'C176,96 178,104 176,112',
-  // fanned tail
-  'L198,140 L179,133 L185,152 L166,139 L165,156 L151,137',
-  // belly back to the chest
-  'C136,131 120,125 106,119',
-  'C92,125 76,123 64,115',
-  // throat back to the beak
-  'C54,118 46,112 40,104',
+  'L264,34 L272,39 L254,46 L260,54 L242,57 L246,66 L228,61 L230,71 L214,64',
+  // trailing edge back to the body
+  'C198,74 178,84 160,91',
+  'C144,97 126,100 112,100',
+  'Z',
+].join(' ')
+
+const INK_CRANE_BODY = [
+  // chest → back → tail tuft (jagged feathers trailing right) → belly
+  'M74,98',
+  'C86,94 104,92 124,93',
+  'C142,94 158,97 170,101',
+  'L194,114 L172,111 L180,122 L160,112',
+  'C138,108 112,107 94,106',
+  'C84,105 76,102 74,98',
   'Z',
 ].join(' ')
