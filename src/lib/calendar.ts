@@ -1,8 +1,11 @@
 // Economic calendar (Alpaca does not provide one).
 // Primary source: ForexFactory weekly feed via faireconomy.media.
-// NOTE (2026-10): the .json mirror answers 429 (rate limited) from this host
-// while the .xml mirror returns 200 — so XML is the primary and the JSON feed
-// is only a fallback attempt. Last resort: a bundled representative schedule.
+// NOTE (2026-11, hosted deploys): BOTH mirrors 429 the shared Render egress
+// IP for long stretches — requests are now backed off exponentially (with
+// Retry-After + jitter) and a mirror-free fallback exists: the FF calendar
+// PAGE fetched via curl carries the FULL week (schedule AND actuals) and is
+// the one FF channel that passes the bot check from datacenter IPs. Last
+// resort: a bundled representative schedule.
 //
 // ACTUAL VALUES: the faireconomy mirrors (xml + json) never contain <actual>
 // data — they are schedule-only feeds. The "Actual" column is therefore filled
@@ -11,7 +14,9 @@
 // timezone (FF renders in the requester's IP-geolocated zone and embeds it as
 // timezone_name in the HTML; its day views group by that zone too). The page
 // sits behind a TLS-fingerprinting bot check that 403s server-side
-// fetch()/undici — but answers plain curl — so the scrape shells out to curl.
+// fetch()/undici — but answers plain curl — so the scrape shells out to curl
+// (baked into the production image since v2.12.10; native fetch is the
+// in-code fallback if the binary is ever missing again).
 // TIMEZONE: the XML feed's date/time tags are UTC (verified against the JSON
 // mirror's explicit offsets) — do NOT read them as New York wall time.
 import { execFile } from 'node:child_process'
@@ -26,6 +31,15 @@ const UA = 'Mozilla/5.0 (compatible; TradeTerminal/1.0; +https://localhost)'
 // browser user-agent (the plain bot UA gets a degraded/blocked response).
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+
+// v2.12.10 — the mirrors 429 the shared Render egress IP for long stretches
+// (every tenant scraping the same feed). Exponential backoff so fresh tab
+// opens stop re-hitting a hot rate limit every 60s: 2 min, 4, 8, 16, 32,
+// 60-min cap, ±20% jitter, raised to the feed's Retry-After when sent.
+const FEED_BACKOFF_BASE_MS = 120_000
+const FEED_BACKOFF_MAX_MS = 60 * 60_000
+let feedRetryAt = 0
+let feedFailStreak = 0
 
 // How long the scraped actuals stay trusted before a refresh:
 //  - background (non-fresh) calls refresh them at most every 4 minutes;
@@ -214,12 +228,46 @@ function decodeHtml(s: string): string {
 
 const NO_VALUE = new Set(['', '-', '—'])
 
+/** FF page impact icon → importance (verified against the live page markup). */
+const IMPACT_CLASS: Record<string, 'high' | 'medium' | 'low'> = {
+  red: 'high',
+  ora: 'medium',
+  yel: 'low',
+  gra: 'low',
+  hol: 'low',
+}
+
+/** Strip tags + entities from one page cell. */
+function cellText(td: string | undefined): string {
+  return td ? decodeHtml(td.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim() : ''
+}
+
+/**
+ * Wall-clock (day, hh:mm) in `tz` → UTC ISO instant. Two-pass offset fixup:
+ * converges for fixed offsets and DST jumps alike (60-min shifts need 2).
+ */
+function instantInTz(day: string, hhmm: string, tz: string): string {
+  const [y, m, d] = day.split('-').map(Number)
+  const [hh, mm] = hhmm.split(':').map(Number)
+  const want = Date.UTC(y, (m || 1) - 1, d || 1, hh || 0, mm || 0)
+  let ts = want
+  for (let i = 0; i < 2; i++) {
+    const wall = wallInTz(new Date(ts).toISOString(), tz)
+    const [wy, wm, wd] = wall.day.split('-').map(Number)
+    const [wh, wmm] = wall.hhmm.split(':').map(Number)
+    const got = Date.UTC(wy, wm - 1, wd, wh, wmm)
+    if (got === want) break
+    ts = want - (got - want)
+  }
+  return new Date(ts).toISOString()
+}
+
 /**
  * GET a URL with curl. Used for the FF calendar page: its bot check rejects
  * non-browser TLS fingerprints (server fetch → 403) while curl passes.
  * Resolves { status, body }; status comes from the trailing %{http_code}.
  */
-function curlGet(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
+function curlExec(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     execFile(
       'curl',
@@ -241,6 +289,121 @@ function curlGet(url: string, timeoutSec: number): Promise<{ status: number; bod
       },
     )
   })
+}
+
+/** Native-fetch twin of curlExec with the same browser-looking headers. */
+function fetchGet(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutSec * 1000)
+  return fetch(url, {
+    signal: controller.signal,
+    cache: 'no-store',
+    headers: {
+      'user-agent': BROWSER_UA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+    .then(async (res) => ({ status: res.status, body: await res.text() }))
+    .finally(() => clearTimeout(timer))
+}
+
+let curlMissing = false
+
+/**
+ * curl first; degrade to native fetch when the binary is absent (slim runner
+ * images without curl used to kill the whole scrape with "Executable not
+ * found in $PATH"). The FF bot check may still 403 the fetch fallback, but
+ * the attempt costs nothing — and the production image now ships curl.
+ */
+async function curlGet(url: string, timeoutSec: number): Promise<{ status: number; body: string }> {
+  if (curlMissing) return fetchGet(url, timeoutSec)
+  try {
+    return await curlExec(url, timeoutSec)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/ENOENT|not found/i.test(msg)) {
+      curlMissing = true
+      console.warn('Calendar: curl not available — page fetches degrade to native fetch')
+      return fetchGet(url, timeoutSec)
+    }
+    throw e
+  }
+}
+
+/**
+ * Parse the DEFAULT (whole-week) ForexFactory calendar page into events plus
+ * an actuals map in the SAME key format fetchDayActuals uses, so ONE page
+ * fetch can serve as the schedule fallback AND seed the actuals overlay.
+ *
+ * Row anatomy (verified 2026-11 against the live page):
+ *  - the FIRST row of each day group carries data-day-dateline="<epoch>" —
+ *    the midnight epoch of that day in the PAGE's rendering timezone
+ *    (timezone_name in the HTML); carry it over subsequent rows;
+ *  - the time cell only fills on the first row of each time group (carry);
+ *  - impact lives in the icon class: icon--ff-impact-{red|ora|yel|gra|hol}.
+ */
+export function parseFfPageWeek(
+  html: string,
+): { events: CalendarEvent[]; tz: string; actuals: Record<string, string> } {
+  const tz = /timezone_name:\s*'([^']+)'/.exec(html)?.[1] || 'America/New_York'
+  const events: CalendarEvent[] = []
+  const actuals: Record<string, string> = {}
+  let lastDateline: number | null = null
+  let lastTime = ''
+  for (const row of html.matchAll(/<tr[^>]*data-event-id="(\d+)"[\s\S]*?<\/tr>/g)) {
+    const blk = row[0]
+    const dl = /data-day-dateline="(\d+)"/.exec(blk)
+    if (dl) lastDateline = parseInt(dl[1], 10) * 1000
+    if (lastDateline === null) continue
+    const timeCell = /<td class="calendar__cell calendar__time"[^>]*>([\s\S]*?)<\/td>/.exec(blk)
+    if (timeCell) {
+      const text = cellText(timeCell[1])
+      if (text) lastTime = text
+    }
+    const ccy = cellText(/<td class="calendar__cell calendar__currency"[^>]*>([\s\S]*?)<\/td>/.exec(blk)?.[1])
+    const titleCell = /<span class="calendar__event-title">([\s\S]*?)<\/span>/.exec(blk)
+    const title = titleCell ? decodeHtml(titleCell[1].replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim() : ''
+    if (!title || !ccy) continue
+    const impact = IMPACT_CLASS[/icon--ff-impact-([a-z]+)/.exec(blk)?.[1] ?? ''] ?? 'medium'
+    const actual = cellText(/class="calendar__cell calendar__actual"[^>]*>([\s\S]*?)<\/td>/.exec(blk)?.[1])
+    const forecast = cellText(/class="calendar__cell calendar__forecast"[^>]*>([\s\S]*?)<\/td>/.exec(blk)?.[1])
+    const prior = cellText(/class="calendar__cell calendar__previous"[^>]*>([\s\S]*?)<\/td>/.exec(blk)?.[1])
+    const day = wallInTz(new Date(lastDateline).toISOString(), tz).day
+    const hhmm = normPageTime(lastTime)
+    const time = /^\d{2}:\d{2}$/.test(hhmm) ? instantInTz(day, hhmm, tz) : instantInTz(day, '00:00', tz)
+    events.push({
+      id: row[1],
+      time,
+      country: ccy,
+      importance: impact,
+      event: title,
+      actual: NO_VALUE.has(actual) ? null : actual,
+      forecast: NO_VALUE.has(forecast) ? null : forecast,
+      prior: NO_VALUE.has(prior) ? null : prior,
+    })
+    const key = `${day}|${ccy}|${hhmm}|${title}`
+    if (!NO_VALUE.has(actual)) actuals[key] = actual
+  }
+  return { events, tz, actuals }
+}
+
+/**
+ * Fetch the whole-week page and parse it. This is the mirror-free fallback:
+ * the schedule mirrors 429 the shared Render egress IP, but the page (fetched
+ * via curl — the one FF channel that passes the bot check) carries the FULL
+ * week — schedule AND already-published actuals — in one request.
+ */
+async function fetchPageWeek(): Promise<{
+  events: CalendarEvent[]
+  tz: string
+  actuals: Record<string, string>
+}> {
+  const { status, body } = await curlGet(FF_PAGE_URL, 10)
+  if (status !== 200) throw new Error(`HTTP ${status}`)
+  const parsed = parseFfPageWeek(body)
+  if (parsed.events.length === 0) throw new Error('empty page')
+  return parsed
 }
 
 /**
@@ -397,6 +560,20 @@ async function enrichActuals(events: CalendarEvent[], fresh: boolean): Promise<C
   return mergeActuals(events, tz, nowMs)
 }
 
+/** Feed failure carrying the server's Retry-After (when sent) for backoff. */
+class FeedError extends Error {
+  retryAfterSec?: number
+  constructor(message: string, retryAfterSec?: number) {
+    super(message)
+    this.retryAfterSec = retryAfterSec
+  }
+}
+
+function retryAfterOf(res: Response): number | undefined {
+  const v = Number(res.headers.get('retry-after'))
+  return Number.isFinite(v) && v > 0 ? v : undefined
+}
+
 async function fetchXml(): Promise<CalendarEvent[]> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 8000)
@@ -406,7 +583,7 @@ async function fetchXml(): Promise<CalendarEvent[]> {
       cache: 'no-store',
       headers: { 'user-agent': UA, accept: 'application/xml,text/xml,*/*' },
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    if (!res.ok) throw new FeedError(`HTTP ${res.status}`, retryAfterOf(res))
     const text = await res.text()
     const events = parseFfXml(text)
     if (events.length === 0) throw new Error('empty feed')
@@ -425,7 +602,7 @@ async function fetchJson(): Promise<CalendarEvent[]> {
       cache: 'no-store',
       headers: { 'user-agent': UA, accept: 'application/json' },
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    if (!res.ok) throw new FeedError(`HTTP ${res.status}`, retryAfterOf(res))
     const raw = (await res.json()) as FfEvent[]
     if (!Array.isArray(raw) || raw.length === 0) throw new Error('empty feed')
     return raw.map((e) => ({
@@ -459,8 +636,10 @@ export async function getEconomicCalendar(
       live = cache.live
     }
   }
-  if (!events) {
-    // 1) XML mirror (currently the one that works) 2) JSON mirror
+  if (!events && nowMs >= feedRetryAt) {
+    // 1) XML mirror 2) JSON mirror — with 429-aware exponential backoff so a
+    // rate-limited shared IP is not re-hit on every fresh tab open.
+    let worstRetryAfterSec: number | undefined
     for (const [fn, src] of [[fetchXml, 'forexfactory-xml'], [fetchJson, 'forexfactory-json']] as const) {
       try {
         events = await fn()
@@ -470,7 +649,44 @@ export async function getEconomicCalendar(
         break
       } catch (e) {
         console.error(`Calendar feed ${src} failed:`, e instanceof Error ? e.message : e)
+        const ra = e instanceof FeedError ? e.retryAfterSec : undefined
+        if (ra && (!worstRetryAfterSec || ra > worstRetryAfterSec)) worstRetryAfterSec = ra
       }
+    }
+    if (events) {
+      feedFailStreak = 0
+      feedRetryAt = 0
+    } else {
+      feedFailStreak++
+      const backoffMs = Math.min(FEED_BACKOFF_BASE_MS * 2 ** (feedFailStreak - 1), FEED_BACKOFF_MAX_MS)
+      const jittered = Math.round(backoffMs * (0.8 + Math.random() * 0.4))
+      feedRetryAt = nowMs + Math.max(jittered, (worstRetryAfterSec ?? 0) * 1000)
+      console.warn(
+        `Calendar feed unavailable — backing off ${Math.round((feedRetryAt - nowMs) / 1000)}s (streak ${feedFailStreak})`,
+      )
+    }
+  }
+  if (!events) {
+    // Mirror-free fallback (v2.12.10): the FF calendar PAGE fetched via curl
+    // carries the FULL week — schedule AND published actuals — and is the one
+    // FF channel that passes the bot check from datacenter IPs. One request
+    // replaces both the feed and the actuals day-scrape while mirrors 429.
+    try {
+      const page = await fetchPageWeek()
+      events = page.events
+      live = true
+      source = 'forexfactory-page'
+      cache = { events, fetchedAt: nowMs, live: true }
+      // seed the actuals overlay from the same fetch (free data — the day
+      // scraper then only tops up days the page did not include)
+      actualsCache = {
+        map: { ...(actualsCache?.map ?? {}), ...page.actuals },
+        fetchedAt: nowMs,
+        pastDaysDone: actualsCache?.pastDaysDone ?? new Set(),
+        tz: page.tz,
+      }
+    } catch (e) {
+      console.error('Calendar page fallback failed:', e instanceof Error ? e.message : e)
     }
   }
   if (!events) {

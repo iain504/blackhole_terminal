@@ -58,6 +58,13 @@ RUN bun run build
 # ---- runner: standalone server + prisma CLI for the boot-time db push --------
 FROM oven/bun:1.3 AS runner
 WORKDIR /app
+# curl — the economic-calendar scraper fetches ForexFactory's page through it:
+# the page's bot check rejects Node/undici TLS fingerprints (403) while curl
+# passes. The base image ships without it, which killed the whole Actuals
+# scrape on hosted deploys with "Executable not found in $PATH" (v2.12.10).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 # HOSTNAME=0.0.0.0 — CRITICAL on PaaS (Render/Fly/Railway): Docker injects
 # HOSTNAME=<container-hostname> and Next's standalone server binds THAT instead
 # of 0.0.0.0 → the platform router connects and gets connection-refused → HTTP
