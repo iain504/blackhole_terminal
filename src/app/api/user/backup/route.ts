@@ -75,6 +75,28 @@ export async function GET() {
         db.algoRecoCache.findUnique({ where: { id: `algo-reco:${user.id}` } }),
       ])
 
+    // A section with no row (layout never autosaved, the per-user algo-reco
+    // sweep cache never generated — guaranteed on a fresh deploy) would be
+    // written as an explicit `null`, and the restore side used to treat that
+    // as a PRESENT-but-broken section ("section invalid") and roll back the
+    // whole import. Omit nulls instead: absent ⇒ skip is restore's own rule.
+    const data: Record<string, unknown> = {
+      layout,
+      watchlists,
+      drawings,
+      alerts,
+      strategyRules,
+      algoRuns,
+      algoLogs: algoLogs.reverse(), // back to chronological
+      calendarAlarms,
+      gridTrades,
+      gridFills: gridFills.reverse(),
+      algoRecoCache,
+    }
+    for (const k of Object.keys(data)) {
+      if (data[k] === null) delete data[k]
+    }
+
     const envelope = {
       app: BACKUP_APP,
       version: BACKUP_VERSION,
@@ -88,19 +110,7 @@ export async function GET() {
         // AS STORED — may contain encrypted broker/telegram blobs
         settings: user.settings ?? null,
       },
-      data: {
-        layout,
-        watchlists,
-        drawings,
-        alerts,
-        strategyRules,
-        algoRuns,
-        algoLogs: algoLogs.reverse(), // back to chronological
-        calendarAlarms,
-        gridTrades,
-        gridFills: gridFills.reverse(),
-        algoRecoCache,
-      },
+      data,
     }
 
     return new NextResponse(JSON.stringify(envelope, null, 2), {
