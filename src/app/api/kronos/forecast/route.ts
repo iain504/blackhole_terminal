@@ -4,7 +4,7 @@ import { handleError } from '@/lib/api-helpers'
 import { getBars } from '@/lib/alpaca'
 import { isCryptoSymbol, TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import {
-  journalForecast, kronosHealth, kronosPollJob, kronosSubmitForecast, type KronosBar,
+  journalForecast, kronosHealth, kronosPollJob, kronosSubmitForecast, KRONOS_PROBEABLE, KRONOS_SETUP_HINT, type KronosBar,
 } from '@/lib/kronos'
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,12 @@ export async function POST(req: Request) {
     if (!symbol) return NextResponse.json({ error: 'symbol required' }, { status: 400 })
 
     const health = await kronosHealth()
-    if (!health?.ok) return NextResponse.json({ error: 'Kronos sidecar not reachable — is mini-services/kronos-service running?' }, { status: 503 })
+    if (!health?.ok) {
+      return NextResponse.json(
+        { error: KRONOS_PROBEABLE ? 'Kronos sidecar not reachable — is mini-services/kronos-service running?' : KRONOS_SETUP_HINT },
+        { status: 503 },
+      )
+    }
     if (!health.ready) return NextResponse.json({ error: 'Kronos model still loading — try again in a minute' }, { status: 503 })
 
     // REAL bars only — the app's own pipeline (alpaca/binance, demo refused)

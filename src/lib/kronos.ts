@@ -28,6 +28,19 @@ export type { KronosBar, KronosForecastResult, KronosHealth, KronosHitRate, Kron
 
 const KRONOS_URL = process.env.KRONOS_URL || 'http://127.0.0.1:3030'
 
+// v2.12.13 — hosted honesty: the sidecar is a Python/PyTorch process that NO
+// baked image ships (a 512MB free container cannot hold torch alongside the
+// app). The localhost default only ever makes sense on a dev box where the
+// sidecar was started by hand — in production the default would just knock on
+// whatever ELSE listens on that local port (the stream sidecar in the hosted
+// image) and report a baffling "unavailable". When not probeable we skip the
+// fetch entirely and the status route reports notConfigured with setup steps.
+export const KRONOS_URL_DISPLAY = KRONOS_URL
+const KRONOS_LOCAL_DEFAULT = !process.env.KRONOS_URL && process.env.NODE_ENV !== 'production'
+export const KRONOS_PROBEABLE = Boolean(process.env.KRONOS_URL) || KRONOS_LOCAL_DEFAULT
+export const KRONOS_SETUP_HINT =
+  'Kronos is a Python/PyTorch sidecar (mini-services/kronos-service) that is not part of this deployment — a 512MB hosted container cannot run it in-process. Deploy the sidecar on any PyTorch-capable host (see its README) and set KRONOS_URL in the environment to its base URL.'
+
 const POLL_INTERVAL_MS = 1200
 const WAIT_DEADLINE_MS = 180_000
 
@@ -44,6 +57,10 @@ async function jfetch<T>(path: string, init?: RequestInit, timeoutMs = 8000): Pr
 }
 
 export async function kronosHealth(): Promise<KronosHealth | null> {
+  // Not probeable = production without an explicit KRONOS_URL: there is no
+  // sidecar to find (see the block comment above) — answer null immediately
+  // instead of fetching some other service that happens to own the port.
+  if (!KRONOS_PROBEABLE) return null
   try {
     return await jfetch<KronosHealth>('/health')
   } catch {

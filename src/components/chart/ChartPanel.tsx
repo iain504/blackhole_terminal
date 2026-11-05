@@ -4634,7 +4634,16 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
                   </>
                 )}
                 {krStatus && !krStatus.available && !krStatus.loading && (
-                  <span className="text-rose-400">Model service unavailable{krStatus.error ? ` — ${krStatus.error}` : ''}. Start mini-services/kronos-service.</span>
+                  krStatus.notConfigured ? (
+                    <span className="text-amber-400/90">
+                      Not part of this deployment — the Kronos sidecar is a Python/PyTorch service that needs its own host
+                      (a 512&nbsp;MB hosted container cannot run it in-process). Deploy <span className="font-medium">mini-services/kronos-service</span>
+                      {' '}anywhere (its README has recipes) and set <span className="font-mono text-amber-300">KRONOS_URL</span> in the environment
+                      {krStatus.sidecarUrl ? <> — currently <span className="font-mono">{krStatus.sidecarUrl}</span> (default, nothing there)</> : null}.
+                    </span>
+                  ) : (
+                    <span className="text-rose-400">Model service unavailable{krStatus.error ? ` — ${krStatus.error}` : ''}. Start mini-services/kronos-service.</span>
+                  )
                 )}
               </p>
               <div className="mt-2 flex items-center gap-1.5">

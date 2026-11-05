@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
-import { kronosHealth, kronosHitRate, realizePendingForecasts } from '@/lib/kronos'
+import {
+  kronosHealth, kronosHitRate, realizePendingForecasts, KRONOS_PROBEABLE, KRONOS_SETUP_HINT, KRONOS_URL_DISPLAY,
+} from '@/lib/kronos'
 import { db } from '@/lib/db'
 
 // GET /api/kronos/status — sidecar health + the model's REALIZED accuracy.
@@ -27,7 +29,9 @@ export async function GET() {
     return NextResponse.json({
       available: !!health?.ready,
       loading: !!health?.loading,
-      error: health?.error ?? null,
+      error: health?.error ?? (health ? null : KRONOS_PROBEABLE ? null : KRONOS_SETUP_HINT),
+      notConfigured: !health && !KRONOS_PROBEABLE,
+      sidecarUrl: KRONOS_URL_DISPLAY,
       lanes: health?.lanes ?? {},
       uptimeSec: health?.uptimeSec ?? null,
       hitRate,

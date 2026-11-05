@@ -363,8 +363,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=load_model, daemon=True).start()
-    srv = ThreadingHTTPServer(('127.0.0.1', 3030), Handler)
-    print('[kronos] sidecar listening on 127.0.0.1:3030 (model loading in background)', flush=True)
+    # Bind: dev default stays loopback-only 127.0.0.1:3030 (the Next.js backend
+    # is the sole caller). For REMOTE deploys (HF Space / PaaS / container)
+    # set HOST=0.0.0.0 and PORT — PaaS platforms inject PORT and health-check
+    # the process from outside, so a loopback bind reads as "service down".
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', '3030'))
+    srv = ThreadingHTTPServer((host, port), Handler)
+    print(f'[kronos] sidecar listening on {host}:{port} (model loading in background)', flush=True)
     srv.serve_forever()
 
 

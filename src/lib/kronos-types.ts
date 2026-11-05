@@ -89,6 +89,10 @@ export interface KronosStatus {
   available: boolean
   loading: boolean
   error: string | null
+  /** true = production without a KRONOS_URL — the sidecar was never part of this deployment (v2.12.13) */
+  notConfigured?: boolean
+  /** the base URL the sidecar client would fetch (debug aid) */
+  sidecarUrl?: string | null
   lanes: Record<string, boolean>
   uptimeSec: number | null
   hitRate: KronosHitRate
