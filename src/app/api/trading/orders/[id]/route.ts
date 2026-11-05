@@ -17,6 +17,15 @@ interface ReplaceBody {
   sl_price?: number
 }
 
+// v2.12.3 — every broker call in this file can fail with an Alpaca 401
+// (rejected keys / engaged auth breaker). NONE of them may return HTTP 401:
+// the client's global 401 watcher treats any trading-route 401 as session
+// death and logs the user out. Map broker-auth failures to 422 + a message
+// that points at the real fix (Settings → API keys) — every consumer here
+// already treats non-2xx as a plain error (r.ok ? json : null / toast).
+const brokerAuthError = (mode: string) =>
+  `Alpaca rejected the ${mode} API keys — update them in Settings → API keys.`
+
 // PATCH /api/trading/orders/[id] — replace SL/TP prices (chart line drag) or
 // change a PENDING entry's limit/TP/SL (drag the dashed lines).
 // Smart replace: PATCH with automatic paper/live host fallback (the drag used
@@ -40,7 +49,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (Object.keys(entryPatch).length > 0) {
       const r = await replacePendingEntrySmart(user.id, mode, id, { ...entryPatch, crypto })
       if (!r.data) {
-        return NextResponse.json({ error: r.error || 'Update failed' }, { status: r.status || 502 })
+        return NextResponse.json(
+          { error: r.status === 401 ? brokerAuthError(mode) : (r.error || 'Update failed') },
+          { status: r.status === 401 ? 422 : (r.status || 502) },
+        )
       }
       return NextResponse.json({ mode: r.mode, order: r.data, method: r.method, note: r.note })
     }
@@ -55,7 +67,10 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
     const r = await replaceExitOrderSmart(user.id, mode, id, patch)
     if (!r.data) {
-      return NextResponse.json({ error: r.error || 'Replace failed' }, { status: r.status || 502 })
+      return NextResponse.json(
+        { error: r.status === 401 ? brokerAuthError(mode) : (r.error || 'Replace failed') },
+        { status: r.status === 401 ? 422 : (r.status || 502) },
+      )
     }
     return NextResponse.json({ mode: r.mode, order: r.data, method: r.method, note: r.note })
   } catch (e) {
@@ -76,7 +91,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const r = await getOrderById(user.id, mode, id)
     if (!r.data) {
-      return NextResponse.json({ error: r.error || 'Order not found' }, { status: r.status || 404 })
+      return NextResponse.json(
+        { error: r.status === 401 ? brokerAuthError(mode) : (r.error || 'Order not found') },
+        { status: r.status === 401 ? 422 : (r.status || 404) },
+      )
     }
     return NextResponse.json({ mode: r.mode, order: r.data })
   } catch (e) {
@@ -94,7 +112,10 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ id: s
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const r = await cancelOrder(user.id, mode, id)
     if (r.status !== 204 && r.status !== 200) {
-      return NextResponse.json({ error: r.error || 'Cancel failed' }, { status: r.status || 502 })
+      return NextResponse.json(
+        { error: r.status === 401 ? brokerAuthError(mode) : (r.error || 'Cancel failed') },
+        { status: r.status === 401 ? 422 : (r.status || 502) },
+      )
     }
     return NextResponse.json({ ok: true, mode })
   } catch (e) {

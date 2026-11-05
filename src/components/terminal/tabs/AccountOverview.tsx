@@ -82,6 +82,10 @@ export default function AccountOverview() {
         const res = await fetch(`/api/trading/account?mode=${mode}`)
         const json = await res.json().catch(() => null)
         if (res.ok && json?.account) return { account: json.account as AccountInfo, loaded: true }
+        // v2.12.3 — Task-36 authError contract (200 + authError, no HTTP 401):
+        // surface the broker-keys message in the card instead of a bogus
+        // "HTTP 200" error line — and it never reaches the 401 watcher.
+        if (json?.authError?.message) return { account: null, error: String(json.authError.message), loaded: true }
         // 'no-keys' (paper) / 'no-live-keys' (live) — Task 37 dual-key tokens;
         // both mean UNCONFIGURED, not an error
         const noKeys = json?.error === 'no-keys' || json?.error === 'no-live-keys'

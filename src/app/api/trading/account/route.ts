@@ -19,6 +19,27 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url)
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const { data, status, error } = await getAccount(user.id, mode)
+    // v2.12.3 — a broker-auth failure must NEVER leave this route as HTTP 401:
+    // the account snapshot is polled from the terminal root seconds after
+    // login (AccountOverview + TradeTicket), and the client's global 401
+    // watcher treats ANY trading-route 401 as session death — the "auto
+    // logout in 2 seconds" hosted report, round two (v2.12.2 fixed
+    // fills/history; the toast then named THIS route). Return the Task-36
+    // contract instead: 200 + structured authError, which the Positions tab
+    // renders as the keys banner. Covers BOTH shapes tradeFetch produces:
+    // the engaged breaker ({data:null,status:401,'auth-backoff:…'}) and the
+    // live rejection ({data:<parsed 401 body>,status:401}).
+    if (status === 401) {
+      return NextResponse.json({
+        mode: isTradeMode(searchParams.get('mode')) ? searchParams.get('mode') : mode,
+        account: null,
+        configured: true,
+        authError: {
+          mode,
+          message: `${mode === 'live' ? 'LIVE' : 'Paper'} keys rejected by Alpaca — account snapshot is paused until the keys are fixed (Settings → API keys).`,
+        },
+      })
+    }
     if (!data) {
       return NextResponse.json(
         { error: error || 'Trading API unavailable', mode, configured: !isNoKeysError(error) },

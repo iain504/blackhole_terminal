@@ -17,7 +17,17 @@ export async function DELETE(req: Request, { params }: { params: Promise<{ symbo
     const mode = await resolveTradeMode(user.id, searchParams.get('mode'))
     const { close, canceledExits } = await closePositionFull(user.id, mode, symbol)
     if (!close.data && close.status !== 204) {
-      return NextResponse.json({ error: close.error || 'Close failed' }, { status: close.status || 502 })
+      // v2.12.3 — broker-auth 401 maps to 422 (never HTTP 401: the global
+      // 401 watcher would log the user out mid-action).
+      const brokerAuth = close.status === 401
+      return NextResponse.json(
+        {
+          error: brokerAuth
+            ? `Alpaca rejected the ${mode} API keys — update them in Settings → API keys.`
+            : (close.error || 'Close failed'),
+        },
+        { status: brokerAuth ? 422 : (close.status || 502) },
+      )
     }
     return NextResponse.json({ ok: true, mode, order: close.data, canceledExits })
   } catch (e) {

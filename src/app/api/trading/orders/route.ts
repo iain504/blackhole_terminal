@@ -109,9 +109,18 @@ export async function POST(req: Request) {
       // trailing stop as success (200 with the error inside orders[]).
       const errBody = r.data as { code?: number; message?: string } | null
       if (!r.data || r.error || errBody?.code != null) {
+        // v2.12.3 — a broker-auth 401 must not leak as HTTP 401 (global 401
+        // watcher = instant logout): map it to 422 + a message that points at
+        // the real fix. The session itself is fine.
+        const brokerAuth = r.status === 401
         return NextResponse.json(
-          { error: friendlyExitQtyError(r.error || errBody?.message || 'Trailing stop failed'), status: r.status },
-          { status: r.status || 502 },
+          {
+            error: brokerAuth
+              ? `Alpaca rejected the ${mode} API keys — update them in Settings → API keys.`
+              : friendlyExitQtyError(r.error || errBody?.message || 'Trailing stop failed'),
+            status: r.status,
+          },
+          { status: brokerAuth ? 422 : (r.status || 502) },
         )
       }
       return NextResponse.json({ mode, orders: [r.data], errors: [] })
