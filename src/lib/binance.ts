@@ -6,10 +6,19 @@
 import { Bar, Quote, Timeframe, TIMEFRAMES } from './market-types'
 
 // Primary REST host + public market-data mirror. api.binance.com intermittently
-// answers HTTP 418/429 (IP rate-limit waves in datacenter ranges) — the mirror
-// `data-api.binance.vision` serves the SAME public market-data paths with laxer
-// limits, so every request falls over to it before giving up.
-const BASES = ['https://api.binance.com', 'https://data-api.binance.vision']
+// answers HTTP 418/429 (IP rate-limit waves in datacenter ranges) and — on
+// US-hosted servers like Render — HTTP 451/403 outright: Binance geo-blocks
+// datacenter IPs by region ("Unavailable For Legal Reasons"). The mirror
+// `data-api.binance.vision` serves the SAME public market-data paths with
+// laxer limits and NO regional block, so every request fails over to it before
+// giving up. BINANCE_BASE_URL (optional env) overrides the primary host.
+const BASES = [
+  ...new Set([
+    process.env.BINANCE_BASE_URL || '',
+    'https://api.binance.com',
+    'https://data-api.binance.vision',
+  ].filter(Boolean)),
+]
 const TIMEOUT_MS = 6000
 // sticky working base (short TTL so the primary is re-tried periodically)
 let activeBase = BASES[0]
@@ -17,6 +26,10 @@ let activeBaseAt = 0
 const BASE_STICKY_MS = 10 * 60 * 1000
 /** Circuit-breaker gate (see binanceFetch): while set, all Binance calls no-op. */
 let binanceBannedUntil = 0
+// v2.12.7 — printed ONCE when the primary host is geo-blocked (HTTP 451/403):
+// the hosted 451 log flood (“many 451 binance error”) was indistinguishable
+// from a hard outage before this one-line explanation.
+let geoBlockNotice = false
 
 /** 'BTC/USD' -> 'BTCUSDT' (Binance quotes USD pairs as USDT), 'ETH/EUR' -> 'ETHEUR'. */
 export function toBinanceSymbol(symbol: string): string | null {
@@ -47,10 +60,25 @@ async function binanceFetch<T>(path: string): Promise<T | null> {
         headers: { accept: 'application/json' },
       })
       if (!res.ok) {
+        // v2.12.7 — 451/403 are HOST-level geo/WAF blocks: the SAME public
+        // path is served by the next base (Render's US region gets 451 from
+        // api.binance.com while data-api.binance.vision serves fine). These
+        // used to hit the generic 4xx early-return below, so the mirror was
+        // NEVER tried and every crypto quote/bar on Render failed. Fail over.
+        if (res.status === 451 || res.status === 403) {
+          if (!geoBlockNotice) {
+            geoBlockNotice = true
+            console.warn(
+              `Binance ${base} is blocked from this host (HTTP ${res.status}, geo/WAF) — ` +
+              `failing over to the mirror base for market data`,
+            )
+          }
+          continue
+        }
         // 4xx that won't change with another host (bad symbol etc.) — stop early
         console.error(`Binance ${base}${path} -> HTTP ${res.status}`)
         if (res.status === 418 || res.status === 429) binanceBannedUntil = Date.now() + 5 * 60_000
-        if (res.status >= 400 && res.status < 500 && res.status !== 418 && res.status !== 429) return null
+        if (res.status >= 400 && res.status < 500) return null
         continue
       }
       const data = (await res.json()) as T

@@ -35,7 +35,11 @@ import { Server, Socket } from 'socket.io'
 
 const PORT = 3030
 const NEXT_BASE = 'http://localhost:3000'
-const BINANCE_WS = 'wss://stream.binance.com:9443/ws'
+// v2.12.7 — Binance also geo-blocks its WS from datacenter IPs (the REST 451s
+// in the same logs). data-stream.binance.vision is the market-data-only WS
+// mirror (same subscribe protocol) — rotate to it when a base never delivers.
+const BINANCE_WS_BASES = ['wss://stream.binance.com:9443/ws', 'wss://data-stream.binance.vision/ws']
+let binanceBaseIdx = 0
 const ALPACA_WS = 'wss://stream.data.alpaca.markets/v2/iex'
 const FLUSH_MS = 200 // per-symbol emit throttle → ≤5 msgs/s
 const KEY_CACHE_MS = 60_000
@@ -439,7 +443,13 @@ function alpacaConnect(conn: AlpacaConn) {
     ws.onopen = () => {
       opened = true
       conn.backoff = 1000
-      ws.send(JSON.stringify({ action: 'auth', keys: [conn.keys.keyId, conn.keys.secret] }))
+      // v2.12.7 — the documented Market-Data auth shape is SINGULAR
+      // `key`/`secret` fields. The old `keys:[id, secret]` array left both
+      // fields absent, so Alpaca answered "error 402: auth failed" on every
+      // deployment (even with perfectly valid keys — REST data calls with the
+      // same pair succeeded, which is why stock ticks silently never streamed
+      // and only REST polling kept charts alive).
+      ws.send(JSON.stringify({ action: 'auth', key: conn.keys.keyId, secret: conn.keys.secret }))
     }
     ws.onmessage = (ev) => {
       let msgs: Record<string, unknown>[] = []
@@ -578,8 +588,10 @@ const binanceReverse = new Map<string, string>() // BTCUSDT → BTC/USD
 
 function binanceConnect() {
   if (binanceWs) return
+  const base = BINANCE_WS_BASES[binanceBaseIdx]
+  let gotMsg = false // did THIS base ever deliver a tick?
   try {
-    const ws = new WebSocket(BINANCE_WS)
+    const ws = new WebSocket(base)
     binanceWs = ws
     ws.onopen = () => {
       binanceUp = true
@@ -589,6 +601,7 @@ function binanceConnect() {
       binanceSync(true)
     }
     ws.onmessage = (ev) => {
+      gotMsg = true
       binanceLastMsg = Date.now()
       let m: Record<string, unknown> | null = null
       try {
@@ -614,6 +627,13 @@ function binanceConnect() {
     ws.onclose = () => {
       binanceWs = null
       binanceUp = false
+      // v2.12.7 — a base that never delivered a single message is unusable
+      // from this host (geo-block: the stream.binance.com handshake 451s from
+      // US datacenter IPs) — rotate to the mirror before the next attempt.
+      if (!gotMsg && binanceBaseIdx < BINANCE_WS_BASES.length - 1) {
+        binanceBaseIdx++
+        console.warn(`[binance] ${base} unusable from this host — rotating to ${BINANCE_WS_BASES[binanceBaseIdx]}`)
+      }
       if (refcounts.size === 0) return
       const wait = binanceBackoff
       binanceBackoff = Math.min(binanceBackoff * 2, 30000)

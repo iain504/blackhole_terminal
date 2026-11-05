@@ -89,16 +89,29 @@ function synthetic(tf: string, limit: number): LandingCandle[] {
   return out
 }
 
+// v2.12.7 — two-host failover: api.binance.com is geo-blocked (HTTP 451) from
+// US-hosted servers like Render ("Unavailable For Legal Reasons"), while the
+// data-api.binance.vision mirror serves the same public market-data paths.
+// Without the mirror the landing chart silently degraded to the synthetic walk.
+const BINANCE_BASES = ['https://api.binance.com', 'https://data-api.binance.vision']
+
 async function fetchBinance(path: string, timeoutMs = 6000): Promise<unknown> {
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), timeoutMs)
-  try {
-    const res = await fetch(`https://api.binance.com${path}`, { signal: ctl.signal, cache: 'no-store' })
-    if (!res.ok) throw new Error(`binance ${res.status}`)
-    return await res.json()
-  } finally {
-    clearTimeout(timer)
+  for (const base of BINANCE_BASES) {
+    const ctl = new AbortController()
+    const timer = setTimeout(() => ctl.abort(), timeoutMs)
+    try {
+      const res = await fetch(`${base}${path}`, { signal: ctl.signal, cache: 'no-store' })
+      if (!res.ok) {
+        // host-level geo/WAF block — the mirror serves the same public path
+        if (res.status === 451 || res.status === 403) continue
+        throw new Error(`binance ${res.status}`)
+      }
+      return await res.json()
+    } finally {
+      clearTimeout(timer)
+    }
   }
+  throw new Error('binance unreachable from this host')
 }
 
 async function buildSnapshot(tf: string, limit: number): Promise<Snapshot> {

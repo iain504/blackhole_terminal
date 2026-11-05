@@ -51,6 +51,11 @@ echo "[entrypoint] DATABASE_URL=$DATABASE_URL"
 # ---- fresh-database hint (ephemeral Render disk = fresh on every deploy) ---
 if [ ! -f "$db_path" ]; then
   echo "[entrypoint] fresh database — create your account via the UI after boot"
+  echo "[entrypoint]   ⚠ NO PERSISTENT DISK: accounts, settings and SAVED API KEYS live in this"
+  echo "[entrypoint]     database file and are RESET on every new deploy (Render free plan)."
+  echo "[entrypoint]     After each deploy you must re-create your account and re-enter API keys"
+  echo "[entrypoint]     in Settings → API keys — until then the operator's env keys (if any) apply."
+  echo "[entrypoint]     To keep everything: Render plan: starter + a Disk mounted at /app/db."
   echo "[entrypoint] (ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-unset})"
 fi
 
