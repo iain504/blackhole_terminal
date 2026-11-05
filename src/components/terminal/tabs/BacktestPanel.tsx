@@ -100,11 +100,6 @@ export interface AlgoSetupCfg {
   flattenEod: boolean
   cooldownMin: number
   requireNewSignal: boolean
-  /** v2.0.0 — the shared setup's live-run Kronos gate (backtests ignore it —
-   * the backtest-side Kronos feature is the separate kronos-ab validation
-   * level; carrying the field keeps setupCfg structurally an AlpoRunConfig
-   * for config export). */
-  kronosGate: boolean
   /** v2.5.0 — the shared setup's live-run sentiment gate (same pattern). */
   sentimentGate: boolean
 }
@@ -264,10 +259,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [wfHoldout, setWfHoldout] = useState('20')
   const [wfAnchored, setWfAnchored] = useState(false)
   const [wfRes, setWfRes] = useState<WalkForwardResult | null>(null)
-  // v2.0.0 — Kronos gate A/B result (ungated baseline vs model-gated replay)
-  interface KronosAbSide { trades: number; netPct: number; winRate: number; pf: number; expectancy: number; maxDDPct: number }
-  interface KronosAbResult { base: KronosAbSide; gated: KronosAbSide; gateVetoed: number; forecasts: number; forecastFailed: number; origins: number; horizon: number; windowBars: number; model: string; avgUpProb: number | null; elapsedSec: number; windowFrom: number; windowTo: number }
-  const [krAbRes, setKrAbRes] = useState<KronosAbResult | null>(null)
   const [mcRes, setMcRes] = useState<MonteCarloResult | null>(null)
   // v1.99.0 — TRUST verdict for the plain run / optimizer best row (computed
   // server-side on the actual per-trade P&L). Walk-forward verdicts are
@@ -312,7 +303,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   const [recoSymbols, setRecoSymbols] = useState<string[]>([])
   const [optOpen, setOptOpen] = useState(false)
   const [ranges, setRanges] = useState<Record<string, RangeState>>({})
-  const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'>(null)
+  const [busy, setBusy] = useState<null | 'run' | 'optimize' | 'sweep' | 'walkforward'>(null)
   const [error, setError] = useState<string | null>(null)
   // Task 15 — live progress of a background optimizer job (heavy modes run
   // detached server-side; this mirrors the GET ?job= poll stream).
@@ -386,7 +377,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setError(null)
     setMcRes(null)
     setAbRes(null)
-    setKrAbRes(null)
     setFlowMode(null) // v1.99.1 — the old pipeline belongs to the old strategy
   }, [cfg.strategy, studio.strategy])
 
@@ -395,7 +385,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setSweepRes(null)
     setWfRes(null)
     setAbRes(null)
-    setKrAbRes(null)
   }, [cfg.symbol, cfg.timeframe, studio.symbol, studio.entryTf])
 
   // v2.2.0 — spec §2.1 sync rules: the wizard's symbol FOLLOWS the shared run
@@ -614,9 +603,9 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     return out
   }, [def, ranges])
 
-  const failToast = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab', description: string) => {
+  const failToast = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward', description: string) => {
     toast({
-      title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : mode === 'walkforward' ? 'Walk-forward failed' : mode === 'kronos-ab' ? 'Kronos gate A/B failed' : 'Strategy sweep failed',
+      title: mode === 'run' ? 'Backtest failed' : mode === 'optimize' ? 'Optimizer failed' : mode === 'walkforward' ? 'Walk-forward failed' : 'Strategy sweep failed',
       description,
       variant: 'destructive',
     })
@@ -624,7 +613,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
 
   // Task 15 — one result-application path shared by the inline response and
   // the background-job poll (the wire shapes are identical)
-  const applyResult = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab', json: unknown) => {
+  const applyResult = (mode: 'run' | 'optimize' | 'sweep' | 'walkforward', json: unknown) => {
     const j = (json ?? {}) as {
       meta?: BacktestMeta | null
       result?: BacktestResult | null
@@ -632,7 +621,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       optimize?: OptimizeResult | null
       walkforward?: WalkForwardResult | null
       sweep?: SweepResult | null
-      kronosAb?: KronosAbResult | null
       trust?: { sig: SignificanceStats | null; verdict: TrustVerdict | null } | null
     }
     setMeta(j.meta ?? null)
@@ -648,7 +636,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setTrailAbRes(null) // a fresh run invalidates the trail-proof A/B
       setWfRes(null)
       setSweepRes(null)
-      setKrAbRes(null)
     } else if (mode === 'optimize') {
       setOptRes(j.optimize ?? null)
       setTrustRes({ basis: 'in-sample', sig: j.trust?.sig ?? null, verdict: j.trust?.verdict ?? null })
@@ -656,22 +643,12 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setMcRes(null)
       setWfRes(null)
       setSweepRes(null)
-      setKrAbRes(null)
     } else if (mode === 'walkforward') {
       setWfRes(j.walkforward ?? null)
       setTrustRes(null)
       setRunRes(null)
       setOptRes(null)
       setMcRes(null)
-      setSweepRes(null)
-      setKrAbRes(null)
-    } else if (mode === 'kronos-ab') {
-      setKrAbRes(j.kronosAb ?? null)
-      setRunRes(null)
-      setOptRes(null)
-      setMcRes(null)
-      setTrustRes(null)
-      setWfRes(null)
       setSweepRes(null)
     } else {
       setSweepRes(j.sweep ?? null)
@@ -680,7 +657,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       setOptRes(null)
       setMcRes(null)
       setWfRes(null)
-      setKrAbRes(null)
     }
   }
 
@@ -690,7 +666,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
   // timeouts (Render's edge ≈100s) or pod churn — no more 502-with-no-result.
   // v1.99.1 — resolves true when a result landed (flow chart → golden),
   // false on any failure/timeout (flow chart → red node).
-  const pollJob = async (mode: 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab', jobId: string): Promise<boolean> => {
+  const pollJob = async (mode: 'optimize' | 'sweep' | 'walkforward', jobId: string): Promise<boolean> => {
     const deadline = Date.now() + 20 * 60_000
     for (;;) {
       if (Date.now() > deadline) {
@@ -738,7 +714,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     }
   }
 
-  const post = async (mode: 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab') => {
+  const post = async (mode: 'run' | 'optimize' | 'sweep' | 'walkforward') => {
     setBusy(mode)
     setError(null)
     setJob(null)
@@ -968,7 +944,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
     setOptRes(null)
     setSweepRes(null)
     setWfRes(null)
-    setKrAbRes(null)
     setMcRes(null)
     setAbRes(null)
     setTrailAbRes(null)
@@ -1077,7 +1052,7 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
       />
 
       {/* ---- results (v2.1.0 — anchored region the CTA scrolls to) ---- */}
-      {(meta || runRes || optRes || sweepRes || wfRes || krAbRes) && (
+      {(meta || runRes || optRes || sweepRes || wfRes) && (
         <div ref={resRef} className="scroll-mt-20">
           <div className="flex flex-wrap items-center gap-2 px-1">
             <Table2 className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
@@ -1819,68 +1794,6 @@ export default function BacktestPanel({ cfg, onApplyParams, onApplySetup }: { cf
             Each fold re-runs the full grid search on its in-sample window (rolling: a fixed window right before the OOS segment · anchored: everything from the
             start), then replays the winner untouched on its out-of-sample segment. Report the DISTRIBUTION — {wfRes.aggregate.positiveFolds}/{wfRes.aggregate.foldsValid || 0} valid folds stayed
             profitable OOS — not the best in-sample row. The pure hold-out tail was never available to any fold. Past performance ≠ future results.
-          </p>
-        </div>
-      )}
-
-      {/* ---- v2.0.0 — Kronos gate A/B card: does the AI gate help or hurt? ---- */}
-      {krAbRes && (
-        <div className="rounded-md border border-amber-500/30 bg-zinc-900/70">
-          <div className="flex flex-wrap items-center gap-2 px-3 py-2">
-            <Sparkles className="h-3.5 w-3.5 text-amber-400" aria-hidden />
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-300">Kronos gate A/B — AI veto vs free entries</span>
-            <Badge variant="outline" className="text-[10px] text-zinc-400">{krAbRes.model}</Badge>
-            <Badge variant="outline" className="text-[10px] text-zinc-400">{krAbRes.forecasts}/{krAbRes.origins} walk-forward forecasts</Badge>
-            {krAbRes.forecastFailed > 0 && (
-              <Badge variant="outline" className="border-rose-500/40 text-[10px] text-rose-400">{krAbRes.forecastFailed} failed (bars ungated)</Badge>
-            )}
-            <span className="ml-auto text-[10px] tabular-nums text-zinc-600">
-              {krAbRes.windowBars}-bar window · {new Date(krAbRes.windowFrom * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} → {new Date(krAbRes.windowTo * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} · {krAbRes.elapsedSec}s
-            </span>
-          </div>
-          <div className="overflow-x-auto px-3 pb-2">
-            <table className="w-full min-w-[520px] text-xs">
-              <thead>
-                <tr className="border-b border-zinc-800 text-left text-[10px] uppercase tracking-wider text-zinc-500">
-                  <th className="py-1.5 pr-2 font-medium">variant</th>
-                  <th className="py-1.5 pr-2 text-right font-medium">trades</th>
-                  <th className="py-1.5 pr-2 text-right font-medium">net %</th>
-                  <th className="py-1.5 pr-2 text-right font-medium">win rate</th>
-                  <th className="py-1.5 pr-2 text-right font-medium">PF</th>
-                  <th className="py-1.5 pr-2 text-right font-medium">expectancy</th>
-                  <th className="py-1.5 text-right font-medium">max DD</th>
-                </tr>
-              </thead>
-              <tbody className="tabular-nums">
-                <tr className="border-b border-zinc-800/60">
-                  <td className="py-1.5 pr-2 text-zinc-300">A · ungated (baseline)</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-300">{krAbRes.base.trades}</td>
-                  <td className={`py-1.5 pr-2 text-right font-semibold ${krAbRes.base.netPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{krAbRes.base.netPct.toFixed(2)}%</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-400">{krAbRes.base.winRate.toFixed(0)}%</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-400">{krAbRes.base.pf.toFixed(2)}</td>
-                  <td className={`py-1.5 pr-2 text-right ${krAbRes.base.expectancy >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'}`}>${krAbRes.base.expectancy.toFixed(2)}</td>
-                  <td className="py-1.5 text-right text-zinc-500">{krAbRes.base.maxDDPct.toFixed(1)}%</td>
-                </tr>
-                <tr>
-                  <td className="py-1.5 pr-2 font-semibold text-amber-300">B · Kronos-gated</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-300">
-                    {krAbRes.gated.trades}
-                    {krAbRes.gateVetoed > 0 && <span className="ml-1 text-[10px] text-amber-400/80" title="Entry signals the model vetoed">−{krAbRes.gateVetoed} vetoed</span>}
-                  </td>
-                  <td className={`py-1.5 pr-2 text-right font-semibold ${krAbRes.gated.netPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{krAbRes.gated.netPct.toFixed(2)}%</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-400">{krAbRes.gated.winRate.toFixed(0)}%</td>
-                  <td className="py-1.5 pr-2 text-right text-zinc-400">{krAbRes.gated.pf.toFixed(2)}</td>
-                  <td className={`py-1.5 pr-2 text-right ${krAbRes.gated.expectancy >= 0 ? 'text-emerald-400/80' : 'text-rose-400/80'}`}>${krAbRes.gated.expectancy.toFixed(2)}</td>
-                  <td className="py-1.5 text-right text-zinc-500">{krAbRes.gated.maxDDPct.toFixed(1)}%</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <p className="border-t border-zinc-800/60 px-3 py-2 text-[10px] leading-snug text-zinc-600">
-            Walk-forward honesty: every forecast was made at its origin bar seeing ONLY past bars (24-bar stride, no look-ahead); the gate vetoes an entry when the
-            model's horizon-end P(up) disagrees (≥0.55 long / ≤0.45 short). {krAbRes.avgUpProb != null && <>Average P(up) across origins: {(krAbRes.avgUpProb * 100).toFixed(0)}%. </>}
-            A gate that removes trades is only good if the REMOVED trades were the bad ones — compare net % and expectancy, not trade count. Forecasts are cached
-            per window, so re-running with different TP/SL is instant. The same gate is available on LIVE runs ("Kronos AI gate" in the run setup).
           </p>
         </div>
       )}

@@ -108,7 +108,7 @@ export async function bootNode(): Promise<void> {
 
   try {
     // 5) v2.11.3 — scheduled DB maintenance: retention prunes (SentimentScore
-    //    90d, KronosForecast 30d, stopped AlgoRuns + their logs 30d, orphan
+    //    90d, stopped AlgoRuns + their logs 30d, orphan
     //    StrategyFireLogs / GridAutoRuns 30d) + a WAL checkpoint, so the
     //    single-file SQLite deployment stops growing forever. Fail-soft by
     //    design; runs +45s after boot then every 6h.

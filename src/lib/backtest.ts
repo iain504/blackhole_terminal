@@ -144,13 +144,6 @@ export interface BacktestConfig {
   // Metrics (incl. mark-to-market maxDrawdownPct) are unaffected — MTM peak/
   // trough tracking is separate from this display array.
   collectEquity?: boolean
-  // v2.0.0 — Kronos AI entry-gate hook (optional). When present, an entry
-  // signal only becomes a pending order if the callback allows THIS bar+side.
-  // Contract: pure + deterministic per (i, side), built ONLY from forecasts
-  // whose origin bar is < i (walk-forward stride sampling — the model never
-  // sees future bars). Undefined = no gate, zero behavior change everywhere
-  // else (sweep/optimizer/plain runs never pass it).
-  entryGate?: (i: number, side: 'long' | 'short') => boolean
   // v2.2.0 — swing MTF lane (spec §1.4): the higher-timeframe ladder for the
   // swing strategies, e.g. { trendTf: '1D', midTf: '4h' } for a 1h entry.
   // Presence = swing lane. The route validates/derives the strings against
@@ -212,7 +205,6 @@ export interface BacktestMetrics {
   to: number // last bar time (unix s)
   openAtEnd: boolean // position was marked-to-market at the last bar
   suppressed: number // signals suppressed by session/cap/window/cooldown/edge gates
-  gateVetoed: number // v2.0.0 — signals vetoed by the Kronos entry-gate hook (0 when absent)
   // Task 3-d — short entries DROPPED because the market is long-only (Alpaca
   // crypto has no shorting — trading.ts). 0 when absent/undefined for old data.
   skippedShorts?: number
@@ -233,7 +225,7 @@ export interface BacktestMetrics {
   //               calendar-naive expected 24)
   //   no-signal — warmup fine, but the entry screens never aligned
   //   filtered  — raw signals existed but every one was dropped (crypto
-  //               long-only shorts, dust, cooldown, Kronos gate vetoes…)
+  //               long-only shorts, dust, cooldown, session/cap filters…)
   zeroTrade?: { code: 'warmup' | 'no-signal' | 'filtered'; message: string; evaluableBars: number; rawSignals: number } | null
 }
 
@@ -951,8 +943,6 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
   let curDay = -1
   let suppressed = 0
   let skippedShorts = 0 // Task 3-d — crypto long-only drops
-  // v2.0.0 — Kronos gate vetoes (entry signals blocked by cfg.entryGate)
-  let gateVetoed = 0
   // v2.2.0 — maxTradesDay 0 = UNLIMITED (the swing lane forces 0 server-side;
   // day-lane configs always carry ≥ 1, so day behavior is unchanged).
   const maxTradesDayEff = cfg.maxTradesDay > 0 ? cfg.maxTradesDay : Number.MAX_SAFE_INTEGER
@@ -1307,7 +1297,6 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         else if (cooldownBlocked) suppressed++
         else if (edgeBlocked) suppressed++
         else if (tradesToday >= maxTradesDayEff) suppressed++
-        else if (cfg.entryGate && !cfg.entryGate(i, dec.entry.side === 'buy' ? 'long' : 'short')) gateVetoed++
         else {
           pending = { side: dec.entry.side === 'buy' ? 1 : -1 }
           // v2.2.0 — ride the swing MTF context (captured by rawDecide THIS
@@ -1404,7 +1393,7 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
         code: 'filtered',
         evaluableBars: evaluable,
         rawSignals,
-        message: `${rawSignals.toLocaleString('en-US')} raw signal(s) never became a trade — shorts skipped on long-only crypto: ${skippedShorts.toLocaleString('en-US')} · session/dust/cooldown/cap suppressed: ${suppressed.toLocaleString('en-US')} · Kronos gate vetoes: ${gateVetoed.toLocaleString('en-US')}${cfg.isCrypto ? '. Alpaca crypto cannot short — a long-only stretch with no pullback leaves zero trades.' : '.'}`,
+        message: `${rawSignals.toLocaleString('en-US')} raw signal(s) never became a trade — shorts skipped on long-only crypto: ${skippedShorts.toLocaleString('en-US')} · session/dust/cooldown/cap suppressed: ${suppressed.toLocaleString('en-US')}${cfg.isCrypto ? '. Alpaca crypto cannot short — a long-only stretch with no pullback leaves zero trades.' : '.'}`,
       }
     }
   }
@@ -1439,8 +1428,6 @@ export function runBacktest(series: BacktestSeries, cfg: BacktestConfig): Backte
     // Review P0 #3 — gate effectiveness counters (all-zero vetoes when the
     // gates are off; signals still counts the raw signal volume)
     regime: regStats,
-    // v2.0.0 — Kronos gate veto count (0 when no entryGate passed)
-    gateVetoed,
     // Review P3 #12 — realized execution cost per fill (0 when frictionless)
     avgFillCostBps: costFills > 0 ? costBpsSum / costFills : 0,
     // v2.2.2 — honest zero-trade reason (null when trades exist)

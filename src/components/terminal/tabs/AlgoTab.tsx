@@ -109,8 +109,6 @@ export default function AlgoTab() {
   // re-entry control (Task 70-c): cooldown minutes after a close + edge-triggered re-entry
   const [cooldownMin, setCooldownMin] = useState('0')
   const [requireNewSignal, setRequireNewSignal] = useState(false)
-  // v2.0.0 — Kronos AI gate: the foundation model must agree with entries
-  const [kronosGate, setKronosGate] = useState(false)
   // v2.5.0 — Market sentiment gate: entries must not fight fresh news
   const [sentimentGate, setSentimentGate] = useState(false)
   const [params, setParams] = useState<Record<string, number>>(() => normalizeAlgoParams('bb-reversion', undefined))
@@ -222,7 +220,6 @@ export default function AlgoTab() {
           flattenEod: !sym.includes('/') && flattenEod,
           cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
           requireNewSignal,
-          kronosGate,
           sentimentGate,
         }),
       })
@@ -333,9 +330,8 @@ export default function AlgoTab() {
     flattenEod,
     cooldownMin: Math.min(240, Math.max(0, Math.round(Number(cooldownMin) || 0))),
     requireNewSignal,
-    kronosGate,
     sentimentGate,
-  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, tpUnit, tpAtrTf, slOn, slPct, slUnit, slAtrTf, trailOn, trailArm, trailGive, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal, kronosGate, sentimentGate])
+  }), [strategy, symbol, timeframe, params, qty, sizingMode, riskBasis, riskMoney, riskPct, tpOn, tpPct, tpUnit, tpAtrTf, slOn, slPct, slUnit, slAtrTf, trailOn, trailArm, trailGive, maxTradesDay, rthOnly, flattenEod, cooldownMin, requireNewSignal, sentimentGate])
   // ---- config import / export (Task 66) ----
   // Task 9-n — exports open the export DIALOG (JSON preview + copy + download):
   // sandboxed preview iframes silently swallow blob downloads, so a bare
@@ -402,7 +398,6 @@ export default function AlgoTab() {
     setFlattenEod(cfg.flattenEod)
     setCooldownMin(String(cfg.cooldownMin ?? 0))
     setRequireNewSignal(cfg.requireNewSignal === true)
-    setKronosGate(cfg.kronosGate === true)
     setSentimentGate(cfg.sentimentGate === true)
     setParams(normalizeAlgoParams(cfg.strategy, cfg.params))
     setParamDraft({})
@@ -770,13 +765,6 @@ export default function AlgoTab() {
                 </div>
                 <div className="mt-1.5 flex items-center justify-between gap-2">
                   <div className="min-w-0">
-                    <Label htmlFor="algo-kronos" className="text-[11px] text-amber-300/90">Kronos AI gate</Label>
-                    <p className="text-[10px] leading-snug text-zinc-500">the local Kronos foundation model must agree with the entry direction (P(up) ≥ 0.55 long / ≤ 0.45 short) — fail-closed while the forecast computes</p>
-                  </div>
-                  <Switch id="algo-kronos" checked={kronosGate} onCheckedChange={setKronosGate} className="scale-90 shrink-0" />
-                </div>
-                <div className="mt-1.5 flex items-center justify-between gap-2">
-                  <div className="min-w-0">
                     <Label htmlFor="algo-sentiment" className="text-[11px] text-emerald-300/90">Market sentiment gate</Label>
                     <p className="text-[10px] leading-snug text-zinc-500">entries must not fight fresh news — BUY blocked while sentiment ≤ -0.30, SELL while ≥ +0.30 · arm it with a scan from the Chart's Sentiment panel</p>
                   </div>
@@ -993,11 +981,6 @@ export default function AlgoTab() {
                   {r.requireNewSignal && (
                     <Badge variant="outline" className="border-amber-500/30 text-[10px] text-amber-400/90" title="Waits for a fresh false→true signal before re-entering">
                       fresh-signal
-                    </Badge>
-                  )}
-                  {r.kronosGate && (
-                    <Badge variant="outline" className="border-amber-500/40 bg-amber-400/5 text-[10px] font-semibold text-amber-300" title="Kronos AI gate — the foundation model must agree with every entry">
-                      ✦ Kronos gate
                     </Badge>
                   )}
                   {r.sentimentGate && (

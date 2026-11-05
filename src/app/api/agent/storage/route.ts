@@ -12,7 +12,6 @@
 //      'vacuum'        | rebuild the DB file and return freed space to the OS
 //      'purge-bars'    | drop the crypto bar cache (rebuilds on demand)
 //      'purge-logs'    | drop algo logs > 14d + expired rate-limit buckets
-//      'purge-kronos'  | drop Kronos forecasts > 30d (journal keeps 30d)
 //   }
 //
 // v2.8.4 — the "shrink freed nothing" report, root-caused and fixed:
@@ -78,13 +77,12 @@ function bytesOrNull(v: number | null): { bytes: number | null; human: string | 
 export async function GET() {
   try {
     await requireUser()
-    const [bars, algoLogs, agentEvents, agentSessions, kronos, rate, sentHead, sentScores, scanCache] =
+    const [bars, algoLogs, agentEvents, agentSessions, rate, sentHead, sentScores, scanCache] =
       await Promise.all([
         db.bar.count(),
         db.algoLog.count(),
         db.agentEvent.count(),
         db.agentSession.count(),
-        db.kronosForecast.count(),
         db.rateLimitBucket.count(),
         db.sentimentHeadline.count(),
         db.sentimentScore.count(),
@@ -110,7 +108,6 @@ export async function GET() {
         { key: 'algoLogs', label: 'Algo engine logs', rows: algoLogs, hint: '15s-cycle engine history' },
         { key: 'agentEvents', label: 'Autopilot brain feed', rows: agentEvents, hint: 'Bounded to 400 per session' },
         { key: 'agentSessions', label: 'Autopilot sessions', rows: agentSessions, hint: 'Newest 20 kept per user' },
-        { key: 'kronos', label: 'Kronos forecasts', rows: kronos, hint: 'Forecast journal' },
         { key: 'rate', label: 'Rate-limit buckets', rows: rate, hint: 'Expired throttles' },
         { key: 'sentHead', label: 'Sentiment headlines', rows: sentHead, hint: '' },
         { key: 'sentScores', label: 'Sentiment scores', rows: sentScores, hint: '' },
@@ -123,7 +120,7 @@ export async function GET() {
 }
 
 interface StoragePostBody {
-  action?: 'vacuum' | 'purge-bars' | 'purge-logs' | 'purge-kronos'
+  action?: 'vacuum' | 'purge-bars' | 'purge-logs'
 }
 
 export async function POST(req: Request) {
@@ -239,12 +236,6 @@ export async function POST(req: Request) {
         ok: true,
         message: `Purged ${logs.count} algo log(s) older than 14d + ${buckets.count} expired rate-limit bucket(s).`,
       })
-    }
-
-    if (action === 'purge-kronos') {
-      const res = await db.kronosForecast.deleteMany({ where: { madeAt: { lt: new Date(Date.now() - 30 * 86_400_000) } } })
-      await checkpointWal('truncate')
-      return NextResponse.json({ ok: true, message: `Purged ${res.count} Kronos forecast(s) older than 30d.` })
     }
 
     return NextResponse.json({ error: 'Unknown action' }, { status: 400 })

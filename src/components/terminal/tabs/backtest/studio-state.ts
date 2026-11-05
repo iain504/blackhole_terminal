@@ -33,17 +33,16 @@ import type { AlgoSetupCfg } from '../BacktestPanel'
 
 // v2.1.0 (kept) — the validation depth picked in step ⑤. ONE CTA runs the
 // whole pipeline for the chosen level head-to-end.
-export type BtLevel = 'quick' | 'wf' | 'sweep' | 'kronos'
+export type BtLevel = 'quick' | 'wf' | 'sweep'
 
-export const LEVEL_META: Record<BtLevel, { mode: 'run' | 'walkforward' | 'sweep' | 'kronos-ab'; flow: BtFlowMode; label: string; time: string }> = {
+export const LEVEL_META: Record<BtLevel, { mode: 'run' | 'walkforward' | 'sweep'; flow: BtFlowMode; label: string; time: string }> = {
   quick: { mode: 'run', flow: 'run', label: 'Quick check', time: 'seconds' },
   wf: { mode: 'walkforward', flow: 'walkforward', label: 'Walk-forward', time: 'minutes' },
   sweep: { mode: 'sweep', flow: 'sweep', label: 'Sweep all strategies', time: 'minutes' },
-  kronos: { mode: 'kronos-ab', flow: 'kronos-ab', label: 'Kronos AI A/B', time: '≈5 min first run' },
 }
 
-/** The five sibling run buttons collapse into this union (busy marker). */
-export type BtBusy = 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'
+/** The sibling run buttons collapse into this union (busy marker). */
+export type BtBusy = 'run' | 'optimize' | 'sweep' | 'walkforward'
 
 /** Optimizer grid dimension (existing shape — the wizard re-uses it 1:1). */
 export interface RangeState { on: boolean; min: string; max: string; step: string }

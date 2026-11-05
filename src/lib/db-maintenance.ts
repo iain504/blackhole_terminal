@@ -4,8 +4,6 @@
 // SQLite deployment:
 //   - SentimentScore: hourly buckets × symbol, no prune anywhere (24 rows/
 //     day/symbol since v2.4.0)
-//   - KronosForecast: one row per forecasted bar, only the MANUAL storage
-//     purge could remove rows
 //   - AlgoRun rows (incl. their `state` JSON) of stopped runs: never pruned
 //   - AlgoLog: capped per-run WHILE a run is active, but stopped runs keep
 //     their 300-row tail forever
@@ -16,7 +14,7 @@
 // runDbMaintenance() is idempotent, fail-soft (every prune is independent —
 // one failing table never blocks the rest) and runs at boot+45s then every
 // 6h via startDbMaintenance(). Each prune is index-backed where it matters
-// (SentimentScore.asOf, KronosForecast.madeAt, StrategyFireLog.createdAt,
+// (SentimentScore.asOf, StrategyFireLog.createdAt,
 // GridAutoRun.createdAt — indexes added in v2.11.3).
 //
 // Retention windows are deliberately GENEROUS vs the existing live prunes
@@ -36,10 +34,6 @@ export async function runDbMaintenance(): Promise<void> {
   // each prune independent + fail-soft (null on error)
   const sent = await db.sentimentScore
     .deleteMany({ where: { asOf: { lt: cut(90) } } })
-    .then((r) => r.count)
-    .catch(() => -1)
-  const kronos = await db.kronosForecast
-    .deleteMany({ where: { madeAt: { lt: cut(30) } } })
     .then((r) => r.count)
     .catch(() => -1)
   const logs = await db.algoLog
@@ -85,7 +79,7 @@ export async function runDbMaintenance(): Promise<void> {
   const fmt = (n: number): string => (n < 0 ? 'skip' : String(n))
   console.log(
     `[maintenance] db prune in ${Date.now() - t0}ms — ` +
-      `sentiment=${fmt(sent)} kronos=${fmt(kronos)} algoLogs=${fmt(logs)} algoRuns=${fmt(runs)} ` +
+      `sentiment=${fmt(sent)} algoLogs=${fmt(logs)} algoRuns=${fmt(runs)} ` +
       `fireLogs=${fmt(fires)} gridAutoRuns=${fmt(autos)} walTruncated=${wal ? 'yes' : 'no'}`,
   )
 }

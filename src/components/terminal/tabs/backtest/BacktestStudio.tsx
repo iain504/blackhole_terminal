@@ -13,7 +13,7 @@
 //  the POST body); this component is a pure-ish view + intent layer.
 import { useMemo, useState, type Dispatch, type RefObject, type SetStateAction } from 'react'
 import {
-  Bot, ChevronDown, Coins, Database, FlaskConical, RefreshCw, Rocket, ShieldCheck, SlidersHorizontal, Sparkles,
+  Bot, ChevronDown, Coins, Database, FlaskConical, RefreshCw, Rocket, ShieldCheck, SlidersHorizontal,
   Repeat, TrendingUp, Wand2, Zap, RotateCcw, type LucideIcon,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -77,7 +77,7 @@ export interface BacktestStudioProps {
     elapsedSec?: number
   }
   error: string | null
-  onRun: (mode: 'run' | 'walkforward' | 'sweep' | 'kronos-ab') => void
+  onRun: (mode: 'run' | 'walkforward' | 'sweep') => void
   onOptimize: () => void
   onPushParams: (p: Record<string, number>, strategy?: AlgoStrategyId) => void
   onApplyPreset: (id: AlgoRegimePresetId) => void
@@ -847,7 +847,6 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                 <LevelTile active={level === 'quick'} icon={TrendingUp} title="Quick check" time="seconds" desc="One replay of the exact setup over the chosen window — is there an edge at all?" onClick={() => setLevel('quick')} />
                 <LevelTile active={level === 'wf'} icon={Repeat} title="Walk-forward" time="minutes" badge="recommended" desc="Re-optimizes on every fold, verifies out-of-sample, then stresses a pure hold-out tail — the honest one." onClick={() => setLevel('wf')} />
                 <LevelTile active={level === 'sweep'} icon={Zap} title="Sweep all strategies" time="minutes" desc={`Every ${studio.lane}-lane strategy at defaults + an auto-built grid, ranked with out-of-sample re-runs.`} onClick={() => setLevel('sweep')} />
-                <LevelTile active={level === 'kronos'} icon={Sparkles} title="Kronos AI A/B" time="≈5 min first run" desc="Walk-forward AI forecasts gate the entries — ungated vs gated, measured on the same window." onClick={() => setLevel('kronos')} />
               </div>
 
               {level === 'wf' && props.activeRanges.length === 0 && (
@@ -905,12 +904,6 @@ export default function BacktestStudio(props: BacktestStudioProps) {
                           <Input id="bt-mintrades-sw" value={props.minTrades} onChange={(e) => props.setMinTrades(e.target.value)} inputMode="numeric" aria-label="Minimum trades to score a combination" className="h-8 w-16 border-zinc-800 bg-zinc-950 text-xs" />
                         </div>
                       </div>
-                    )}
-                    {level === 'kronos' && (
-                      <p className="text-[10px] leading-snug text-zinc-500">
-                        First run computes ~35 walk-forward forecasts (≈5 min of model CPU — each origin sees only its past bars, no look-ahead). Verdicts are cached per window, so
-                        re-running with different TP/SL is instant. The same gate is available on LIVE runs (&quot;Kronos AI gate&quot; in the run setup).
-                      </p>
                     )}
                   </div>
                 )}

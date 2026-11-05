@@ -6,7 +6,7 @@
 // full-width BTC chart section at the bottom was removed in v2.9.1 too.
 // What stays live: the nav ticker strip and the small Binance BTC chip
 // pinned over the photo (public /api/landing/btc route, cached server-side).
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import Image from 'next/image'
 import { motion } from 'framer-motion'
 import { Bell, Search, Settings, ArrowRight, LogIn } from 'lucide-react'

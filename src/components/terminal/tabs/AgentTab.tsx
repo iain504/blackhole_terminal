@@ -662,15 +662,6 @@ export default function AgentTab() {
               >
                 {storageBusy === 'purge-logs' ? 'PURGING…' : 'Purge old logs'}
               </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 border-zinc-700 text-xs text-zinc-300 hover:bg-zinc-800"
-                disabled={storageBusy != null}
-                onClick={() => void storageAction('purge-kronos')}
-              >
-                {storageBusy === 'purge-kronos' ? 'PURGING…' : 'Purge old forecasts'}
-              </Button>
             </div>
             {storageMsg && <div className="rounded-md bg-zinc-800/60 p-2 text-[11px] text-zinc-300">{storageMsg}</div>}
             <p className="text-[10px] leading-relaxed text-zinc-600">

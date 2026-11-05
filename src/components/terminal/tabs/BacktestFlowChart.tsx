@@ -9,7 +9,7 @@
 //     → [swing only] Aggregate HTF (trend + confirm · pivots/S-R)
 //     → Prepare series
 //     → Replay
-//     → Validate (per level: WF folds | sweep + OOS | Kronos gate A/B | grid)
+//     → Validate (per level: WF folds | sweep + OOS | grid)
 //     → Verdict
 //     → 🏆 Result
 //
@@ -24,11 +24,11 @@
 // disclosure on mobile (both toggleable).
 import { useState, useSyncExternalStore } from 'react'
 import {
-  BadgeCheck, BrainCircuit, ChartLine, Check, Database, Filter, Grid3x3, Layers, Play, Repeat, ShieldCheck, Target, Trophy, type LucideIcon,
+  BadgeCheck, ChartLine, Check, Database, Grid3x3, Layers, Play, Repeat, ShieldCheck, Target, Trophy, type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export type BtFlowMode = 'run' | 'optimize' | 'sweep' | 'walkforward' | 'kronos-ab'
+export type BtFlowMode = 'run' | 'optimize' | 'sweep' | 'walkforward'
 
 interface FlowNodeDef {
   id: string
@@ -48,8 +48,6 @@ const NODES: Record<string, FlowNodeDef> = {
   folds: { id: 'folds', label: 'WF folds', icon: Repeat, hint: 'Re-optimize on each fold\'s in-sample window, verify out-of-sample' },
   oos: { id: 'oos', label: 'OOS verify', icon: ShieldCheck, hint: 'Re-run the winners untouched on the out-of-sample tail' },
   holdout: { id: 'holdout', label: 'Hold-out', icon: Target, hint: 'Stress the surviving config on pure unseen data' },
-  forecast: { id: 'forecast', label: 'WF forecasts', icon: BrainCircuit, hint: 'Walk-forward Kronos forecasts — each origin sees only its past bars, never the future it predicts' },
-  gate: { id: 'gate', label: 'Gate A/B', icon: Filter, hint: 'Replay the same config twice: ungated baseline vs Kronos-gated entries' },
   verdict: { id: 'verdict', label: 'Verdict', icon: BadgeCheck, hint: 'Metrics · trust CI · Monte Carlo — plain-language significance verdict' },
 }
 
@@ -59,7 +57,6 @@ const PIPELINES: Record<BtFlowMode, string[]> = {
   optimize: ['fetch', 'prepare', 'replay', 'grid', 'verdict'],
   sweep: ['fetch', 'prepare', 'replay', 'sweep', 'oos', 'verdict'],
   walkforward: ['fetch', 'prepare', 'replay', 'folds', 'holdout', 'verdict'],
-  'kronos-ab': ['fetch', 'prepare', 'replay', 'forecast', 'gate', 'verdict'],
 }
 
 /** Server job phase → node id (the validate stage fan-in, spec §2.4). */
@@ -82,7 +79,6 @@ const MODE_LABEL: Record<BtFlowMode, string> = {
   optimize: 'Optimizer',
   sweep: 'Strategy sweep',
   walkforward: 'Walk-forward',
-  'kronos-ab': 'Kronos gate A/B',
 }
 
 interface BacktestFlowChartProps {

@@ -888,7 +888,6 @@ export async function engageAgent(userId: string, sessionId: string): Promise<{ 
         flattenEod: c.lane === 'day',
         cooldownMin: c.lane === 'day' ? 10 : 0,
         requireNewSignal: false,
-        kronosGate: false,
         // v2.5.0 — the autopilot ALWAYS arms the sentiment gate: fleet entries
         // must not fight fresh news (the ranking already blended sentiment in)
         sentimentGate: true,
