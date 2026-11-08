@@ -34,6 +34,7 @@ const ReportTab = dynamic(() => import('./tabs/ReportTab'), { ssr: false, loadin
 const AlgoTab = dynamic(() => import('./tabs/AlgoTab'), { ssr: false, loading: TabFallback })
 const GridTab = dynamic(() => import('./tabs/GridTab'), { ssr: false, loading: TabFallback })
 const AgentTab = dynamic(() => import('./tabs/AgentTab'), { ssr: false, loading: TabFallback })
+const AiTradeTab = dynamic(() => import('./tabs/AiTradeTab'), { ssr: false, loading: TabFallback })
 import { StrategyDrawer } from './StrategyDrawer'
 import { ServerDownBanner } from './ServerDownBanner'
 import { useToast } from '@/hooks/use-toast'
@@ -750,6 +751,7 @@ function ActiveTabContent() {
   if (active.type === 'algo') return <AlgoTab />
   if (active.type === 'grid') return <GridTab />
   if (active.type === 'agent') return <AgentTab key={active.id} />
+  if (active.type === 'aitrade') return <AiTradeTab key={active.id} />
   return <ChartWorkspace key={active.id} tab={active} />
 }
 

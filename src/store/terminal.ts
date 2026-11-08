@@ -11,7 +11,7 @@ export interface SessionUser {
   username: string
 }
 
-export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions' | 'strategy' | 'report' | 'algo' | 'grid' | 'agent'
+export type TabType = 'chart' | 'calendar' | 'heatmap' | 'positions' | 'strategy' | 'report' | 'algo' | 'grid' | 'agent' | 'aitrade'
 
 // Multi-chart grid layouts (per chart tab). '1' single, '2h' side-by-side,
 // '2v' stacked, '3s' one wide top + two bottom, '4' 2×2 grid, '6' 3×2 grid,
@@ -572,7 +572,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       return Object.keys(out).length ? out : undefined
     }
     const tabs = blob.tabs
-      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions', 'strategy', 'report', 'algo', 'grid', 'agent'].includes(t.type))
+      .filter((t) => t && typeof t.id === 'string' && ['chart', 'calendar', 'heatmap', 'positions', 'strategy', 'report', 'algo', 'grid', 'agent', 'aitrade'].includes(t.type))
       .map((t) => {
         const base = {
           id: t.id,

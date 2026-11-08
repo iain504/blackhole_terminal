@@ -30,6 +30,7 @@ const TYPE_META: Record<TabType, { label: string; icon: typeof CandlestickChart 
   algo: { label: 'Algo Trading', icon: Rocket },
   grid: { label: 'Grid', icon: LayoutGrid },
   agent: { label: '智慧體 AI Agent', icon: Sparkles },
+  aitrade: { label: 'AI Trade 交易顧問', icon: Sparkles },
 }
 
 export function TabBar({
@@ -214,6 +215,9 @@ export function TabBar({
             </DropdownMenuItem>
             <DropdownMenuItem onClick={() => addTab('agent')} className="gap-2 text-xs">
               <Sparkles className="h-3.5 w-3.5" /> 智慧體 AI Agent
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => addTab('aitrade')} className="gap-2 text-xs">
+              <Sparkles className="h-3.5 w-3.5 text-violet-400" /> AI Trade 交易顧問
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

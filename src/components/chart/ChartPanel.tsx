@@ -38,6 +38,7 @@ import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { SymbolSearchDialog } from './SymbolSearchDialog'
 import { TradeTicket, TicketPrefill } from './TradeTicket'
 import { TradeAdvisor } from './TradeAdvisor'
+import { AiTradeAdviser } from './AiTradeAdviser'
 import GridTradeDialog from './GridTradeDialog'
 import { MarketStatusBadge } from './MarketStatusBadge'
 import { useSymbolPositions } from './usePositions'
@@ -358,6 +359,8 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
   const [tradeOpen, setTradeOpen] = useState(false)
   const [ticketPrefill, setTicketPrefill] = useState<TicketPrefill | null>(null)
   const [advisorOpen, setAdvisorOpen] = useState(false)
+  // v2.12.17 — per-chart EdgeZero AI adviser panel
+  const [aiOpen, setAiOpen] = useState(false)
   // ---- Grid trade range tool (Task 9-q): arm → the next TWO chart clicks
   // capture two PRICES (main scale via coordinateToPrice) → config dialog.
   // Local to this pane; nothing is drawn or persisted on the chart itself.
@@ -4726,6 +4729,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
         >
           <Lightbulb className="h-3.5 w-3.5" />
         </button>
+        {/* v2.12.17 — EdgeZero AI Trade adviser: LLM read of THIS chart's bars */}
+        <button
+          title="AI Trade adviser — EdgeZero read of this chart (bias / levels / risks / plan)"
+          aria-label="AI Trade adviser"
+          aria-pressed={aiOpen}
+          onClick={() => setAiOpen((v) => !v)}
+          className={cn(
+            'flex h-7 w-7 items-center justify-center rounded-md transition-colors',
+            aiOpen ? 'bg-violet-500/25 text-violet-400' : 'text-zinc-300 hover:bg-violet-500/15 hover:text-violet-400',
+          )}
+        >
+          <Sparkles className="h-3.5 w-3.5" />
+        </button>
         <button
           title="Grid trade: click two price levels"
           aria-label="Grid trade: click two price levels"
@@ -5058,6 +5074,19 @@ export function ChartPanel({ symbol, timeframe: tf, onSymbolChange, onTimeframeC
           onClose={() => setAdvisorOpen(false)}
           createDrawing={createDrawing}
           deleteDrawing={deleteDrawing}
+        />
+      )}
+
+      {/* v2.12.17 — EdgeZero AI adviser (per chart): reads this chart's loaded
+          bars, returns bias/levels/risks/plan; follow-ups keep the grounding */}
+      {aiOpen && (
+        <AiTradeAdviser
+          key={`${symbol}:${tf}`}
+          symbol={symbol}
+          timeframe={tf}
+          livePrice={quote?.price ?? null}
+          getBars={() => barsRef.current}
+          onClose={() => setAiOpen(false)}
         />
       )}
 
