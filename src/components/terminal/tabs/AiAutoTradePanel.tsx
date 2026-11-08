@@ -5,9 +5,10 @@
 // @/store/ai-auto-trade (module scope), so the scan keeps running when this
 // tab is unmounted. Honesty contract: every candidate shows WHY it passed or
 // was rejected; the log never hides a failed order.
-import { useEffect, useState } from 'react'
-import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks } from 'lucide-react'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
+import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { AI_TRADE_MODELS } from '@/lib/ai-trade'
 import { TIMEFRAMES } from '@/lib/market-types'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -47,6 +48,7 @@ export default function AiAutoTradePanel() {
   const scanOnce = useAiAutoStore((s) => s.scanOnce)
   const cancelScan = useAiAutoStore((s) => s.cancelScan)
   const clearLog = useAiAutoStore((s) => s.clearLog)
+  const watchlists = useTerminal((s) => s.watchlists)
 
   // 1s ticker for the next-scan countdown (only while armed)
   const [, tickTock] = useState(0)
@@ -74,6 +76,19 @@ export default function AiAutoTradePanel() {
   }
 
   const liveDanger = cfg.mode === 'live' && !cfg.dryRun
+
+  // selected watchlist + its symbol items (separators become group labels)
+  const selectedList = watchlists.find((l) => l.id === cfg.watchlistId) ?? watchlists[0] ?? null
+  const scanItems = selectedList?.items ?? []
+  const scanSymbols = useMemo(() => watchlistSymbols(scanItems), [scanItems])
+  const excluded = cfg.excludedSymbols
+  const toggleSymbol = (sym: string) => {
+    const next = excluded.includes(sym) ? excluded.filter((s) => s !== sym) : [...excluded, sym]
+    updateConfig({ excludedSymbols: next })
+  }
+  const setAllExcluded = (all: boolean) => {
+    updateConfig({ excludedSymbols: all ? [...scanSymbols] : [] })
+  }
 
   return (
     <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3" aria-label="AI 自動交易">
@@ -124,6 +139,25 @@ export default function AiAutoTradePanel() {
             <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
               {INTERVAL_OPTIONS.map((o) => (
                 <SelectItem key={o.v} value={String(o.v)} className="text-[11px]">{o.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">關注清單</Label>
+          <Select
+            value={selectedList?.id ?? ''}
+            onValueChange={(v) => updateConfig({ watchlistId: v, excludedSymbols: [] })}
+            disabled={watchlists.length === 0}
+          >
+            <SelectTrigger className="h-7 border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="掃描用關注清單">
+              <SelectValue placeholder={watchlists.length ? '—' : '無清單'} />
+            </SelectTrigger>
+            <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+              {watchlists.map((l) => (
+                <SelectItem key={l.id} value={l.id} className="text-[11px]">
+                  {l.name}（{watchlistSymbols(l.items).length}）
+                </SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -198,7 +232,7 @@ export default function AiAutoTradePanel() {
             <Select value={String(cfg.maxSymbols)} onValueChange={(v) => updateConfig({ maxSymbols: Number(v) })}>
               <SelectTrigger className="h-7 w-full border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="每輪掃描標數上限"><SelectValue /></SelectTrigger>
               <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-                {[3, 6, 10, 15].map((n) => (
+                {[3, 6, 10, 15, 20, 30, 50].map((n) => (
                   <SelectItem key={n} value={String(n)} className="text-[11px]">{n} 個</SelectItem>
                 ))}
               </SelectContent>
@@ -209,6 +243,67 @@ export default function AiAutoTradePanel() {
             試運行（不下單）
           </label>
         </div>
+      </div>
+
+      {/* scan list — which symbols from the selected watchlist participate */}
+      <div className="mt-2 rounded border border-zinc-800/80 bg-zinc-950/40 p-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-widest text-zinc-500">
+            <ListChecks className="h-3 w-3" aria-hidden />
+            掃描標的（{scanSymbols.length - excluded.length}/{scanSymbols.length}）
+          </span>
+          <span className="flex items-center gap-1">
+            <button
+              onClick={() => setAllExcluded(false)}
+              className="rounded px-1 text-[9px] text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
+              disabled={scanSymbols.length === 0 || excluded.length === 0}
+              aria-label="全部加入掃描"
+            >全選</button>
+            <button
+              onClick={() => setAllExcluded(true)}
+              className="rounded px-1 text-[9px] text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
+              disabled={excluded.length >= scanSymbols.length}
+              aria-label="全部排除"
+            >全不選</button>
+          </span>
+        </div>
+        {scanSymbols.length === 0 ? (
+          <p className="mt-1 text-[10px] text-zinc-600">
+            {selectedList ? `「${selectedList.name}」沒有可掃描的符號` : '尚未選擇關注清單'}
+          </p>
+        ) : (
+          <ul className="terminal-scroll mt-1 max-h-36 space-y-0.5 overflow-y-auto pr-1">
+            {scanItems.map((item) => {
+              if (item.startsWith('#')) {
+                return (
+                  <li key={item} className="pt-1 text-[9px] font-semibold uppercase tracking-wider text-zinc-600">
+                    {item.slice(1)}
+                  </li>
+                )
+              }
+              const on = !excluded.includes(item)
+              return (
+                <li key={item}>
+                  <label className="flex cursor-pointer items-center justify-between gap-2 rounded px-1 py-0.5 hover:bg-zinc-900/70">
+                    <span className="flex items-center gap-1.5 font-mono text-[10px] text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        onChange={() => toggleSymbol(item)}
+                        className="h-3 w-3 accent-violet-500"
+                        aria-label={`掃描 ${item}`}
+                      />
+                      {item}
+                    </span>
+                    <span className={cn('text-[8.5px]', on ? 'text-emerald-500/80' : 'text-zinc-600')}>
+                      {on ? '掃描' : '排除'}
+                    </span>
+                  </label>
+                </li>
+              )
+            })}
+          </ul>
+        )}
       </div>
 
       {/* sizing explainer + gate reminder */}

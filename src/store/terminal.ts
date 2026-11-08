@@ -109,6 +109,14 @@ export interface Watchlist {
   items: string[]
 }
 
+/** Symbol items only — entries starting with '#' are GROUP SEPARATORS, not
+ *  symbols (see the store's separator docs). Every consumer that feeds items
+ *  to a quote/bars API or a scan MUST pass through this filter first — the
+ *  '#Tech' rows used to leak into the AI Trade quote card as fake quotes. */
+export function watchlistSymbols(items: string[]): string[] {
+  return items.filter((s) => !s.startsWith('#'))
+}
+
 /** Result of adding a symbol to a watchlist (validation-aware). */
 export type AddSymbolResult = { ok: true } | { ok: false; reason: 'invalid' | 'duplicate' | 'unknown' | 'error' }
 

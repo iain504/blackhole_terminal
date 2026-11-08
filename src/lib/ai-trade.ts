@@ -61,6 +61,102 @@ export interface ChartSnapshot {
   sma50: number | null
   rsi14: number | null
   volRatio: number | null // last bar volume vs 20-bar average
+  // v2.12.19 — the model complained the snapshot lacked MACD-class momentum
+  // and volume distribution, and asked for higher-timeframe confirmation.
+  macdLine: number | null // EMA12 − EMA26
+  macdSignal: number | null // EMA9 of the MACD line
+  macdHist: number | null // line − signal
+  macdHistRising: boolean | null // histogram expanding (last > previous)
+  upDownVolRatio: number | null // up-bar volume ÷ down-bar volume (last 20 bars)
+  volTrendPct: number | null // (avg vol last 5 ÷ avg 20 − 1) × 100
+  htf: HigherTfContext | null // synthetic 4× timeframe trend context
+}
+
+export interface HigherTfContext {
+  label: string // e.g. "4×1h"
+  barCount: number
+  changePct: number
+  sma20: number | null
+  sma50: number | null
+  rsi14: number | null
+}
+
+function ema(xs: number[], n: number): number | null {
+  if (xs.length < n) return null
+  const k = 2 / (n + 1)
+  let e = xs.slice(0, n).reduce((a, b) => a + b, 0) / n // SMA seed
+  for (let i = n; i < xs.length; i++) e = xs[i] * k + e * (1 - k)
+  return e
+}
+
+/** MACD(12,26,9): returns [line, signal, histogram, histogramRising] on closes. */
+function macd(closes: number[]): { line: number | null; signal: number | null; hist: number | null; histRising: boolean | null } {
+  const out = { line: null as number | null, signal: null as number | null, hist: null as number | null, histRising: null as boolean | null }
+  if (closes.length < 35) return out // 26 + 9 signal history — don't hand-wave it
+  const k12 = 2 / 13
+  const k26 = 2 / 27
+  let e12 = closes.slice(0, 12).reduce((a, b) => a + b, 0) / 12
+  let e26 = closes.slice(0, 26).reduce((a, b) => a + b, 0) / 26
+  const macdSeries: number[] = []
+  macdSeries.push(e12 - e26)
+  for (let i = 26; i < closes.length; i++) {
+    e12 = closes[i] * k12 + e12 * (1 - k12)
+    e26 = closes[i] * k26 + e26 * (1 - k26)
+    macdSeries.push(e12 - e26)
+  }
+  const sig = ema(macdSeries, 9)
+  const line = macdSeries[macdSeries.length - 1]
+  out.line = line
+  out.signal = sig
+  if (sig != null) {
+    out.hist = line - sig
+    if (macdSeries.length >= 2) {
+      const prevLine = macdSeries[macdSeries.length - 2]
+      // EMA9 one step back — recompute cheaply instead of storing the series
+      const sigPrev = ema(macdSeries.slice(0, -1), 9)
+      if (sigPrev != null) out.histRising = line - sig > prevLine - sigPrev
+    }
+  }
+  return out
+}
+
+/** Up-bar vs down-bar volume balance + short-vs-average volume trend (last 20 bars). */
+function volumeProfile(bars: Bar[]): { upDownRatio: number | null; trendPct: number | null } {
+  const win = bars.slice(-20)
+  if (win.length < 5) return { upDownRatio: null, trendPct: null }
+  let up = 0
+  let down = 0
+  for (const b of win) {
+    const v = Number.isFinite(b.volume) ? b.volume : 0
+    if (b.close >= b.open) up += v
+    else down += v
+  }
+  const avgN = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0)
+  const vols = win.map((b) => (Number.isFinite(b.volume) ? b.volume : 0))
+  const avgAll = avgN(vols)
+  const avgLast5 = avgN(vols.slice(-5))
+  return {
+    upDownRatio: down > 0 ? up / down : up > 0 ? Infinity : null,
+    trendPct: avgAll > 0 ? ((avgLast5 / avgAll - 1) * 100) : null,
+  }
+}
+
+/** Aggregate bars into synthetic 4× timeframe OHLCV (trend context, not trade-grade data). */
+function aggregateBars(bars: Bar[], factor = 4): Bar[] {
+  const out: Bar[] = []
+  const src = bars.slice(-factor * 60) // → up to 60 synthetic bars
+  for (let i = src.length % factor; i + factor <= src.length; i += factor) {
+    const g = src.slice(i, i + factor)
+    out.push({
+      time: g[0].time,
+      open: g[0].open,
+      high: Math.max(...g.map((b) => b.high)),
+      low: Math.min(...g.map((b) => b.low)),
+      close: g[g.length - 1].close,
+      volume: g.reduce((a, b) => a + (Number.isFinite(b.volume) ? b.volume : 0), 0),
+    })
+  }
+  return out
 }
 
 function sma(xs: number[], n: number): number | null {
@@ -120,6 +216,21 @@ export function buildChartSnapshot(
   const first = closes[0] ?? last
   const vols = win.map((b) => (Number.isFinite(b.volume) ? b.volume : 0))
   const volAvg = sma(vols, 20)
+  const m = macd(closes)
+  const vp = volumeProfile(win)
+  // higher-TF trend context: aggregate the loaded bars into a synthetic 4× TF
+  const htfBars = bars.length >= 40 ? aggregateBars(bars) : []
+  const htfCloses = htfBars.map((b) => b.close)
+  const htf: HigherTfContext | null = htfBars.length >= 20
+    ? {
+        label: `4×${timeframe}`,
+        barCount: htfBars.length,
+        changePct: htfCloses[0] > 0 ? ((htfCloses[htfCloses.length - 1] - htfCloses[0]) / htfCloses[0]) * 100 : 0,
+        sma20: sma(htfCloses, 20),
+        sma50: sma(htfCloses, 50),
+        rsi14: rsi(htfCloses),
+      }
+    : null
   return {
     symbol,
     timeframe,
@@ -134,6 +245,13 @@ export function buildChartSnapshot(
     sma50: sma(closes, 50),
     rsi14: rsi(closes),
     volRatio: volAvg && volAvg > 0 ? vols[vols.length - 1] / volAvg : null,
+    macdLine: m.line,
+    macdSignal: m.signal,
+    macdHist: m.hist,
+    macdHistRising: m.histRising,
+    upDownVolRatio: vp.upDownRatio,
+    volTrendPct: vp.trendPct,
+    htf,
   }
 }
 
@@ -141,7 +259,7 @@ export function buildChartSnapshot(
 export function snapshotToText(s: ChartSnapshot): string {
   const n = (v: number | null, d = 2, suf = '') =>
     v == null || !Number.isFinite(v) ? 'n/a' : `${v.toFixed(d)}${suf}`
-  return [
+  const lines = [
     `symbol: ${s.symbol} · timeframe: ${s.timeframe}`,
     `bars analysed: ${s.barCount} · live price: ${s.livePrice ?? n(s.lastClose)}`,
     `last close: ${n(s.lastClose, 4)} · window change: ${n(s.changePct)}%`,
@@ -149,6 +267,13 @@ export function snapshotToText(s: ChartSnapshot): string {
     `ATR(14): ${n(s.atrPct)}% of price`,
     `SMA20 / SMA50: ${n(s.sma20, 4)} / ${n(s.sma50, 4)}`,
     `RSI(14): ${n(s.rsi14, 1)}`,
-    `volume vs 20-bar avg: ${n(s.volRatio)}×`,
-  ].join('\n')
+    `MACD(12,26,9): line ${n(s.macdLine, 4)} · signal ${n(s.macdSignal, 4)} · histogram ${n(s.macdHist, 4)}${s.macdHistRising == null ? '' : s.macdHistRising ? ' (hist expanding)' : ' (hist contracting)'}`,
+    `volume: last vs 20-avg ${n(s.volRatio)}× · up/down-bar volume ${s.upDownVolRatio == null ? 'n/a' : s.upDownVolRatio === Infinity ? 'all up' : n(s.upDownVolRatio)} · 5-bar vs 20-avg trend ${s.volTrendPct == null ? 'n/a' : `${n(s.volTrendPct)}%`}`,
+  ]
+  if (s.htf) {
+    lines.push(
+      `higher-TF trend context (${s.htf.label} synthetic bars, ${s.htf.barCount}): change ${n(s.htf.changePct)}% · SMA20/SMA50 ${n(s.htf.sma20, 4)}/${n(s.htf.sma50, 4)}${s.htf.sma20 != null && s.htf.sma50 != null ? (s.htf.sma20 > s.htf.sma50 ? ' (above)' : ' (below)') : ''} · RSI(14) ${n(s.htf.rsi14, 1)}`,
+    )
+  }
+  return lines.join('\n')
 }

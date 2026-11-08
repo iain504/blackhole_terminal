@@ -26,7 +26,7 @@ import {
   isAiTradeModel, type AiTradeModel, type AiChatMsg,
 } from '@/lib/ai-trade'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
-import { useTerminal } from '@/store/terminal'
+import { useTerminal, watchlistSymbols } from '@/store/terminal'
 
 // ---- config ----------------------------------------------------------------
 
@@ -42,6 +42,8 @@ export interface AiAutoConfig {
   maxSymbols: number // watchlist symbols evaluated per scan
   mode: 'paper' | 'live'
   dryRun: boolean // evaluate + log what WOULD fire, place nothing
+  watchlistId: string | null // which watchlist feeds the scan (null = first)
+  excludedSymbols: string[] // per-symbol opt-out from the scan list
 }
 
 export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
@@ -56,6 +58,8 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   maxSymbols: 6,
   mode: 'paper',
   dryRun: false,
+  watchlistId: null,
+  excludedSymbols: [],
 }
 
 const LS_KEY = 'bh-ai-auto-cfg-v1'
@@ -79,9 +83,13 @@ function loadConfig(): AiAutoConfig {
       minRR: clampN(num(j.minRR, AI_AUTO_DEFAULT_CONFIG.minRR), 0.1, 100),
       riskPct: clampN(num(j.riskPct, AI_AUTO_DEFAULT_CONFIG.riskPct), 0.01, 10),
       maxOpenAuto: Math.round(clampN(num(j.maxOpenAuto, AI_AUTO_DEFAULT_CONFIG.maxOpenAuto), 1, 20)),
-      maxSymbols: Math.round(clampN(num(j.maxSymbols, AI_AUTO_DEFAULT_CONFIG.maxSymbols), 1, 15)),
+      maxSymbols: Math.round(clampN(num(j.maxSymbols, AI_AUTO_DEFAULT_CONFIG.maxSymbols), 1, 50)),
       mode: j.mode === 'live' ? 'live' : 'paper',
       dryRun: Boolean(j.dryRun),
+      watchlistId: typeof j.watchlistId === 'string' && j.watchlistId ? j.watchlistId : null,
+      excludedSymbols: Array.isArray(j.excludedSymbols)
+        ? j.excludedSymbols.filter((s): s is string => typeof s === 'string' && /^[A-Z0-9./:-]{1,15}$/.test(s)).slice(0, 100)
+        : [],
     }
   } catch {
     return { ...AI_AUTO_DEFAULT_CONFIG }
@@ -228,6 +236,22 @@ export function resumeAiAutoIfNeeded() {
 
 const fmtInterval = (s: number) => (s % 3600 === 0 ? `${s / 3600}小時` : s % 60 === 0 ? `${s / 60}分鐘` : `${s}秒`)
 
+/** Snapshots per model call — 8 × ~650 chars keeps the DATA block inside the chat route's 8k context clamp. */
+const SCAN_CHUNK = 8
+
+function scanInstruction(n: number): string {
+  return [
+    `以下是關注清單 ${n} 個標的的技術快照（DATA 區）。請擔任量評估引擎，逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
+    `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"entry":<數字>,"stop":<數字>,"target":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
+    `規則：`,
+    `- entry 取現價附近；stop/target 用 ATR 概念給合理距離。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
+    `- direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
+    `- confidence 是你對該方向的把握度；證據不足或訊號矛盾時誠實給低分或 flat。`,
+    `- DATA 區已提供 MACD(12,26,9)、量能分布（up/down-bar volume、5/20-bar 量能趨勢）與 4× 高週期趨勢 — 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason。`,
+    `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
+  ].join('\n')
+}
+
 // ---- one scan round ---------------------------------------------------------
 
 const chunk = <T,>(xs: T[], n: number): T[][] => {
@@ -254,13 +278,21 @@ export async function runScan(): Promise<void> {
   st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · ${cfg.model}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
 
   try {
-    // 1) watchlist symbols (first list — same source the adviser context uses)
-    const wl = useTerminal.getState().watchlists[0]
-    const symbols = (wl?.items ?? []).slice(0, cfg.maxSymbols)
+    // 1) watchlist symbols — user-selected list (null = first), '#Group'
+    //    separators filtered out, then the panel's per-symbol exclusions
+    const lists = useTerminal.getState().watchlists
+    const list = lists.find((l) => l.id === cfg.watchlistId) ?? lists[0]
+    const excl = new Set(cfg.excludedSymbols)
+    const symbols = watchlistSymbols(list?.items ?? [])
+      .filter((s) => !excl.has(s))
+      .slice(0, cfg.maxSymbols)
     if (symbols.length === 0) {
-      st0.addLog('warn', '關注清單為空 — 無標的可掃描。先在圖表加入關注符號。')
+      st0.addLog('warn', list
+        ? `清單「${list.name}」沒有可掃描標的（空、全被排除或只剩分隔線）。`
+        : '沒有關注清單 — 先在圖表建立清單並加入符號。')
       return
     }
+    st0.addLog('info', `掃描清單「${list?.name ?? '?'}」— ${symbols.length} 標的${excl.size ? `（排除 ${excl.size} 個）` : ''}`)
 
     // 2) account (for sizing) + open positions (skip symbols already held)
     let equity: number | null = null
@@ -299,60 +331,69 @@ export async function runScan(): Promise<void> {
       return
     }
 
-    // 4) ONE batched verdict call — strict JSON array, terminal recomputes R:R
-    const dataBlock = snaps.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
-    const instruction = [
-      `以下是關注清單 ${snaps.length} 個標的的技術快照（DATA 區）。請擔任量評估引擎，逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
-      `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"entry":<數字>,"stop":<數字>,"target":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
-      `規則：`,
-      `- entry 取現價附近；stop/target 用 ATR 概念給合理距離。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
-      `- direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
-      `- confidence 是你對該方向的把握度；證據不足或訊號矛盾時誠實給低分或 flat。`,
-      `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
-    ].join('\n')
-    const chatRes = await fetch('/api/ai-trade/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: 'user', content: instruction }] as AiChatMsg[],
-        context: dataBlock,
-        maxTokens: 1200,
-      }),
-      signal: sig,
-    })
-    const chatJ = await chatRes.json().catch(() => null) as { ok?: boolean; content?: string; error?: string } | null
-    if (!chatRes.ok || !chatJ?.ok || typeof chatJ.content !== 'string') {
-      st0.addLog('error', `模型評估失敗 — ${chatJ?.error || `HTTP ${chatRes.status}`}`)
-      return
-    }
-
-    // 5) parse + validate (geometry checked HERE, not trusted from the model)
-    const raw = parseJsonArray(chatJ.content)
-    if (!raw) {
-      st0.addLog('error', '模型回覆無法解析為 JSON 陣列 — 本輪放棄（原文已捨棄，不猜測）。')
-      return
-    }
+    // 4) batched verdict calls — 8 snapshots per call (keeps the DATA block
+    //    inside the route's 8k context clamp), up to 2 calls in flight; a
+    //    failed chunk degrades honestly: its symbols report 評估失敗
+    const groups = chunk(snaps, SCAN_CHUNK)
     const bySym = new Map<string, Partial<Record<'symbol' | 'direction' | 'confidence' | 'entry' | 'stop' | 'target' | 'reason', unknown>>>()
-    for (const it of Array.isArray(raw) ? raw : []) {
-      if (it && typeof it === 'object') {
-        const s = String((it as Record<string, unknown>).symbol ?? '').toUpperCase()
-        if (s) bySym.set(s, it as Record<string, unknown>)
+    let okChunks = 0
+    let failChunks = 0
+    for (const pair of chunk(groups, 2)) {
+      const settled = await Promise.allSettled(
+        pair.map(async (grp) => {
+          const dataBlock = grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
+          const res = await fetch('/api/ai-trade/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: cfg.model,
+              messages: [{ role: 'user', content: scanInstruction(grp.length) }] as AiChatMsg[],
+              context: dataBlock,
+              maxTokens: Math.min(2000, 200 * grp.length + 300),
+            }),
+            signal: sig,
+          })
+          const j = await res.json().catch(() => null) as { ok?: boolean; content?: string; error?: string } | null
+          if (!res.ok || !j?.ok || typeof j.content !== 'string') throw new Error(j?.error || `HTTP ${res.status}`)
+          const raw = parseJsonArray(j.content)
+          if (!raw) throw new Error('模型回覆無法解析為 JSON 陣列')
+          for (const it of raw) {
+            if (it && typeof it === 'object') {
+              const s = String((it as Record<string, unknown>).symbol ?? '').toUpperCase()
+              if (s) bySym.set(s, it as Record<string, unknown>)
+            }
+          }
+        }),
+      )
+      for (const r of settled) {
+        if (r.status === 'fulfilled') okChunks++
+        else {
+          failChunks++
+          st0.addLog('warn', `評估組失敗 — ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`)
+        }
       }
     }
+    if (okChunks === 0) {
+      st0.addLog('error', '模型評估全部失敗 — 本輪放棄（不猜測）。')
+      return
+    }
+    if (failChunks > 0) st0.addLog('warn', `部分評估組失敗（${failChunks}/${okChunks + failChunks} 組）— 相關標的記為「評估失敗」`)
+
+    // 5) parse + validate (geometry checked HERE, not trusted from the model)
     let passCount = 0
     let fireCount = 0
     const verdicts: AiAutoVerdict[] = snaps.map((snap) => {
-      const it = bySym.get(snap.symbol) ?? {}
-      const direction: AiAutoDirection = it.direction === 'long' || it.direction === 'short' ? it.direction : 'flat'
-      const confidence = clampN(Math.round(num(it.confidence, 0)), 0, 100)
-      const entry = it.entry != null && Number.isFinite(Number(it.entry)) && Number(it.entry) > 0 ? Number(it.entry) : null
-      const stop = it.stop != null && Number.isFinite(Number(it.stop)) && Number(it.stop) > 0 ? Number(it.stop) : null
-      const target = it.target != null && Number.isFinite(Number(it.target)) && Number(it.target) > 0 ? Number(it.target) : null
-      const reason = String(it.reason ?? '').slice(0, 80)
+      const it = bySym.get(snap.symbol)
+      const direction: AiAutoDirection = it?.direction === 'long' || it?.direction === 'short' ? it.direction : 'flat'
+      const confidence = clampN(Math.round(num(it?.confidence, 0)), 0, 100)
+      const entry = it?.entry != null && Number.isFinite(Number(it.entry)) && Number(it.entry) > 0 ? Number(it.entry) : null
+      const stop = it?.stop != null && Number.isFinite(Number(it.stop)) && Number(it.stop) > 0 ? Number(it.stop) : null
+      const target = it?.target != null && Number.isFinite(Number(it.target)) && Number(it.target) > 0 ? Number(it.target) : null
+      const reason = String(it?.reason ?? '').slice(0, 80)
 
       const v: AiAutoVerdict = { symbol: snap.symbol, direction, confidence, entry, stop, target, rr: null, reason, demoBars: snap.demo, passed: false, rejectReason: null, dryRunNote: null }
 
+      if (!it) { v.rejectReason = '評估失敗（模型組失敗或漏答）'; return v }
       if (direction === 'flat') { v.rejectReason = '模型判中性'; return v }
       // geometry: long stop<entry<target / short target<entry<stop
       const geoOk = entry != null && stop != null && target != null && (

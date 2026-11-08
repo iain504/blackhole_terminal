@@ -8,7 +8,8 @@
 // data is insufficient — the tab never fakes a reply either.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAlert } from 'lucide-react'
-import { useTerminal } from '@/store/terminal'
+import { useTerminal, watchlistSymbols } from '@/store/terminal'
+import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
 import AiAutoTradePanel from './AiAutoTradePanel'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -37,6 +38,12 @@ const EMPTY_CTX: CtxState = { accountLine: null, positions: [], quotes: [], fetc
 
 export default function AiTradeTab() {
   const watchlists = useTerminal((s) => s.watchlists)
+  // v2.12.19 — which watchlist feeds the quotes card AND the auto-trade scan
+  // (one shared choice, stored in the auto-trade config); '#Group' separators
+  // never leak into quotes again.
+  const autoWatchlistId = useAiAutoStore((s) => s.config.watchlistId)
+  const updateAutoConfig = useAiAutoStore((s) => s.updateConfig)
+  const selectedList = watchlists.find((l) => l.id === autoWatchlistId) ?? watchlists[0] ?? null
 
   const [model, setModel] = useState<AiTradeModel>(AI_TRADE_DEFAULT_MODEL)
   const [messages, setMessages] = useState<AiChatMsg[]>([])
@@ -94,13 +101,14 @@ export default function AiTradeTab() {
           }))
           .filter((p: { symbol: string }) => p.symbol)
       }
-      // watchlist quotes — first watchlist, capped at 15 symbols
-      const items = watchlists[0]?.items ?? []
+      // watchlist quotes — selected list (shared with auto-trade), separators
+      // filtered out, capped at 30 symbols
+      const items = watchlistSymbols(selectedList?.items ?? [])
       if (items.length > 0) {
         const qRes = await fetch('/api/market/quote', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbols: items.slice(0, 15) }),
+          body: JSON.stringify({ symbols: items.slice(0, 30) }),
         })
         if (qRes.ok) {
           const j = await qRes.json().catch(() => null)
@@ -113,7 +121,7 @@ export default function AiTradeTab() {
             .filter((q: { symbol: string }) => q.symbol)
         }
       } else {
-        out.note = out.note ?? '關注清單為空 — 無報價上下文'
+        out.note = out.note ?? (selectedList ? `清單「${selectedList.name}」沒有可顯示的符號` : '關注清單為空 — 無報價上下文')
       }
     } catch {
       out.note = out.note ?? '部分上下文取得失敗（離線？）'
@@ -121,7 +129,7 @@ export default function AiTradeTab() {
       setCtx(out)
       setCtxBusy(false)
     }
-  }, [watchlists])
+  }, [watchlists, selectedList])
 
   useEffect(() => { void refreshCtx() }, [refreshCtx])
 
@@ -370,7 +378,26 @@ export default function AiTradeTab() {
             )}
           </div>
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
-            <span className="mb-2 block text-[10px] font-semibold uppercase tracking-widest text-zinc-500">關注清單報價（{ctx.quotes.length}）</span>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">關注清單報價（{ctx.quotes.length}）</span>
+              {watchlists.length > 0 && (
+                <Select
+                  value={selectedList?.id ?? ''}
+                  onValueChange={(v) => updateAutoConfig({ watchlistId: v, excludedSymbols: [] })}
+                >
+                  <SelectTrigger className="h-5 w-[130px] border-zinc-800 bg-zinc-900/80 px-1.5 text-[9px] text-zinc-300" aria-label="報價關注清單">
+                    <SelectValue placeholder="— 選清單 —" />
+                  </SelectTrigger>
+                  <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                    {watchlists.map((l) => (
+                      <SelectItem key={l.id} value={l.id} className="text-[10px]">
+                        {l.name}（{watchlistSymbols(l.items).length}）
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            </div>
             {ctx.quotes.length === 0 ? (
               <p className="text-[11px] text-zinc-600">{ctx.quotes.length === 0 && ctx.note ? ctx.note : '無資料'}</p>
             ) : (
