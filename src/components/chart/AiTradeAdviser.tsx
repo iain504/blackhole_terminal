@@ -6,8 +6,12 @@
 // market fetches) and asks the model for a structured read: bias → levels →
 // risks → plan. Follow-up questions keep the same grounding. Honesty
 // contract: if bars aren't loaded, the panel says so instead of guessing.
+// v2.12.18 — the panel is MOVE-ABLE: drag the header anywhere inside the
+// chart container (pointer events, clamped so it can't be lost off-panel),
+// double-click or 「還原」 snaps back to the default dock; arrow keys move it
+// for keyboard users.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Sparkles, SendHorizontal, Square, X, LineChart } from 'lucide-react'
+import { Sparkles, SendHorizontal, Square, X, LineChart, GripVertical } from 'lucide-react'
 import {
   AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL,
   buildChartSnapshot, snapshotToText,
@@ -29,6 +33,23 @@ const CHART_PROMPT =
 
 type Turn = AiChatMsg
 
+/** null = docked at the default spot (right-2 top-12); numbers = free position inside the chart container. */
+type PanelPos = { left: number; top: number } | null
+
+interface DragState {
+  grabDX: number // pointer → panel-left offset (viewport px)
+  grabDY: number
+  prLeft: number // chart container origin (viewport px)
+  prTop: number
+  pW: number // container size
+  pH: number
+  w: number // panel size
+}
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
+/** keep at least the header strip visible at the bottom edge */
+const MIN_VISIBLE = 36
+
 export function AiTradeAdviser({
   symbol,
   timeframe,
@@ -47,13 +68,89 @@ export function AiTradeAdviser({
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [barError, setBarError] = useState<string | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const [pos, setPos] = useState<PanelPos>(null)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<DragState | null>(null)
 
   useEffect(() => {
     const el = scrollRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [turns, busy])
+
+  // ---- move-able panel (v2.12.18) -----------------------------------------
+
+  /** Convert the currently-rendered (docked or free) position into explicit container-relative left/top. */
+  const materializePos = useCallback((): PanelPos => {
+    const panel = panelRef.current
+    const parent = panel?.offsetParent as HTMLElement | null
+    if (!panel || !parent) return null
+    const r = panel.getBoundingClientRect()
+    const pr = parent.getBoundingClientRect()
+    return { left: r.left - pr.left, top: r.top - pr.top }
+  }, [])
+
+  const startDrag = useCallback((e: React.PointerEvent) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    // the close button lives in the header — clicking it must not start a drag
+    if ((e.target as HTMLElement).closest('button')) return
+    const panel = panelRef.current
+    const parent = panel?.offsetParent as HTMLElement | null
+    if (!panel || !parent) return
+    const m = materializePos()
+    if (!m) return
+    const pr = parent.getBoundingClientRect()
+    dragRef.current = {
+      grabDX: e.clientX - (pr.left + m.left),
+      grabDY: e.clientY - (pr.top + m.top),
+      prLeft: pr.left,
+      prTop: pr.top,
+      pW: parent.clientWidth,
+      pH: parent.clientHeight,
+      w: panel.offsetWidth,
+    }
+    setPos(m) // switch from docked (right-anchored) to explicit left/top anchoring
+    setDragging(true)
+    try { (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId) } catch { /* older engines */ }
+  }, [materializePos])
+
+  const onDragMove = useCallback((e: React.PointerEvent) => {
+    const d = dragRef.current
+    if (!d) return
+    const left = clamp(e.clientX - d.grabDX - d.prLeft, 0, Math.max(0, d.pW - d.w))
+    const top = clamp(e.clientY - d.grabDY - d.prTop, 0, Math.max(0, d.pH - MIN_VISIBLE))
+    setPos({ left, top })
+  }, [])
+
+  const endDrag = useCallback((e: React.PointerEvent) => {
+    if (!dragRef.current) return
+    dragRef.current = null
+    setDragging(false)
+    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId) } catch { /* noop */ }
+  }, [])
+
+  const resetPos = useCallback(() => setPos(null), [])
+
+  // keyboard: arrows nudge 12px (Shift = 32px) — first press materializes the docked spot
+  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+    const step = e.shiftKey ? 32 : 12
+    const dv = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[e.key]
+    if (!dv) return
+    e.preventDefault()
+    const panel = panelRef.current
+    const parent = panel?.offsetParent as HTMLElement | null
+    if (!panel || !parent) return
+    setPos((cur) => {
+      const base = cur ?? materializePos()
+      if (!base) return cur
+      return {
+        left: clamp(base.left + dv[0], 0, Math.max(0, parent.clientWidth - panel.offsetWidth)),
+        top: clamp(base.top + dv[1], 0, Math.max(0, parent.clientHeight - MIN_VISIBLE)),
+      }
+    })
+  }, [materializePos])
 
   const ask = useCallback(async (content: string) => {
     if (busy || !content.trim()) return
@@ -99,20 +196,53 @@ export function AiTradeAdviser({
 
   return (
     <div
+      ref={panelRef}
       className="absolute right-2 top-12 z-40 flex max-h-[calc(100%-3.5rem)] w-[300px] max-w-[calc(100%-1rem)] flex-col rounded-lg border border-zinc-700/80 bg-zinc-900/95 text-xs text-zinc-200 shadow-2xl backdrop-blur"
+      style={pos ? { left: pos.left, top: pos.top, right: 'auto' } : undefined}
       role="dialog"
       aria-label={`AI Trade adviser ${symbol}`}
     >
-      {/* header */}
-      <div className="flex items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2">
-        <span className="flex items-center gap-1.5 font-semibold text-zinc-100">
-          <Sparkles className="h-3.5 w-3.5 text-violet-400" aria-hidden />
-          AI 顧問 <span className="text-violet-400">{symbol}</span>
-          <span className="text-[10px] font-normal text-zinc-500">{timeframe}</span>
+      {/* header = drag handle */}
+      <div
+        className={cn(
+          'flex touch-none select-none items-center justify-between gap-2 border-b border-zinc-800 px-2 py-2',
+          dragging ? 'cursor-grabbing' : 'cursor-grab',
+        )}
+        onPointerDown={startDrag}
+        onPointerMove={onDragMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onDoubleClick={resetPos}
+        onKeyDown={onKeyDown}
+        tabIndex={0}
+        role="heading"
+        aria-level={2}
+        aria-label={`AI 顧問 ${symbol} — 拖曳移動面板；方向鍵微調；雙擊還原`}
+        title="拖曳移動 · 雙擊還原"
+      >
+        <span className="flex min-w-0 items-center gap-1.5 font-semibold text-zinc-100">
+          <GripVertical className="h-3.5 w-3.5 shrink-0 text-zinc-600" aria-hidden />
+          <Sparkles className="h-3.5 w-3.5 shrink-0 text-violet-400" aria-hidden />
+          <span className="truncate">
+            AI 顧問 <span className="text-violet-400">{symbol}</span>
+            <span className="ml-1 text-[10px] font-normal text-zinc-500">{timeframe}</span>
+          </span>
         </span>
-        <button onClick={onClose} aria-label="Close AI adviser" className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
-          <X className="h-3.5 w-3.5" />
-        </button>
+        <span className="flex shrink-0 items-center gap-0.5">
+          {pos && (
+            <button
+              onClick={resetPos}
+              aria-label="還原面板位置"
+              title="還原位置"
+              className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <LineChart className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <button onClick={onClose} aria-label="Close AI adviser" className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </span>
       </div>
 
       {/* model row + one-shot analyse */}

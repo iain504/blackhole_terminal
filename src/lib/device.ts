@@ -123,6 +123,7 @@ const TAB_SHORT: Record<TabType, string> = {
   algo: 'Algo',
   grid: 'Grid',
   agent: 'FSD',
+  aitrade: 'AI Trade',
 }
 
 export function tabShortLabel(t: Pick<Tab, 'type' | 'symbol' | 'timeframe'>): string {

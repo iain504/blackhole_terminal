@@ -2,13 +2,13 @@
 // Re-stamped on every `bun run dev` / `bun run build` (predev/prebuild):
 // base = package.json version · build = git commit count · sha = HEAD.
 export const APP_VERSION = {
-  base: '2.12.17',
+  base: '2.12.18',
   build: 293,
-  sha: 'b574e8e',
+  sha: '8d80adb',
   branch: 'main',
-  commitDate: '2026-11-08T19:40:16Z',
-  full: '2.12.17+293.b574e8e',
-  display: 'v2.12.17+293',
+  commitDate: '2026-11-08T19:40:20Z',
+  full: '2.12.18+293.8d80adb',
+  display: 'v2.12.18+293',
 } as const
 
 export type AppVersion = typeof APP_VERSION
