@@ -117,7 +117,10 @@ export async function POST(req: Request) {
           {
             error: brokerAuth
               ? `Alpaca rejected the ${mode} API keys — update them in Settings → API keys.`
-              : friendlyExitQtyError(r.error || errBody?.message || 'Trailing stop failed'),
+              : // v2.12.23 — this is order PLACEMENT: the ambiguous balance
+                // errors get the entry hint (crypto SELL = short, refused;
+                // BUY = no cash), not the exit-leg partial-fills hint.
+                friendlyExitQtyError(r.error || errBody?.message || 'Trailing stop failed', 'entry'),
             status: r.status,
           },
           { status: brokerAuth ? 422 : (r.status || 502) },
@@ -137,7 +140,10 @@ export async function POST(req: Request) {
       stop_loss: body.stop_loss,
     })
     if (r.results.length === 0 && r.errors.length > 0) {
-      return NextResponse.json({ error: friendlyExitQtyError(r.errors[0]), mode }, { status: 422 })
+      // v2.12.23 — 'entry' kind: the auto-trader's crypto short entry used to
+      // surface the exit-only "remaining position is smaller than the exit
+      // size … try again" hint, sending the engine into a pointless retry loop.
+      return NextResponse.json({ error: friendlyExitQtyError(r.errors[0], 'entry'), mode }, { status: 422 })
     }
     return NextResponse.json({ mode, orders: r.results, errors: r.errors, splitNote: r.splitNote })
   } catch (e) {

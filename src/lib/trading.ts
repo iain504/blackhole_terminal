@@ -452,6 +452,71 @@ export async function getClosedOrders(userId: string, mode: TradeMode, limit = 3
   return { ...flat, data: merged }
 }
 
+// ---- asset tradability (v2.12.23) ----
+// The AI auto-trader used to fire orders at symbols Alpaca cannot trade at
+// all (VIX is a us_index — the broker answers "trading is not supported for
+// us_index asset class") and to SHORT spot crypto (Alpaca crypto has no
+// shorting — the SELL dies with "insufficient balance … available: 0").
+// The engine now probes /v2/assets/{symbol} through this cached helper
+// before evaluating anything, and rejects short verdicts on non-shortable
+// assets up front.
+export interface AssetInfo {
+  tradable: boolean
+  shortable: boolean
+  /** 'us_equity' | 'crypto' | … ; 'unknown' = Alpaca has no such asset (404) */
+  assetClass: string
+}
+
+const assetCache = new Map<string, { at: number; info: AssetInfo | null }>()
+const ASSET_CACHE_TTL_MS = 6 * 60 * 60_000
+const ASSET_CACHE_MAX = 800
+
+interface AlpacaAsset {
+  symbol?: string
+  class?: string
+  asset_class?: string
+  tradable?: boolean
+  shortable?: boolean
+}
+
+/** Cached tradability probe for ONE symbol (6h TTL, negative results cached
+ *  too: a 404 on both spellings means "not an Alpaca asset" — exactly the
+ *  VIX case — and that verdict is just as cacheable). Returns null only on
+ *  TRANSIENT failures (no keys, auth breaker, network) — callers degrade
+ *  gracefully and keep working off their own static filters. */
+export async function getAssetInfo(userId: string, mode: TradeMode, symbol: string): Promise<AssetInfo | null> {
+  const key = symbol.trim().toUpperCase()
+  if (!key) return null
+  const hit = assetCache.get(key)
+  if (hit && Date.now() - hit.at < ASSET_CACHE_TTL_MS) return hit.info
+  // Asset symbols keep the crypto slash ("BTC/USD") while positions drop it
+  // ("BTCUSD") — try both spellings once; whichever Alpaca answers wins.
+  const spellings = key.includes('/') ? [key, key.replace('/', '')] : [key]
+  let info: AssetInfo | null = null
+  let notFound = false
+  for (const sp of spellings) {
+    const r = await tradeFetch<AlpacaAsset>(userId, mode, `/v2/assets/${encodeURIComponent(sp)}`)
+    if (r.status === 200 && r.data) {
+      info = {
+        tradable: Boolean(r.data.tradable),
+        shortable: Boolean(r.data.shortable),
+        assetClass: String(r.data.class ?? r.data.asset_class ?? 'unknown'),
+      }
+      break
+    }
+    if (r.status === 404) { notFound = true; continue }
+    // anything else (no keys / 401 breaker / network) is TRANSIENT — never cached
+    return hit?.info ?? null
+  }
+  if (!info && notFound) info = { tradable: false, shortable: false, assetClass: 'unknown' }
+  assetCache.set(key, { at: Date.now(), info })
+  if (assetCache.size > ASSET_CACHE_MAX) {
+    const oldest = assetCache.keys().next().value
+    if (oldest) assetCache.delete(oldest)
+  }
+  return info
+}
+
 export interface PlaceOrderBody {
   symbol: string
   side: 'buy' | 'sell'
@@ -1335,8 +1400,13 @@ async function waitUntilCanceled(userId: string, host: TradeMode, orderId: strin
   }
 }
 
-/** Alpaca error text for "the position qty is already reserved by open exits". */
-export function friendlyExitQtyError(msg: string): string {
+/** Map a raw broker failure to an actionable message. `kind` selects the
+ *  guidance for the ambiguous balance errors: 'exit' (default — the legacy
+ *  partial-fills hint for close/attach legs) vs 'entry' (order PLACEMENT —
+ *  v2.12.23: the auto-trader's BTC/USD short entry used to be told "the
+ *  remaining position is smaller than the exit size … try again", which is
+ *  nonsense for an entry; the real cause is that spot crypto cannot short). */
+export function friendlyExitQtyError(msg: string, kind: 'exit' | 'entry' = 'exit'): string {
   // Task 37 — no usable key pair for the requested mode → say WHERE to fix it
   if (msg === 'no-keys') {
     return 'No Alpaca keys configured — add them in Settings → API keys (Paper account).'
@@ -1348,15 +1418,28 @@ export function friendlyExitQtyError(msg: string): string {
     )
   }
   if (/insufficient qty available for order/i.test(msg)) {
+    if (kind === 'entry') {
+      return (
+        msg +
+        ' — an entry on this side needs available quantity: a SELL entry requires an existing position or short borrow (spot crypto cannot short at all).'
+      )
+    }
     return (
       msg +
       ' — your open TP/SL exit orders reserve the position quantity. Cancel the existing exit first, or use the position row\u2019s [+TP]/[+SL] buttons (they rebuild both exits as one OCO).'
     )
   }
-  // crypto exits (SELL legs) reject with "insufficient balance for <ASSET>"
-  // when the position shrank below the requested size — nearly always the
-  // residue of PARTIAL fills (the SL filled part of the position already)
+  // "insufficient balance for <ASSET>" is ambiguous: on EXIT legs (SELL) it
+  // means the position shrank below the requested size (partial fills); on
+  // an ENTRY it means the side has nothing behind it (crypto SELL = short,
+  // which Alpaca spot crypto refuses; BUY = not enough cash/buying power).
   if (/insufficient balance for /i.test(msg)) {
+    if (kind === 'entry') {
+      return (
+        msg +
+        ' — the entry has nothing behind it on this side: a crypto SELL is a SHORT and Alpaca spot crypto cannot short (long entries only); a BUY needs enough cash/buying power.'
+      )
+    }
     return (
       msg +
       ' — the remaining position is smaller than the exit size (partial fills reduced it). The qty is recalculated from the live position — try again.'

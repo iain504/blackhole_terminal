@@ -12,9 +12,21 @@
 // order is a market entry with the model's levels attached as TP + SL bracket
 // via the existing /api/trading/orders route.
 //
-// Honesty contract: demo-flagged bars are allowed for evaluation (clearly
-// marked) but only fireable in paper mode; every skip/reject is logged with
-// its reason; a failed model call kills the round — nothing is invented.
+// Honesty contract: demo-flagged bars are EVALUATION-ONLY — they never fire
+// an order (paper or live); every skip/reject is logged with its reason; a
+// failed model call kills the round — nothing is invented.
+//
+// v2.12.23 — tradability gate. The scanner used to fire at symbols the
+// broker cannot trade: VIX is a us_index ("trading is not supported for
+// us_index asset class") and spot crypto cannot be SHORTED (a bearish
+// BTC/USD verdict sent a SELL that died with "insufficient balance …
+// available: 0", then the exit-only retry hint invited another blind loop
+// every scan). Now a static index/forex filter + a cached broker probe
+// (/api/trading/assets → /v2/assets/{sym}) drop un-tradeable symbols BEFORE
+// any bars/model call, SHORT verdicts on non-shortable assets are rejected
+// at the gate, demo bars never fire, and a failed order cools the symbol
+// down (30 min, 12h when the broker says unsupported) instead of retrying
+// blindly every scan.
 //
 // The engine lives at module scope (setTimeout chain), so the scan keeps
 // running when the AI Trade tab is unmounted. Config persists in localStorage;
@@ -98,6 +110,40 @@ function loadConfig(): AiAutoConfig {
 
 function persistConfig(cfg: AiAutoConfig) {
   try { window.localStorage.setItem(LS_KEY, JSON.stringify(cfg)) } catch { /* private mode */ }
+}
+
+// ---- tradability gate (v2.12.23) -------------------------------------------
+
+/** Index/forex symbols the broker can't trade — filtered before ANY fetch so
+ *  a watchlist holding VIX stops burning model tokens + broker errors. The
+ *  broker probe (/api/trading/assets) is the authoritative second layer; this
+ *  static list is the zero-cost first one (also covers the no-broker demo
+ *  scan where the probe answers nothing). */
+const NON_TRADABLE_STATIC = new Set([
+  'VIX', 'VIX3M', 'VVIX', 'SPX', 'NDX', 'RUT', 'DJI', 'NYA',
+  'DXY', 'XAU', 'XAG', 'UKX', 'NKY', 'HSI', 'GDAXI', 'CAC40',
+])
+function staticTradabilityNote(sym: string): string | null {
+  if (sym.startsWith('^')) return '指數'
+  if (sym.endsWith('=X')) return '外匯'
+  if (NON_TRADABLE_STATIC.has(sym)) return '指數'
+  return null
+}
+
+const COOLDOWN_MS_ORDER = 30 * 60_000 // generic order failure → 30 min
+const COOLDOWN_MS_UNSUPPORTED = 12 * 3600_000 // broker says "unsupported" → half a day
+/** symbol → cooldown-until epoch ms. Session-scope (a reload clears it — the
+ *  broker probe + entry-hint fixes make repeat failures rare anyway). */
+const orderFailCooldown = new Map<string, number>()
+
+/** After a failed order: cool the symbol down so one broken candidate can't
+ *  spam the broker + the activity log every scan. Broker "unsupported"
+ *  errors get the long cooldown and a memorable log line. */
+function classifyOrderFailure(symbol: string, msg: string) {
+  const m = msg.toLowerCase()
+  const unsupported = /not supported|asset class|us_index|not found|does not exist|not tradable|cannot open a short/.test(m)
+  orderFailCooldown.set(symbol.toUpperCase(), Date.now() + (unsupported ? COOLDOWN_MS_UNSUPPORTED : COOLDOWN_MS_ORDER))
+  useAiAutoStore.getState().addLog('info', `${symbol} 進入冷卻 — ${unsupported ? 'broker 不支持該標的/方向，12 小時內不再評估' : '30 分鐘內不再評估'}`)
 }
 
 // ---- runtime types ----------------------------------------------------------
@@ -294,6 +340,21 @@ export async function runScan(): Promise<void> {
     }
     st0.addLog('info', `掃描清單「${list?.name ?? '?'}」— ${symbols.length} 標的${excl.size ? `（排除 ${excl.size} 個）` : ''}`)
 
+    // v2.12.23 — cooldown + static tradability filters BEFORE anything else
+    const nowTs = Date.now()
+    const cooledSyms: string[] = []
+    const staticBlocked: string[] = []
+    const scanSyms: string[] = []
+    for (const s of symbols) {
+      const until = orderFailCooldown.get(s)
+      if (until != null && until > nowTs) { cooledSyms.push(s); continue }
+      const note = staticTradabilityNote(s)
+      if (note) { staticBlocked.push(`${s}（${note}）`); continue }
+      scanSyms.push(s)
+    }
+    if (cooledSyms.length > 0) st0.addLog('info', `冷卻中 — 先前下單失敗，本輪跳過：${cooledSyms.join('、')}`)
+    if (staticBlocked.length > 0) st0.addLog('info', `不可交易 — 跳過：${staticBlocked.join('、')}`)
+
     // 2) account (for sizing) + open positions (skip symbols already held)
     let equity: number | null = null
     const openSyms = new Set<string>()
@@ -305,14 +366,57 @@ export async function runScan(): Promise<void> {
     const eqRaw = accJ?.account?.equity
     if (eqRaw != null) { const n = Number(eqRaw); if (Number.isFinite(n) && n > 0) equity = n }
     const posJ = pos.j as { positions?: { symbol?: string }[] } | null
-    for (const p of posJ?.positions ?? []) { const s = String(p.symbol ?? '').toUpperCase(); if (s) openSyms.add(s) }
+    // POSITION symbols drop the crypto slash (BTCUSD) while ORDER/watchlist
+    // symbols keep it (BTC/USD) — index BOTH spellings so a held BTC position
+    // actually blocks a new BTC/USD entry (v2.12.23).
+    for (const p of posJ?.positions ?? []) { const s = String(p.symbol ?? '').toUpperCase(); if (s) { openSyms.add(s); openSyms.add(s.replace('/', '')) } }
     if (equity == null) st0.addLog('warn', '取得帳戶權益失敗 — 候選即使達標也無法計算倉位')
+
+    // 2.5) broker tradability probe — one batched call, server-cached 6h
+    // (including 404s). tradable:false drops the symbol NOW (before bars / a
+    // model call); shortable:false feeds the verdict gate — Alpaca spot
+    // crypto cannot short, so a bearish BTC/USD verdict must die here, not
+    // as a broker error. probeFailed/empty → degrade to the static filters.
+    interface AssetProbe { tradable: boolean; shortable: boolean; assetClass: string }
+    const assetMap = new Map<string, AssetProbe>()
+    const noShort = new Set<string>()
+    {
+      const probe = await fetchJson(`/api/trading/assets?mode=${cfg.mode}&symbols=${encodeURIComponent(scanSyms.slice(0, 30).join(','))}`, { signal: sig })
+        .catch(() => ({ status: 0, j: null as Record<string, unknown> | null }))
+      const assets = (probe.j as { assets?: Record<string, AssetProbe> } | null)?.assets
+      if (assets && typeof assets === 'object') {
+        const brokerBlocked: { sym: string; label: string }[] = []
+        // iterate what WE asked for — never trust extra keys a (mock/proxy)
+        // response may carry for symbols already dropped upstream
+        for (const sym of scanSyms) {
+          const info = assets[sym]
+          if (!info || typeof info !== 'object') continue
+          assetMap.set(sym.toUpperCase(), info)
+          if (info.tradable === false) {
+            brokerBlocked.push({ sym: sym.toUpperCase(), label: info.assetClass === 'unknown' ? '非 Alpaca 資產' : info.assetClass })
+            continue
+          }
+          if (info.shortable === false) noShort.add(sym.toUpperCase())
+        }
+        if (brokerBlocked.length > 0) {
+          for (const { sym } of brokerBlocked) {
+            const idx = scanSyms.indexOf(sym)
+            if (idx >= 0) scanSyms.splice(idx, 1)
+          }
+          st0.addLog('info', `broker 不可交易 — 跳過：${brokerBlocked.map(({ sym, label }) => `${sym}（${label}）`).join('、')}`)
+        }
+      }
+    }
+    if (scanSyms.length === 0) {
+      st0.addLog('warn', '本輪沒有可評估標的（全部不可交易、冷卻中或被排除）。')
+      return
+    }
 
     // 3) bars → snapshots (concurrency 3, demo-flagged kept but marked)
     interface Snap { symbol: string; text: string; demo: boolean; lastClose: number }
     const snaps: Snap[] = []
     const skipped: string[] = []
-    for (const group of chunk(symbols, 3)) {
+    for (const group of chunk(scanSyms, 3)) {
       const settled = await Promise.allSettled(
         group.map(async (sym): Promise<Snap | null> => {
           const { j } = await fetchJson(`/api/market/bars?symbol=${encodeURIComponent(sym)}&tf=${cfg.timeframe}`, { signal: sig })
@@ -400,6 +504,12 @@ export async function runScan(): Promise<void> {
         direction === 'long' ? stop < entry && entry < target : target < entry && entry < stop
       )
       if (!geoOk) { v.rejectReason = '停損/目標方位不合理'; return v }
+      // v2.12.23 — non-shortable assets (Alpaca spot crypto): reject the
+      // SHORT verdict here instead of sending a SELL the broker refuses.
+      if (direction === 'short' && noShort.has(snap.symbol)) {
+        v.rejectReason = `該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''} — 偏空訊號跳過`
+        return v
+      }
       if (Math.abs(entry - snap.lastClose) / snap.lastClose > 0.05) { v.rejectReason = '進場價偏離現價 >5%'; return v }
       // terminal-computed R:R (fill assumed ≈ live close)
       const rr = Math.abs(target - snap.lastClose) / Math.abs(snap.lastClose - stop)
@@ -414,15 +524,24 @@ export async function runScan(): Promise<void> {
       if (!confOk || !rrOk) return v
 
       // passed the numeric gate — execution checks
-      if (openSyms.has(snap.symbol)) { v.rejectReason = '已有該標的持倉'; return v }
+      if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { v.rejectReason = '已有該標的持倉'; return v }
       const openAuto = st0.fired.length + fireCount
       if (openAuto >= cfg.maxOpenAuto) { v.rejectReason = `達自動倉上限（${cfg.maxOpenAuto}）`; return v }
+      // v2.12.23 — demo bars are evaluation-only: firing an order on
+      // synthetic data (upstream rate-limited → generated fallback) would
+      // trade a market that does not exist. The verdict still shows the
+      // direction/confidence with an honest reject reason.
+      if (snap.demo) { v.rejectReason = '⚠示範K線 — 非真實行情，僅評估不下單'; return v }
       v.passed = true
       passCount++
       return v
     })
 
     useAiAutoStore.setState({ verdicts })
+    const shortSkips = verdicts.filter((v) => v.rejectReason?.includes('不可做空')).length
+    if (shortSkips > 0) st0.addLog('warn', `${shortSkips} 個偏空訊號被跳過 — 標的不可做空（現貨加密僅能做多）`)
+    const demoSkips = verdicts.filter((v) => v.rejectReason?.includes('示範K線')).length
+    if (demoSkips > 0) st0.addLog('warn', `示範K線 — ${demoSkips} 個訊號僅評估不下單（非真實行情）`)
 
     // 6) fire the passes (sizing by confidence → bracket order)
     for (const v of verdicts) {
@@ -473,11 +592,13 @@ export async function runScan(): Promise<void> {
           v.passed = false
           v.rejectReason = String((j as { error?: string } | null)?.error || `下單失敗 HTTP ${status}`)
           st0.addLog('error', `${v.symbol} 下單失敗 — ${v.rejectReason}`)
+          classifyOrderFailure(v.symbol, v.rejectReason)
         }
       } catch (e) {
         v.passed = false
         v.rejectReason = e instanceof DOMException && e.name === 'AbortError' ? '掃描被取消' : '下單連線失敗'
         st0.addLog('error', `${v.symbol} ${v.rejectReason}`)
+        if (v.rejectReason !== '掃描被取消') classifyOrderFailure(v.symbol, v.rejectReason)
       }
     }
 
