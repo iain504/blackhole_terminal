@@ -29,9 +29,13 @@
 // blindly every scan.
 //
 // The engine lives at module scope (setTimeout chain), so the scan keeps
-// running when the AI Trade tab is unmounted. Config persists in localStorage;
-// an enabled scanner auto-resumes after reload via resumeAiAutoIfNeeded()
-// (called from TerminalRoot once the user session is known).
+// running when the AI Trade tab is unmounted. Config persists in localStorage
+// (instant cache); the enabled flag + config are SYNCED to the account via
+// /api/settings/ai-ops (v2.12.24) so every signed-in computer sees the same
+// toggles, and a server-side heartbeat elects ONE browser as the runner —
+// other devices show 「其他裝置運行中」 and never double-fire orders. An enabled
+// scanner auto-resumes after reload via resumeAiAutoIfNeeded() (called from
+// TerminalRoot once the user session is known).
 import { create } from 'zustand'
 import {
   AI_TRADE_DEFAULT_MODEL, buildChartSnapshot, snapshotToText,
@@ -39,6 +43,10 @@ import {
 } from '@/lib/ai-trade'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
+import {
+  registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
+  type AiOpsRunnerInfo,
+} from '@/lib/ai-ops-sync'
 
 // ---- config ----------------------------------------------------------------
 
@@ -79,30 +87,39 @@ const LS_KEY = 'bh-ai-auto-cfg-v1'
 const num = (v: unknown, d: number) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 const clampN = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
 
+/** Sanitize any untrusted object into a valid AiAutoConfig (clamped, typed).
+ *  Shared by the localStorage loader AND the cross-device sync adoption so
+ *  a config saved on another computer passes through the exact same gates. */
+export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
+  const d = AI_AUTO_DEFAULT_CONFIG
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { ...d }
+  const j = input as Partial<AiAutoConfig>
+  return {
+    enabled: Boolean(j.enabled),
+    intervalSec: clampN(num(j.intervalSec, d.intervalSec), 60, 7200),
+    timeframe: (typeof j.timeframe === 'string' && TIMEFRAMES[j.timeframe as Timeframe])
+      ? j.timeframe as Timeframe : d.timeframe,
+    model: isAiTradeModel(j.model) ? j.model : d.model,
+    minConfidence: clampN(num(j.minConfidence, d.minConfidence), 0, 100),
+    minRR: clampN(num(j.minRR, d.minRR), 0.1, 100),
+    riskPct: clampN(num(j.riskPct, d.riskPct), 0.01, 10),
+    maxOpenAuto: Math.round(clampN(num(j.maxOpenAuto, d.maxOpenAuto), 1, 20)),
+    maxSymbols: Math.round(clampN(num(j.maxSymbols, d.maxSymbols), 1, 50)),
+    mode: j.mode === 'live' ? 'live' : 'paper',
+    dryRun: Boolean(j.dryRun),
+    watchlistId: typeof j.watchlistId === 'string' && j.watchlistId ? j.watchlistId : null,
+    excludedSymbols: Array.isArray(j.excludedSymbols)
+      ? j.excludedSymbols.filter((s): s is string => typeof s === 'string' && /^[A-Z0-9./:-]{1,15}$/.test(s)).slice(0, 100)
+      : [],
+  }
+}
+
 function loadConfig(): AiAutoConfig {
   if (typeof window === 'undefined') return { ...AI_AUTO_DEFAULT_CONFIG }
   try {
     const raw = window.localStorage.getItem(LS_KEY)
     if (!raw) return { ...AI_AUTO_DEFAULT_CONFIG }
-    const j = JSON.parse(raw) as Partial<AiAutoConfig>
-    return {
-      enabled: Boolean(j.enabled),
-      intervalSec: clampN(num(j.intervalSec, AI_AUTO_DEFAULT_CONFIG.intervalSec), 60, 7200),
-      timeframe: (typeof j.timeframe === 'string' && TIMEFRAMES[j.timeframe as Timeframe])
-        ? j.timeframe as Timeframe : AI_AUTO_DEFAULT_CONFIG.timeframe,
-      model: isAiTradeModel(j.model) ? j.model : AI_AUTO_DEFAULT_CONFIG.model,
-      minConfidence: clampN(num(j.minConfidence, AI_AUTO_DEFAULT_CONFIG.minConfidence), 0, 100),
-      minRR: clampN(num(j.minRR, AI_AUTO_DEFAULT_CONFIG.minRR), 0.1, 100),
-      riskPct: clampN(num(j.riskPct, AI_AUTO_DEFAULT_CONFIG.riskPct), 0.01, 10),
-      maxOpenAuto: Math.round(clampN(num(j.maxOpenAuto, AI_AUTO_DEFAULT_CONFIG.maxOpenAuto), 1, 20)),
-      maxSymbols: Math.round(clampN(num(j.maxSymbols, AI_AUTO_DEFAULT_CONFIG.maxSymbols), 1, 50)),
-      mode: j.mode === 'live' ? 'live' : 'paper',
-      dryRun: Boolean(j.dryRun),
-      watchlistId: typeof j.watchlistId === 'string' && j.watchlistId ? j.watchlistId : null,
-      excludedSymbols: Array.isArray(j.excludedSymbols)
-        ? j.excludedSymbols.filter((s): s is string => typeof s === 'string' && /^[A-Z0-9./:-]{1,15}$/.test(s)).slice(0, 100)
-        : [],
-    }
+    return sanitizeAiAutoConfig(JSON.parse(raw))
   } catch {
     return { ...AI_AUTO_DEFAULT_CONFIG }
   }
@@ -194,6 +211,9 @@ interface AiAutoState {
   log: AiAutoLogEntry[]
   verdicts: AiAutoVerdict[] // latest finished scan
   fired: AiAutoFired[]
+  /** v2.12.24 — who is the elected runner for this engine (cross-device
+   *  sync). null = unknown/disabled; isMe:false = another device runs it. */
+  runnerInfo: AiOpsRunnerInfo | null
   addLog: (level: AiAutoLogEntry['level'], text: string) => void
   updateConfig: (patch: Partial<AiAutoConfig>) => void
   setEnabled: (on: boolean) => void
@@ -202,6 +222,10 @@ interface AiAutoState {
   scanOnce: () => Promise<void>
   cancelScan: () => void
   clearLog: () => void
+  /** sync-layer hooks (v2.12.24) — not for UI use */
+  setRunnerInfo: (info: AiOpsRunnerInfo | null) => void
+  adoptConfig: (cfg: unknown) => void
+  setEnabledFlag: (on: boolean) => void
 }
 
 // ---- module-scope engine ----------------------------------------------------
@@ -221,23 +245,56 @@ export const useAiAutoStore = create<AiAutoState>((set, get) => ({
   log: [],
   verdicts: [],
   fired: [],
+  runnerInfo: null,
   addLog: (level, text) => set((s) => ({ log: [...s.log, { id: ++logSeq, at: Date.now(), level, text }].slice(-250) })),
   updateConfig: (patch) => {
     const next = { ...get().config, ...patch }
     persistConfig(next)
     set({ config: next })
+    // v2.12.24 — push the edit to the account (debounced; no runner claim:
+    // editing the interval on device 2 must not yank execution off device 1)
+    queueAiOpsConfigPut('auto-trade')
     // a period change while running reschedules the pending tick from now
     if (patch.intervalSec !== undefined && timer && next.enabled && !scanning) {
       if (timer) { clearTimeout(timer); timer = null }
       armTimer(next.intervalSec)
     }
   },
-  setEnabled: (on) => { if (on) startScanner(true); else stopScanner() },
+  setEnabled: (on) => {
+    if (on) {
+      startScanner(true) // flips the flag, starts the engine, PUT + claim
+    } else {
+      // v2.12.24 — flag and engine are separate concerns now: flip the
+      // account-level toggle, stop the local engine if it was running here,
+      // then publish (the PUT clears the runner slot server-side).
+      useAiAutoStore.getState().setEnabledFlag(false)
+      stopScanner()
+      void pushAiOpsState('auto-trade')
+    }
+  },
   start: (immediate = true) => startScanner(immediate),
   stop: () => stopScanner(),
   scanOnce: () => runScan(),
   cancelScan: () => scanAbort?.abort(),
   clearLog: () => set({ log: [] }),
+  setRunnerInfo: (info) => set({ runnerInfo: info }),
+  adoptConfig: (cfg) => {
+    // Server-sent config (cross-device sync). `enabled` is owned by the
+    // sync layer + toggles, never by the config payload.
+    const next = sanitizeAiAutoConfig(cfg)
+    next.enabled = get().config.enabled
+    persistConfig(next)
+    set({ config: next })
+  },
+  setEnabledFlag: (on) => {
+    // Account-level toggle flip WITHOUT touching the local engine — used by
+    // the sync layer so followers show the switch ON while idle.
+    const cur = get().config
+    if (cur.enabled === on) return
+    const next = { ...cur, enabled: on }
+    persistConfig(next)
+    set({ config: next })
+  },
 }))
 
 function armTimer(intervalSec: number) {
@@ -246,13 +303,17 @@ function armTimer(intervalSec: number) {
   useAiAutoStore.setState({ nextScanAt: Date.now() + intervalSec * 1000 })
 }
 
-function startScanner(immediate: boolean) {
+function startScanner(immediate: boolean, opts?: { fromSync?: boolean; note?: string }) {
   const st = useAiAutoStore.getState()
   if (st.config.enabled && timer) return // already running
   const next = { ...st.config, enabled: true }
   persistConfig(next)
   useAiAutoStore.setState({ config: next })
-  st.addLog('info', `自動交易掃描器啟動 — 每 ${fmtInterval(next.intervalSec)} 掃描關注清單一次（門檻：信心 ≥ ${next.minConfidence}% · R:R ≥ 1:${next.minRR}）`)
+  st.addLog('info', `${opts?.note ?? '自動交易掃描器啟動'} — 每 ${fmtInterval(next.intervalSec)} 掃描關注清單一次（門檻：信心 ≥ ${next.minConfidence}% · R:R ≥ 1:${next.minRR}）`)
+  // v2.12.24 — user-facing start publishes to the account AND claims the
+  // runner slot for this device; sync-driven starts skip the PUT (the server
+  // row is already enabled — that's why we're starting).
+  if (!opts?.fromSync) void pushAiOpsState('auto-trade', { claim: true })
   if (immediate) {
     void runScan()
   } else {
@@ -260,25 +321,54 @@ function startScanner(immediate: boolean) {
   }
 }
 
-function stopScanner() {
+function stopScanner(opts?: { fromSync?: boolean; reason?: 'synced-off' | 'yield' }) {
+  // v2.12.24 — engine-only stop: the enabled FLAG is managed by setEnabled /
+  // setEnabledFlag, this just tears down the local timer/scan. Idempotent:
+  // repeated sync ticks on a follower (engine never armed) don't spam logs.
+  if (!timer && !scanning) return
   if (timer) { clearTimeout(timer); timer = null }
   if (scanning) scanAbort?.abort() // honest stop mid-flight too
-  const st = useAiAutoStore.getState()
-  const next = { ...st.config, enabled: false }
-  persistConfig(next)
-  useAiAutoStore.setState({ config: next, nextScanAt: null })
-  st.addLog('info', '自動交易掃描器已停止')
+  useAiAutoStore.setState({ nextScanAt: null })
+  useAiAutoStore.getState().addLog(
+    'info',
+    opts?.reason === 'synced-off'
+      ? '自動交易已於其他裝置關閉 — 本機同步停止'
+      : opts?.reason === 'yield'
+        ? '自動交易改由其他裝置執行 — 本機待命'
+        : '自動交易掃描器已停止',
+  )
 }
 
-/** Called from TerminalRoot once the user session is known: re-arm an enabled scanner left on by a previous session. */
+/** Called from TerminalRoot once the user session is known: re-arm an enabled
+ *  scanner left on by a previous session (localStorage fallback). The PUT to
+ *  the server is deliberately skipped — the cross-device sync layer owns the
+ *  account state; if the row is missing it migrates this state up itself. */
 export function resumeAiAutoIfNeeded() {
   if (resumed) return
   resumed = true
   const st = useAiAutoStore.getState()
   if (!st.config.enabled || timer || scanning) return
   st.addLog('info', '偵測到上次啟用的自動交易 — 自動恢復掃描')
-  startScanner(false)
+  startScanner(false, { fromSync: true })
 }
+
+// v2.12.24 — register with the cross-device sync layer. The heartbeat tick
+// (20s, every signed-in tab) drives start/stop through these hooks, so the
+// account's enabled flag and ONE elected runner stay honest everywhere.
+registerAiOpsAdapter({
+  kind: 'auto-trade',
+  isEnabled: () => useAiAutoStore.getState().config.enabled,
+  // startScanner's own guard (enabled && timer) makes this idempotent.
+  startLocal: () => startScanner(false, { fromSync: true, note: '已同步 — 自動交易於本裝置執行' }),
+  stopLocal: (reason) => stopScanner({ fromSync: true, reason }),
+  adoptConfig: (cfg) => useAiAutoStore.getState().adoptConfig(cfg),
+  setRunnerInfo: (info) => useAiAutoStore.getState().setRunnerInfo(info),
+  setEnabledFlag: (on) => useAiAutoStore.getState().setEnabledFlag(on),
+  configForServer: () => {
+    const { enabled: _enabled, ...rest } = useAiAutoStore.getState().config
+    return { ...rest }
+  },
+})
 
 const fmtInterval = (s: number) => (s % 3600 === 0 ? `${s / 3600}小時` : s % 60 === 0 ? `${s / 60}分鐘` : `${s}秒`)
 
@@ -612,8 +702,12 @@ export async function runScan(): Promise<void> {
     scanAbort = null
     setScanning(false)
     const cur = useAiAutoStore.getState().config
+    const ri = useAiAutoStore.getState().runnerInfo
     useAiAutoStore.setState({ lastScanAt: Date.now() })
-    if (cur.enabled) armTimer(cur.intervalSec)
+    // v2.12.24 — re-arm only when the engine is supposed to run HERE: a
+    // manual scan on a follower device (or with the toggle off) must never
+    // start a second periodic loop behind the elected runner's back.
+    if (cur.enabled && (!ri || ri.isMe)) armTimer(cur.intervalSec)
   }
 }
 

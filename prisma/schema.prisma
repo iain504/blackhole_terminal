@@ -654,3 +654,28 @@ model AiStewardEvent {
 
   @@index([userId, createdAt])
 }
+
+// v2.12.24 — account-level enabled/config state for the two client-run AI
+// engines (AI 自動交易 scanner + AI 護倉 steward), so every signed-in computer
+// sees the same toggles (the engines used to be localStorage-only — device 2
+// never saw what device 1 switched on). One row per (user, kind).
+// runnerId/runnerName/heartbeatAt elect ONE browser as the engine runner:
+// other devices show 「其他裝置運行中」 and stay idle; a stale heartbeat (>75s)
+// or a pagehide release frees the slot for automatic takeover. The election
+// update is a guarded updateMany so two devices claiming a dead slot
+// simultaneously resolve to exactly one winner server-side.
+model AiOpsState {
+  id          String    @id @default(cuid())
+  userId      String
+  kind        String // 'auto-trade' | 'steward'
+  enabled     Boolean   @default(false)
+  config      Json? // sanitized engine config (enabled lives in the column, stripped from here)
+  runnerId    String? // deviceId:tabNonce of the elected browser
+  runnerName  String? // friendly device name for the honest UI
+  heartbeatAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([userId, kind])
+  @@index([userId])
+}

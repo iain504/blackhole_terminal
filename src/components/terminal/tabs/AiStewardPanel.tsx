@@ -80,6 +80,8 @@ export default function AiStewardPanel() {
   const runOnce = useAiStewardStore((s) => s.runOnce)
   const clearLog = useAiStewardStore((s) => s.clearLog)
   const setEvents = useAiStewardStore((s) => s.setEvents)
+  // v2.12.24 — cross-device sync: who is the elected runner (null = off/unknown)
+  const runnerInfo = useAiStewardStore((s) => s.runnerInfo)
 
   // pull the DB trail on mount (also feeds the engine's 記憶 before the first cycle)
   useEffect(() => {
@@ -101,6 +103,9 @@ export default function AiStewardPanel() {
 
   const lessons = events.filter((e) => e.kind === 'lesson').slice(0, 6)
   const shownEvents = events.filter((e) => e.kind !== 'lesson').slice(0, 40)
+  // v2.12.24 — enabled on the account but the elected runner is ANOTHER
+  // device: honest amber pill (the steward is NOT running in this browser).
+  const remoteRunner = Boolean(cfg.enabled && runnerInfo && !runnerInfo.isMe)
 
   const toggleEventWatch = async () => {
     if (events.length === 0) return
@@ -130,13 +135,16 @@ export default function AiStewardPanel() {
               'flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-medium',
               running
                 ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                : cfg.enabled
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
-                  : 'border-zinc-700 bg-zinc-800/60 text-zinc-500',
+                : remoteRunner
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-400'
+                  : cfg.enabled
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                    : 'border-zinc-700 bg-zinc-800/60 text-zinc-500',
             )}
+            title={remoteRunner ? `由 ${runnerInfo?.name ?? '其他裝置'} 執行 — 本機待命` : undefined}
           >
             {running && <TaijiSpinner className="h-2.5 w-2.5" aria-hidden />}
-            {running ? '檢視中' : cfg.enabled ? '運行中' : '已停止'}
+            {running ? '檢視中' : remoteRunner ? '其他裝置運行中' : cfg.enabled ? '運行中' : '已停止'}
           </span>
           <Switch checked={cfg.enabled} onCheckedChange={setEnabled} aria-label="啟用 AI 護倉" />
         </span>
@@ -148,12 +156,14 @@ export default function AiStewardPanel() {
 
       {/* status line */}
       <p className="mt-1.5 font-mono text-[10px] leading-4 text-zinc-500">
-        {nextRunAt && cfg.enabled
-          ? `下次檢視 ${fmtCountdown(nextRunAt - Date.now())}`
-          : cfg.enabled
-            ? '排程中…'
-            : '護倉未運行'}
-        {lastRunAt ? ` · 上次 ${new Date(lastRunAt).toLocaleTimeString()}` : ''}
+        {remoteRunner
+          ? `由 ${runnerInfo?.name ?? '其他裝置'} 執行 — 本機待命（裝置離線自動接管）`
+          : nextRunAt && cfg.enabled
+            ? `下次檢視 ${fmtCountdown(nextRunAt - Date.now())}`
+            : cfg.enabled
+              ? '排程中…'
+              : '護倉未運行'}
+        {!remoteRunner && lastRunAt ? ` · 上次 ${new Date(lastRunAt).toLocaleTimeString()}` : ''}
       </p>
       {lastSummary && (
         <p className="mt-1 rounded border border-zinc-800 bg-zinc-950/60 px-1.5 py-1 font-mono text-[10px] leading-4 text-zinc-400">

@@ -52,6 +52,8 @@ export default function AiAutoTradePanel() {
   const scanOnce = useAiAutoStore((s) => s.scanOnce)
   const cancelScan = useAiAutoStore((s) => s.cancelScan)
   const clearLog = useAiAutoStore((s) => s.clearLog)
+  // v2.12.24 — cross-device sync: who is the elected runner (null = off/unknown)
+  const runnerInfo = useAiAutoStore((s) => s.runnerInfo)
   const watchlists = useTerminal((s) => s.watchlists)
 
   // v2.12.20 — the AI Agent endpoint (Settings → AI Agent API) overrides the
@@ -100,6 +102,9 @@ export default function AiAutoTradePanel() {
   }
 
   const liveDanger = cfg.mode === 'live' && !cfg.dryRun
+  // v2.12.24 — enabled on the account but the elected runner is ANOTHER
+  // device: honest amber pill (the engine is NOT running in this browser).
+  const remoteRunner = Boolean(cfg.enabled && runnerInfo && !runnerInfo.isMe)
 
   // selected watchlist + its symbol items (separators become group labels)
   const selectedList = watchlists.find((l) => l.id === cfg.watchlistId) ?? watchlists[0] ?? null
@@ -131,13 +136,16 @@ export default function AiAutoTradePanel() {
               'flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-medium',
               scanning
                 ? 'border-violet-500/40 bg-violet-500/10 text-violet-300'
-                : cfg.enabled
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
-                  : 'border-zinc-700 bg-zinc-800/60 text-zinc-500',
+                : remoteRunner
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-400'
+                  : cfg.enabled
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                    : 'border-zinc-700 bg-zinc-800/60 text-zinc-500',
             )}
+            title={remoteRunner ? `由 ${runnerInfo?.name ?? '其他裝置'} 執行 — 本機待命` : undefined}
           >
             {scanning && <TaijiSpinner className="h-2.5 w-2.5" aria-hidden />}
-            {scanning ? '掃描中' : cfg.enabled ? '運行中' : '已停止'}
+            {scanning ? '掃描中' : remoteRunner ? '其他裝置運行中' : cfg.enabled ? '運行中' : '已停止'}
           </span>
           <Switch checked={cfg.enabled} onCheckedChange={setEnabled} aria-label="啟用 AI 自動交易" />
         </span>
@@ -145,13 +153,15 @@ export default function AiAutoTradePanel() {
 
       {/* status line */}
       <p className="mt-1.5 font-mono text-[10px] leading-4 text-zinc-500">
-        {nextScanAt && cfg.enabled
-          ? `下次掃描 ${fmtCountdown(nextScanAt - Date.now())}`
-          : cfg.enabled
-            ? '排程中…'
-            : '掃描器未運行'}
-        {lastScanAt ? ` · 上次 ${new Date(lastScanAt).toLocaleTimeString()}` : ''}
-        {fired.length > 0 ? ` · 已觸發 ${fired.length} 筆` : ''}
+        {remoteRunner
+          ? `由 ${runnerInfo?.name ?? '其他裝置'} 執行 — 本機待命（裝置離線自動接管）`
+          : nextScanAt && cfg.enabled
+            ? `下次掃描 ${fmtCountdown(nextScanAt - Date.now())}`
+            : cfg.enabled
+              ? '排程中…'
+              : '掃描器未運行'}
+        {!remoteRunner && lastScanAt ? ` · 上次 ${new Date(lastScanAt).toLocaleTimeString()}` : ''}
+        {!remoteRunner && fired.length > 0 ? ` · 已觸發 ${fired.length} 筆` : ''}
       </p>
 
       {/* config grid */}

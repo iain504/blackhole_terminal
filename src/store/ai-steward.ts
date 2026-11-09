@@ -24,8 +24,18 @@
 // Honesty contract: dry-run logs what WOULD happen without touching the
 // broker; every skip/refusal is recorded with its reason; a failed model
 // call aborts the cycle (an error event is stored) — nothing is invented.
+//
+// v2.12.24 — cross-device sync: enabled + config live in the account
+// (AiOpsState via /api/settings/ai-ops, localStorage stays the instant
+// cache) so every signed-in computer sees the same 護倉 toggle, and a
+// server-side heartbeat elects ONE browser as the runner — other devices
+// show 「其他裝置運行中」 and never double-run the steward.
 import { create } from 'zustand'
 import type { AiChatMsg } from '@/lib/ai-trade'
+import {
+  registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
+  type AiOpsRunnerInfo,
+} from '@/lib/ai-ops-sync'
 
 // ---- config ----------------------------------------------------------------
 
@@ -62,26 +72,34 @@ const LS_KEY = 'bh-ai-steward-cfg-v1'
 const num = (v: unknown, d: number) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 const clampN = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
 
+/** Sanitize any untrusted object into a valid AiStewardConfig (clamped,
+ *  typed). Shared by the localStorage loader AND the cross-device sync
+ *  adoption so a config saved on another computer passes the same gates. */
+export function sanitizeAiStewardConfig(input: unknown): AiStewardConfig {
+  const d = AI_STEWARD_DEFAULT_CONFIG
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { ...d }
+  const j = input as Partial<AiStewardConfig>
+  return {
+    enabled: Boolean(j.enabled),
+    intervalSec: clampN(num(j.intervalSec, d.intervalSec), 120, 21600),
+    mode: j.mode === 'live' ? 'live' : 'paper',
+    dryRun: Boolean(j.dryRun),
+    amendPositions: j.amendPositions !== false,
+    amendOrders: j.amendOrders !== false,
+    cancelOrders: j.cancelOrders !== false,
+    closePositions: Boolean(j.closePositions),
+    minConfidence: clampN(num(j.minConfidence, d.minConfidence), 0, 100),
+    maxActionsPerCycle: Math.round(clampN(num(j.maxActionsPerCycle, d.maxActionsPerCycle), 1, 10)),
+    purgeDays: clampN(num(j.purgeDays, d.purgeDays), 3, 60),
+  }
+}
+
 function loadConfig(): AiStewardConfig {
   if (typeof window === 'undefined') return { ...AI_STEWARD_DEFAULT_CONFIG }
   try {
     const raw = window.localStorage.getItem(LS_KEY)
     if (!raw) return { ...AI_STEWARD_DEFAULT_CONFIG }
-    const j = JSON.parse(raw) as Partial<AiStewardConfig>
-    const d = AI_STEWARD_DEFAULT_CONFIG
-    return {
-      enabled: Boolean(j.enabled),
-      intervalSec: clampN(num(j.intervalSec, d.intervalSec), 120, 21600),
-      mode: j.mode === 'live' ? 'live' : 'paper',
-      dryRun: Boolean(j.dryRun),
-      amendPositions: j.amendPositions !== false,
-      amendOrders: j.amendOrders !== false,
-      cancelOrders: j.cancelOrders !== false,
-      closePositions: Boolean(j.closePositions),
-      minConfidence: clampN(num(j.minConfidence, d.minConfidence), 0, 100),
-      maxActionsPerCycle: Math.round(clampN(num(j.maxActionsPerCycle, d.maxActionsPerCycle), 1, 10)),
-      purgeDays: clampN(num(j.purgeDays, d.purgeDays), 3, 60),
-    }
+    return sanitizeAiStewardConfig(JSON.parse(raw))
   } catch {
     return { ...AI_STEWARD_DEFAULT_CONFIG }
   }
@@ -131,6 +149,9 @@ interface AiStewardState {
   lastSummary: string | null
   events: StewardEvent[] // latest DB events (newest first)
   log: StewardLogEntry[]
+  /** v2.12.24 — who is the elected runner for this engine (cross-device
+   *  sync). null = unknown/disabled; isMe:false = another device runs it. */
+  runnerInfo: AiOpsRunnerInfo | null
   addLog: (level: StewardLogEntry['level'], text: string) => void
   updateConfig: (patch: Partial<AiStewardConfig>) => void
   setEnabled: (on: boolean) => void
@@ -138,6 +159,10 @@ interface AiStewardState {
   cancelRun: () => void
   clearLog: () => void
   setEvents: (events: StewardEvent[]) => void
+  /** sync-layer hooks (v2.12.24) — not for UI use */
+  setRunnerInfo: (info: AiOpsRunnerInfo | null) => void
+  adoptConfig: (cfg: unknown) => void
+  setEnabledFlag: (on: boolean) => void
 }
 
 // ---- module-scope engine ----------------------------------------------------
@@ -156,21 +181,54 @@ export const useAiStewardStore = create<AiStewardState>((set, get) => ({
   lastSummary: null,
   events: [],
   log: [],
+  runnerInfo: null,
   addLog: (level, text) => set((s) => ({ log: [...s.log, { id: ++logSeq, at: Date.now(), level, text }].slice(-250) })),
   updateConfig: (patch) => {
     const next = { ...get().config, ...patch }
     persistConfig(next)
     set({ config: next })
+    // v2.12.24 — push the edit to the account (debounced; no runner claim:
+    // editing the interval on device 2 must not yank execution off device 1)
+    queueAiOpsConfigPut('steward')
     if (patch.intervalSec !== undefined && timer && next.enabled && !running) {
       if (timer) { clearTimeout(timer); timer = null }
       armTimer(next.intervalSec)
     }
   },
-  setEnabled: (on) => { if (on) startSteward(true); else stopSteward() },
+  setEnabled: (on) => {
+    if (on) {
+      startSteward(true) // flips the flag, starts the engine, PUT + claim
+    } else {
+      // v2.12.24 — flag and engine are separate concerns now: flip the
+      // account-level toggle, stop the local engine if it was running here,
+      // then publish (the PUT clears the runner slot server-side).
+      useAiStewardStore.getState().setEnabledFlag(false)
+      stopSteward()
+      void pushAiOpsState('steward')
+    }
+  },
   runOnce: () => runStewardOnce(),
   cancelRun: () => runAbort?.abort(),
   clearLog: () => set({ log: [] }),
   setEvents: (events) => set({ events }),
+  setRunnerInfo: (info) => set({ runnerInfo: info }),
+  adoptConfig: (cfg) => {
+    // Server-sent config (cross-device sync). `enabled` is owned by the
+    // sync layer + toggles, never by the config payload.
+    const next = sanitizeAiStewardConfig(cfg)
+    next.enabled = get().config.enabled
+    persistConfig(next)
+    set({ config: next })
+  },
+  setEnabledFlag: (on) => {
+    // Account-level toggle flip WITHOUT touching the local engine — used by
+    // the sync layer so followers show the switch ON while idle.
+    const cur = get().config
+    if (cur.enabled === on) return
+    const next = { ...cur, enabled: on }
+    persistConfig(next)
+    set({ config: next })
+  },
 }))
 
 function armTimer(intervalSec: number) {
@@ -179,13 +237,16 @@ function armTimer(intervalSec: number) {
   useAiStewardStore.setState({ nextRunAt: Date.now() + intervalSec * 1000 })
 }
 
-function startSteward(immediate: boolean) {
+function startSteward(immediate: boolean, opts?: { fromSync?: boolean; note?: string }) {
   const st = useAiStewardStore.getState()
   if (st.config.enabled && timer) return // already running
   const next = { ...st.config, enabled: true }
   persistConfig(next)
   useAiStewardStore.setState({ config: next })
-  st.addLog('info', `AI 護倉啟動 — 每 ${fmtInterval(next.intervalSec)} 檢視一次${next.dryRun ? ' · 試運行（只建議不動單）' : ''}（信心門檻 ${next.minConfidence}% · 每輪最多 ${next.maxActionsPerCycle} 個動作）`)
+  st.addLog('info', `${opts?.note ?? 'AI 護倉啟動'} — 每 ${fmtInterval(next.intervalSec)} 檢視一次${next.dryRun ? ' · 試運行（只建議不動單）' : ''}（信心門檻 ${next.minConfidence}% · 每輪最多 ${next.maxActionsPerCycle} 個動作）`)
+  // v2.12.24 — user-facing start publishes to the account AND claims the
+  // runner slot for this device; sync-driven starts skip the PUT.
+  if (!opts?.fromSync) void pushAiOpsState('steward', { claim: true })
   if (immediate) {
     void runStewardOnce()
   } else {
@@ -193,25 +254,54 @@ function startSteward(immediate: boolean) {
   }
 }
 
-function stopSteward() {
+function stopSteward(opts?: { fromSync?: boolean; reason?: 'synced-off' | 'yield' }) {
+  // v2.12.24 — engine-only stop: the enabled FLAG is managed by setEnabled /
+  // setEnabledFlag, this just tears down the local timer/cycle. Idempotent:
+  // repeated sync ticks on a follower (engine never armed) don't spam logs.
+  if (!timer && !running) return
   if (timer) { clearTimeout(timer); timer = null }
   if (running) runAbort?.abort()
-  const st = useAiStewardStore.getState()
-  const next = { ...st.config, enabled: false }
-  persistConfig(next)
-  useAiStewardStore.setState({ config: next, nextRunAt: null })
-  st.addLog('info', 'AI 護倉已停止')
+  useAiStewardStore.setState({ nextRunAt: null })
+  useAiStewardStore.getState().addLog(
+    'info',
+    opts?.reason === 'synced-off'
+      ? 'AI 護倉已於其他裝置關閉 — 本機同步停止'
+      : opts?.reason === 'yield'
+        ? 'AI 護倉改由其他裝置執行 — 本機待命'
+        : 'AI 護倉已停止',
+  )
 }
 
-/** Called from TerminalRoot once the user session is known: re-arm an enabled steward left on by a previous session. */
+/** Called from TerminalRoot once the user session is known: re-arm an enabled
+ *  steward left on by a previous session (localStorage fallback). The PUT to
+ *  the server is deliberately skipped — the cross-device sync layer owns the
+ *  account state; if the row is missing it migrates this state up itself. */
 export function resumeAiStewardIfNeeded() {
   if (resumed) return
   resumed = true
   const st = useAiStewardStore.getState()
   if (!st.config.enabled || timer || running) return
   st.addLog('info', '偵測到上次啟用的 AI 護倉 — 自動恢復巡檢')
-  startSteward(false)
+  startSteward(false, { fromSync: true })
 }
+
+// v2.12.24 — register with the cross-device sync layer. The heartbeat tick
+// (20s, every signed-in tab) drives start/stop through these hooks, so the
+// account's enabled flag and ONE elected runner stay honest everywhere.
+registerAiOpsAdapter({
+  kind: 'steward',
+  isEnabled: () => useAiStewardStore.getState().config.enabled,
+  // startSteward's own guard (enabled && timer) makes this idempotent.
+  startLocal: () => startSteward(false, { fromSync: true, note: '已同步 — AI 護倉於本裝置執行' }),
+  stopLocal: (reason) => stopSteward({ fromSync: true, reason }),
+  adoptConfig: (cfg) => useAiStewardStore.getState().adoptConfig(cfg),
+  setRunnerInfo: (info) => useAiStewardStore.getState().setRunnerInfo(info),
+  setEnabledFlag: (on) => useAiStewardStore.getState().setEnabledFlag(on),
+  configForServer: () => {
+    const { enabled: _enabled, ...rest } = useAiStewardStore.getState().config
+    return { ...rest }
+  },
+})
 
 const fmtInterval = (s: number) => (s % 3600 === 0 ? `${s / 3600}小時` : s % 60 === 0 ? `${s / 60}分鐘` : `${s}秒`)
 
@@ -796,6 +886,10 @@ export async function runStewardOnce(): Promise<void> {
     runAbort = null
     useAiStewardStore.setState({ running: false, lastRunAt: Date.now() })
     const cur = useAiStewardStore.getState().config
-    if (cur.enabled) armTimer(cur.intervalSec)
+    const ri = useAiStewardStore.getState().runnerInfo
+    // v2.12.24 — re-arm only when the engine is supposed to run HERE: a
+    // manual 立即檢視 on a follower device must never start a second
+    // periodic loop behind the elected runner's back.
+    if (cur.enabled && (!ri || ri.isMe)) armTimer(cur.intervalSec)
   }
 }
