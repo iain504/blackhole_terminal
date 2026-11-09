@@ -334,7 +334,7 @@ interface PendingRow {
   status: string
   tpPrice: number | null
   slPrice: number | null
-  source?: 'manual' | 'algo' | 'grid'
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
   createdAt: string | null
 }
 
@@ -350,7 +350,7 @@ interface PositionRow {
   uplPct: number
   assetClass: string
   openedAt: string | null
-  source?: 'manual' | 'algo' | 'grid'
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
   strategy?: string
 }
 
@@ -364,7 +364,7 @@ interface ClosedTrade {
   pnl: number
   pnlPct: number
   durationMs: number
-  source?: 'manual' | 'algo' | 'grid'
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
 }
 
 function stewardInstruction(): string {
@@ -417,7 +417,11 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
   }
 }
 
-const isManual = (src?: string) => src === undefined || src === null || src === 'manual'
+// v2.12.25 — AI Trade Adviser positions ARE maintained by the steward: the
+// auto-trader fires a bracket and never revisits it, so the steward is the
+// follow-up caretaker for 'ai' inventory too. Algo/grid keep their own
+// engines — the steward never touches those.
+const isManual = (src?: string) => src === undefined || src === null || src === 'manual' || src === 'ai'
 const isCryptoSym = (s: string) => s.includes('/') || s.endsWith('USD') && /^[A-Z0-9]{2,5}USD$/.test(s)
 
 export async function runStewardOnce(): Promise<void> {

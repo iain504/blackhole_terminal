@@ -11,6 +11,7 @@ import { Bot, Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAl
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
+import { visibleAwareInterval } from '@/lib/visible-poll'
 import AiAutoTradePanel from './AiAutoTradePanel'
 import AiStewardPanel from './AiStewardPanel'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -23,7 +24,7 @@ import { cn } from '@/lib/utils'
 interface CtxState {
   accountLine: string | null
   positions: { symbol: string; side: string; qty: number; avgEntry: number; current: number; upl: number; uplPct: number }[]
-  quotes: { symbol: string; price: number; changePct: number }[]
+  quotes: { symbol: string; price: number; changePct: number; sim?: boolean }[]
   fetchedAt: number | null
   note: string | null // honest degradations (no keys, watchlist empty, …)
 }
@@ -96,8 +97,12 @@ export default function AiTradeTab() {
   }, [])
 
   // ---- live terminal context (account + positions + watchlist quotes) ----
-  const refreshCtx = useCallback(async () => {
-    setCtxBusy(true)
+  // v2.12.25 — fetchCtx is the pure data pass; refreshCtx = fetch + render.
+  // send() awaits fetchCtx DIRECTLY so every AI judgment is grounded in
+  // data fetched at send time (the mount-time snapshot used to go stale for
+  // hours — stale buying power/positions fed the model wrong sizing and
+  // repeated-buy advice).
+  const fetchCtx = useCallback(async (): Promise<CtxState> => {
     const out: CtxState = { ...EMPTY_CTX, fetchedAt: Date.now() }
     try {
       const [accRes, posRes] = await Promise.all([fetch('/api/trading/account'), fetch('/api/trading/positions')])
@@ -142,25 +147,49 @@ export default function AiTradeTab() {
         if (qRes.ok) {
           const j = await qRes.json().catch(() => null)
           out.quotes = (Array.isArray(j?.quotes) ? j.quotes : [])
-            .map((q: { symbol?: string; price?: number; changePct?: number }) => ({
+            .map((q: { symbol?: string; price?: number; changePct?: number; sim?: boolean }) => ({
               symbol: String(q.symbol ?? ''),
               price: Number(q.price) || 0,
               changePct: Number(q.changePct) || 0,
+              sim: Boolean(q.sim),
             }))
             .filter((q: { symbol: string }) => q.symbol)
+          // honest degradation: rows the real feed couldn't answer were
+          // silently sim-filled — surface it instead of feeding fake prices
+          const simRows = out.quotes.filter((q) => q.sim).length
+          if (simRows > 0) out.note = out.note ?? `${simRows} 個標的沒有真實行情 — 顯示模擬價（標記「模擬」）`
         }
       } else {
         out.note = out.note ?? (selectedList ? `清單「${selectedList.name}」沒有可顯示的符號` : '關注清單為空 — 無報價上下文')
       }
     } catch {
       out.note = out.note ?? '部分上下文取得失敗（離線？）'
-    } finally {
-      setCtx(out)
-      setCtxBusy(false)
     }
+    return out
   }, [watchlists, selectedList])
 
-  useEffect(() => { void refreshCtx() }, [refreshCtx])
+  const refreshCtx = useCallback(async () => {
+    setCtxBusy(true)
+    const out = await fetchCtx()
+    setCtx(out)
+    setCtxBusy(false)
+  }, [fetchCtx])
+
+  // v2.12.25 — the context cards (帳戶/持倉/關注清單報價) used to fetch ONCE
+  // on mount and only on the manual 重新整理 button, so the sidebar showed
+  // stale buying power/positions for hours. 15s visible-aware polling keeps
+  // them current (paused while the tab is hidden, one catch-up on return).
+  useEffect(() => {
+    const stop = visibleAwareInterval(() => void refreshCtx(), 15_000)
+    const onChanged = () => void refreshCtx()
+    window.addEventListener('tt:positions-changed', onChanged)
+    window.addEventListener('tt:settings-changed', onChanged)
+    return () => {
+      stop()
+      window.removeEventListener('tt:positions-changed', onChanged)
+      window.removeEventListener('tt:settings-changed', onChanged)
+    }
+  }, [refreshCtx])
 
   // keep the thread pinned to the latest bubble
   useEffect(() => {
@@ -168,23 +197,28 @@ export default function AiTradeTab() {
     if (el) el.scrollTop = el.scrollHeight
   }, [messages, busy])
 
-  const buildContext = useCallback(() => {
+  const buildContext = useCallback((state?: CtxState) => {
+    const c = state ?? ctx
     const parts: string[] = []
-    if (ctx.accountLine) parts.push(`ACCOUNT: ${ctx.accountLine}`)
-    if (ctx.positions.length > 0) {
+    if (c.accountLine) parts.push(`ACCOUNT: ${c.accountLine}`)
+    if (c.positions.length > 0) {
       parts.push(
         'OPEN POSITIONS:\n' +
-          ctx.positions
+          c.positions
             .map((p) => `- ${p.symbol} ${p.side} ${p.qty} @ ${p.avgEntry}, now ${p.current}, uP/L ${p.upl.toFixed(2)} (${p.uplPct.toFixed(2)}%)`)
             .join('\n'),
       )
     } else {
       parts.push('OPEN POSITIONS: none')
     }
-    if (ctx.quotes.length > 0) {
+    if (c.quotes.length > 0) {
       parts.push(
         'WATCHLIST QUOTES:\n' +
-          ctx.quotes.map((q) => `- ${q.symbol}: ${q.price} (${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}% today)`).join('\n'),
+          c.quotes
+            // v2.12.25 — simulated rows are labeled IN the prompt so the model
+            // never treats a synthetic price as market data
+            .map((q) => `- ${q.symbol}: ${q.price} (${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}% today)${q.sim ? ' [SIMULATED — not real market data]' : ''}`)
+            .join('\n'),
       )
     }
     return parts.join('\n\n')
@@ -200,13 +234,24 @@ export default function AiTradeTab() {
     const ctrl = new AbortController()
     abortRef.current = ctrl
     try {
+      // v2.12.25 — judge on FRESH data: re-fetch the context at send time
+      // (account/positions/quotes), render it, and build the prompt from it.
+      // The mount-time snapshot could be hours old — stale buying power and
+      // positions used to drive repeated-buy / wrong-sizing advice.
+      let ctxForPrompt = ctx
+      if (includeCtx) {
+        setCtxBusy(true)
+        ctxForPrompt = await fetchCtx()
+        setCtx(ctxForPrompt)
+        setCtxBusy(false)
+      }
       const res = await fetch('/api/ai-trade/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
           messages: next.slice(-24),
-          context: includeCtx ? buildContext() : undefined,
+          context: includeCtx ? buildContext(ctxForPrompt) : undefined,
         }),
         signal: ctrl.signal,
       })
@@ -224,7 +269,7 @@ export default function AiTradeTab() {
       setBusy(false)
       abortRef.current = null
     }
-  }, [input, busy, messages, model, includeCtx, buildContext])
+  }, [input, busy, messages, model, includeCtx, ctx, fetchCtx, buildContext])
 
   const cancel = useCallback(() => {
     abortRef.current?.abort()
@@ -450,6 +495,14 @@ export default function AiTradeTab() {
                   <li key={q.symbol} className="flex items-center justify-between font-mono text-[11px]">
                     <span className="text-zinc-300">{q.symbol}</span>
                     <span className="flex items-center gap-2">
+                      {q.sim && (
+                        <span
+                          className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] font-medium text-amber-400"
+                          title="模擬價 — 真實行情來源沒有此標的，數值由模擬器生成，不可作為交易依據"
+                        >
+                          模擬
+                        </span>
+                      )}
                       <span className="text-zinc-500">{q.price}</span>
                       <span className={cn(q.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
                         {q.changePct >= 0 ? '+' : ''}{q.changePct.toFixed(2)}%

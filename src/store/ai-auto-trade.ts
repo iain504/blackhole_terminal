@@ -447,14 +447,22 @@ export async function runScan(): Promise<void> {
 
     // 2) account (for sizing) + open positions (skip symbols already held)
     let equity: number | null = null
+    // v2.12.25 — in-round buying-power budget. Every order in THIS scan used
+    // to size off the same account snapshot taken before ANY order fired, so
+    // two passes could both spend the full budget (the 'repeated buying /
+    // wrong position sizing' report). bpLeft shrinks as orders fire.
+    let bpLeft: number | null = null
     const openSyms = new Set<string>()
     const [acc, pos] = await Promise.all([
       fetchJson('/api/trading/account', { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson('/api/trading/positions', { signal: sig }).catch(() => ({ status: 0, j: null })),
     ])
-    const accJ = acc.j as { account?: { equity?: unknown }; error?: string } | null
+    const accJ = acc.j as { account?: { equity?: unknown; buyingPower?: unknown }; error?: string } | null
     const eqRaw = accJ?.account?.equity
     if (eqRaw != null) { const n = Number(eqRaw); if (Number.isFinite(n) && n > 0) equity = n }
+    const bpRaw = accJ?.account?.buyingPower
+    if (bpRaw != null) { const n = Number(bpRaw); if (Number.isFinite(n) && n > 0) bpLeft = n }
+    if (bpLeft == null && equity != null) bpLeft = equity // no BP field — degrade to equity
     const posJ = pos.j as { positions?: { symbol?: string }[] } | null
     // POSITION symbols drop the crypto slash (BTCUSD) while ORDER/watchlist
     // symbols keep it (BTC/USD) — index BOTH spellings so a held BTC position
@@ -644,6 +652,19 @@ export async function runScan(): Promise<void> {
       let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
       const maxNotional = equity * 0.5
       if (qty * price > maxNotional) qty = Math.floor((maxNotional / price) * 1e4) / 1e4
+      // v2.12.25 — spend only what THIS round still has: earlier fires in the
+      // same scan already committed their cost against buying power
+      if (bpLeft != null && qty * price > bpLeft) {
+        const scaled = Math.floor((bpLeft / price) * 1e4) / 1e4
+        if (scaled <= 0 || scaled * price < 1) {
+          v.passed = false
+          v.rejectReason = `Buying power 不足（餘 $${bpLeft.toFixed(2)}）— 無法建立倉位`
+          st0.addLog('warn', `${v.symbol} 跳過 — ${v.rejectReason}`)
+          continue
+        }
+        st0.addLog('info', `${v.symbol} 倉位縮減 — 本輪 buying power 餘 $${bpLeft.toFixed(2)}，qty ${qty} → ${scaled}`)
+        qty = scaled
+      }
       if (qty <= 0 || qty * price < 1) {
         v.passed = false
         v.rejectReason = `風險預算太小（$${riskAmt.toFixed(2)} ÷ $${perRisk.toFixed(2)}）無法形成倉位`
@@ -669,12 +690,18 @@ export async function runScan(): Promise<void> {
             time_in_force: 'gtc',
             take_profit: v.target,
             stop_loss: v.stop,
+            // v2.12.25 — attribute this entry to the AI Trade Adviser: the
+            // `tta-` client_order_id makes Positions SOURCE + trade history
+            // render it as AI instead of Manual
+            sourceKind: 'ai',
           }),
           signal: sig,
         })
         const ok = status === 200 && Array.isArray((j as { orders?: unknown[] } | null)?.orders) && ((j as { orders: unknown[] }).orders.length > 0)
         if (ok) {
           fireCount++
+          // v2.12.25 — commit this order's cost against the in-round budget
+          if (bpLeft != null) bpLeft = Math.max(0, bpLeft - qty * price)
           const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: v.symbol, side, qty, price, stop: v.stop!, target: v.target!, confidence: v.confidence, rr: v.rr!, mode: cfg.mode }
           useAiAutoStore.setState((s) => ({ fired: [rec, ...s.fired].slice(0, 50) }))
           st0.addLog('success', `已下單 ${v.symbol} ${side} ${qty} @市價 · TL ${v.target} / SL ${v.stop}（信心 ${v.confidence}% · R:R 1:${v.rr?.toFixed(1)} · ${cfg.mode}）`)

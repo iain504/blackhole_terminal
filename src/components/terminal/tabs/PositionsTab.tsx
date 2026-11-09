@@ -77,14 +77,14 @@ interface PosConsoleRow {
  * FIFO open lots span more than one source (algo AND grid both bought) lists
  * every slice with its open qty instead of collapsing to one winner. */
 type SourceSlice = {
-  source: 'manual' | 'algo' | 'grid'
+  source: 'manual' | 'algo' | 'grid' | 'ai'
   qty: number
   runRef?: string | null
   strategy?: string
 }
 type PositionRowExt = PositionRow & {
   openedAt?: string | null
-  source?: 'manual' | 'algo' | 'grid'
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
   strategy?: string
   sources?: SourceSlice[]
 }
@@ -145,6 +145,25 @@ const HIST_RANGES = Object.keys(HIST_RANGE_LABELS) as HistRange[]
 /** local midnight of `d` (browser timezone) */
 const localMidnight = (d = new Date()): Date => new Date(d.getFullYear(), d.getMonth(), d.getDate())
 
+// v2.12.25 — remember the user's history range across sessions/visits (the
+// "pick Today once" request): persisted in localStorage, validated against
+// the presets; custom keeps its from/to dates too. SSR-safe default = all.
+const HIST_RANGE_LS = 'bh-hist-range-v1'
+function loadHistRange(): { range: HistRange; from: string; to: string } {
+  if (typeof window === 'undefined') return { range: 'all', from: '', to: '' }
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIST_RANGE_LS) || 'null') as { range?: string; from?: string; to?: string } | null
+    const range = raw?.range && (HIST_RANGES as string[]).includes(raw.range) ? (raw.range as HistRange) : 'all'
+    return {
+      range,
+      from: typeof raw?.from === 'string' ? raw.from : '',
+      to: typeof raw?.to === 'string' ? raw.to : '',
+    }
+  } catch {
+    return { range: 'all', from: '', to: '' }
+  }
+}
+
 /** from/to URLSearchParams for a history range — '' when unbounded ('all',
  * or custom with neither date picked). Custom `to` = end of that local day. */
 function histRangeQuery(range: HistRange, fromStr: string, toStr: string): string {
@@ -176,15 +195,27 @@ function histRangeQuery(range: HistRange, fromStr: string, toStr: string): strin
   return p.toString()
 }
 
-/** Manual / Algo / Grid source badge (Task 65, grid in Task 10-k): algo rows
- *  show which strategy placed it, grid rows an emerald Grid tag. Task 79 — an
- *  UNKNOWN source (no open entry lot in the recent closed-orders window,
- *  e.g. an old position or a pre-dating fill) used to render as "Manual" — a
- *  wrong attribution. It now shows a dim "—" like other unknown columns;
- *  only a decoded `ttb-`/external coid renders "Manual". Task 81 — an
- *  optional qty label (shown only on multi-source rows) sizes each slice. */
-function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | undefined; strategy?: string; qty?: number }) {
+/** Manual / Algo / Grid / AI source badge (Task 65, grid in Task 10-k, AI in
+ *  v2.12.25): algo rows show which strategy placed it, grid rows an emerald
+ *  Grid tag, AI rows a violet AI tag (the AI Trade Adviser auto-trader).
+ *  Task 79 — an UNKNOWN source (no open entry lot in the recent closed-orders
+ *  window, e.g. an old position or a pre-dating fill) used to render as
+ *  "Manual" — a wrong attribution. It now shows a dim "—" like other unknown
+ *  columns; only a decoded `ttb-`/external coid renders "Manual". Task 81 —
+ *  an optional qty label (shown only on multi-source rows) sizes each slice. */
+function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | 'ai' | undefined; strategy?: string; qty?: number }) {
   const qtyLabel = qty != null ? ` ${fmtQtyLabel(qty)}` : ''
+  if (source === 'ai') {
+    return (
+      <Badge
+        variant="outline"
+        className="border-fuchsia-500/40 bg-fuchsia-500/10 text-[10px] text-fuchsia-300"
+        title="Placed by the AI Trade Adviser (auto-trade)"
+      >
+        AI{qtyLabel}
+      </Badge>
+    )
+  }
   if (source === 'algo') {
     return (
       <Badge
@@ -231,10 +262,10 @@ function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'g
  *  also holds open inventory) renders one badge PER source with its open
  *  qty — biggest holding first — so an algo position can no longer be masked
  *  as plain "Grid" (and old manual dust can't mask an active grid either). */
-function PositionSourceCell({ source, strategy, sources }: { source?: 'manual' | 'algo' | 'grid'; strategy?: string; sources?: SourceSlice[] }) {
+function PositionSourceCell({ source, strategy, sources }: { source?: 'manual' | 'algo' | 'grid' | 'ai'; strategy?: string; sources?: SourceSlice[] }) {
   if (sources && sources.length > 1) {
     const summary = sources
-      .map((s) => `${s.source === 'algo' && s.strategy ? `Algo · ${s.strategy}` : s.source} ${fmtQtyLabel(s.qty)}`)
+      .map((s) => (s.source === 'algo' && s.strategy ? `Algo · ${s.strategy}` : s.source === 'ai' ? 'AI' : s.source) + ` ${fmtQtyLabel(s.qty)}`)
       .join(' + ')
     return (
       <span
@@ -349,9 +380,15 @@ export default function PositionsTab() {
   const [histSort, setHistSort] = useState<SortState>(null)
   // Task 82 — Trade history date range (server-side exit-time filter; a range
   // change gives `refresh` a new identity so the fetch effect re-fires)
-  const [histRange, setHistRange] = useState<HistRange>('all')
-  const [histFrom, setHistFrom] = useState('')
-  const [histTo, setHistTo] = useState('')
+  // v2.12.25 — the picked range survives reloads: localStorage-backed, so
+  // "Today" stays selected tomorrow instead of snapping back to All.
+  const savedHist = useMemo(loadHistRange, [])
+  const [histRange, setHistRange] = useState<HistRange>(savedHist.range)
+  const [histFrom, setHistFrom] = useState(savedHist.from)
+  const [histTo, setHistTo] = useState(savedHist.to)
+  useEffect(() => {
+    try { localStorage.setItem(HIST_RANGE_LS, JSON.stringify({ range: histRange, from: histFrom, to: histTo })) } catch { /* private mode */ }
+  }, [histRange, histFrom, histTo])
   // v1.95.0 — symbol filter (user request): type any part of a symbol
   // ("aapl", "btc", "F") to narrow the history table client-side
   const [histSymbol, setHistSymbol] = useState('')

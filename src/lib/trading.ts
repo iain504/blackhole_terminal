@@ -532,8 +532,9 @@ export interface PlaceOrderBody {
   sourceRef?: string
   /** Task 10-k — which pipeline placed the order: 'algo' (default) embeds
    * `ttr-`, 'grid' embeds `ttg-` in the client_order_id so positions/history
-   * can attribute the trade to a grid. */
-  sourceKind?: 'algo' | 'grid'
+   * can attribute the trade to a grid. v2.12.25 — 'ai' embeds `tta-` so the
+   * AI Trade Adviser's auto-trader orders render as an AI source. */
+  sourceKind?: 'algo' | 'grid' | 'ai'
 }
 
 /**
@@ -676,15 +677,24 @@ function exitLegClientId(entryOrderId: string, kind: 'tp' | 'sl'): string {
  *   manual/plan entry:  ttb-<m>-tp<enc>-sl<enc>-<rand6>
  *   ALGO RUN entry:     ttr-<m>-<runRef>-tp<enc>-sl<enc>-<rand4>
  *   GRID entry (10-k):  ttg-<m>-<gridRef>-tp<enc>-sl<enc>-<rand4>
+ *   AI ADVISER (2.12.25): tta-<m>-<aiRef>-tp<enc>-sl<enc>-<rand4>
  * `ttb-` powers the chart's pending TP/SL display and the crypto OCO
  * supervisor; `ttr-` additionally carries the first 8 chars of the AlgoRun id
  * so every trade can be attributed Manual vs Algo (which strategy); `ttg-`
- * carries the first 8 chars of the GridTrade id (sourceKind 'grid').
+ * carries the first 8 chars of the GridTrade id (sourceKind 'grid'); `tta-`
+ * marks an AI Trade Adviser order (sourceKind 'ai', random ref — the adviser
+ * has no run entity, the SOURCE column only needs the prefix).
  */
-export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null, runRef?: string | null, sourceKind?: 'algo' | 'grid'): string {
+export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: number | null, runRef?: string | null, sourceKind?: 'algo' | 'grid' | 'ai'): string {
   const tpE = tp != null && tp > 0 ? encP(tp) : '0'
   const slE = sl != null && sl > 0 ? encP(sl) : '0'
-  if (runRef) {
+  if (sourceKind === 'ai') {
+    // the adviser has no run id — a random 6-char ref keeps the shared grammar
+    const aiRef = runRef || Math.random().toString(36).slice(2, 8)
+    const coid = `tta-${mode[0]}-${aiRef}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 6)}`
+    if (coid.length <= 48) return coid
+    // overflow fallback below (attribution lost, order stays valid)
+  } else if (runRef) {
     const prefix = sourceKind === 'grid' ? 'ttg' : 'ttr'
     const coid = `${prefix}-${mode[0]}-${runRef}-tp${tpE}-sl${slE}-${Math.random().toString(36).slice(2, 6)}`
     if (coid.length <= 48) return coid
@@ -695,23 +705,26 @@ export function encodePlanClientId(mode: TradeMode, tp: number | null, sl: numbe
 }
 
 /**
- * Decode the plan (and the algo/grid source tag) from a `ttb-…`/`ttr-…`/
- * `ttg-…` client_order_id. Returns null when the order was not placed by this
- * terminal (external orders — Alpaca dashboard, mobile app — carry uuid coids).
+ * Decode the plan (and the algo/grid/AI source tag) from a `ttb-…`/`ttr-…`/
+ * `ttg-…`/`tta-…` client_order_id. Returns null when the order was not placed
+ * by this terminal (external orders — Alpaca dashboard, mobile app — carry
+ * uuid coids).
  */
-export function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null; runRef: string | null; gridRef: string | null } | null {
+export function parseCryptoPlan(clientOrderId: string | undefined | null): { tp: number | null; sl: number | null; runRef: string | null; gridRef: string | null; aiRef: string | null } | null {
   const coid = clientOrderId || ''
   const pos = (s: string | undefined) => {
     const v = s ? parseInt(s, 10) / 1e6 : 0
     return v > 0 ? v : null
   }
   const algo = /^ttr-[a-z]-([a-z0-9]{6,12})-tp(\d+)-sl(\d+)-/.exec(coid)
-  if (algo) return { tp: pos(algo[2]), sl: pos(algo[3]), runRef: algo[1], gridRef: null }
+  if (algo) return { tp: pos(algo[2]), sl: pos(algo[3]), runRef: algo[1], gridRef: null, aiRef: null }
   const grid = /^ttg-[a-z]-([a-z0-9]{6,12})(?:-tp(\d+)-sl(\d+))?-/.exec(coid)
-  if (grid) return { tp: pos(grid[2]), sl: pos(grid[3]), runRef: null, gridRef: grid[1] }
+  if (grid) return { tp: pos(grid[2]), sl: pos(grid[3]), runRef: null, gridRef: grid[1], aiRef: null }
+  const ai = /^tta-[a-z]-([a-z0-9]{4,12})(?:-tp(\d+)-sl(\d+))?-/.exec(coid)
+  if (ai) return { tp: pos(ai[2]), sl: pos(ai[3]), runRef: null, gridRef: null, aiRef: ai[1] }
   const m = /^ttb-[a-z](?:-tp(\d+))?(?:-sl(\d+))?-/.exec(coid)
   if (!m) return null
-  return { tp: pos(m[1]), sl: pos(m[2]), runRef: null, gridRef: null }
+  return { tp: pos(m[1]), sl: pos(m[2]), runRef: null, gridRef: null, aiRef: null }
 }
 
 /**

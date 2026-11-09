@@ -35,6 +35,11 @@ export interface Quote {
   // Optional everywhere: absent = feed didn't return a usable quote.
   bid?: number
   ask?: number
+  /** v2.12.25 — true when this row was synthesized by the simulator
+   * (sim-fill for a symbol the real feed couldn't answer, or a no-keys demo
+   * snapshot). Truthful consumers (AI Trade Adviser context) must NOT treat
+   * these prices as market data. */
+  sim?: boolean
 }
 
 export interface NewsItem {
@@ -244,8 +249,9 @@ export interface ClosedTrade {
   /** bracket/OCO family ids involved, when known */
   groupIds: string[]
   /** placement source, decoded from the entry order's client_order_id
-   * ('ttb-' manual · 'ttr-' algo run · 'ttg-' grid, Task 10-k) */
-  source?: 'manual' | 'algo' | 'grid'
+   * ('ttb-' manual · 'ttr-' algo run · 'ttg-' grid, Task 10-k · 'tta-' AI
+   * Trade Adviser, v2.12.25) */
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
   /** when source === 'algo': the first 8 chars of the originating AlgoRun id */
   runRef?: string | null
   /** when source === 'algo': resolved strategy display name (server-side join with AlgoRun) */

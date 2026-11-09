@@ -28,9 +28,9 @@ export interface PendingOrderInfo {
   tpPrice: number | null
   slPrice: number | null
   managed: boolean
-  /** placement source: algo entries carry a `ttr-`, grid entries a `ttg-`
-   * client_order_id (Task 10-k) */
-  source: 'manual' | 'algo' | 'grid'
+  /** placement source: algo entries carry a `ttr-`, grid entries a `ttg-`,
+   * AI Trade Adviser entries a `tta-` client_order_id (Task 10-k, v2.12.25) */
+  source: 'manual' | 'algo' | 'grid' | 'ai'
   /** strategy display name when source === 'algo' */
   strategy?: string
   createdAt: string | null

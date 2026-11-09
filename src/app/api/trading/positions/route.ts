@@ -45,8 +45,9 @@ export interface PositionRow {
   /** placement source decoded from that lot's client_order_id — absent when
    * no open lot was found (rendered as '—' like other unknown columns).
    * 'grid' (Task 10-k): a `ttg-` tagged entry OR any open lot whose orderId
-   * appears in GridFill (retro-attribution of pre-tagging grid fills). */
-  source?: 'manual' | 'algo' | 'grid'
+   * appears in GridFill (retro-attribution of pre-tagging grid fills).
+   * 'ai' (v2.12.25): a `tta-` tagged entry — the AI Trade Adviser auto-trader. */
+  source?: 'manual' | 'algo' | 'grid' | 'ai'
   /** when source === 'algo': first 8 chars of the originating AlgoRun id */
   runRef?: string | null
   /** when source === 'algo': strategy display name (resolved from AlgoRun) */
@@ -62,7 +63,7 @@ export interface PositionRow {
 }
 
 export interface PositionSourceSlice {
-  source: 'manual' | 'algo' | 'grid'
+  source: 'manual' | 'algo' | 'grid' | 'ai'
   /** summed open qty across this slice's FIFO lots (float-trimmed) */
   qty: number
   /** when source === 'algo': the originating AlgoRun id prefix */
@@ -87,9 +88,9 @@ export interface PendingOrderRow {
   slPrice: number | null
   /** true when TP/SL ride along (managed complex order) */
   managed: boolean
-  /** placement source: algo entries carry a `ttr-`, grid entries a `ttg-`
-   * client_order_id (Task 10-k) */
-  source: 'manual' | 'algo' | 'grid'
+  /** placement source: algo entries carry a `ttr-`, grid entries a `ttg-`,
+   * AI Trade Adviser entries a `tta-` client_order_id (Task 10-k, v2.12.25) */
+  source: 'manual' | 'algo' | 'grid' | 'ai'
   /** strategy display name when source === 'algo' (resolved from AlgoRun) */
   strategy?: string
   createdAt: string | null
@@ -266,14 +267,15 @@ export async function GET(req: Request) {
         // first, tie → oldest) so every coexisting source stays visible.
         const lots = openLotsByNorm.get(normSymbol(p.symbol)) ?? []
         const oldest = lots[0]
-        type LotSrc = { source: 'manual' | 'algo' | 'grid'; qty: number; runRef: string | null; at: number }
+        type LotSrc = { source: 'manual' | 'algo' | 'grid' | 'ai'; qty: number; runRef: string | null; at: number }
         const lotSrcs: LotSrc[] = lots.map((l) => {
           const plan = parseCryptoPlan(l.clientOrderId)
           const isGrid = plan?.gridRef != null || gridOrderIds?.has(l.orderId) === true
+          const isAi = !isGrid && plan?.aiRef != null
           return {
-            source: isGrid ? ('grid' as const) : plan?.runRef ? ('algo' as const) : ('manual' as const),
+            source: isGrid ? ('grid' as const) : isAi ? ('ai' as const) : plan?.runRef ? ('algo' as const) : ('manual' as const),
             qty: l.qty,
-            runRef: !isGrid && plan?.runRef ? plan.runRef : null,
+            runRef: !isGrid && !isAi && plan?.runRef ? plan.runRef : null,
             at: new Date(l.entryTime).getTime() || 0,
           }
         })
@@ -447,7 +449,7 @@ export async function GET(req: Request) {
         tpPrice,
         slPrice,
         managed: Boolean(plan) || (o.legs?.length ?? 0) > 0,
-        source: plan?.gridRef ? 'grid' : plan?.runRef ? 'algo' : 'manual',
+        source: plan?.gridRef ? 'grid' : plan?.aiRef ? 'ai' : plan?.runRef ? 'algo' : 'manual',
         strategy: plan?.runRef ? stratNames.get(plan.runRef) : undefined,
         createdAt: o.created_at,
       })

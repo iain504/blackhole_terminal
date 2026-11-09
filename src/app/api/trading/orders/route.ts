@@ -20,6 +20,10 @@ interface PlaceBody {
   take_profit?: number
   stop_loss?: number
   trail_percent?: number
+  /** v2.12.25 — ONLY 'ai' is accepted from the HTTP route (the AI Trade
+   * Adviser auto-trader). 'algo'/'grid' attribution stays an internal
+   * server-side privilege — a client request must not be able to spoof it. */
+  sourceKind?: 'ai'
 }
 
 // GET /api/trading/orders?mode=paper&symbol=TSLA — OPEN orders (merged
@@ -138,6 +142,7 @@ export async function POST(req: Request) {
       time_in_force: body.time_in_force,
       take_profit: body.take_profit,
       stop_loss: body.stop_loss,
+      sourceKind: body.sourceKind === 'ai' ? 'ai' : undefined,
     })
     if (r.results.length === 0 && r.errors.length > 0) {
       // v2.12.23 — 'entry' kind: the auto-trader's crypto short entry used to

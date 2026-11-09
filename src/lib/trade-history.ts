@@ -40,11 +40,13 @@ const EPS = 1e-9
 
 /** Decode the placement source from the ENTRY order's client_order_id —
  * `ttr-` (algo run, runRef = first 8 of the AlgoRun id), `ttg-` (grid, Task
- * 10-k, gridRef = first 8 of the GridTrade id) vs `ttb-`/external (manual).
+ * 10-k, gridRef = first 8 of the GridTrade id), `tta-` (AI Trade Adviser,
+ * v2.12.25) vs `ttb-`/external (manual).
  * The strategy NAME is resolved server-side where the DB lives. */
 function sourceOf(entryClientOrderId: string | null): Pick<ClosedTrade, 'source' | 'runRef'> {
   const plan = parseCryptoPlan(entryClientOrderId)
   if (plan?.gridRef) return { source: 'grid', runRef: null }
+  if (plan?.aiRef) return { source: 'ai', runRef: null }
   if (plan?.runRef) return { source: 'algo', runRef: plan.runRef }
   return { source: 'manual', runRef: null }
 }

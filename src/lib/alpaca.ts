@@ -1031,8 +1031,10 @@ export async function getQuotes(
   }
 
   if (quotes.length === 0) {
+    // v2.12.25 — every demo row is tagged sim:true so truthful consumers
+    // (AI Trade Adviser context) can label the price as simulated
     return demoResult(
-      (reason) => ({ quotes: symbols.map((s) => simQuote(s)), demo: true, reason }),
+      (reason) => ({ quotes: symbols.map((s) => ({ ...simQuote(s), sim: true })), demo: true, reason }),
       lastStatus === 0 ? 'no-keys' : lastStatus ? (`alpaca-http-${lastStatus}` as DemoReason) : 'empty',
     )
   }
@@ -1041,7 +1043,8 @@ export async function getQuotes(
   let simFilled = false
   for (const s of symbols) {
     if (!have2.has(s)) {
-      quotes.push({ ...simQuote(s), symbol: s })
+      // v2.12.25 — sim rows carry sim:true (used to render silently as real)
+      quotes.push({ ...simQuote(s), symbol: s, sim: true })
       simFilled = true
     }
   }
