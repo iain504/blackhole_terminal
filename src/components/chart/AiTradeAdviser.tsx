@@ -10,8 +10,13 @@
 // chart container (pointer events, clamped so it can't be lost off-panel),
 // double-click or 「還原」 snaps back to the default dock; arrow keys move it
 // for keyboard users.
+// v2.12.21 — the panel follows the user's AI Agent lane (Settings → AI Agent
+// API): when a custom OpenAI-compatible endpoint is saved the hardcoded
+// EdgeZero model Select is REPLACED by a 「自訂 · model」 badge — the chat
+// route uses the saved model anyway, so offering edge0 choices there was
+// misleading. Re-probes on the tt:settings-changed event.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Sparkles, SendHorizontal, Square, X, LineChart, GripVertical } from 'lucide-react'
+import { Sparkles, SendHorizontal, Square, X, LineChart, GripVertical, Bot } from 'lucide-react'
 import {
   AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL,
   buildChartSnapshot, snapshotToText,
@@ -50,6 +55,8 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), h
 /** keep at least the header strip visible at the bottom edge */
 const MIN_VISIBLE = 36
 
+const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
+
 export function AiTradeAdviser({
   symbol,
   timeframe,
@@ -70,6 +77,9 @@ export function AiTradeAdviser({
   const [barError, setBarError] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
   const [pos, setPos] = useState<PanelPos>(null)
+  // v2.12.21 — the saved AI Agent config (Settings → AI Agent API) owns the
+  // model lane: non-null = show 「自訂 · model」 instead of the EdgeZero Select.
+  const [aiCustom, setAiCustom] = useState<{ model: string; host: string } | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
@@ -79,6 +89,24 @@ export function AiTradeAdviser({
     const el = scrollRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [turns, busy])
+
+  // follow the user's AI Agent lane; re-probe when Settings saves/removes it
+  useEffect(() => {
+    let alive = true
+    const probe = () =>
+      fetch('/api/settings/ai-agent')
+        .then((r) => r.json())
+        .then((j: { configured?: boolean; model?: string; endpointHost?: string }) => {
+          if (alive) setAiCustom(j.configured && j.model ? { model: j.model, host: j.endpointHost ?? '' } : null)
+        })
+        .catch(() => {})
+    probe()
+    window.addEventListener(SETTINGS_CHANGED_EVENT, probe)
+    return () => {
+      alive = false
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, probe)
+    }
+  }, [])
 
   // ---- move-able panel (v2.12.18) -----------------------------------------
 
@@ -245,18 +273,30 @@ export function AiTradeAdviser({
         </span>
       </div>
 
-      {/* model row + one-shot analyse */}
+      {/* model row + one-shot analyse — the Select only exists on the built-in
+          EdgeZero lane; with a saved AI Agent config the saved model is used
+          server-side, so the panel badges it instead of offering edge0 picks */}
       <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2">
-        <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
-          <SelectTrigger className="h-6 w-[150px] border-zinc-800 bg-zinc-900/80 px-2 text-[10px] text-zinc-300" aria-label="AI model">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-            {AI_TRADE_MODELS.map((m) => (
-              <SelectItem key={m.id} value={m.id} className="text-[10px]">{m.title}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {aiCustom ? (
+          <span
+            className="flex h-6 min-w-0 items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 text-[10px] font-medium text-violet-300"
+            title={`自訂 AI 端點 · ${aiCustom.host}（於 Settings → AI Agent 管理）`}
+          >
+            <Bot className="h-3 w-3 shrink-0" aria-hidden />
+            <span className="truncate">自訂 · {aiCustom.model}</span>
+          </span>
+        ) : (
+          <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
+            <SelectTrigger className="h-6 w-[150px] border-zinc-800 bg-zinc-900/80 px-2 text-[10px] text-zinc-300" aria-label="AI model">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+              {AI_TRADE_MODELS.map((m) => (
+                <SelectItem key={m.id} value={m.id} className="text-[10px]">{m.title}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
         <Button
           size="sm"
           className="ml-auto h-6 gap-1 bg-violet-600 px-2 text-[10px] text-white hover:bg-violet-500"
@@ -274,7 +314,7 @@ export function AiTradeAdviser({
           <div className="space-y-2 pt-1 text-center">
             <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900 lp-kai text-sm text-[#c2452d]" aria-hidden>道</div>
             <p className="text-[11px] leading-4 text-zinc-500">
-              以此圖已載入的K線計算技術快照，交給 EdgeZero 推演。<br />不外乎資料、不承諾行情。
+              以此圖已載入的K線計算技術快照，交給{aiCustom ? `自訂模型（${aiCustom.model}）` : 'EdgeZero'}推演。<br />不外乎資料、不承諾行情。
             </p>
           </div>
         )}
