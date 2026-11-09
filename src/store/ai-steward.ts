@@ -20,6 +20,10 @@
 // grid-managed inventory is listed for context but protected. Executed
 // actions ride the existing PATCH/DELETE trading routes, then the whole
 // cycle is POSTed to /api/ai-steward/events which stores + prunes.
+// v2.12.26 — the distilled 記憶 (lessons) are PERMANENT now: the events POST
+// mirrors every lesson row into the AiStewardLesson table (never retention-
+// purged), and each cycle feeds the newest-reinforced slice from that table
+// back into the prompt — the memory survives days, months, reloads, devices.
 //
 // Honesty contract: dry-run logs what WOULD happen without touching the
 // broker; every skip/refusal is recorded with its reason; a failed model
@@ -134,6 +138,18 @@ type StewardEventDraft = {
   payload?: Record<string, unknown>
 }
 
+// v2.12.26 — lessons are PERMANENT memory now: they live in the
+// AiStewardLesson table (never retention-purged; only a generous 300-row cap
+// trims the oldest never-reinforced ones). Every cycle distils lessons from
+// today's closed trades into that table (mirrored by the events POST) and
+// feeds the newest-reinforced slice back into the review prompt.
+export interface StewardLesson {
+  id: string
+  text: string
+  createdAt: string // first learned
+  lastSeenAt: string // last reinforced
+}
+
 export interface StewardLogEntry {
   id: number
   at: number
@@ -148,6 +164,7 @@ interface AiStewardState {
   nextRunAt: number | null
   lastSummary: string | null
   events: StewardEvent[] // latest DB events (newest first)
+  lessons: StewardLesson[] // PERMANENT memory (v2.12.26) — fed back each cycle
   log: StewardLogEntry[]
   /** v2.12.24 — who is the elected runner for this engine (cross-device
    *  sync). null = unknown/disabled; isMe:false = another device runs it. */
@@ -159,6 +176,12 @@ interface AiStewardState {
   cancelRun: () => void
   clearLog: () => void
   setEvents: (events: StewardEvent[]) => void
+  setLessons: (lessons: StewardLesson[]) => void
+  /** curate the memory: remove one lesson (DELETE /api/ai-steward/lessons?id=) */
+  deleteLesson: (id: string) => Promise<void>
+  /** v2.12.26 — MANUAL lesson: the user types their own rule into the panel
+   *  (POST /api/ai-steward/lessons). Returns false when the server refused. */
+  addLesson: (text: string) => Promise<boolean>
   /** sync-layer hooks (v2.12.24) — not for UI use */
   setRunnerInfo: (info: AiOpsRunnerInfo | null) => void
   adoptConfig: (cfg: unknown) => void
@@ -180,6 +203,7 @@ export const useAiStewardStore = create<AiStewardState>((set, get) => ({
   nextRunAt: null,
   lastSummary: null,
   events: [],
+  lessons: [],
   log: [],
   runnerInfo: null,
   addLog: (level, text) => set((s) => ({ log: [...s.log, { id: ++logSeq, at: Date.now(), level, text }].slice(-250) })),
@@ -211,6 +235,41 @@ export const useAiStewardStore = create<AiStewardState>((set, get) => ({
   cancelRun: () => runAbort?.abort(),
   clearLog: () => set({ log: [] }),
   setEvents: (events) => set({ events }),
+  setLessons: (lessons) => set({ lessons }),
+  deleteLesson: async (id) => {
+    // optimistic remove, then the server call; on failure refetch the truth
+    const prev = get().lessons
+    set({ lessons: prev.filter((l) => l.id !== id) })
+    try {
+      const r = await fetch(`/api/ai-steward/lessons?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    } catch {
+      set({ lessons: prev })
+      useAiStewardStore.getState().addLog('warn', '教訓刪除失敗 — 已還原')
+    }
+  },
+  addLesson: async (raw) => {
+    const text = raw.trim().replace(/\s+/g, ' ').slice(0, 200)
+    if (!text) return false
+    try {
+      const r = await fetch('/api/ai-steward/lessons', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lessons: [text] }),
+      })
+      const j = await r.json() as { ok?: boolean; lessons?: StewardLesson[]; error?: string } | null
+      if (r.ok && j?.ok && Array.isArray(j.lessons)) {
+        set({ lessons: j.lessons })
+        useAiStewardStore.getState().addLog('success', `已加入教訓（永久記憶）：${text.slice(0, 40)}${text.length > 40 ? '…' : ''}`)
+        return true
+      }
+      useAiStewardStore.getState().addLog('warn', `教訓加入失敗 — ${j?.error || `HTTP ${r.status}`}`)
+      return false
+    } catch {
+      useAiStewardStore.getState().addLog('warn', '教訓加入失敗 — 連線問題')
+      return false
+    }
+  },
   setRunnerInfo: (info) => set({ runnerInfo: info }),
   adoptConfig: (cfg) => {
     // Server-sent config (cross-device sync). `enabled` is owned by the
@@ -443,12 +502,12 @@ export async function runStewardOnce(): Promise<void> {
 
   try {
     // 1) data pulls — positions(+exits+pending), today's realized trades,
-    //    stored memory (lessons survive reloads via the DB)
+    //    stored memory (v2.12.26 — PERMANENT lessons, never retention-purged)
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0)
     const [posRes, histRes, memRes] = await Promise.all([
       fetchJson(`/api/trading/positions?mode=${cfg.mode}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson(`/api/trading/history?mode=${cfg.mode}&from=${encodeURIComponent(midnight.toISOString())}&limit=100`, { signal: sig }).catch(() => ({ status: 0, j: null })),
-      fetchJson('/api/ai-steward/events', { signal: sig }).catch(() => ({ status: 0, j: null })),
+      fetchJson('/api/ai-steward/lessons', { signal: sig }).catch(() => ({ status: 0, j: null })),
     ])
 
     const posJ = posRes.j as { positions?: PositionRow[]; exits?: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>; pending?: PendingRow[]; keysMissing?: unknown; authError?: unknown } | null
@@ -457,9 +516,10 @@ export async function runStewardOnce(): Promise<void> {
     const pending = Array.isArray(posJ?.pending) ? posJ!.pending : []
     const histJ = histRes.j as { trades?: ClosedTrade[]; configured?: boolean } | null
     const trades = Array.isArray(histJ?.trades) ? histJ!.trades.slice(0, 12) : []
-    const memJ = memRes.j as { events?: StewardEvent[] } | null
-    const memEvents = Array.isArray(memJ?.events) ? memJ!.events : []
-    const lessons = memEvents.filter((e) => e.kind === 'lesson').slice(0, 8).map((e) => e.detail)
+    const memJ = memRes.j as { lessons?: StewardLesson[] } | null
+    const memLessons = Array.isArray(memJ?.lessons) ? memJ!.lessons : []
+    // permanent memory: newest-reinforced first, top slice into the prompt
+    const lessons = memLessons.slice(0, 16).map((l) => l.text)
 
     // 2) live quotes: market context + every held/pending symbol
     const heldSyms = positions.map((p) => p.tradeSymbol || p.symbol)
@@ -867,6 +927,15 @@ export async function runStewardOnce(): Promise<void> {
       if (post.status === 200 && pj?.ok) {
         useAiStewardStore.setState({ events: Array.isArray(pj.events) ? pj.events : [] })
         if ((pj.pruned ?? 0) > 0) st0.addLog('info', `已清理 ${pj!.pruned} 條過期護倉記錄（保留 ${cfg.purgeDays} 天）`)
+        // v2.12.26 — the POST mirrored lesson rows into the permanent memory
+        // table; refresh the store's copy so the panel + next cycle see them
+        try {
+          const lr = await fetchJson('/api/ai-steward/lessons', { signal: sig })
+          const lj = lr.j as { lessons?: StewardLesson[] } | null
+          if (lr.status === 200 && Array.isArray(lj?.lessons)) {
+            useAiStewardStore.setState({ lessons: lj!.lessons })
+          }
+        } catch { /* non-fatal — next cycle refetches */ }
       } else {
         st0.addLog('warn', `護倉記錄寫入失敗 — ${pj?.error || `HTTP ${post.status}`}（動作已執行，僅審計未存）`)
       }

@@ -42,6 +42,23 @@ const EMPTY_CTX: CtxState = { accountLine: null, positions: [], quotes: [], fetc
 // save; kept as a literal so this tab doesn't pull the whole dialog module in.
 const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
 
+// v2.12.26 — the right AI bar (自動交易 + 護倉 + context cards) is RESIZABLE:
+// drag the separator between the chat and the bar, use ←/→ keys (Shift = big
+// step), or double-click to reset. Width persists per browser
+// (bh-aitrade-barw-v1); mobile stacks vertically so the handle hides below lg.
+const BAR_W_LS_KEY = 'bh-aitrade-barw-v1'
+const BAR_W_MIN = 260
+const BAR_W_MAX = 560
+const BAR_W_DEFAULT = 320
+function loadBarWidth(): number {
+  try {
+    const n = Number(window.localStorage.getItem(BAR_W_LS_KEY))
+    return Number.isFinite(n) && n > 0 ? Math.min(BAR_W_MAX, Math.max(BAR_W_MIN, Math.round(n))) : BAR_W_DEFAULT
+  } catch {
+    return BAR_W_DEFAULT
+  }
+}
+
 export default function AiTradeTab() {
   const watchlists = useTerminal((s) => s.watchlists)
   // v2.12.19 — which watchlist feeds the quotes card AND the auto-trade scan
@@ -67,6 +84,44 @@ export default function AiTradeTab() {
   const [ctxBusy, setCtxBusy] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // v2.12.26 — resizable right AI bar: width state + pointer-drag handling
+  const [barW, setBarW] = useState<number>(loadBarWidth)
+  const barDrag = useRef<{ startX: number; startW: number } | null>(null)
+  const persistBarW = useCallback((w: number) => {
+    try { window.localStorage.setItem(BAR_W_LS_KEY, String(w)) } catch { /* private mode */ }
+  }, [])
+  const onBarSepDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    e.currentTarget.setPointerCapture(e.pointerId)
+    barDrag.current = { startX: e.clientX, startW: barW }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
+  const onBarSepMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = barDrag.current
+    if (!d) return
+    // sidebar sits on the RIGHT: dragging left grows it, dragging right shrinks
+    setBarW(Math.min(BAR_W_MAX, Math.max(BAR_W_MIN, Math.round(d.startW - (e.clientX - d.startX)))))
+  }
+  const onBarSepEnd = () => {
+    if (!barDrag.current) return
+    barDrag.current = null
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+    setBarW((w) => { persistBarW(w); return w })
+  }
+  const onBarSepKey = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 48 : 16
+    let next: number | null = null
+    if (e.key === 'ArrowLeft') next = barW + step // ← widens the right-side bar
+    if (e.key === 'ArrowRight') next = barW - step
+    if (next !== null) {
+      e.preventDefault()
+      const clamped = Math.min(BAR_W_MAX, Math.max(BAR_W_MIN, next))
+      setBarW(clamped)
+      persistBarW(clamped)
+    }
+  }
 
   // health probe on mount (re-probed when Settings saves an AI Agent change) —
   // honest 在線/離線 pill + which lane is live (custom endpoint vs EdgeZero)
@@ -347,9 +402,12 @@ export default function AiTradeTab() {
         </div>
       </header>
 
-      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 lg:flex-row lg:overflow-hidden">
+      <div
+        className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 lg:flex-row lg:overflow-hidden"
+        style={{ '--bar-w': `${barW}px` } as React.CSSProperties}
+      >
         {/* chat column */}
-        <section className="flex min-h-0 flex-1 flex-col rounded-lg border border-zinc-800 bg-zinc-900/40" aria-label="AI 對話">
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-lg border border-zinc-800 bg-zinc-900/40" aria-label="AI 對話">
           <div ref={scrollRef} className="terminal-scroll min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
             {messages.length === 0 && !busy && (
               <div className="flex h-full flex-col items-center justify-center gap-4 py-10 text-center">
@@ -429,8 +487,30 @@ export default function AiTradeTab() {
           </div>
         </section>
 
+        {/* v2.12.26 — drag handle: resize the right AI bar (desktop only) */}
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="調整右側 AI 欄寬度 — 拖曳、左右方向鍵（Shift 大步進）、雙擊重設"
+          aria-valuemin={BAR_W_MIN}
+          aria-valuemax={BAR_W_MAX}
+          aria-valuenow={barW}
+          className="hidden w-2 shrink-0 cursor-col-resize rounded-full bg-transparent transition-colors hover:bg-violet-500/25 focus-visible:bg-violet-500/40 focus-visible:outline-none active:bg-violet-500/30 relative lg:block"
+          data-testid="ai-bar-resizer"
+          onPointerDown={onBarSepDown}
+          onPointerMove={onBarSepMove}
+          onPointerUp={onBarSepEnd}
+          onPointerCancel={onBarSepEnd}
+          onDoubleClick={() => { setBarW(BAR_W_DEFAULT); persistBarW(BAR_W_DEFAULT) }}
+          onKeyDown={onBarSepKey}
+          title="拖曳調整 AI 欄寬度 · 雙擊重設"
+        >
+          <span className="pointer-events-none absolute left-1/2 top-1/2 h-9 w-0.5 -translate-x-1/2 -translate-y-1/2 rounded bg-zinc-700" aria-hidden />
+        </div>
+
         {/* context sidebar */}
-        <aside className="flex w-full shrink-0 flex-col gap-3 lg:w-80 lg:overflow-y-auto terminal-scroll" aria-label="上下文資料">
+        <aside className="flex w-full shrink-0 flex-col gap-3 lg:w-[var(--bar-w)] lg:overflow-y-auto terminal-scroll" aria-label="上下文資料">
           {/* v2.12.18 — AI 自動交易：定期掃描關注清單，達門檻自動下單（TL/SL） */}
           <AiAutoTradePanel />
           {/* v2.12.22 — AI 護倉：定期維護持倉 TP/SL、掛單與今日平倉檢討（DB 記錄+定期清理） */}

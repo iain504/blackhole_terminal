@@ -1,19 +1,22 @@
 'use client'
 
-// AI 護倉 control panel (v2.12.22) — rendered in the AI Trade tab sidebar,
+// AI 護倉 control panel (v2.12.26) — rendered in the AI Trade tab sidebar,
 // under the auto-trade scanner. Pure UI: state + the periodic review engine
 // live in @/store/ai-steward (module scope), so the steward keeps patrolling
 // when this tab is unmounted. It periodically reviews (1) open positions —
 // TP/SL maintenance against performance/US market/VIX, (2) pending orders —
 // re-price or cancel when the market moved away, (3) today's closed trades —
 // distils reusable lessons. Every action is stored in the DB via
-// /api/ai-steward/events and pruned by retention (purgeDays).
+// /api/ai-steward/events and pruned by retention (purgeDays); the distilled
+// lessons (記取的教訓) live in the PERMANENT AiStewardLesson memory table
+// (v2.12.26 — never retention-purged, fed back into every review cycle,
+// curated per-lesson via /api/ai-steward/lessons).
 import { useEffect, useState } from 'react'
 import {
   ShieldCheck, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX,
-  Minus, BookOpen, RefreshCw,
+  Minus, BookOpen, RefreshCw, X, Plus,
 } from 'lucide-react'
-import { useAiStewardStore, type StewardEvent } from '@/store/ai-steward'
+import { useAiStewardStore, type StewardEvent, type StewardLesson } from '@/store/ai-steward'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -82,6 +85,22 @@ export default function AiStewardPanel() {
   const setEvents = useAiStewardStore((s) => s.setEvents)
   // v2.12.24 — cross-device sync: who is the elected runner (null = off/unknown)
   const runnerInfo = useAiStewardStore((s) => s.runnerInfo)
+  // v2.12.26 — PERMANENT lesson memory + its store hooks
+  const lessons = useAiStewardStore((s) => s.lessons)
+  const setLessons = useAiStewardStore((s) => s.setLessons)
+  const deleteLesson = useAiStewardStore((s) => s.deleteLesson)
+  const addLesson = useAiStewardStore((s) => s.addLesson)
+  // manual lesson input (v2.12.26 — the user's own rules live in the same memory)
+  const [lessonDraft, setLessonDraft] = useState('')
+  const [addingLesson, setAddingLesson] = useState(false)
+  const submitLesson = async () => {
+    const text = lessonDraft.trim()
+    if (!text || addingLesson) return
+    setAddingLesson(true)
+    const ok = await addLesson(text)
+    setAddingLesson(false)
+    if (ok) setLessonDraft('')
+  }
 
   // pull the DB trail on mount (also feeds the engine's 記憶 before the first cycle)
   useEffect(() => {
@@ -90,8 +109,13 @@ export default function AiStewardPanel() {
       .then((r) => r.json())
       .then((j: { events?: StewardEvent[] }) => { if (alive && Array.isArray(j.events)) setEvents(j.events) })
       .catch(() => {})
+    // v2.12.26 — the PERMANENT lesson memory (never retention-purged)
+    fetch('/api/ai-steward/lessons')
+      .then((r) => r.json())
+      .then((j: { lessons?: StewardLesson[] }) => { if (alive && Array.isArray(j.lessons)) setLessons(j.lessons) })
+      .catch(() => {})
     return () => { alive = false }
-  }, [setEvents])
+  }, [setEvents, setLessons])
 
   // 1s ticker for the next-run countdown (only while armed)
   const [, tickTock] = useState(0)
@@ -101,7 +125,6 @@ export default function AiStewardPanel() {
     return () => clearInterval(t)
   }, [cfg.enabled, nextRunAt])
 
-  const lessons = events.filter((e) => e.kind === 'lesson').slice(0, 6)
   const shownEvents = events.filter((e) => e.kind !== 'lesson').slice(0, 40)
   // v2.12.24 — enabled on the account but the elected runner is ANOTHER
   // device: honest amber pill (the steward is NOT running in this browser).
@@ -114,7 +137,7 @@ export default function AiStewardPanel() {
       const j = await r.json() as { ok?: boolean; deleted?: number }
       if (j.ok) {
         setEvents([])
-        addLog('info', `已清除 ${j.deleted ?? 0} 條護倉記錄`)
+        addLog('info', `已清除 ${j.deleted ?? 0} 條護倉記錄（教訓永久保留）`)
       }
     } catch { /* offline — leave as-is */ }
   }
@@ -322,20 +345,63 @@ export default function AiStewardPanel() {
         )}
       </div>
 
-      {/* DB trail: lessons (the memory) */}
-      {lessons.length > 0 && (
-        <div className="mt-2">
-          <span className="mb-1 block text-[9px] font-semibold uppercase tracking-widest text-zinc-500">記取的教訓（餵回每輪檢視）</span>
-          <ul className="max-h-32 space-y-1 overflow-y-auto terminal-scroll pr-1">
-            {lessons.map((e) => (
-              <li key={e.id} className="flex items-start gap-1.5 rounded border border-violet-900/40 bg-violet-500/5 px-1.5 py-1">
+      {/* PERMANENT memory: lessons (v2.12.26 — never retention-purged) */}
+      <div className="mt-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[9px] font-semibold uppercase tracking-widest text-zinc-500">記取的教訓（永久記憶 · 餵回每輪檢視）</span>
+          <span className="text-[9px] text-zinc-600">{lessons.length} 條</span>
+        </div>
+        {/* manual add — the user's own rules join the AI's distilled memory */}
+        <div className="mb-1.5 flex items-center gap-1">
+          <Input
+            value={lessonDraft}
+            onChange={(e) => setLessonDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) void submitLesson() }}
+            placeholder="手動加入教訓…（Enter 或＋）"
+            maxLength={200}
+            className="h-7 min-w-0 flex-1 border-zinc-800 bg-zinc-900/80 px-2 text-[10px] text-zinc-200 placeholder:text-zinc-600"
+            aria-label="手動加入教訓"
+            data-testid="lesson-input"
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 shrink-0 gap-0.5 border-violet-800/60 px-1.5 text-[10px] text-violet-300 hover:bg-violet-500/10"
+            onClick={() => void submitLesson()}
+            disabled={!lessonDraft.trim() || addingLesson}
+            aria-label="加入教訓"
+            data-testid="lesson-add"
+          >
+            <Plus className="h-3 w-3" aria-hidden /> 加入
+          </Button>
+        </div>
+        {lessons.length === 0 ? (
+          <p className="text-[10px] leading-4 text-zinc-600">尚無教訓 — 檢視今日平倉後歸納的改善會永久保存（不隨記錄清理刪除），並於每輪檢視時回饋給 AI。</p>
+        ) : (
+          <ul className="max-h-44 space-y-1 overflow-y-auto terminal-scroll pr-1">
+            {lessons.map((l) => (
+              <li key={l.id} className="flex items-start gap-1.5 rounded border border-violet-900/40 bg-violet-500/5 px-1.5 py-1">
                 <BookOpen className="mt-0.5 h-3 w-3 shrink-0 text-violet-400" aria-hidden />
-                <span className="text-[10px] leading-4 text-zinc-300">{e.detail}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[10px] leading-4 text-zinc-300">{l.text}</span>
+                  <span className="mt-0.5 block text-[8px] text-zinc-600" title={`首次學於 ${new Date(l.createdAt).toLocaleString()}`}>
+                    學於 {new Date(l.createdAt).toLocaleDateString()}{l.lastSeenAt !== l.createdAt ? ` · 最近強化 ${new Date(l.lastSeenAt).toLocaleDateString()}` : ''}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void deleteLesson(l.id)}
+                  className="mt-0.5 rounded p-0.5 text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300"
+                  aria-label={`刪除教訓：${l.text}`}
+                  title="刪除此教訓（其餘永久保留）"
+                >
+                  <X className="h-3 w-3" aria-hidden />
+                </button>
               </li>
             ))}
           </ul>
-        </div>
-      )}
+        )}
+      </div>
 
       <p className="mt-2 text-[9px] leading-4 text-zinc-600">
         安全：只動手動來源的倉/單（algo/grid 引擎管理中的不碰）；每個動作須過信心門檻與方位/幅度檢查；每輪有動作上限。AI 建議僅供參考，不構成投資建議。

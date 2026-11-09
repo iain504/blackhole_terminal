@@ -655,6 +655,24 @@ model AiStewardEvent {
   @@index([userId, createdAt])
 }
 
+// v2.12.26 — permanent steward memory. The ask: "need to remember
+// 記取的教訓（餵回每輪檢視） permanently" — distilled lessons must NOT be
+// purged with the audit trail (AiStewardEvent rows are bounded by purgeDays +
+// a hard cap, so lessons used to vanish after a few days). One row per
+// (user, lesson text); re-observed lessons bump lastSeenAt so reinforced
+// insights stay fresh; the table is capped generously (300) — oldest
+// never-reinforced rows fall off first, everything else lives forever.
+model AiStewardLesson {
+  id         String   @id @default(cuid())
+  userId     String
+  text       String
+  createdAt  DateTime @default(now()) // first learned
+  lastSeenAt DateTime @default(now()) // last reinforced (bumped on re-observation)
+
+  @@unique([userId, text])
+  @@index([userId, lastSeenAt])
+}
+
 // v2.12.24 — account-level enabled/config state for the two client-run AI
 // engines (AI 自動交易 scanner + AI 護倉 steward), so every signed-in computer
 // sees the same toggles (the engines used to be localStorage-only — device 2

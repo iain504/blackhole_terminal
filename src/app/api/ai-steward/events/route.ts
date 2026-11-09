@@ -5,6 +5,7 @@ import { requireUser, UnauthorizedError } from '@/lib/auth'
 import { handleError } from '@/lib/api-helpers'
 import { rateLimit } from '@/lib/rate-limit'
 import { readJsonSafe } from '@/lib/validation'
+import { trimAiStewardLessons } from '@/lib/ai-steward-lessons'
 
 export const dynamic = 'force-dynamic'
 
@@ -14,6 +15,9 @@ export const dynamic = 'force-dynamic'
 // panel (and the engine's cross-reload 記憶). Pruning happens inside POST:
 // rows older than the retention window are deleted and a hard per-user cap
 // bounds the table — "stored in db and purged periodically to save space".
+// v2.12.26 — lesson rows are MIRRORED into the permanent AiStewardLesson
+// table before the prune runs, so distilled lessons survive the retention
+// window and the cap (the audit row still ages out; the memory never does).
 const KINDS = new Set(['position', 'order', 'lesson', 'cycle', 'error'])
 const STATUSES = new Set(['executed', 'skipped', 'failed', 'dry_run', 'stored'])
 const MAX_PER_POST = 40
@@ -91,6 +95,20 @@ export async function POST(req: Request) {
 
     if (rows.length > 0) {
       await db.aiStewardEvent.createMany({ data: rows as Prisma.AiStewardEventCreateManyInput[] })
+      // v2.12.26 — mirror lesson rows into the PERMANENT memory table before
+      // the prune below: same text re-observed bumps lastSeenAt (reinforced),
+      // new texts are added. The audit rows above still age out; these don't.
+      const lessonRows = rows.filter((r) => r.kind === 'lesson') as { detail?: string }[]
+      for (const lr of lessonRows) {
+        const text = String(lr.detail ?? '').trim()
+        if (!text) continue
+        await db.aiStewardLesson.upsert({
+          where: { userId_text: { userId: user.id, text } },
+          create: { userId: user.id, text },
+          update: { lastSeenAt: new Date() },
+        })
+      }
+      await trimAiStewardLessons(user.id)
     }
 
     // ---- prune to save space ------------------------------------------------
