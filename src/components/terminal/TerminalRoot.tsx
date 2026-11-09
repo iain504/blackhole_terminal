@@ -10,6 +10,7 @@ import dynamic from 'next/dynamic'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTerminal, SessionUser, Alert } from '@/store/terminal'
 import { resumeAiAutoIfNeeded } from '@/store/ai-auto-trade'
+import { resumeAiStewardIfNeeded } from '@/store/ai-steward'
 import AuthForms from '@/components/auth/AuthForms'
 import SettingsDialog from '@/components/settings/SettingsDialog'
 import { TabBar } from './TabBar'
@@ -138,9 +139,11 @@ export function TerminalRoot({ onExit }: { onExit?: () => void }) {
 
   // v2.12.18 — AI 自動交易：若上次啟用過掃描器，登入後自動恢復週期掃描
   // （module-scope engine，切走 AI Trade 分頁也不停；冪等，重複呼叫無副作用）。
+  // v2.12.22 — AI 護倉同樣冪等恢復巡檢。
   useEffect(() => {
     if (!user) return
     resumeAiAutoIfNeeded()
+    resumeAiStewardIfNeeded()
   }, [user])
 
   // v2.7.3 — global 401 watcher: if the server-side session dies under an

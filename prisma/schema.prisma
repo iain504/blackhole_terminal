@@ -634,3 +634,23 @@ model AgentScanCache {
 
   @@id([symbol, lane])
 }
+
+// v2.12.22 — AI 護倉 (portfolio steward) audit trail: one row per steward
+// action/observation — position TP/SL amend, pending-order amend/cancel,
+// close, hold note, review lesson, cycle summary, error. The engine prunes
+// in the same POST that writes: rows older than the user's retention window
+// (purgeDays, clamped 3–60) are deleted, plus a hard per-user cap keeps this
+// table tiny no matter what.
+model AiStewardEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  kind      String // 'position' | 'order' | 'lesson' | 'cycle' | 'error'
+  action    String // 'amend_tp' | 'amend_sl' | 'amend_entry' | 'cancel' | 'close' | 'hold' | 'keep' | 'summary' | 'lesson'
+  symbol    String?
+  status    String // 'executed' | 'skipped' | 'failed' | 'dry_run' | 'stored'
+  detail    String // human-readable verdict reason (server-bounded)
+  payload   Json? // {from,to,confidence,reason,orderId,...} audit detail
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}

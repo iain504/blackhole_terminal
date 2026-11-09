@@ -12,6 +12,7 @@ import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
 import AiAutoTradePanel from './AiAutoTradePanel'
+import AiStewardPanel from './AiStewardPanel'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
@@ -387,6 +388,8 @@ export default function AiTradeTab() {
         <aside className="flex w-full shrink-0 flex-col gap-3 lg:w-80 lg:overflow-y-auto terminal-scroll" aria-label="上下文資料">
           {/* v2.12.18 — AI 自動交易：定期掃描關注清單，達門檻自動下單（TL/SL） */}
           <AiAutoTradePanel />
+          {/* v2.12.22 — AI 護倉：定期維護持倉 TP/SL、掛單與今日平倉檢討（DB 記錄+定期清理） */}
+          <AiStewardPanel />
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
             <div className="mb-2 flex items-center justify-between">
               <span className="text-[10px] font-semibold uppercase tracking-widest text-zinc-500">帳戶</span>
