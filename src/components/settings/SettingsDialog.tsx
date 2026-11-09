@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Check, Download, FileJson, KeyRound, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
+import { AlertTriangle, Bot, Check, Download, FileJson, KeyRound, Palette, Percent, PlugZap, Send, Sparkles, Sunrise, Upload } from 'lucide-react';
 import { TaijiSpinner } from '@/components/theme/TaoistLoader';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -56,6 +56,16 @@ type SettingsState = {
   sessionSplash?: boolean;
 };
 
+/** v2.12.20 — AI Agent endpoint status (GET /api/settings/ai-agent, masked). */
+type AiAgentStatus = {
+  configured: boolean;
+  endpoint: string;
+  endpointHost: string;
+  model: string;
+  keyMasked: string;
+  secretSet: boolean;
+};
+
 const DEFAULT_GLOW_GRID = '#10b981';
 const DEFAULT_GLOW_ALGO = '#a855f7';
 
@@ -94,6 +104,21 @@ export default function SettingsDialog({
   const [testingPaper, setTestingPaper] = useState(false);
   const [testingLive, setTestingLive] = useState(false);
   const [testingTelegram, setTestingTelegram] = useState(false);
+
+  // v2.12.20 — AI Agent API (the user's own OpenAI-compatible endpoint for
+  // the AI adviser + auto-trade). Self-contained section: its own Save/Test
+  // buttons hit /api/settings/ai-agent, independent of the main form save.
+  // Credential fields only ride along when TOUCHED — an empty-but-touched key
+  // explicitly removes the credential (key-less endpoints like LAN Ollama).
+  const [aiStatus, setAiStatus] = useState<AiAgentStatus | null>(null);
+  const [aiEndpoint, setAiEndpoint] = useState('');
+  const [aiModel, setAiModel] = useState('');
+  const [aiKey, setAiKey] = useState('');
+  const [aiSecret, setAiSecret] = useState('');
+  const [aiKeyTouched, setAiKeyTouched] = useState(false);
+  const [aiSecretTouched, setAiSecretTouched] = useState(false);
+  const [aiTesting, setAiTesting] = useState(false);
+  const [aiSaving, setAiSaving] = useState(false);
 
   // ---- Task 28 — appearance (UI theme) ----
   // The applied theme (html class + localStorage) IS the source of truth for
@@ -256,7 +281,11 @@ export default function SettingsDialog({
     liveSecret.trim() ||
     token.trim() ||
     chatId.trim() !== (state?.telegram?.chatId ?? '') ||
-    (glowLoaded && (glowGrid !== (state?.glow?.grid ?? DEFAULT_GLOW_GRID) || glowAlgo !== (state?.glow?.algo ?? DEFAULT_GLOW_ALGO)))
+    (glowLoaded && (glowGrid !== (state?.glow?.grid ?? DEFAULT_GLOW_GRID) || glowAlgo !== (state?.glow?.algo ?? DEFAULT_GLOW_ALGO))) ||
+    // v2.12.20 — unsaved AI Agent edits (endpoint compared slash-insensitively;
+    // typed-but-unsaved credentials always count)
+    ((aiStatus && (aiEndpoint.replace(/\/+$/, '').trim() !== aiStatus.endpoint || aiModel.trim() !== aiStatus.model || aiKey.trim() || aiSecret.trim())) ||
+      (!aiStatus && Boolean(aiEndpoint.trim() || aiModel.trim() || aiKey.trim() || aiSecret.trim())))
   );
 
   const confirmDiscard = useCallback(
@@ -275,10 +304,24 @@ export default function SettingsDialog({
     setLoading(true);
     setLoadError('');
     try {
-      const res = await fetch('/api/settings');
+      const [res, aiRes] = await Promise.all([
+        fetch('/api/settings'),
+        fetch('/api/settings/ai-agent').catch(() => null),
+      ]);
       if (!res.ok) throw new Error(`Failed to load settings (${res.status}).`);
       const data: SettingsState = await res.json();
       setState(data);
+      // v2.12.20 — AI Agent status (masked) + field prefill
+      if (aiRes && aiRes.ok) {
+        const ai = (await aiRes.json()) as AiAgentStatus;
+        setAiStatus(ai);
+        setAiEndpoint(ai.configured ? ai.endpoint : '');
+        setAiModel(ai.configured ? ai.model : '');
+        setAiKey('');
+        setAiSecret('');
+        setAiKeyTouched(false);
+        setAiSecretTouched(false);
+      }
       setChatId(data?.telegram?.chatId ?? '');
       setNotifyFills(data?.telegram?.notifyFills !== false);
       setNotifyCloses(data?.telegram?.notifyCloses !== false);
@@ -480,6 +523,123 @@ export default function SettingsDialog({
     }
   }
 
+  // ---- v2.12.20 — AI Agent API handlers ----
+  function applyAiStatus(d: AiAgentStatus) {
+    setAiStatus(d);
+    setAiEndpoint(d.configured ? d.endpoint : '');
+    setAiModel(d.configured ? d.model : '');
+    setAiKey('');
+    setAiSecret('');
+    setAiKeyTouched(false);
+    setAiSecretTouched(false);
+  }
+
+  // Test the TYPED endpoint (blank fields fall back to the stored values) with
+  // a real minimal chat call — proves reachability AND the model name in one
+  // shot, before anything is saved.
+  async function handleTestAi() {
+    setAiTesting(true);
+    try {
+      const res = await fetch('/api/settings/ai-agent/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          endpoint: aiEndpoint.trim() || undefined,
+          model: aiModel.trim() || undefined,
+          ...(aiKeyTouched ? { apiKey: aiKey } : {}),
+          ...(aiSecretTouched ? { apiSecret: aiSecret } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok) {
+        toast({
+          title: 'AI endpoint working ✓',
+          description: `${data.model} replied in ${((data.latencyMs ?? 0) / 1000).toFixed(1)}s — press "Save AI endpoint" to switch to it.`,
+        });
+      } else {
+        toast({
+          title: 'AI endpoint test failed',
+          description: data?.error || `Test failed (${res.status}).`,
+          variant: 'destructive',
+        });
+      }
+    } catch (err) {
+      toast({
+        title: 'Test failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setAiTesting(false);
+    }
+  }
+
+  async function handleSaveAi() {
+    const endpoint = aiEndpoint.trim();
+    const model = aiModel.trim();
+    if (!endpoint || !model) {
+      toast({
+        title: 'Missing fields',
+        description: 'Endpoint URL and Model are both required.',
+        variant: 'destructive',
+      });
+      return;
+    }
+    setAiSaving(true);
+    try {
+      const payload: Record<string, string> = { endpoint, model };
+      if (aiKeyTouched) payload.apiKey = aiKey;
+      if (aiSecretTouched) payload.apiSecret = aiSecret;
+      const res = await fetch('/api/settings/ai-agent', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || `Save failed (${res.status}).`);
+      applyAiStatus(data as AiAgentStatus);
+      toast({
+        title: 'AI Agent saved',
+        description: `${data.endpointHost} · ${data.model} — the adviser and auto-trade now use your endpoint.`,
+      });
+      window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_EVENT));
+    } catch (err) {
+      toast({
+        title: 'Save failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setAiSaving(false);
+    }
+  }
+
+  async function handleDisableAi() {
+    if (
+      !window.confirm(
+        'Remove the custom AI endpoint?\n\nThe AI adviser and auto-trade will use the built-in EdgeZero models again.'
+      )
+    )
+      return;
+    setAiSaving(true);
+    try {
+      const res = await fetch('/api/settings/ai-agent', { method: 'DELETE' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || `Failed (${res.status}).`);
+      applyAiStatus(data as AiAgentStatus);
+      toast({ title: 'Custom endpoint removed', description: 'Back to the built-in EdgeZero lane.' });
+      window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_EVENT));
+    } catch (err) {
+      toast({
+        title: 'Remove failed',
+        description: err instanceof Error ? err.message : 'Something went wrong.',
+        variant: 'destructive',
+      });
+    } finally {
+      setAiSaving(false);
+    }
+  }
+
   const inputClass =
     'border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600';
 
@@ -502,7 +662,7 @@ export default function SettingsDialog({
         <DialogHeader>
           <DialogTitle className="text-zinc-100">Settings</DialogTitle>
           <DialogDescription className="text-zinc-400">
-            Manage your Alpaca API keys and Telegram alert delivery.
+            Manage your Alpaca API keys, AI Agent endpoint and Telegram alerts.
           </DialogDescription>
         </DialogHeader>
 
@@ -725,6 +885,142 @@ export default function SettingsDialog({
               Keys are encrypted (AES-256-GCM) and only used server-side. Get keys at
               alpaca.markets (free) — paper keys start with &quot;PK&quot;, live keys with
               &quot;AK&quot;. Each Test proves which account a key belongs to before it can 401.
+            </p>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- AI Agent API (v2.12.20 — LLM behind adviser + auto-trade) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Bot className="h-4 w-4 text-violet-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">AI Agent API</h3>
+              {aiStatus == null ? (
+                <span className="text-[11px] text-zinc-500">…</span>
+              ) : aiStatus.configured ? (
+                <Badge className="border-violet-500/40 bg-violet-500/10 text-violet-300">
+                  Custom · {aiStatus.endpointHost} · {aiStatus.model}
+                </Badge>
+              ) : (
+                <Badge className="border-zinc-700 bg-zinc-800 text-zinc-300">Built-in EdgeZero</Badge>
+              )}
+              {aiStatus?.configured && aiStatus.keyMasked && (
+                <span className="font-mono text-[11px] text-zinc-400">Key {aiStatus.keyMasked}</span>
+              )}
+              {aiStatus?.configured && !aiStatus.keyMasked && (
+                <span className="text-[11px] text-zinc-500">no API key (open endpoint)</span>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              Bring your own OpenAI-compatible endpoint — the AI Trade adviser and the AI auto-trade
+              engine will use it instead of the built-in EdgeZero models. Paste the base URL (a trailing
+              /chat/completions is stripped automatically) and the exact model name your endpoint serves.
+            </p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="ai-agent-endpoint" className="text-xs text-zinc-400">
+                  Endpoint URL
+                </Label>
+                <Input
+                  id="ai-agent-endpoint"
+                  type="text"
+                  placeholder="https://api.openai.com/v1"
+                  value={aiEndpoint}
+                  onChange={(e) => setAiEndpoint(e.target.value)}
+                  autoComplete="off"
+                  disabled={loading || aiSaving}
+                  className={inputClass}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="ai-agent-model" className="text-xs text-zinc-400">
+                  Model
+                </Label>
+                <Input
+                  id="ai-agent-model"
+                  type="text"
+                  placeholder="gpt-4o-mini · deepseek-chat · qwen-max"
+                  value={aiModel}
+                  onChange={(e) => setAiModel(e.target.value)}
+                  autoComplete="off"
+                  disabled={loading || aiSaving}
+                  className={inputClass}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="ai-agent-key" className="text-xs text-zinc-400">
+                  API Key
+                </Label>
+                <Input
+                  id="ai-agent-key"
+                  type="password"
+                  placeholder={aiStatus?.configured && aiStatus.keyMasked ? 'unchanged' : 'optional — key-less endpoints allowed'}
+                  value={aiKey}
+                  onChange={(e) => {
+                    setAiKey(e.target.value);
+                    setAiKeyTouched(true);
+                  }}
+                  autoComplete="off"
+                  disabled={loading || aiSaving}
+                  className={inputClass}
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor="ai-agent-secret" className="text-xs text-zinc-400">
+                  API Secret (optional)
+                </Label>
+                <Input
+                  id="ai-agent-secret"
+                  type="password"
+                  placeholder={aiStatus?.configured && aiStatus.secretSet ? 'unchanged' : 'second key — only if your provider needs one'}
+                  value={aiSecret}
+                  onChange={(e) => {
+                    setAiSecret(e.target.value);
+                    setAiSecretTouched(true);
+                  }}
+                  autoComplete="off"
+                  disabled={loading || aiSaving}
+                  className={inputClass}
+                />
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => void handleTestAi()}
+                disabled={aiTesting || aiSaving}
+                className="w-fit border-violet-900/70 bg-zinc-950 text-violet-300 hover:bg-zinc-900 hover:text-violet-200"
+              >
+                {aiTesting ? <TaijiSpinner className="h-4 w-4" /> : <PlugZap className="h-4 w-4" />}
+                Test connection
+              </Button>
+              <Button
+                type="button"
+                onClick={() => void handleSaveAi()}
+                disabled={aiTesting || aiSaving}
+                className="bg-emerald-600 text-white hover:bg-emerald-500"
+              >
+                {aiSaving ? <TaijiSpinner className="h-4 w-4" /> : <Check className="h-4 w-4" />}
+                Save AI endpoint
+              </Button>
+              {aiStatus?.configured && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => void handleDisableAi()}
+                  disabled={aiSaving}
+                  className="text-zinc-400 hover:text-zinc-200"
+                >
+                  Use built-in EdgeZero
+                </Button>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              Most providers only need the API Key (sent as a Bearer header). The Secret is optional for
+              dual-key providers (rides an x-api-secret header). Clear the Key field and save to run a
+              key-less endpoint (e.g. LAN Ollama). Keys are encrypted (AES-256-GCM) and never leave the
+              server; Test proves reachability AND the model name before you save.
             </p>
           </section>
 

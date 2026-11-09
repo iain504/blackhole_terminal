@@ -7,7 +7,7 @@
 // reaches the browser). Honesty contract: the model is told to say when the
 // data is insufficient — the tab never fakes a reply either.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAlert } from 'lucide-react'
+import { Bot, Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAlert } from 'lucide-react'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
@@ -36,6 +36,10 @@ const SUGGESTIONS = [
 
 const EMPTY_CTX: CtxState = { accountLine: null, positions: [], quotes: [], fetchedAt: null, note: null }
 
+// v2.12.20 — same event SettingsDialog dispatches after an AI Agent endpoint
+// save; kept as a literal so this tab doesn't pull the whole dialog module in.
+const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
+
 export default function AiTradeTab() {
   const watchlists = useTerminal((s) => s.watchlists)
   // v2.12.19 — which watchlist feeds the quotes card AND the auto-trade scan
@@ -49,21 +53,45 @@ export default function AiTradeTab() {
   const [messages, setMessages] = useState<AiChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [health, setHealth] = useState<{ ok: boolean; error?: string } | null>(null)
+  const [health, setHealth] = useState<{
+    ok: boolean
+    error?: string
+    custom?: boolean
+    endpointHost?: string
+    model?: string
+  } | null>(null)
   const [includeCtx, setIncludeCtx] = useState(true)
   const [ctx, setCtx] = useState<CtxState>(EMPTY_CTX)
   const [ctxBusy, setCtxBusy] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
-  // health probe on mount — honest 在線/離線 pill
+  // health probe on mount (re-probed when Settings saves an AI Agent change) —
+  // honest 在線/離線 pill + which lane is live (custom endpoint vs EdgeZero)
   useEffect(() => {
     let alive = true
-    fetch('/api/ai-trade/health')
-      .then((r) => r.json())
-      .then((j) => { if (alive) setHealth({ ok: Boolean(j.ok), error: j.error }) })
-      .catch(() => { if (alive) setHealth({ ok: false, error: '無法查詢' }) })
-    return () => { alive = false }
+    const probe = () =>
+      fetch('/api/ai-trade/health')
+        .then((r) => r.json())
+        .then((j) => {
+          if (alive)
+            setHealth({
+              ok: Boolean(j.ok),
+              error: j.error,
+              custom: Boolean(j.custom),
+              endpointHost: j.endpointHost,
+              model: j.model,
+            })
+        })
+        .catch(() => {
+          if (alive) setHealth({ ok: false, error: '無法查詢' })
+        })
+    probe()
+    window.addEventListener(SETTINGS_CHANGED_EVENT, probe)
+    return () => {
+      alive = false
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, probe)
+    }
   }, [])
 
   // ---- live terminal context (account + positions + watchlist quotes) ----
@@ -210,7 +238,9 @@ export default function AiTradeTab() {
           <Sparkles className="h-4 w-4 text-violet-400" aria-hidden />
           <h1 className="text-sm font-semibold text-zinc-100">AI Trade 交易顧問</h1>
         </div>
-        <span className="hidden text-[11px] text-zinc-500 sm:inline">EdgeZero · 本地推理邊緣</span>
+        <span className="hidden text-[11px] text-zinc-500 sm:inline">
+          {health?.custom ? `自訂端點 · ${health.endpointHost || 'AI Agent'}` : 'EdgeZero · 本地推理邊緣'}
+        </span>
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
           {/* health pill */}
@@ -228,20 +258,31 @@ export default function AiTradeTab() {
             <span className={cn('h-1.5 w-1.5 rounded-full', health == null ? 'bg-zinc-600' : health.ok ? 'bg-emerald-400' : 'bg-rose-400')} aria-hidden />
             {health == null ? '檢測中…' : health.ok ? '在線' : '離線'}
           </span>
-          {/* model picker */}
-          <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
-            <SelectTrigger className="h-7 w-[170px] border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="AI model">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-              {AI_TRADE_MODELS.map((m) => (
-                <SelectItem key={m.id} value={m.id} className="text-[11px]">
-                  {m.title}
-                  <span className="ml-1.5 text-[9px] text-zinc-500">{m.hint}</span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          {/* model picker — replaced by a custom-endpoint badge when the user's
+              own AI Agent API is active (the chat route uses its model anyway) */}
+          {health?.custom ? (
+            <span
+              className="flex h-7 items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 text-[11px] font-medium text-violet-300"
+              title={`自訂 AI 端點 · ${health.endpointHost ?? ''}（於 Settings → AI Agent 管理）`}
+            >
+              <Bot className="h-3 w-3" aria-hidden />
+              自訂 · {health.model || 'model'}
+            </span>
+          ) : (
+            <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
+              <SelectTrigger className="h-7 w-[170px] border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="AI model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                {AI_TRADE_MODELS.map((m) => (
+                  <SelectItem key={m.id} value={m.id} className="text-[11px]">
+                    {m.title}
+                    <span className="ml-1.5 text-[9px] text-zinc-500">{m.hint}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
           {/* context toggle */}
           <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-zinc-400">
             <Switch checked={includeCtx} onCheckedChange={setIncludeCtx} aria-label="附帶帳戶與持倉上下文" />
@@ -419,7 +460,8 @@ export default function AiTradeTab() {
           {health && !health.ok && (
             <div className="flex items-start gap-2 rounded-lg border border-rose-500/30 bg-rose-500/5 p-3 text-[11px] leading-5 text-rose-300">
               <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-              EdgeZero 端點離線（{health.error}）— 對話將無法取得回覆。
+              {health.custom ? '自訂 AI 端點' : 'EdgeZero'} 離線（{health.error}）— 對話將無法取得回覆
+              {health.custom ? '；可於 Settings → AI Agent 檢查設定或改回內建。' : '。'}
             </div>
           )}
         </aside>

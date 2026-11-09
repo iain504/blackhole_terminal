@@ -30,6 +30,10 @@ const INTERVAL_OPTIONS = [
 
 const TF_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1D'] as const
 
+// v2.12.20 — same event SettingsDialog dispatches after an AI Agent endpoint
+// save; kept as a literal so this panel doesn't pull the dialog module in.
+const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
+
 function fmtCountdown(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
@@ -49,6 +53,26 @@ export default function AiAutoTradePanel() {
   const cancelScan = useAiAutoStore((s) => s.cancelScan)
   const clearLog = useAiAutoStore((s) => s.clearLog)
   const watchlists = useTerminal((s) => s.watchlists)
+
+  // v2.12.20 — the AI Agent endpoint (Settings → AI Agent API) overrides the
+  // model lane for scans too: badge it honestly, refetch on settings saves
+  const [aiCustom, setAiCustom] = useState<{ model: string; host: string } | null>(null)
+  useEffect(() => {
+    let alive = true
+    const probe = () =>
+      fetch('/api/settings/ai-agent')
+        .then((r) => r.json())
+        .then((j: { configured?: boolean; model?: string; endpointHost?: string }) => {
+          if (alive) setAiCustom(j.configured && j.model ? { model: j.model, host: j.endpointHost ?? '' } : null)
+        })
+        .catch(() => {})
+    probe()
+    window.addEventListener(SETTINGS_CHANGED_EVENT, probe)
+    return () => {
+      alive = false
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, probe)
+    }
+  }, [])
 
   // 1s ticker for the next-scan countdown (only while armed)
   const [, tickTock] = useState(0)
@@ -175,14 +199,24 @@ export default function AiAutoTradePanel() {
         </div>
         <div className="space-y-1">
           <Label className="text-[9px] uppercase tracking-wider text-zinc-500">模型</Label>
-          <Select value={cfg.model} onValueChange={(v) => updateConfig({ model: v as typeof cfg.model })}>
-            <SelectTrigger className="h-7 border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="模型"><SelectValue /></SelectTrigger>
-            <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-              {AI_TRADE_MODELS.map((m) => (
-                <SelectItem key={m.id} value={m.id} className="text-[11px]">{m.title}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          {aiCustom ? (
+            <span
+              className="flex h-7 items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 text-[10px] font-medium text-violet-300"
+              title={`自訂 AI 端點 · ${aiCustom.host}（於 Settings → AI Agent 管理）`}
+            >
+              <Bot className="h-3 w-3 shrink-0" aria-hidden />
+              <span className="truncate">自訂 · {aiCustom.model}</span>
+            </span>
+          ) : (
+            <Select value={cfg.model} onValueChange={(v) => updateConfig({ model: v as typeof cfg.model })}>
+              <SelectTrigger className="h-7 border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="模型"><SelectValue /></SelectTrigger>
+              <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
+                {AI_TRADE_MODELS.map((m) => (
+                  <SelectItem key={m.id} value={m.id} className="text-[11px]">{m.title}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
         </div>
         <div className="space-y-1">
           <Label className="text-[9px] uppercase tracking-wider text-zinc-500">帳戶模式</Label>
@@ -244,6 +278,13 @@ export default function AiAutoTradePanel() {
           </label>
         </div>
       </div>
+
+      {/* custom AI Agent endpoint note (overrides the built-in model lane) */}
+      {aiCustom && (
+        <p className="mt-1.5 text-[9px] leading-3.5 text-violet-400/90">
+          推論端點：自訂 {aiCustom.host}（{aiCustom.model}）— 於 Settings → AI Agent 管理
+        </p>
+      )}
 
       {/* scan list — which symbols from the selected watchlist participate */}
       <div className="mt-2 rounded border border-zinc-800/80 bg-zinc-950/40 p-2">
