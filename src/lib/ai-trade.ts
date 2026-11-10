@@ -7,6 +7,7 @@
 // AI_TRADE_BASE_URL / AI_TRADE_API_KEY themselves).
 
 import type { Bar } from '@/lib/market-types'
+import { detectSrLevels } from '@/lib/sr'
 
 /** Models offered by the EdgeZero edge (whitelist — the route rejects others). */
 export const AI_TRADE_MODELS = [
@@ -70,6 +71,19 @@ export interface ChartSnapshot {
   upDownVolRatio: number | null // up-bar volume ÷ down-bar volume (last 20 bars)
   volTrendPct: number | null // (avg vol last 5 ÷ avg 20 − 1) × 100
   htf: HigherTfContext | null // synthetic 4× timeframe trend context
+  // v2.12.32 — WIN-RATE CONTEXT PACK (structure + volatility state): where the
+  // price sits inside the window range, the nearest tested S/R levels, and the
+  // longer-horizon ATR — stops/targets anchored to STRUCTURE beat arbitrary
+  // ATR multiples, and chop/expansion state separates trend trades from
+  // mean-reversion coin flips.
+  rangePosPct: number | null // 0 = at window low, 100 = at window high
+  srSupport: number | null // nearest tested level BELOW the price
+  srSupportPct: number | null // distance to it, % (positive = below)
+  srSupportTouches: number | null // how many pivot rejections elected it
+  srResistance: number | null // nearest tested level ABOVE the price
+  srResistancePct: number | null // distance to it, % (positive = above)
+  srResistanceTouches: number | null
+  atrPct50: number | null // ATR(50) as % of price — compare with atrPct (14)
 }
 
 export interface HigherTfContext {
@@ -231,6 +245,21 @@ export function buildChartSnapshot(
         rsi14: rsi(htfCloses),
       }
     : null
+  // v2.12.32 — structure + volatility context
+  const wHigh = win.length ? Math.max(...win.map((b) => b.high)) : 0
+  const wLow = win.length ? Math.min(...win.map((b) => b.low)) : 0
+  const rangePosPct = wHigh > wLow ? ((last - wLow) / (wHigh - wLow)) * 100 : null
+  // pivot S/R on the analysed window (minTouches 2 — 120 bars don't always
+  // elect 3-touch walls, and a 2-touch level is still real structure)
+  const ref = livePrice ?? last
+  const levels = win.length >= 15
+    ? detectSrLevels(
+        win.map((b) => ({ time: b.time, high: b.high, low: b.low, close: b.close })),
+        { minTouches: 2, maxLevels: 6, pivotWindow: 5, refPrice: ref },
+      )
+    : []
+  const sup = levels.filter((l) => l.side === 'support').sort((a, b) => b.price - a.price)[0] ?? null
+  const res = levels.filter((l) => l.side === 'resistance').sort((a, b) => a.price - b.price)[0] ?? null
   return {
     symbol,
     timeframe,
@@ -238,8 +267,8 @@ export function buildChartSnapshot(
     barCount: win.length,
     lastClose: last,
     changePct: first > 0 ? ((last - first) / first) * 100 : 0,
-    high: win.length ? Math.max(...win.map((b) => b.high)) : 0,
-    low: win.length ? Math.min(...win.map((b) => b.low)) : 0,
+    high: wHigh,
+    low: wLow,
     atrPct: atrPct(win),
     sma20: sma(closes, 20),
     sma50: sma(closes, 50),
@@ -252,6 +281,14 @@ export function buildChartSnapshot(
     upDownVolRatio: vp.upDownRatio,
     volTrendPct: vp.trendPct,
     htf,
+    rangePosPct,
+    srSupport: sup?.price ?? null,
+    srSupportPct: sup && ref > 0 ? ((ref - sup.price) / ref) * 100 : null,
+    srSupportTouches: sup?.touches ?? null,
+    srResistance: res?.price ?? null,
+    srResistancePct: res && ref > 0 ? ((res.price - ref) / ref) * 100 : null,
+    srResistanceTouches: res?.touches ?? null,
+    atrPct50: atrPct(win, 50),
   }
 }
 
@@ -263,12 +300,13 @@ export function snapshotToText(s: ChartSnapshot): string {
     `symbol: ${s.symbol} · timeframe: ${s.timeframe}`,
     `bars analysed: ${s.barCount} · live price: ${s.livePrice ?? n(s.lastClose)}`,
     `last close: ${n(s.lastClose, 4)} · window change: ${n(s.changePct)}%`,
-    `window high/low: ${n(s.high, 4)} / ${n(s.low, 4)}`,
-    `ATR(14): ${n(s.atrPct)}% of price`,
+    `window high/low: ${n(s.high, 4)} / ${n(s.low, 4)} · position in range: ${s.rangePosPct == null ? 'n/a' : `${n(s.rangePosPct, 0)}%`}`,
+    `ATR(14): ${n(s.atrPct)}% of price${s.atrPct50 != null && s.atrPct != null ? (s.atrPct > s.atrPct50 ? ' (vol EXPANDING vs ATR50 ' + n(s.atrPct50) + '%)' : s.atrPct < s.atrPct50 * 0.8 ? ` (vol contracting vs ATR50 ${n(s.atrPct50)}%)` : ` (vs ATR50 ${n(s.atrPct50)}%)`) : ''}`,
     `SMA20 / SMA50: ${n(s.sma20, 4)} / ${n(s.sma50, 4)}`,
     `RSI(14): ${n(s.rsi14, 1)}`,
     `MACD(12,26,9): line ${n(s.macdLine, 4)} · signal ${n(s.macdSignal, 4)} · histogram ${n(s.macdHist, 4)}${s.macdHistRising == null ? '' : s.macdHistRising ? ' (hist expanding)' : ' (hist contracting)'}`,
     `volume: last vs 20-avg ${n(s.volRatio)}× · up/down-bar volume ${s.upDownVolRatio == null ? 'n/a' : s.upDownVolRatio === Infinity ? 'all up' : n(s.upDownVolRatio)} · 5-bar vs 20-avg trend ${s.volTrendPct == null ? 'n/a' : `${n(s.volTrendPct)}%`}`,
+    `nearest S/R: support ${n(s.srSupport, 4)} (${n(s.srSupportPct)}% below, ${s.srSupportTouches ?? 'n/a'} touches) · resistance ${n(s.srResistance, 4)} (${n(s.srResistancePct)}% above, ${s.srResistanceTouches ?? 'n/a'} touches)`,
   ]
   if (s.htf) {
     lines.push(

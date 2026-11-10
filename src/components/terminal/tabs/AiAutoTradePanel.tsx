@@ -287,6 +287,14 @@ export default function AiAutoTradePanel() {
             試運行（不下單）
           </label>
         </div>
+        {/* v2.12.32 — earnings gap-risk hard gate */}
+        <div className="col-span-2 flex items-center justify-between gap-2">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-zinc-400">
+            <Switch checked={cfg.blockEarnings} onCheckedChange={(v) => updateConfig({ blockEarnings: v })} aria-label="避開財報窗口" />
+            避開財報窗口
+          </label>
+          <span className="text-[9px] text-zinc-600">發布前 2 天至發布後禁止開新倉（跳空風險 · 日期未知時放行）</span>
+        </div>
       </div>
 
       {/* custom AI Agent endpoint note (overrides the built-in model lane) */}

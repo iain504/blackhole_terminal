@@ -12,6 +12,19 @@
 // order is a market entry with the model's levels attached as TP + SL bracket
 // via the existing /api/trading/orders route.
 //
+// v2.12.32 — WIN-RATE CONTEXT PACK. Judging a symbol from its own bars alone
+// leaves the classic win-rate killers invisible, so every scan now feeds the
+// model: pivot S/R structure + position-in-range + ATR14-vs-ATR50 volatility
+// state (computed from the loaded bars — free), the market regime
+// (RISK_ON/NEUTRAL/RISK_OFF + why), earnings proximity per symbol with a
+// DETERMINISTIC hard gate inside the danger window (report − 2d … + 20h —
+// the terminal refuses, not the model; fail-open when the date is unknown),
+// high-impact USD events inside 48h, news sentiment where covered, the 52w
+// range position, the engine's OWN realized performance (win rate / avg
+// win-loss / profit factor / streak / per-direction — the model calibrates
+// its confidence against its actual track record), and the current holdings
+// (correlation-aware entries). Every source fails open.
+//
 // Honesty contract: demo-flagged bars are EVALUATION-ONLY — they never fire
 // an order (paper or live); every skip/reject is logged with its reason; a
 // failed model call kills the round — nothing is invented.
@@ -64,6 +77,10 @@ export interface AiAutoConfig {
   dryRun: boolean // evaluate + log what WOULD fire, place nothing
   watchlistId: string | null // which watchlist feeds the scan (null = first)
   excludedSymbols: string[] // per-symbol opt-out from the scan list
+  /** v2.12.32 — hard-gate new entries inside the earnings danger window
+   *  (report − 2d … report + 20h). Deterministic — does not depend on the
+   *  model noticing. Fail-open when the date is unknown. Default ON. */
+  blockEarnings: boolean
 }
 
 export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
@@ -80,6 +97,7 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   dryRun: false,
   watchlistId: null,
   excludedSymbols: [],
+  blockEarnings: true,
 }
 
 const LS_KEY = 'bh-ai-auto-cfg-v1'
@@ -111,6 +129,9 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     excludedSymbols: Array.isArray(j.excludedSymbols)
       ? j.excludedSymbols.filter((s): s is string => typeof s === 'string' && /^[A-Z0-9./:-]{1,15}$/.test(s)).slice(0, 100)
       : [],
+    // undefined (old saved config) → default ON — the gap-risk gate must not
+    // silently vanish for existing users
+    blockEarnings: j.blockEarnings === undefined ? d.blockEarnings : Boolean(j.blockEarnings),
   }
 }
 
@@ -372,18 +393,24 @@ registerAiOpsAdapter({
 
 const fmtInterval = (s: number) => (s % 3600 === 0 ? `${s / 3600}小時` : s % 60 === 0 ? `${s / 60}分鐘` : `${s}秒`)
 
-/** Snapshots per model call — 8 × ~650 chars keeps the DATA block inside the chat route's 8k context clamp. */
-const SCAN_CHUNK = 8
+/** Snapshots per model call — 6 × ~900 chars keeps the DATA block (enriched
+ *  v2.12.32 snapshots + the shared win-rate context pack) inside the chat
+ *  route's 8k context clamp. */
+const SCAN_CHUNK = 6
 
 function scanInstruction(n: number): string {
   return [
-    `以下是關注清單 ${n} 個標的的技術快照（DATA 區）。請擔任量評估引擎，逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
+    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化評估引擎，逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
     `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"entry":<數字>,"stop":<數字>,"target":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
     `規則：`,
-    `- entry 取現價附近；stop/target 用 ATR 概念給合理距離。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
-    `- direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
-    `- confidence 是你對該方向的把握度；證據不足或訊號矛盾時誠實給低分或 flat。`,
-    `- DATA 區已提供 MACD(12,26,9)、量能分布（up/down-bar volume、5/20-bar 量能趨勢）與 4× 高週期趨勢 — 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason。`,
+    `- 證據計數：方向需要「至少 2 類獨立證據同向」才可 non-flat（趨勢/動量、量能、結構 S/R、高週期、情緒/環境）。證據互相矛盾或只有單一訊號 → 誠實 flat 或低 confidence。`,
+    `- 市場環境：RISK_OFF 時做多需更高證據門檻（逆風交易勝率低）；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）時假突破多 — flat 傾向提高。`,
+    `- 近期表現：這是本引擎最近已平倉交易的真實成績。用它校準 confidence — 勝率低於 45% 時全面調低信心並提高 flat 比例；某方向勝率明顯差時對該方向更保守。`,
+    `- entry 取現價附近；stop 掛在最近支撐之下 / 最近阻力之上（結構外），距離參考 ATR — 不可緊貼現價；target 放在到達下一個 S/R 之前。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
+    `- 財報/事件：快照標明「財報臨近（block）」的標的必然被終端硬閘拒絕 — 直接給 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55（跳空風險）；共用區列出的 48 小時內高影響事件同樣壓低所有相關方向信心。`,
+    `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）。`,
+    `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
+    `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）與 52 週區間位置 — 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason。`,
     `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
   ].join('\n')
 }
@@ -463,7 +490,7 @@ export async function runScan(): Promise<void> {
     const bpRaw = accJ?.account?.buyingPower
     if (bpRaw != null) { const n = Number(bpRaw); if (Number.isFinite(n) && n > 0) bpLeft = n }
     if (bpLeft == null && equity != null) bpLeft = equity // no BP field — degrade to equity
-    const posJ = pos.j as { positions?: { symbol?: string }[] } | null
+    const posJ = pos.j as { positions?: { symbol?: string; side?: string; qty?: number | string; uplPct?: number }[] } | null
     // POSITION symbols drop the crypto slash (BTCUSD) while ORDER/watchlist
     // symbols keep it (BTC/USD) — index BOTH spellings so a held BTC position
     // actually blocks a new BTC/USD entry (v2.12.23).
@@ -510,6 +537,150 @@ export async function runScan(): Promise<void> {
       return
     }
 
+    // 2.6) v2.12.32 — WIN-RATE CONTEXT PACK. The model used to judge each
+    // symbol from its own bars alone: no idea what the broader tape is doing,
+    // whether earnings land tomorrow, how its OWN recent calls performed, or
+    // where the tested S/R walls sit. Those blind spots are the classic
+    // win-rate killers — counter-trend longs in RISK_OFF, entries 1 day
+    // before an earnings gap, stops inside structure, confidence never
+    // calibrated against realized results. One batched round of best-effort
+    // fetches; EVERY source fails open (missing → the line is omitted, the
+    // scan never dies because a side-channel hiccups).
+    interface EarningsInfo { daysAway: number | null; inBlock: boolean; known: boolean }
+    const earningsBySym = new Map<string, EarningsInfo>()
+    const w52BySym = new Map<string, { high: number | null; low: number | null }>()
+    const sentBySym = new Map<string, { score: number; momentum: number | null; headlines: number }>()
+    let regimeLine: string | null = null
+    let calendarLine: string | null = null
+    let perfLine: string | null = null
+    let holdingsLine: string | null = null
+    {
+      const normSym = (s: string) => s.replace('/', '').toUpperCase()
+      const [regRes, calRes, senRes, eaRes, qRes, hRes] = await Promise.all([
+        fetchJson('/api/agent/regime', { signal: sig }).catch(() => ({ status: 0, j: null })),
+        fetchJson('/api/market/calendar', { signal: sig }).catch(() => ({ status: 0, j: null })),
+        fetchJson('/api/sentiment?scope=market', { signal: sig }).catch(() => ({ status: 0, j: null })),
+        fetchJson(`/api/market/earnings?symbols=${encodeURIComponent(scanSyms.slice(0, 30).join(','))}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
+        fetch('/api/market/quote', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbols: scanSyms.slice(0, 30) }), signal: sig,
+        }).then((r) => r.json() as Promise<Record<string, unknown> | null>).catch(() => null),
+        fetchJson(`/api/trading/history?mode=${cfg.mode}&limit=150`, { signal: sig }).catch(() => ({ status: 0, j: null })),
+      ])
+      // regime — RISK_ON/NEUTRAL/RISK_OFF + why (server-cached 15 min)
+      const reg = regRes.j as { regime?: string; stale?: boolean; reasons?: string[] } | null
+      if (reg?.regime && reg.regime !== 'UNKNOWN') {
+        const why = (Array.isArray(reg.reasons) ? reg.reasons : []).slice(0, 2).join('；')
+        regimeLine = `regime: ${reg.regime}${reg.stale ? '（資料過期）' : ''}${why ? ` — ${why}` : ''}`
+      }
+      // calendar — high-impact USD events within the next 48h (recent ones
+      // count too). The feed degrades to bundled SAMPLE rows when both FF
+      // mirrors fail — sample data must NEVER be fed to the model as real
+      // events, so the line only renders when source is the live feed.
+      const cal = calRes.j as { events?: { time: string; country: string; importance: string; event: string }[]; source?: string } | null
+      {
+        const now = Date.now()
+        const soon = cal?.source === 'forexfactory'
+          ? (cal?.events ?? [])
+            .filter((e) => e && e.importance === 'high' && e.country === 'USD')
+            .map((e) => ({ e, t: Date.parse(e.time) }))
+            .filter(({ t }) => Number.isFinite(t) && t > now - 2 * 3600_000 && t < now + 48 * 3600_000)
+            .sort((a, b) => a.t - b.t)
+            .slice(0, 4)
+          : []
+        if (soon.length > 0) {
+          calendarLine = `48h 高影響事件：${soon.map(({ e, t }) => { const d = new Date(t); return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} UTC ${e.event}` }).join(' · ')}`
+        }
+      }
+      // sentiment — only where the news engine actually covers a scan symbol
+      const sen = senRes.j as { summary?: { symbol?: string; score?: number; momentum?: number | null; headlines?: number }[] } | null
+      for (const s of sen?.summary ?? []) {
+        if (!s || typeof s.symbol !== 'string' || typeof s.score !== 'number') continue
+        const key = normSym(s.symbol)
+        if (!scanSyms.some((x) => normSym(x) === key)) continue
+        sentBySym.set(key, { score: s.score, momentum: typeof s.momentum === 'number' ? s.momentum : null, headlines: Number(s.headlines) || 0 })
+      }
+      // earnings — days away + hard-block flag (fail-open)
+      const ea = eaRes.j as { events?: Record<string, EarningsInfo> } | null
+      if (ea?.events && typeof ea.events === 'object') {
+        for (const [sym, ev] of Object.entries(ea.events)) {
+          if (ev && typeof ev === 'object') earningsBySym.set(sym.toUpperCase(), { daysAway: ev.daysAway ?? null, inBlock: Boolean(ev.inBlock), known: Boolean(ev.known) })
+        }
+      }
+      // 52-week range — breakout vs mean-reversion context (30-min cached)
+      const q = qRes as { quotes?: { symbol?: string; weekHigh?: number; weekLow?: number }[] } | null
+      for (const it of q?.quotes ?? []) {
+        if (!it || typeof it.symbol !== 'string') continue
+        const hi = Number(it.weekHigh)
+        const lo = Number(it.weekLow)
+        w52BySym.set(normSym(it.symbol), { high: Number.isFinite(hi) && hi > 0 ? hi : null, low: Number.isFinite(lo) && lo > 0 ? lo : null })
+      }
+      // recent performance — the engine's OWN realized results (calibration)
+      const hist = hRes.j as { trades?: { pnl?: number; side?: string }[] } | null
+      const trades = (Array.isArray(hist?.trades) ? hist.trades : [])
+        .filter((t) => t && Number.isFinite(Number(t.pnl)))
+        .map((t) => ({ pnl: Number(t.pnl), side: t.side === 'short' ? 'short' : 'long' }))
+      if (trades.length > 0) {
+        const ts = trades.slice(0, 100)
+        const wins = ts.filter((t) => t.pnl > 0)
+        const losses = ts.filter((t) => t.pnl <= 0)
+        const avgWin = wins.length ? wins.reduce((a, t) => a + t.pnl, 0) / wins.length : 0
+        const avgLoss = losses.length ? Math.abs(losses.reduce((a, t) => a + t.pnl, 0) / losses.length) : 0
+        const grossWin = wins.reduce((a, t) => a + t.pnl, 0)
+        const grossLoss = losses.reduce((a, t) => a + Math.abs(t.pnl), 0)
+        const pf = grossLoss > 0 ? grossWin / grossLoss : null
+        let streak: string | null = null
+        if (ts.length > 0) {
+          const win0 = ts[0].pnl > 0
+          let n = 0
+          for (const t of ts) { if ((t.pnl > 0) === win0) n++; else break }
+          streak = `${win0 ? 'W' : 'L'}${n}`
+        }
+        const wr = (xs: typeof ts) => (xs.length ? Math.round((xs.filter((t) => t.pnl > 0).length / xs.length) * 100) : null)
+        const longs = ts.filter((t) => t.side === 'long')
+        const shorts = ts.filter((t) => t.side === 'short')
+        perfLine = `近 ${ts.length} 筆已平倉：勝率 ${Math.round((wins.length / ts.length) * 100)}% · 平均獲利 $${avgWin.toFixed(0)} / 平均虧損 $${avgLoss.toFixed(0)} · 盈虧比 ${pf == null ? 'n/a' : pf.toFixed(2)} · 目前連續 ${streak ?? 'n/a'} · 做多勝率 ${wr(longs) == null ? 'n/a' : `${wr(longs)}%`} · 做空勝率 ${wr(shorts) == null ? 'n/a' : `${wr(shorts)}%`}`
+      }
+      // current holdings — correlation-aware entries
+      const held = (posJ?.positions ?? [])
+        .filter((p) => typeof p.symbol === 'string' && p.symbol)
+        .map((p) => `${String(p.symbol).replace('/', '')} ${p.side === 'short' ? '空' : '多'} ${String(p.qty ?? '')}${typeof p.uplPct === 'number' ? `（${p.uplPct >= 0 ? '+' : ''}${p.uplPct.toFixed(1)}%）` : ''}`)
+      if (held.length > 0) holdingsLine = held.join(' · ')
+    }
+    // per-symbol context lines appended to every snapshot
+    const snapshotExtras = (sym: string, lastClose: number): string => {
+      const lines: string[] = []
+      const key = sym.replace('/', '').toUpperCase()
+      const ea = earningsBySym.get(key)
+      if (ea) {
+        if (ea.known && ea.daysAway != null) lines.push(ea.inBlock ? `earnings: 財報臨近（block，${ea.daysAway} 天後）` : `earnings: ${ea.daysAway} 天後`)
+        else if (!ea.known) lines.push('earnings: 日期未知（加密或無資料）')
+      }
+      const w = w52BySym.get(key)
+      if (w && w.high != null && w.low != null && lastClose > 0) {
+        const fromHigh = ((lastClose - w.high) / w.high) * 100
+        const fromLow = ((lastClose - w.low) / w.low) * 100
+        lines.push(`52w range: 距高 ${fromHigh.toFixed(1)}% / 距低 ${fromLow >= 0 ? '+' : ''}${fromLow.toFixed(1)}%`)
+      }
+      const s = sentBySym.get(key)
+      if (s) lines.push(`news sentiment: ${s.score >= 0 ? '+' : ''}${s.score.toFixed(2)}${s.momentum != null ? ` (momentum ${s.momentum >= 0 ? '+' : ''}${s.momentum.toFixed(2)})` : ''} · ${s.headlines} 則`)
+      return lines.length ? `\n${lines.join(' · ')}` : ''
+    }
+    // the shared block rides EVERY model call (identical across chunks)
+    const contextPack = [
+      regimeLine ? `[市場環境] ${regimeLine}` : null,
+      calendarLine ? `[事件] ${calendarLine}` : null,
+      perfLine ? `[近期表現（本引擎真實成績 — 校準 confidence 用）] ${perfLine}` : null,
+      holdingsLine ? `[目前持倉] ${holdingsLine}` : '[目前持倉] 無',
+    ].filter(Boolean).join('\n')
+    if (regimeLine) st0.addLog('info', `市場環境 — ${regimeLine}`)
+    if (calendarLine) st0.addLog('info', `事件 — ${calendarLine}`)
+    if (perfLine) st0.addLog('info', `近期表現 — ${perfLine}`)
+    {
+      const blockedSyms = scanSyms.filter((s) => earningsBySym.get(s.replace('/', '').toUpperCase())?.inBlock)
+      if (blockedSyms.length > 0) st0.addLog('info', `財報窗口 — 本輪禁止開倉：${blockedSyms.join('、')}`)
+    }
+
     // 3) bars → snapshots (concurrency 3, demo-flagged kept but marked)
     interface Snap { symbol: string; text: string; demo: boolean; lastClose: number }
     const snaps: Snap[] = []
@@ -522,7 +693,7 @@ export async function runScan(): Promise<void> {
           if (!Array.isArray(bars) || bars.length < 30) { skipped.push(sym); return null }
           const meta = (j?.meta ?? {}) as { demo?: boolean }
           const snap = buildChartSnapshot(bars as never, sym, cfg.timeframe, bars[bars.length - 1].close)
-          return { symbol: sym, text: snapshotToText(snap), demo: Boolean(meta.demo), lastClose: snap.lastClose }
+          return { symbol: sym, text: snapshotToText(snap) + snapshotExtras(sym, snap.lastClose), demo: Boolean(meta.demo), lastClose: snap.lastClose }
         }),
       )
       for (const r of settled) if (r.status === 'fulfilled' && r.value) snaps.push(r.value)
@@ -533,9 +704,10 @@ export async function runScan(): Promise<void> {
       return
     }
 
-    // 4) batched verdict calls — 8 snapshots per call (keeps the DATA block
-    //    inside the route's 8k context clamp), up to 2 calls in flight; a
-    //    failed chunk degrades honestly: its symbols report 評估失敗
+    // 4) batched verdict calls — 6 enriched snapshots + the shared context
+    //    pack per call (keeps the DATA block inside the route's 8k context
+    //    clamp), up to 2 calls in flight; a failed chunk degrades honestly:
+    //    its symbols report 評估失敗
     const groups = chunk(snaps, SCAN_CHUNK)
     const bySym = new Map<string, Partial<Record<'symbol' | 'direction' | 'confidence' | 'entry' | 'stop' | 'target' | 'reason', unknown>>>()
     let okChunks = 0
@@ -543,7 +715,7 @@ export async function runScan(): Promise<void> {
     for (const pair of chunk(groups, 2)) {
       const settled = await Promise.allSettled(
         pair.map(async (grp) => {
-          const dataBlock = grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
+          const dataBlock = (contextPack ? `${contextPack}\n\n` : '') + grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
           const res = await fetch('/api/ai-trade/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -597,6 +769,18 @@ export async function runScan(): Promise<void> {
 
       if (!it) { v.rejectReason = '評估失敗（模型組失敗或漏答）'; return v }
       if (direction === 'flat') { v.rejectReason = '模型判中性'; return v }
+      // v2.12.32 — earnings gap-risk gate (DETERMINISTIC, not model-dependent):
+      // an entry inside [report − 2d, report + 20h] owns the overnight
+      // re-pricing with no stop that can protect it — the terminal refuses it
+      // even if the model got excited. Fail-open when the date is unknown
+      // (known:false → the map simply has no inBlock entry).
+      if (cfg.blockEarnings) {
+        const ea = earningsBySym.get(snap.symbol.replace('/', '').toUpperCase())
+        if (ea?.inBlock) {
+          v.rejectReason = `財報窗口（${ea.daysAway ?? '?'} 天後發布）— 跳空風險，禁止開新倉`
+          return v
+        }
+      }
       // geometry: long stop<entry<target / short target<entry<stop
       const geoOk = entry != null && stop != null && target != null && (
         direction === 'long' ? stop < entry && entry < target : target < entry && entry < stop
