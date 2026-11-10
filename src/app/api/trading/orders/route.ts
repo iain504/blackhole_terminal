@@ -4,6 +4,10 @@ import {
   placeOrderWithExits, placeTrailingStop, resolveTradeMode, ensureCryptoOcoSupervisor,
   friendlyExitQtyError, getOpenOrders, TradeMode,
 } from '@/lib/trading'
+import { getMarketHours } from '@/lib/market-hours'
+import { getQuotes } from '@/lib/alpaca'
+import { isCryptoSymbol } from '@/lib/market-types'
+import { extendedLimitPrice, fmtLimitPx, EXTENDED_ENTRY_BAND_PCT } from '@/lib/ai-steward-disciplines'
 import { readJson, handleError } from '@/lib/api-helpers'
 import { rateLimit } from '@/lib/rate-limit'
 import { symbolSchema } from '@/lib/validation'
@@ -61,7 +65,7 @@ export async function POST(req: Request) {
         { status: 429 },
       )
     }
-    const body = await readJson<PlaceBody>(req)
+    let body = await readJson<PlaceBody>(req)
     const symbol = (body.symbol || '').trim().toUpperCase()
     // Task 89 — the manual ticket is now held to the SAME validation standard
     // as every grid/algo path: charset-checked symbol, finite bounded qty,
@@ -92,6 +96,41 @@ export async function POST(req: Request) {
     }
     if (typeof body.trail_percent === 'number' && (!Number.isFinite(body.trail_percent) || body.trail_percent <= 0 || body.trail_percent > 100)) {
       return NextResponse.json({ error: 'Trail percent must be between 0 and 100' }, { status: 400 })
+    }
+
+    // v2.12.29 — 延長時段紀律 (extended-hours discipline, user standing order):
+    // Alpaca does NOT fill market orders during pre/post market — it silently
+    // queues them until the NEXT regular session. A market order submitted at
+    // 18:00 ET looks "working" but does nothing for 16+ hours (and a queued
+    // fill at the next open can be far from the price the user saw). Convert
+    // the order into a MARKETABLE LIMIT off the live quote (± band),
+    // tif=day + extended_hours=true, so it can actually execute NOW in the
+    // extended session. Only converts on a REAL quote (never the simulator's
+    // synthetic price) and only for US equities (crypto trades 24/7).
+    // Session truth = the shared Alpaca-clock service (30s cache; also knows
+    // holidays/weekends, unlike a naive ET clock). Fail-open: if the session
+    // or quote check throws, place the order as-is.
+    let extendedNote: string | undefined
+    if (
+      (body.type === 'market' || body.type === undefined) &&
+      typeof body.trail_percent !== 'number' &&
+      qty > 0 &&
+      !isCryptoSymbol(symbol)
+    ) {
+      try {
+        const mh = await getMarketHours(['SPY'], user.id)
+        const st = mh.hours['SPY']?.state
+        if (st === 'pre' || st === 'post') {
+          const { quotes } = await getQuotes([symbol], user.id)
+          const ref = Number(quotes[0]?.price)
+          if (Number.isFinite(ref) && ref > 0 && !quotes[0]?.sim) {
+            const lp = extendedLimitPrice(body.side, ref, EXTENDED_ENTRY_BAND_PCT)
+            body = { ...body, type: 'limit', limit_price: lp, time_in_force: 'day' }
+            const refStr = ref >= 100 ? ref.toFixed(2) : ref >= 1 ? ref.toFixed(3) : ref.toFixed(5)
+            extendedNote = `延長交易時段（${st === 'pre' ? 'Pre' : 'Post'}-market）不接受市價單，已自動轉為限價 ${fmtLimitPx(lp)}（現價 ${refStr} ±${EXTENDED_ENTRY_BAND_PCT}%，本交易日有效）`
+          }
+        }
+      } catch { /* session/quote unavailable — place as-is (honest queue) */ }
     }
 
     // Trailing-stop order — stocks only (Alpaca crypto rejects trailing_stop).
@@ -150,7 +189,7 @@ export async function POST(req: Request) {
       // size … try again" hint, sending the engine into a pointless retry loop.
       return NextResponse.json({ error: friendlyExitQtyError(r.errors[0], 'entry'), mode }, { status: 422 })
     }
-    return NextResponse.json({ mode, orders: r.results, errors: r.errors, splitNote: r.splitNote })
+    return NextResponse.json({ mode, orders: r.results, errors: r.errors, splitNote: r.splitNote, extendedNote })
   } catch (e) {
     return handleError(e)
   }

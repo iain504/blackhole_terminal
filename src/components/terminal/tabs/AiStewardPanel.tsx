@@ -17,6 +17,7 @@ import {
   Minus, BookOpen, RefreshCw, X, Plus,
 } from 'lucide-react'
 import { useAiStewardStore, type StewardEvent, type StewardLesson } from '@/store/ai-steward'
+import { CORE_DISCIPLINES } from '@/lib/ai-steward-disciplines'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -343,6 +344,24 @@ export default function AiStewardPanel() {
             ))}
           </ul>
         )}
+      </div>
+
+      {/* v2.12.29 — core disciplines: code-level standing orders, always fed
+          to every review cycle; unlike user lessons these can never be
+          deleted, trimmed, or forgotten */}
+      <div className="mt-2">
+        <div className="mb-1 flex items-center justify-between">
+          <span className="text-[9px] font-semibold uppercase tracking-widest text-zinc-500">核心紀律（系統內建 · 永遠遵守）</span>
+          <ShieldCheck className="h-3 w-3 text-emerald-500" aria-hidden />
+        </div>
+        <ul className="space-y-1">
+          {CORE_DISCIPLINES.map((d, i) => (
+            <li key={i} className="flex items-start gap-1.5 rounded border border-emerald-900/40 bg-emerald-500/5 px-1.5 py-1" data-testid="core-discipline">
+              <ShieldCheck className="mt-0.5 h-3 w-3 shrink-0 text-emerald-500" aria-hidden />
+              <span className="min-w-0 flex-1 text-[10px] leading-4 text-zinc-300">{d}</span>
+            </li>
+          ))}
+        </ul>
       </div>
 
       {/* PERMANENT memory: lessons (v2.12.26 — never retention-purged) */}

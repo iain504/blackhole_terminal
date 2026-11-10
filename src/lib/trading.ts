@@ -19,6 +19,7 @@
 import { db } from './db'
 import { getAlpacaKeysForMode } from './alpaca'
 import { maskKey } from './crypt'
+import { extendedLimitPrice } from './ai-steward-disciplines'
 
 export type TradeMode = 'paper' | 'live'
 
@@ -586,6 +587,12 @@ export interface PlaceOrderBody {
   stop_loss?: number
   trail_percent?: number
   client_order_id?: string
+  /** v2.12.29 — stocks only: allow the order to execute in the EXTENDED
+   *  session (Alpaca requires type=limit + tif=day alongside this flag).
+   *  Set by the orders route when it converts a market order during pre/post
+   *  market (a market order would silently queue until the next regular
+   *  session). Crypto trades 24/7 — never set there. */
+  extended_hours?: boolean
   /** short algo source tag (first 8 of the AlgoRun id) — embeds `ttr-` attribution in the client_order_id */
   sourceRef?: string
   /** Task 10-k — which pipeline placed the order: 'algo' (default) embeds
@@ -627,6 +634,8 @@ export async function placeOrderWithExits(
     if (!body.limit_price) return { results: [], errors: ['Limit price required for limit orders'] }
     entry.limit_price = String(body.limit_price)
   }
+  // v2.12.29 — extended-hours execution flag (stocks only, see PlaceOrderBody)
+  if (!isCrypto && body.extended_hours) entry.extended_hours = true
   if (body.client_order_id) entry.client_order_id = body.client_order_id
 
   const errors: string[] = []
@@ -1878,12 +1887,25 @@ export async function replacePendingEntrySmart(
  * so lingering SL/TP legs would starve the liquidation (Alpaca sells only
  * qty_available) — cancel the symbol's opposite-side (exit) orders FIRST,
  * then close. Returns the close order and how many exits were cancelled.
+ *
+ * v2.12.29 — `opts.extendedRef` + `opts.extendedBandPct`: during pre/post
+ * market Alpaca's close-position endpoint submits a MARKET order, which the
+ * broker silently QUEUES until the next regular session — a "close now" at
+ * 18:00 ET would leave the position exposed (and unprotected: its exits were
+ * just cancelled) for 16+ hours. When the route passes a REAL reference
+ * quote, the close is placed as a marketable LIMIT (ref ± band on the exit
+ * side: long→sell limits BELOW the quote, short→buy limits ABOVE),
+ * type=limit tif=day extended_hours=true, so it can actually execute in the
+ * extended session. Falls back to the regular close endpoint when the
+ * position/side is unknown or the limit placement fails (honest queue rather
+ * than a silently skipped close).
  */
 export async function closePositionFull(
   userId: string,
   mode: TradeMode,
   symbol: string,
-): Promise<{ close: TradeFetchResult<TradingOrder>; canceledExits: number }> {
+  opts?: { extendedRef?: number; extendedBandPct?: number },
+): Promise<{ close: TradeFetchResult<TradingOrder>; canceledExits: number; extendedClose?: boolean }> {
   const tSym = tradeSymbol(symbol)
   const norm = (s: string) => s.replace('/', '').toUpperCase()
   // snapshot the position side BEFORE closing (long -> sell exits, short -> buy)
@@ -1905,6 +1927,39 @@ export async function closePositionFull(
     if (o.status === 'held') continue
     const c = await cancelOrder(userId, mode, o.id)
     if (c.status === 204 || c.status === 200) canceledExits += 1
+  }
+  const extRef = opts?.extendedRef
+  const extBand = opts?.extendedBandPct ?? 1.5
+  if (exitSide && typeof extRef === 'number' && Number.isFinite(extRef) && extRef > 0 && posRes.data) {
+    const extPx = extendedLimitPrice(exitSide, extRef, extBand)
+    const p = posRes.data
+    const rawQty = posSide === 'short'
+      ? Math.abs(Number.parseFloat(p.qty) || 0) // shorts: exits reserve buying power, size is |qty|
+      : Number.parseFloat(p.qty_available) || Number.parseFloat(p.qty) || 0
+    if (rawQty > 0) {
+      const isCryptoPos = p.asset_class === 'crypto' || p.symbol.includes('/')
+      const q = isCryptoPos
+        ? String(rawQty).replace(/0+$/, '').replace(/\.$/, '')
+        : String(Math.floor(rawQty))
+      if (Number.parseFloat(q) > 0) {
+        const close = await tradeFetch<TradingOrder>(userId, mode, '/v2/orders', {
+          method: 'POST',
+          body: JSON.stringify({
+            symbol: p.symbol,
+            qty: q,
+            side: exitSide,
+            type: 'limit',
+            time_in_force: 'day',
+            extended_hours: true,
+            limit_price: extPx >= 1 ? extPx.toFixed(2) : extPx.toFixed(4),
+          }),
+        })
+        if (close.data && (close.data as TradingOrder).id) {
+          return { close, canceledExits, extendedClose: true }
+        }
+        // limit placement refused — fall through to the regular close attempt
+      }
+    }
   }
   const close = await closePosition(userId, mode, symbol)
   return { close, canceledExits }

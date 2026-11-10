@@ -284,6 +284,9 @@ export function TradeTicket({
           title: `${side === 'buy' ? '🟢 Buy' : '🔴 Sell'} order submitted (${json.mode || mode})`,
           description: [
             `${q} ${symbol} ${orderType}`,
+            // v2.12.29 — during pre/post the route converts a market order
+            // into a marketable limit; tell the user exactly what happened
+            json.extendedNote,
             json.splitNote,
             ...errs,
             oid ? `#${String(oid).slice(0, 8)}` : '',

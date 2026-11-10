@@ -36,6 +36,7 @@
 // show 「其他裝置運行中」 and never double-run the steward.
 import { create } from 'zustand'
 import type { AiChatMsg } from '@/lib/ai-trade'
+import { CORE_DISCIPLINES } from '@/lib/ai-steward-disciplines'
 import {
   registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
   type AiOpsRunnerInfo,
@@ -195,6 +196,11 @@ let running = false
 let runAbort: AbortController | null = null
 let logSeq = 0
 let resumed = false
+// v2.12.29 — last observed US session phase (pre/regular/post/closed): a
+// regular ↔ extended transition is the known TP/SL killer (DAY-tif legs die
+// at the close), so the cycle that SEES a transition forces a full
+// protection audit.
+let lastSessionPhase: string | null = null
 
 export const useAiStewardStore = create<AiStewardState>((set, get) => ({
   config: loadConfig(),
@@ -429,12 +435,13 @@ interface ClosedTrade {
 function stewardInstruction(): string {
   return [
     `你是 BLACKHOLE 終端的「AI 護倉」。定期審視持倉、待成交訂單與今日已平倉交易，提出保守、可執行的維護決策。只輸出一個 JSON 物件，禁止任何其他文字或說明：`,
-    `{"positions":[{"symbol":"AAPL","action":"hold|tighten|widen|exit","new_stop":<數字或0>,"new_target":<數字或0>,"confidence":<0-100整數>,"reason":"<繁中≤40字>"}],`,
+    `{"positions":[{"symbol":"AAPL","action":"hold|tighten|widen|exit|reattach","new_stop":<數字或0>,"new_target":<數字或0>,"confidence":<0-100整數>,"reason":"<繁中≤40字>"}],`,
     ` "orders":[{"id":"<DATA中的id>","action":"keep|amend|cancel","new_entry":<數字或0>,"new_tp":<數字或0>,"new_sl":<數字或0>,"confidence":<0-100整數>,"reason":"<繁中≤40字>"}],`,
     ` "lessons":["<繁中≤60字>"]}`,
     `規則：`,
     `- positions/orders 只回覆需要處理的項目；沒問題的不必列出。action=hold/keep 時 new_* 全部填 0。`,
     `- tighten=把 SL/TP 往現價收緊以鎖定保護；widen=放寬距離避開震盪。`,
+    `- reattach=持倉的 SL 或 TP 缺失（DATA 顯示「無」或出現 ⚠ 保護缺失區）時重新掛上保護：SL 缺失用 new_stop（long: <現價；short: >現價），TP 缺失用 new_target（long: >現價；short: <現價），兩者皆缺可一併填。SL 缺失＝全倉清盤風險，是最高優先級動作。`,
     `- long 倉：new_stop 必須 < 現價 且 new_target 必須 > 現價；short 倉相反。禁止把 stop 移過現價。`,
     `- 修改幅度 <0.5% 沒有意義，請勿提出。exit（市價平倉）只在風險明確時提出且 confidence ≥ 70。`,
     `- VIX 偏高或大盤急跌時傾向 tighten/exit 高風險持倉；數據不足時誠實 hold。`,
@@ -442,6 +449,8 @@ function stewardInstruction(): string {
     `- orders：現價已遠離掛單價（>3%）或形勢改變 → amend 新價或 cancel；reason 必須引用 DATA 區數字。`,
     `- lessons：從今日已平倉交易歸納 ≤3 梄可執行的改善（停損紀律、進場時機、部位控制…），不要空話。`,
     `- 只能使用 DATA 區的數字，不可杜撰；誠實保守優先於頻繁操作。`,
+    `核心紀律（系統內建 · 永遠遵守 · 優先於一切其他考量）：`,
+    ...CORE_DISCIPLINES.map((d, i) => `${i + 1}. ${d}`),
   ].join('\n')
 }
 
@@ -502,12 +511,16 @@ export async function runStewardOnce(): Promise<void> {
 
   try {
     // 1) data pulls — positions(+exits+pending), today's realized trades,
-    //    stored memory (v2.12.26 — PERMANENT lessons, never retention-purged)
+    //    stored memory (v2.12.26 — PERMANENT lessons, never retention-purged),
+    //    and the US session state (v2.12.29 — extended-hours discipline:
+    //    pre/post bans market orders; transitions kill DAY-tif TP/SL legs)
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0)
-    const [posRes, histRes, memRes] = await Promise.all([
+    const [posRes, histRes, memRes, hoursRes] = await Promise.all([
       fetchJson(`/api/trading/positions?mode=${cfg.mode}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson(`/api/trading/history?mode=${cfg.mode}&from=${encodeURIComponent(midnight.toISOString())}&limit=100`, { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson('/api/ai-steward/lessons', { signal: sig }).catch(() => ({ status: 0, j: null })),
+      // /api/market/hours is POST-only (shared with the chart session badge)
+      fetchJson('/api/market/hours', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbols: ['SPY'] }), signal: sig }).catch(() => ({ status: 0, j: null })),
     ])
 
     const posJ = posRes.j as { positions?: PositionRow[]; exits?: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>; pending?: PendingRow[]; keysMissing?: unknown; authError?: unknown } | null
@@ -520,6 +533,31 @@ export async function runStewardOnce(): Promise<void> {
     const memLessons = Array.isArray(memJ?.lessons) ? memJ!.lessons : []
     // permanent memory: newest-reinforced first, top slice into the prompt
     const lessons = memLessons.slice(0, 16).map((l) => l.text)
+
+    // v2.12.29 — session phase + transition detection + the deterministic
+    // TP/SL guard. A regular ↔ pre/post transition is the known protective-leg
+    // killer (DAY-tif legs die at the session close) and a steward cancel-
+    // replace failure can leave a position naked too — a missing SL carries
+    // full-liquidation risk (全倉清盤), so it is audited EVERY cycle.
+    const hoursJ = hoursRes.j as { hours?: Record<string, { state?: string }> } | null
+    const session = hoursJ?.hours?.SPY?.state ?? 'unknown'
+    const prevPhase = lastSessionPhase
+    const sessionChanged = prevPhase !== null && session !== 'unknown' && session !== prevPhase
+    if (session !== 'unknown') lastSessionPhase = session
+    const sessionLabel = session === 'pre' ? 'Pre-market（延長時段 04:00-09:30 ET · 禁市價單）'
+      : session === 'post' ? 'Post-market（延長時段 16:00-20:00 ET · 禁市價單）'
+      : session === 'regular' ? 'Regular Trading Hour（常規時段）'
+      : session === 'closed' ? '市場休市'
+      : session === 'open24' ? '24小時交易（crypto）'
+      : '未知'
+    const slMissingRows = positions.filter((p) => {
+      if (!isManual(p.source)) return false // algo/grid engines protect their own
+      const ex = exits[p.symbol] ?? exits[p.tradeSymbol] ?? {}
+      return !ex.sl
+    })
+    // symbols whose missing SL the model re-attaches THIS cycle — their guard
+    // event is then dropped (the feed shows the fix, not a stale complaint)
+    const slFixed = new Set<string>()
 
     // 2) live quotes: market context + every held/pending symbol
     const heldSyms = positions.map((p) => p.tradeSymbol || p.symbol)
@@ -549,12 +587,44 @@ export async function runStewardOnce(): Promise<void> {
     if (posJ?.keysMissing) st0.addLog('warn', `${cfg.mode} 模式未設定 Alpaca keys — 持倉/訂單資料為空，僅能回顧歷史。`)
     if (posJ?.authError) st0.addLog('warn', 'Alpaca 認證問題 — 持倉/訂單可能不完整（見持倉頁橫幅）。')
 
+    // v2.12.29 — persistent guard events + warn logs for every NAKED
+    // position (no SL). Recorded even if the model call fails below — the
+    // detection is deterministic and must not depend on the model. Dropped
+    // later only if this same cycle re-attaches the missing leg.
+    if (sessionChanged) st0.addLog('warn', `市場時段轉換：${prevPhase} → ${session} — 本輪強制複查所有持倉的 TP/SL 保護單`)
+    for (const p of slMissingRows) {
+      drafts.push({
+        kind: 'position',
+        action: 'sl_missing',
+        status: 'stored',
+        symbol: p.tradeSymbol || p.symbol,
+        detail: `SL 缺失 — 持倉無停損保護（全倉清盤風險）${sessionChanged ? ` · 疑似時段轉換（${prevPhase} → ${session}）流失` : ''}`,
+        payload: { from: 'guard', session },
+      })
+      st0.addLog('warn', `⚠ ${p.tradeSymbol || p.symbol} SL 缺失 — 無停損保護（每輪提醒直至修復）`)
+    }
+
     // 3) build the DATA block (everything the model may cite)
     const lines: string[] = []
     lines.push('市場狀態:')
     for (const m of ['SPY', 'QQQ', 'VIX']) {
       const q = qOf(m)
       lines.push(q ? `- ${m} ${fmtPrice(q.price)}${m === 'VIX' ? '' : ` 日變動 ${q.changePct >= 0 ? '+' : ''}${q.changePct.toFixed(2)}%`}` : `- ${m} 無報價`)
+    }
+    lines.push('')
+    lines.push(`交易時段: ${sessionLabel}`)
+    if (session === 'pre' || session === 'post') {
+      lines.push('- ⚠ 延長交易時段：Alpaca 不接受市價單（會被靜默擱置至下次 regular session）— exit 建議仍可提出，終端會自動轉為限價執行。')
+    }
+    if (sessionChanged) {
+      lines.push(`- ⚠ 時段剛轉換（${prevPhase} → ${session}）— 這類轉換常令 TP/SL 保護單消失，必須逐倉複查下面每個持倉的 SL/TP 是否仍在。`)
+    }
+    if (slMissingRows.length > 0) {
+      lines.push('')
+      lines.push('⚠ 保護缺失（最高優先級 — 必須處理）:')
+      for (const p of slMissingRows) {
+        lines.push(`- ${p.tradeSymbol || p.symbol}（${p.side.toUpperCase()} ${p.qty}股，現價 ${fmtPrice(p.current)}）：SL 無 — 全倉清盤風險。請以 action=reattach + new_stop 重新掛上停損。`)
+      }
     }
     lines.push('')
     lines.push(`持倉（${positions.length}）:`)
@@ -588,7 +658,7 @@ export async function runStewardOnce(): Promise<void> {
     }
     const dataBlock = lines.join('\n')
 
-    st0.addLog('info', `送審：持倉 ${positions.length} · 待成交 ${pending.length} · 今日平倉 ${trades.length}${lessons.length ? ` · 記憶 ${lessons.length} 條` : ''}`)
+    st0.addLog('info', `送審：持倉 ${positions.length} · 待成交 ${pending.length} · 今日平倉 ${trades.length}${lessons.length ? ` · 記憶 ${lessons.length} 條` : ''}${slMissingRows.length ? ` · ⚠ SL缺失 ${slMissingRows.length}` : ''} · 時段 ${session}`)
 
     // 4) one batched model call
     const res = await fetch('/api/ai-trade/chat', {
@@ -655,8 +725,12 @@ export async function runStewardOnce(): Promise<void> {
           const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(row.tradeSymbol || row.symbol)}?mode=${cfg.mode}`, { method: 'DELETE', signal: sig })
           if (r.status === 200) {
             executed++
-            drafts.push({ ...kindBase, action: 'close', status: 'executed', detail: `已市價平倉 ${row.qty}股 — ${reason}`, payload: { confidence: conf, uplPct: row.uplPct } })
-            st0.addLog('success', `${row.tradeSymbol} 已平倉 — ${reason}`)
+            // v2.12.29 — during pre/post the route converts the market close
+            // into a marketable limit (extended-hours discipline); surface
+            // that honestly in the event + log
+            const extNote = String((r.j as { extendedNote?: string } | null)?.extendedNote || '')
+            drafts.push({ ...kindBase, action: 'close', status: 'executed', detail: `已平倉 ${row.qty}股 — ${reason}${extNote ? `（${extNote}）` : ''}`, payload: { confidence: conf, uplPct: row.uplPct } })
+            st0.addLog('success', `${row.tradeSymbol} 已平倉 — ${reason}${extNote ? `（${extNote}）` : ''}`)
           } else {
             failed++
             drafts.push({ ...kindBase, action: 'close', status: 'failed', detail: `平倉失敗（HTTP ${r.status}）— ${reason}` })
@@ -668,8 +742,10 @@ export async function runStewardOnce(): Promise<void> {
         }
         continue
       }
-      // tighten|widen → amend SL and/or TP exit legs
-      if (action !== 'tighten' && action !== 'widen') continue
+      // tighten|widen|reattach → amend/attach SL and/or TP exit legs
+      // (v2.12.29 — reattach flows the SAME validated path; the attach blocks
+      // below key on the leg being MISSING, not on the verb)
+      if (action !== 'tighten' && action !== 'widen' && action !== 'reattach') continue
       if (!cfg.amendPositions) {
         skipped++
         drafts.push({ ...kindBase, action: 'amend', status: 'skipped', detail: `${reason} — 已停用「調整持倉 TP/SL」開關` })
@@ -685,6 +761,8 @@ export async function runStewardOnce(): Promise<void> {
       const cur = row.current
       const newStop = num(pv.new_stop, 0)
       const newTarget = num(pv.new_target, 0)
+      // v2.12.29 — set when a missing TP rides the SL attach call (single OCO)
+      let tpAttached = false
 
       // SL leg
       if (newStop > 0 && ex.sl) {
@@ -732,6 +810,50 @@ export async function runStewardOnce(): Promise<void> {
         }
       }
 
+      // v2.12.29 — ATTACH path: the SL leg is GONE (the guard case). Same
+      // geometry gate as an amend, no old-price comparison — protection must
+      // not depend on which verb the model chose (tighten/widen/reattach all
+      // restore a missing leg). Both legs missing → ONE attach call (the
+      // exits route rebuilds them as a single OCO).
+      if (newStop > 0 && !ex.sl && (long ? newStop < cur : newStop > cur)) {
+        const sym = row.tradeSymbol || row.symbol
+        const tpAlsoMissing = newTarget > 0 && !ex.tp && (long ? newTarget > cur : newTarget < cur)
+        const kindAttach = { kind: 'position' as const, symbol: sym, detail: reason, payload: { from: 'model', confidence: conf, action: 'reattach_sl' } }
+        if (!cfg.amendPositions) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 ${fmtPrice(newStop)} — 已停用「調整持倉 TP/SL」開關` })
+        } else if (conf < cfg.minConfidence) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 ${fmtPrice(newStop)} — 信心 ${conf}% 低於門檻 ${cfg.minConfidence}%` })
+        } else if (actionsLeft() <= 0) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 — 本輪動作數已達上限` })
+        } else if (cfg.dryRun) {
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'dry_run', detail: `試運行：重新掛上缺失的 SL ${fmtPrice(newStop)}${tpAlsoMissing ? ` + TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
+        } else {
+          try {
+            const attachBody: Record<string, unknown> = { mode: cfg.mode, sl: newStop }
+            if (tpAlsoMissing) attachBody.tp = newTarget
+            const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(sym)}/exits`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(attachBody), signal: sig })
+            if (r.status === 200) {
+              executed++
+              if (tpAlsoMissing) tpAttached = true
+              slFixed.add(sym.toUpperCase())
+              drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'executed', detail: `已重新掛上缺失的 SL ${fmtPrice(newStop)}${tpAlsoMissing ? ` 與 TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
+              st0.addLog('success', `${sym} SL 重新掛上 ${fmtPrice(newStop)}${tpAlsoMissing ? ` · TP ${fmtPrice(newTarget)}` : ''} — ${reason}`)
+            } else {
+              failed++
+              const err = String((r.j as { error?: string } | null)?.error || `HTTP ${r.status}`)
+              drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'failed', detail: `SL 重新掛上失敗 — ${err}` })
+              st0.addLog('error', `${sym} SL 重新掛上失敗 — ${err}`)
+            }
+          } catch {
+            failed++
+            drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'failed', detail: `SL 重新掛上連線失敗 — ${reason}` })
+          }
+        }
+      }
+
       // TP leg
       if (newTarget > 0 && ex.tp) {
         const oldTp = ex.tp.limitPrice ?? ex.tp.stopPrice
@@ -772,6 +894,44 @@ export async function runStewardOnce(): Promise<void> {
                 drafts.push({ ...kindBase, action: 'amend_tp', status: 'failed', detail: `TP 修改連線失敗 — ${reason}` })
               }
             }
+          }
+        }
+      }
+
+      // v2.12.29 — ATTACH path for a MISSING TP leg (tp-only; when both legs
+      // were missing the SL attach above already placed them together in one
+      // OCO). The exits route preserves the SL sibling by rebuilding the pair
+      // from the canceled snapshot.
+      if (!tpAttached && newTarget > 0 && !ex.tp && (long ? newTarget > cur : newTarget < cur)) {
+        const sym = row.tradeSymbol || row.symbol
+        const kindAttach = { kind: 'position' as const, symbol: sym, detail: reason, payload: { from: 'model', confidence: conf, action: 'reattach_tp' } }
+        if (!cfg.amendPositions) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'skipped', detail: `TP 缺失，需重新掛上 ${fmtPrice(newTarget)} — 已停用「調整持倉 TP/SL」開關` })
+        } else if (conf < cfg.minConfidence) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'skipped', detail: `TP 缺失，需重新掛上 ${fmtPrice(newTarget)} — 信心 ${conf}% 低於門檻 ${cfg.minConfidence}%` })
+        } else if (actionsLeft() <= 0) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'skipped', detail: `TP 缺失，需重新掛上 — 本輪動作數已達上限` })
+        } else if (cfg.dryRun) {
+          drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'dry_run', detail: `試運行：重新掛上缺失的 TP ${fmtPrice(newTarget)} — ${reason}` })
+        } else {
+          try {
+            const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(sym)}/exits`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: cfg.mode, tp: newTarget }), signal: sig })
+            if (r.status === 200) {
+              executed++
+              drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'executed', detail: `已重新掛上缺失的 TP ${fmtPrice(newTarget)} — ${reason}` })
+              st0.addLog('success', `${sym} TP 重新掛上 ${fmtPrice(newTarget)} — ${reason}`)
+            } else {
+              failed++
+              const err = String((r.j as { error?: string } | null)?.error || `HTTP ${r.status}`)
+              drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'failed', detail: `TP 重新掛上失敗 — ${err}` })
+              st0.addLog('error', `${sym} TP 重新掛上失敗 — ${err}`)
+            }
+          } catch {
+            failed++
+            drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'failed', detail: `TP 重新掛上連線失敗 — ${reason}` })
           }
         }
       }
@@ -904,6 +1064,15 @@ export async function runStewardOnce(): Promise<void> {
       if (!text) continue
       lessonCount++
       drafts.push({ kind: 'lesson', action: 'lesson', status: 'stored', detail: text })
+    }
+
+    // v2.12.29 — drop the guard events for legs this cycle re-attached (the
+    // feed shows the FIX, not a stale complaint that was already handled)
+    if (slFixed.size > 0) {
+      for (let i = drafts.length - 1; i >= 0; i--) {
+        const d = drafts[i]
+        if (d.action === 'sl_missing' && d.symbol && slFixed.has(d.symbol.toUpperCase())) drafts.splice(i, 1)
+      }
     }
 
     // 6) store everything (+ server-side prune) — one POST
