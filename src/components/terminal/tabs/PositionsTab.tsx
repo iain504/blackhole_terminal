@@ -208,24 +208,28 @@ function histRangeQuery(range: HistRange, fromStr: string, toStr: string): strin
   return p.toString()
 }
 
-/** Manual / Algo / Grid / AI source badge (Task 65, grid in Task 10-k, AI in
- *  v2.12.25): algo rows show which strategy placed it, grid rows an emerald
- *  Grid tag, AI rows a violet AI tag (the AI Trade Adviser auto-trader).
+/** Manual / Algo / Grid / AI Trade source badge (Task 65, grid in Task 10-k,
+ *  AI in v2.12.25): algo rows show which strategy placed it, grid rows an
+ *  emerald Grid tag, AI rows a violet AI Trade tag (the AI Trade Adviser
+ *  auto-trader). v2.12.31 — the badge reads "AI Trade" (a bare "AI" read as
+ *  a typo) and a slice qty renders " · N" — the number is the still-open
+ *  entry-lot qty that came from this source, never a mystery suffix.
  *  Task 79 — an UNKNOWN source (no open entry lot in the recent closed-orders
  *  window, e.g. an old position or a pre-dating fill) used to render as
  *  "Manual" — a wrong attribution. It now shows a dim "—" like other unknown
  *  columns; only a decoded `ttb-`/external coid renders "Manual". Task 81 —
  *  an optional qty label (shown only on multi-source rows) sizes each slice. */
 function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | 'ai' | null | undefined; strategy?: string; qty?: number }) {
-  const qtyLabel = qty != null ? ` ${fmtQtyLabel(qty)}` : ''
+  const qtyLabel = qty != null ? ` · ${fmtQtyLabel(qty)}` : ''
+  const qtyNote = qty != null ? ` — ${fmtQtyLabel(qty)} units of this position's still-open entry lots came from this source` : ''
   if (source === 'ai') {
     return (
       <Badge
         variant="outline"
         className="border-fuchsia-500/40 bg-fuchsia-500/10 text-[10px] text-fuchsia-300"
-        title="Placed by the AI Trade Adviser (auto-trade)"
+        title={`Placed by the AI Trade Adviser (auto-trade)${qtyNote}`}
       >
-        AI{qtyLabel}
+        AI Trade{qtyLabel}
       </Badge>
     )
   }
@@ -234,7 +238,7 @@ function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'g
       <Badge
         variant="outline"
         className="border-violet-500/40 bg-violet-500/10 text-[10px] text-violet-300"
-        title={strategy ? `Placed by the ${strategy} algo run` : 'Placed by an algo run'}
+        title={strategy ? `Placed by the ${strategy} algo run${qtyNote}` : `Placed by an algo run${qtyNote}`}
       >
         {strategy ? `Algo · ${strategy}` : 'Algo'}{qtyLabel}
       </Badge>
@@ -245,7 +249,7 @@ function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'g
       <Badge
         variant="outline"
         className="border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-300"
-        title="Placed by a grid trade"
+        title={`Placed by a grid trade${qtyNote}`}
       >
         Grid{qtyLabel}
       </Badge>
@@ -263,7 +267,7 @@ function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'g
     )
   }
   return (
-    <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400" title="Placed manually from the chart / ticket">
+    <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-400" title={`Placed manually from the chart / ticket${qtyNote}`}>
       Manual{qtyLabel}
     </Badge>
   )
@@ -334,7 +338,7 @@ function ReasonCell({ reason }: { reason?: TradeReason }) {
 function PositionSourceCell({ source, strategy, sources }: { source?: 'manual' | 'algo' | 'grid' | 'ai'; strategy?: string; sources?: SourceSlice[] }) {
   if (sources && sources.length > 1) {
     const summary = sources
-      .map((s) => (s.source === 'algo' && s.strategy ? `Algo · ${s.strategy}` : s.source === 'ai' ? 'AI' : s.source) + ` ${fmtQtyLabel(s.qty)}`)
+      .map((s) => (s.source === 'algo' && s.strategy ? `Algo · ${s.strategy}` : s.source === 'ai' ? 'AI Trade' : s.source) + ` · ${fmtQtyLabel(s.qty)}`)
       .join(' + ')
     return (
       <span

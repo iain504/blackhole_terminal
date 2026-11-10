@@ -4,7 +4,7 @@ import {
   getPositions, getOpenOrders, getClosedOrders, resolveTradeMode, ensureCryptoOcoSupervisor,
   TradingOrder, TradingPosition, parseCryptoPlan, authBackoffMsLeft, isNoKeysError, isKeysUnreadableError,
 } from '@/lib/trading'
-import { matchFifo, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
+import { matchFifo, ghostLotSymbols, resolveRunStrategyNames, type OpenLot } from '@/lib/trade-history'
 import { ensureFillNotifier } from '@/lib/fill-notifier'
 import { hasAlpacaKeys, describeAlpacaKeys } from '@/lib/alpaca'
 import { handleError } from '@/lib/api-helpers'
@@ -255,7 +255,25 @@ export async function GET(req: Request) {
     const orders: TradingOrder[] = Array.isArray(ordRes.data) ? ordRes.data : []
     const closedOrders: TradingOrder[] = Array.isArray(closedRes.data) ? closedRes.data : []
     // max=0: closed TRADES are not needed here — only the open lots per symbol
-    const openLots = matchFifo(closedOrders, 0).openLots
+    // v2.12.31 — GHOST CHECK → WIDEN (the medicine the history route got in
+    // v2.12.28, which this route never received): a position straddling the
+    // newest-500 window makes the walk mint a SYNTHETIC lot from its own
+    // straddling EXIT. That phantom carries the exit leg's client_order_id
+    // (decodes to no source → 'manual'), so the SOURCE column sprouted a
+    // phantom "Manual <exit qty>" badge on a position the AI Trade Adviser
+    // opened — next to the real "AI <qty>" slice. Widen with older pages and
+    // re-walk so the real entry fills close the phantom before attribution.
+    let lotsOrders = closedOrders
+    let openLots = matchFifo(lotsOrders, 0).openLots
+    try {
+      if (positions.length > 0 && ghostLotSymbols(openLots, positions).length > 0) {
+        const wider = await getClosedOrders(user.id, mode, 500, 3)
+        if (Array.isArray(wider.data) && wider.data.length > lotsOrders.length) {
+          lotsOrders = wider.data
+          openLots = matchFifo(lotsOrders, 0).openLots
+        }
+      }
+    } catch { /* attribution must never fail the route — the page-1 walk stands */ }
     // Task 79 — FIFO lot keys keep the crypto slash (ORDER symbols are
     // 'BTC/USD') while POSITION symbols drop it ('BTCUSD'), so the direct
     // `openLots.get(p.symbol)` lookup missed EVERY crypto position and their
@@ -347,7 +365,13 @@ export async function GET(req: Request) {
         // plain "Grid", hiding the algo run. The lots are now aggregated into
         // per-source slices (source + runRef key, qty summed, dominant qty
         // first, tie → oldest) so every coexisting source stays visible.
-        const lots = openLotsByNorm.get(normSymbol(p.symbol)) ?? []
+        // v2.12.31 — only lots on the position's OWN side can be its entry
+        // lots (long ← buy lots, short ← sell lots). The FIFO walk spans the
+        // whole window: a residual inverted/synthetic lot (window truncation
+        // the widening could not heal) must never leak into the source slices
+        // as a phantom "Manual" badge — or flip openedAt to an exit's time.
+        const posSide = p.side === 'short' ? 'sell' : 'buy'
+        const lots = (openLotsByNorm.get(normSymbol(p.symbol)) ?? []).filter((l) => l.side === posSide)
         const oldest = lots[0]
         type LotSrc = { source: 'manual' | 'algo' | 'grid' | 'ai'; qty: number; runRef: string | null; at: number }
         const lotSrcs: LotSrc[] = lots.map((l) => {
