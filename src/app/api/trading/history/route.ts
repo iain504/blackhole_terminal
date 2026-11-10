@@ -1,21 +1,33 @@
 import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { getClosedOrders, resolveTradeMode, isNoKeysError, isKeysUnreadableError, authBackoffMsLeft } from '@/lib/trading'
+import { getClosedOrders, getPositions, resolveTradeMode, isNoKeysError, isKeysUnreadableError, authBackoffMsLeft, parseCryptoPlan, type TradingOrder } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
-import { matchClosedTrades, resolveRunStrategyNames } from '@/lib/trade-history'
+import { matchFifo, ghostLotSymbols, resolveRunStrategyNames, displaySymbolOf } from '@/lib/trade-history'
+import { loadStewardActions, resolveTradeReason, resolveCancelReason } from '@/lib/trade-reasons'
+import type { CanceledOrderRow, ClosedTrade } from '@/lib/market-types'
 import { handleError } from '@/lib/api-helpers'
 
 // GET /api/trading/history?mode=paper&limit=100 — realized round-trip trades
 // (FIFO-matched from the broker's filled closed orders) with realized P&L.
 // Powers the Positions tab "Trade history" group + the Performance Report.
-// Each trade carries `source: 'manual' | 'algo' | 'grid'` (decoded from the
-// entry order's client_order_id, Task 10-k) and, for algo trades, the
-// resolved strategy name.
+// Each trade carries `source: 'manual' | 'algo' | 'grid' | 'ai'` (decoded
+// from the entry order's client_order_id, Task 10-k) and, for algo trades,
+// the resolved strategy name.
 // Task 82 — optional `from`/`to` (ISO timestamps) filter the matched trades
 // by EXIT time (the CLOSED column): the FIFO walk still runs over the whole
 // recent closed-orders window, the date filter is applied BEFORE the limit
 // so a narrow range isn't crowded out by newer trades. Ranges come from the
 // client in the browser's timezone (local-midnight ISO).
+// v2.12.28 — three additions: (1) HELD-BUG fix — after the walk the open
+// lots are checked against the LIVE positions; a lot with no backing
+// position (or a contradicting side) is a WINDOW-TRUNCATION GHOST whose
+// pairing poisoned HELD/P&L ("same-day trade shows 7d"), so the tape is
+// WIDENED with older pages (page_token, up to 3 pages) and re-walked.
+// (2) zero-fill CANCELED/expired orders surface as their own rows (they used
+// to vanish without a trace; edit-replacements are excluded as noise).
+// (3) every row gains a `reason` (TP/SL hit, AI-steward close/cancel with
+// the steward's verdict, engine exit, manual close…) for the new REASON
+// column.
 export async function GET(req: Request) {
   try {
     const user = await getSessionUser()
@@ -27,11 +39,16 @@ export async function GET(req: Request) {
     const fromMs = Date.parse(searchParams.get('from') || '')
     const toMs = Date.parse(searchParams.get('to') || '')
 
-    const r = await getClosedOrders(user.id, mode, 500)
+    // v2.12.28 — the live-positions list rides along (parallel, cheap) for
+    // the ghost-lot check; it does NOT fail the history when it errors.
+    const [r, posRes] = await Promise.all([
+      getClosedOrders(user.id, mode, 500),
+      getPositions(user.id, mode).catch(() => ({ data: null, status: 0 })),
+    ])
     if (!r.data) {
       // no keys configured is a quiet empty state (same convention as fills)
       if (isNoKeysError(r.error)) {
-        return NextResponse.json({ mode, trades: [], configured: false })
+        return NextResponse.json({ mode, trades: [], canceled: [], configured: false })
       }
       // v2.12.6 — saved pair couldn't be decrypted (APP_ENCRYPTION_SECRET
       // changed): actionable re-save banner, never silent env substitution.
@@ -40,6 +57,7 @@ export async function GET(req: Request) {
         return NextResponse.json({
           mode,
           trades: [],
+          canceled: [],
           configured: true,
           authError: {
             mode,
@@ -63,6 +81,7 @@ export async function GET(req: Request) {
           {
             mode,
             trades: [],
+            canceled: [],
             configured: true,
             authError: {
               mode,
@@ -74,10 +93,37 @@ export async function GET(req: Request) {
       }
       return NextResponse.json({ error: r.error || 'Closed orders fetch failed' }, { status: r.status || 502 })
     }
-    const orderList = Array.isArray(r.data) ? r.data : []
-    // uncapped walk (large cap — 500 orders can't produce more): filter by
+
+    // v2.12.28 — GHOST CHECK → WIDEN: walk the tape; if the leftover open
+    // lots can't be explained by the live positions (no position for the
+    // symbol, or the side contradicts), the newest-500 window truncated a
+    // straddling position — refetch with up to 2 OLDER pages and re-walk.
+    // The walk is cheap; the extra broker calls only happen on the rare
+    // ghost path. At the cap we accept the best-effort tape.
+    let orderList = Array.isArray(r.data) ? r.data : []
+    const positions = Array.isArray(posRes.data) ? (posRes.data as { symbol: string; side: string }[]) : []
+    let fm = matchFifo(orderList, 1000)
+    try {
+      if (ghostLotSymbols(fm.openLots, positions).length > 0) {
+        const wider = await getClosedOrders(user.id, mode, 500, 3)
+        if (Array.isArray(wider.data) && wider.data.length > orderList.length) {
+          orderList = wider.data
+          fm = matchFifo(orderList, 1000)
+        }
+      }
+    } catch {
+      // ghost check must never fail the history
+    }
+
+    // reason sources: the AI steward's recent executed actions (best-effort)
+    const steward = await loadStewardActions(user.id)
+    const byId = new Map<string, TradingOrder>()
+    for (const o of orderList) byId.set(o.id, o)
+    for (const o of orderList) for (const leg of o.legs ?? []) if (!byId.has(leg.id)) byId.set(leg.id, leg)
+
+    // uncapped walk (large cap — 500+ orders can't produce more): filter by
     // exit time FIRST, then cap, so a date range gets its full share
-    const matched = matchClosedTrades(orderList, 1000).filter((t) => {
+    const matched = fm.trades.filter((t) => {
       const at = Date.parse(t.exitAt)
       if (!Number.isFinite(at)) return true // keep malformed-time trades out of the filter's blast radius
       if (Number.isFinite(fromMs) && at < fromMs) return false
@@ -89,12 +135,63 @@ export async function GET(req: Request) {
     // (refs are 8-char id prefixes so `startsWith` is unique in practice)
     const refs = [...new Set(trades.map((t) => t.runRef).filter((x): x is string => !!x))]
     const stratNames = await resolveRunStrategyNames(refs)
-    const enriched = trades.map((t) =>
-      t.source === 'algo' && t.runRef
-        ? { ...t, strategy: stratNames.get(t.runRef) ?? 'Algo' }
-        : t,
+    const enriched: ClosedTrade[] = trades.map((t) => {
+      const withStrat =
+        t.source === 'algo' && t.runRef
+          ? { ...t, strategy: stratNames.get(t.runRef) ?? 'Algo' }
+          : t
+      // v2.12.28 — close reason (exit order role/grammar + steward log)
+      const exitOrder = byId.get(t.exitOrderIds[t.exitOrderIds.length - 1] ?? '')
+      return { ...withStrat, reason: resolveTradeReason(withStrat, exitOrder, steward) }
+    })
+
+    // v2.12.28 — CANCELED/expired zero-fill orders (they used to vanish from
+    // the Pending list without a trace). Edit-REPLACEMENTS (replaced_by set)
+    // are excluded — every chart drag / steward amend produces one, pure
+    // noise. Legs of a canceled UNFILLED family are folded into their
+    // canceled parent row (the parent is the meaningful event; its TP/SL
+    // plan died with it).
+    const canceledRows: TradingOrder[] = orderList.filter(
+      (o) =>
+        (o.status === 'canceled' || o.status === 'expired') &&
+        parseFloat(o.filled_qty || '0') === 0 &&
+        !o.replaced_by,
     )
-    return NextResponse.json({ mode, trades: enriched, configured: true })
+    const canceledParents = new Set(
+      canceledRows.filter((o) => (o.legs?.length ?? 0) > 0 || o.order_class === 'bracket' || o.order_class === 'oto').map((o) => o.group_id ?? o.id),
+    )
+    const canceled: CanceledOrderRow[] = canceledRows
+      .filter((o) => {
+        // a leg whose family parent was itself canceled (unfilled entry) is
+        // represented by the parent row — skip it here
+        if (!o.group_id || !o.group_role) return true
+        if (o.group_role === 'entry') return true
+        return !canceledParents.has(o.group_id)
+      })
+      .sort((a, b) => new Date(b.updated_at || b.created_at || '').getTime() - new Date(a.updated_at || a.created_at || '').getTime())
+      .slice(0, 60)
+      .map((o) => ({
+        id: o.id,
+        symbol: displaySymbolOf(o),
+        side: o.side === 'sell' ? ('sell' as const) : ('buy' as const),
+        qty: parseFloat(o.qty || '0') || 0,
+        price: Number.isFinite(parseFloat(o.limit_price ?? '')) && parseFloat(o.limit_price ?? '') > 0
+          ? parseFloat(o.limit_price as string)
+          : Number.isFinite(parseFloat(o.stop_price ?? '')) && parseFloat(o.stop_price ?? '') > 0
+            ? parseFloat(o.stop_price as string)
+            : null,
+        type: o.type,
+        status: o.status,
+        createdAt: o.created_at ?? '',
+        canceledAt: o.updated_at || o.created_at || '',
+        source: (() => {
+          const plan = parseCryptoPlan(o.client_order_id)
+          return plan?.gridRef ? ('grid' as const) : plan?.runRef ? ('algo' as const) : plan?.aiRef ? ('ai' as const) : ('manual' as const)
+        })(),
+        reason: resolveCancelReason(o, steward),
+      }))
+
+    return NextResponse.json({ mode, trades: enriched, canceled, configured: true })
   } catch (e) {
     return handleError(e)
   }

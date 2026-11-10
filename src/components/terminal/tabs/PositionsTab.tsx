@@ -17,7 +17,7 @@
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
-import { ArrowDown, ArrowUp, ArrowUpDown, History, KeyRound, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, Ban, History, KeyRound, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -28,7 +28,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { useToast } from '@/hooks/use-toast'
 import { fetchAtr, atrExitPrice, fmtAtrExit, ATR_TF_OPTIONS, type AtrInfo } from '@/lib/atr-client'
-import { fmtPrice, fmtHeldDuration, ClosedTrade } from '@/lib/market-types'
+import { fmtPrice, fmtHeldDuration, ClosedTrade, CanceledOrderRow, TradeReason } from '@/lib/market-types'
 import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import { useTerminal } from '@/store/terminal'
 import AccountOverview from './AccountOverview'
@@ -54,6 +54,9 @@ interface ModeData {
 
 interface HistoryData {
   trades: ClosedTrade[]
+  /** v2.12.28 — zero-fill canceled/expired orders (they used to vanish from
+   *  the Pending list without a trace); rendered as their own rows. */
+  canceled: CanceledOrderRow[]
   configured: boolean
   loaded: boolean
   error?: string
@@ -69,6 +72,12 @@ interface PosConsoleRow {
   sl?: ExitInfo
   tp?: ExitInfo
 }
+
+/** v2.12.28 — one Trade-history table row: a FIFO closed trade OR a
+ * canceled/expired (zero-fill) order, merged under one filter/sort model. */
+type HistRow =
+  | { kind: 'trade'; mode: Mode; at: number; t: ClosedTrade }
+  | { kind: 'cancel'; mode: Mode; at: number; c: CanceledOrderRow }
 
 /** Position row + open-lot attribution fields (OPENED / SOURCE — served by
  * /api/trading/positions from the FIFO matcher's oldest open entry lot;
@@ -256,6 +265,62 @@ function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'g
   )
 }
 
+/** v2.12.28 — badge tint per reason family (mirrors the Source palette: AI
+ * fuchsia, grid emerald, algo violet; TP/SL by hit kind; cancels dim). */
+function reasonBadgeCls(code: string): string {
+  if (code === 'tp' || code === 'tp_ai') return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+  if (code === 'sl' || code === 'sl_ai' || code === 'trail') return 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+  if (code === 'ai_close' || code === 'ai_cancel') return 'border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300'
+  if (code === 'grid_exit' || code === 'grid_cancel') return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+  if (code === 'algo_exit' || code === 'algo_cancel') return 'border-violet-500/40 bg-violet-500/10 text-violet-300'
+  if (code === 'expired') return 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+  return 'border-zinc-700 text-zinc-400'
+}
+
+/** v2.12.28 — the rightmost REASON cell of a history row: a short badge
+ * (TP 命中 / SL 命中 / AI 護倉平倉 / 手動取消 …) plus an optional long
+ * detail (the AI steward's verdict sentence). Long details truncate to one
+ * line; the [更多] toggle expands the row height so the full sentence is
+ * readable ([收合] collapses it again). */
+function ReasonCell({ reason }: { reason?: TradeReason }) {
+  const [open, setOpen] = useState(false)
+  if (!reason) {
+    return <span className="text-zinc-600">—</span>
+  }
+  const hasDetail = !!reason.detail
+  return (
+    <div className={cn('flex items-start gap-1.5', open && 'whitespace-normal')}>
+      <Badge
+        variant="outline"
+        className={cn('shrink-0 text-[10px]', reasonBadgeCls(reason.code))}
+        title={reason.detail ?? reason.label}
+      >
+        {reason.label}
+      </Badge>
+      {hasDetail && (
+        <span
+          className={cn(
+            'min-w-0 flex-1 text-[11px] leading-4 text-zinc-400',
+            open ? 'whitespace-normal break-words' : 'truncate',
+          )}
+        >
+          {reason.detail}
+        </span>
+      )}
+      {hasDetail && (
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          className="shrink-0 text-[10px] font-semibold text-amber-400/90 underline-offset-2 hover:text-amber-300 hover:underline"
+        >
+          {open ? '收合' : '更多'}
+        </button>
+      )}
+    </div>
+  )
+}
+
 /** Task 81 — the Source cell of a POSITION row. Single-source positions keep
  *  the classic one-badge look. A position whose still-open FIFO lots span
  *  MULTIPLE sources (e.g. an algo entry on a symbol where the grid engine
@@ -291,8 +356,8 @@ export default function PositionsTab() {
     live: { mode: 'live', positions: [], exits: {}, pending: [], loaded: false },
   })
   const [history, setHistory] = useState<Record<Mode, HistoryData>>({
-    paper: { trades: [], configured: true, loaded: false },
-    live: { trades: [], configured: true, loaded: false },
+    paper: { trades: [], canceled: [], configured: true, loaded: false },
+    live: { trades: [], canceled: [], configured: true, loaded: false },
   })
   const [refreshing, setRefreshing] = useState(false)
   const [closing, setClosing] = useState<string | null>(null) // `${mode}:${symbol}`
@@ -441,6 +506,7 @@ export default function PositionsTab() {
           // per-mode error line above the table
           return {
             trades: [],
+            canceled: [],
             configured: true,
             loaded: true,
             error: authError ? undefined : ((json?.error as string) || `HTTP ${res.status}`),
@@ -449,13 +515,14 @@ export default function PositionsTab() {
         }
         return {
           trades: (json.trades || []) as ClosedTrade[],
+          canceled: (json.canceled || []) as CanceledOrderRow[],
           configured: json.configured !== false,
           loaded: true,
           error: authError ? undefined : ((json?.error as string) || undefined),
           authError: authError ?? undefined,
         }
       } catch {
-        return { trades: [], configured: true, loaded: true, error: 'network error' }
+        return { trades: [], canceled: [], configured: true, loaded: true, error: 'network error' }
       }
     }
     const [paper, live] = await Promise.all(MODES.map(one))
@@ -493,6 +560,17 @@ export default function PositionsTab() {
   const historyRows = MODES.flatMap((m) =>
     (history[m].trades || []).map((t) => ({ mode: m as Mode, t })),
   ).sort((a, b) => new Date(b.t.exitAt).getTime() - new Date(a.t.exitAt).getTime())
+  // v2.12.28 — the history table merges CLOSED TRADES with CANCELED/expired
+  // (zero-fill) orders: a cancel used to make the order vanish without a
+  // trace. Both kinds share one row model for filter/sort; P&L sums and the
+  // "closed" count stay trade-only.
+  const cancelRows = MODES.flatMap((m) =>
+    (history[m].canceled || []).map((c) => ({ mode: m as Mode, c })),
+  )
+  const mergedHistory: HistRow[] = [
+    ...historyRows.map((r) => ({ kind: 'trade' as const, mode: r.mode, at: new Date(r.t.exitAt).getTime() || 0, t: r.t })),
+    ...cancelRows.map((r) => ({ kind: 'cancel' as const, mode: r.mode, at: new Date(r.c.canceledAt).getTime() || 0, c: r.c })),
+  ].sort((a, b) => b.at - a.at)
   // applied sorts (52.3)
   const sortedRows = sortRows(rows, posSort, (r) => {
     switch (posSort?.key) {
@@ -530,27 +608,34 @@ export default function PositionsTab() {
   // symbol filter (v1.95.0) — normalized so "btcusd" matches "BTC/USD",
   // "brkb" matches "BRK.B"; empty = unfiltered
   const histSymNorm = histSymbol.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
-  const filteredHistory = histSymNorm
-    ? historyRows.filter((r) => r.t.symbol.toUpperCase().replace(/[^A-Z0-9]/g, '').includes(histSymNorm))
-    : historyRows
-  const sortedHistory = sortRows(filteredHistory, histSort, ({ mode, t }) => {
+  const filteredHistory: HistRow[] = histSymNorm
+    ? mergedHistory.filter((r) => {
+        const sym = (r.kind === 'trade' ? r.t.symbol : r.c.symbol).toUpperCase().replace(/[^A-Z0-9]/g, '')
+        return sym.includes(histSymNorm)
+      })
+    : mergedHistory
+  const sortedHistory = sortRows(filteredHistory, histSort, (r) => {
+    const trade = r.kind === 'trade' ? r.t : null
+    const c = r.kind === 'cancel' ? r.c : null
     switch (histSort?.key) {
-      case 'closed': return new Date(t.exitAt).getTime()
-      case 'symbol': return t.symbol
-      case 'market': return mode
-      case 'side': return t.side
-      case 'qty': return numOr(t.qty)
-      case 'entry': return t.entryPrice
-      case 'exit': return t.exitPrice
-      case 'held': return t.durationMs
-      case 'pnl': return t.pnl
-      case 'pct': return t.pnlPct
+      case 'closed': return r.at
+      case 'symbol': return trade ? trade.symbol : (c?.symbol ?? null)
+      case 'market': return r.mode
+      case 'source': return trade ? (trade.source ?? null) : (c?.source ?? null)
+      case 'side': return trade ? trade.side : (c?.side ?? null)
+      case 'qty': return trade ? numOr(trade.qty) : numOr(c?.qty)
+      case 'entry': return trade ? trade.entryPrice : (c?.price ?? null)
+      case 'exit': return trade ? trade.exitPrice : null
+      case 'held': return trade ? trade.durationMs : null
+      case 'pnl': return trade ? trade.pnl : null
+      case 'pct': return trade ? trade.pnlPct : null
       default: return null
     }
   })
   // realized P&L follows the FILTERED set (the header labels it "the trades
-  // in the history group below" — with a symbol filter that means the matches)
-  const historyPnl = filteredHistory.reduce((acc, r) => acc + r.t.pnl, 0)
+  // in the history group below" — with a symbol filter that means the matches);
+  // canceled rows carry no P&L (nothing executed)
+  const historyPnl = filteredHistory.reduce((acc, r) => acc + (r.kind === 'trade' ? r.t.pnl : 0), 0)
   const noKeys = (m: Mode) => data[m].loaded && (data[m].keysMissing != null || data[m].error === 'no-keys')
 
   const closePosition = async (row: PosConsoleRow) => {
@@ -957,9 +1042,22 @@ export default function PositionsTab() {
         <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
           <History className="h-3.5 w-3.5 text-zinc-500" aria-hidden />
           <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Trade history</span>
-          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">
-            {histSymNorm ? `${filteredHistory.length} of ${historyRows.length}` : historyRows.length}
+          {/* v2.12.28 — the count now splits closed trades vs cancelled orders
+              (cancels ride in the same table as dimmed rows) */}
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500" title="Closed round-trip trades">
+            {histSymNorm
+              ? `${filteredHistory.filter((r) => r.kind === 'trade').length} of ${historyRows.length} closed`
+              : `${historyRows.length} closed`}
           </Badge>
+          {cancelRows.length > 0 && (
+            <Badge
+              variant="outline"
+              className="border-zinc-800 text-[10px] text-zinc-500"
+              title="Cancelled / expired (zero-fill) orders — edit-replacements are excluded"
+            >
+              {filteredHistory.filter((r) => r.kind === 'cancel').length}/{cancelRows.length} cancelled
+            </Badge>
+          )}
           {filteredHistory.length > 0 && (
             <span
               className={cn(
@@ -1069,7 +1167,7 @@ export default function PositionsTab() {
           </div>
         )}
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
-          <table className="w-full min-w-[860px] border-collapse text-xs">
+          <table className="w-full min-w-[1000px] border-collapse text-xs">
             <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
               <tr className="border-b border-zinc-800">
                 <SortTh label="Closed" k="closed" sort={histSort} onSort={setHistSort} />
@@ -1083,30 +1181,68 @@ export default function PositionsTab() {
                 <SortTh label="Held" k="held" sort={histSort} onSort={setHistSort} align="right" />
                 <SortTh label="P&L" k="pnl" sort={histSort} onSort={setHistSort} align="right" />
                 <SortTh label="%" k="pct" sort={histSort} onSort={setHistSort} align="right" />
+                <th className="px-3 py-1.5 text-left font-medium" title="Why it closed / was cancelled — TP/SL hit, AI steward, engine or manual">Reason</th>
               </tr>
             </thead>
             <tbody>
               {sortedHistory.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-3 py-6 text-center text-zinc-600">
+                  <td colSpan={12} className="px-3 py-6 text-center text-zinc-600">
                     {!history.paper.loaded && !history.live.loaded ? (
                       <span className="inline-flex items-center gap-2"><TaijiSpinner className="h-4 w-4" /> Loading trade history…</span>
                     ) : histSymNorm ? (
-                      `No closed trades match “${histSymbol.trim()}” — clear the symbol filter to see everything.`
+                      `No closed trades or cancelled orders match “${histSymbol.trim()}” — clear the symbol filter to see everything.`
                     ) : history.paper.configured === false && history.live.configured === false ? (
                       'No Alpaca keys configured — trade history unavailable.'
                     ) : histQuery ? (
-                      'No closed trades in the selected date range.'
+                      'No closed trades or cancelled orders in the selected date range.'
                     ) : (
-                      'No closed trades yet — completed round-trips (entry + exit filled) appear here with their realized P&L.'
+                      'No closed trades yet — completed round-trips (entry + exit filled) appear here with their realized P&L, cancelled orders as 已取消 rows.'
                     )}
                   </td>
                 </tr>
               )}
-              {sortedHistory.map(({ mode, t }) => {
+              {sortedHistory.map((r) => {
+                if (r.kind === 'cancel') {
+                  const c = r.c
+                  const expired = c.status === 'expired'
+                  return (
+                    <tr key={`${r.mode}:c:${c.id}`} className="border-b border-zinc-800/40 bg-zinc-900/40 transition-colors hover:bg-zinc-800/30">
+                      <td className="whitespace-nowrap px-3 py-1.5 text-zinc-500">
+                        <span className="inline-flex items-center gap-1.5" title={`${expired ? 'Expired' : 'Cancelled'} ${fmtCompactDT(c.createdAt)} → ${fmtCompactDT(c.canceledAt)}`}>
+                          <Ban className="h-3 w-3 text-zinc-600" aria-hidden />
+                          {fmtCompactDT(c.canceledAt)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-1.5 font-semibold text-zinc-400">{c.symbol}</td>
+                      <td className="px-3 py-1.5">
+                        <Badge
+                          variant="outline"
+                          className={cn('text-[10px]', r.mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400')}
+                        >
+                          {r.mode}
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <SourceBadge source={c.source} />
+                      </td>
+                      <td className={cn('px-3 py-1.5 font-medium text-zinc-500')}>{c.side === 'buy' ? 'LONG' : 'SHORT'}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{fmtQtyLabel(c.qty)}</td>
+                      <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{c.price != null ? fmtPrice(c.price) : '—'}</td>
+                      <td className="px-3 py-1.5 text-right text-zinc-600">—</td>
+                      <td className="px-3 py-1.5 text-right text-zinc-600" title={`${expired ? 'Expired' : 'Cancelled'} before any fill — nothing executed`}>—</td>
+                      <td className="px-3 py-1.5 text-right text-zinc-600" title="Nothing executed — no P&L">—</td>
+                      <td className="px-3 py-1.5 text-right text-zinc-600">—</td>
+                      <td className="px-3 py-1.5">
+                        <ReasonCell reason={c.reason} />
+                      </td>
+                    </tr>
+                  )
+                }
+                const t = r.t
                 const up = t.pnl >= 0
                 return (
-                  <tr key={`${mode}:${t.id}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+                  <tr key={`${r.mode}:${t.id}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
                     <td className="whitespace-nowrap px-3 py-1.5 text-zinc-400">
                       {new Date(t.exitAt).toLocaleString('en-GB', {
                         day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
@@ -1116,9 +1252,9 @@ export default function PositionsTab() {
                     <td className="px-3 py-1.5">
                       <Badge
                         variant="outline"
-                        className={cn('text-[10px]', mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400')}
+                        className={cn('text-[10px]', r.mode === 'live' ? 'border-amber-500/40 text-amber-400' : 'border-emerald-500/40 text-emerald-400')}
                       >
-                        {mode}
+                        {r.mode}
                       </Badge>
                     </td>
                     <td className="px-3 py-1.5">
@@ -1130,12 +1266,24 @@ export default function PositionsTab() {
                     <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{t.qty}</td>
                     <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{fmtPrice(t.entryPrice)}</td>
                     <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{fmtPrice(t.exitPrice)}</td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{fmtHeldDuration(t.durationMs)}</td>
+                    <td
+                      className="px-3 py-1.5 text-right tabular-nums text-zinc-500"
+                      // v2.12.28 — the exact pairing is one hover away: a HELD
+                      // that looks wrong (e.g. a same-day trade showing days)
+                      // is FIFO pairing this exit with the OLDEST open lot —
+                      // the tooltip names both endpoints so it's verifiable
+                      title={`Entry fill ${new Date(t.entryAt).toLocaleString()} → exit fill ${new Date(t.exitAt).toLocaleString()} (FIFO pairs this exit with the oldest open lot)`}
+                    >
+                      {fmtHeldDuration(t.durationMs)}
+                    </td>
                     <td className={cn('px-3 py-1.5 text-right font-semibold tabular-nums', up ? 'text-emerald-400' : 'text-rose-400')}>
                       {up ? '+' : '−'}${Math.abs(t.pnl).toFixed(2)}
                     </td>
                     <td className={cn('px-3 py-1.5 text-right tabular-nums', up ? 'text-emerald-400/80' : 'text-rose-400/80')}>
                       {up ? '+' : '−'}{Math.abs(t.pnlPct).toFixed(2)}%
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <ReasonCell reason={t.reason} />
                     </td>
                   </tr>
                 )
@@ -1147,7 +1295,7 @@ export default function PositionsTab() {
 
       <p className="flex shrink-0 items-center gap-1.5 px-1 text-[11px] text-zinc-600">
         <X className="h-3 w-3" aria-hidden />
-        Drag the ── handles to resize the panels (saved with your layout) · click a column header to sort asc/desc · Close submits a market order for the full position · refreshes every 10s · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L.
+        Drag the ── handles to resize the panels (saved with your layout) · click a column header to sort asc/desc · Close submits a market order for the full position · refreshes every 10s · [+TP]/[+SL] attaches a new exit to the position · Trade history pairs each entry fill with its exit fills (FIFO) to compute realized P&amp;L — the Held tooltip shows both fill times · cancelled orders appear as dimmed rows with their reason (edit-replacements excluded); long reasons expand via [更多].
       </p>
 
       {/* Task 4-c: close-position confirmation — restates symbol + qty so the

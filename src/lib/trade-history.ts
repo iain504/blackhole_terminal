@@ -20,11 +20,14 @@ import { db } from '@/lib/db'
 import { ALGO_STRATEGIES } from '@/lib/algo-strategies'
 
 /** Chart-style display symbol: Alpaca crypto already carries the slash. */
-function displaySymbol(o: Pick<TradingOrder, 'symbol' | 'asset_class'>): string {
+export function displaySymbolOf(o: Pick<TradingOrder, 'symbol' | 'asset_class'>): string {
   if (o.symbol.includes('/')) return o.symbol
   if (o.asset_class === 'crypto') return o.symbol.replace(/USD$/, '/USD')
   return o.symbol
 }
+
+/** internal alias (the FIFO walk uses it for trade rows) */
+const displaySymbol = displaySymbolOf
 
 interface Lot {
   side: string // 'buy' | 'sell' (the ENTRY side)
@@ -74,6 +77,18 @@ function cleanQty(n: number): number {
   return Number(n.toPrecision(10))
 }
 
+/** v2.12.28 — FIFO queue key: slash-stripped uppercase symbol. The queues
+ * used to key on the RAW order symbol, so a tape that spells the same asset
+ * two ways ("BTC/USD" vs "BTCUSD" — Alpaca's echo has drifted across order
+ * vintages/endpoints) split one position's fills into TWO queues: the entry
+ * lot never met its exit, the round trip never closed, and every LATER exit
+ * on that symbol paired with the stale lot — a same-day trade showing a
+ * multi-day HELD was the visible symptom. Normalizing the key makes both
+ * spellings one bucket; the display symbol still comes from the exit order. */
+function queueKey(symbol: string): string {
+  return symbol.replace('/', '').toUpperCase()
+}
+
 /**
  * FIFO-match filled orders into round-trip trades AND report the still-open
  * entry lots per symbol (the same walk — open lots are simply what remains
@@ -92,12 +107,21 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
   // round trip was MISSING from history. An order with zero fill still
   // filters out (filled_qty 0 / no avg price / no fill time), so pure
   // cancels stay invisible exactly as before.
+  //
+  // v2.12.28 — HELD-BUG fix, layer 1: a fill with filled_qty > 0 but a NULL
+  // filled_avg_price (a real Alpaca data quirk on some leg/crypto fills)
+  // used to be dropped ENTIRELY — its opposing lot never closed and stayed
+  // open forever, so every LATER exit on the symbol paired with that stale
+  // lot: "same-day trade shows 7d HELD" was the visible symptom (the P&L of
+  // the re-paired trades was wrong too). Such fills now stay in the walk
+  // with a price fallback: limit_price → stop_price →, when the fill CLOSES
+  // an opposing lot, the lot's own price (P&L contribution honestly 0 —
+  // pairing and HELD stay correct). A fill that would OPEN a lot but has no
+  // derivable price at all still drops (an unpriceable lot would wreck P&L).
   const filled = orders
     .filter(
       (o) =>
         o.filled_at != null &&
-        o.filled_avg_price != null &&
-        Number.isFinite(parseFloat(o.filled_avg_price)) &&
         parseFloat(o.filled_qty || '0') > 0,
     )
     .sort(
@@ -117,16 +141,29 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
   let seq = 0
 
   for (const o of filled) {
-    const exitPrice = parseFloat(o.filled_avg_price as string)
+    // v2.12.28 — price fallback chain for the null-filled_avg_price rescue
+    // (see the filter comment): broker avg → limit → stop; null = "real fill,
+    // unpriceable from this order alone" — the close loop below prices it
+    // from the lot it closes (honest 0 P&L) or the fill is dropped if it
+    // would have to OPEN a lot.
+    const avg = parseFloat(o.filled_avg_price ?? '')
+    const fb = Number.isFinite(avg)
+      ? avg
+      : parseFloat(o.limit_price ?? '') || parseFloat(o.stop_price ?? '')
+    const exitPrice = Number.isFinite(fb) && fb > 0 ? fb : null
     let remaining = parseFloat(o.filled_qty)
-    const q = lots.get(o.symbol) ?? []
+    const key = queueKey(o.symbol)
+    const q = lots.get(key) ?? []
 
     // close the oldest opposing lots first
     while (remaining > EPS && q.length > 0 && q[0].side !== o.side) {
       const lot = q[0]
       const take = Math.min(lot.qty, remaining)
       const long = lot.side === 'buy'
-      const pnl = (long ? exitPrice - lot.price : lot.price - exitPrice) * take
+      // unpriceable exit fill closes the lot at the lot's own price: the
+      // pairing (and therefore HELD) stays truthful, P&L honestly 0
+      const px = exitPrice ?? lot.price
+      const pnl = (long ? px - lot.price : lot.price - px) * take
       const exitAt = o.filled_at as string
       const entryAt = lot.time
       trades.push({
@@ -135,7 +172,7 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
         side: long ? 'long' : 'short',
         qty: cleanQty(take),
         entryPrice: lot.price,
-        exitPrice,
+        exitPrice: px,
         entryAt,
         exitAt,
         pnl,
@@ -152,8 +189,9 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
       if (lot.qty <= EPS) q.shift()
     }
 
-    // whatever remains increases the position → new lot
-    if (remaining > EPS) {
+    // whatever remains increases the position → new lot (needs a price —
+    // an unpriceable fill can only ever CLOSE, never OPEN)
+    if (remaining > EPS && exitPrice != null) {
       q.push({
         side: o.side,
         qty: remaining,
@@ -164,8 +202,8 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
         clientOrderId: o.client_order_id ?? null,
       })
     }
-    if (q.length > 0) lots.set(o.symbol, q)
-    else lots.delete(o.symbol)
+    if (q.length > 0) lots.set(key, q)
+    else lots.delete(key)
   }
 
   // whatever is left in the queues is still OPEN — one or more live lots per
@@ -203,6 +241,44 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
  */
 export function matchClosedTrades(orders: TradingOrder[], max = 200): ClosedTrade[] {
   return matchFifo(orders, max).trades
+}
+
+/** v2.12.28 — HELD-BUG fix, layer 2: WINDOW-TRUNCATION ghost lots. The
+ * closed-orders tape is the newest N orders; when a position STRADDLES the
+ * window boundary (its entry is older than the tape), the walk sees that
+ * position's EXIT fill with no lot to close and mints a SYNTHETIC opposing
+ * lot at the exit's price/time. That phantom then STEALS later real exits:
+ * a same-day round trip pairs against the phantom (multi-day HELD + wrong
+ * P&L) while the user's actual entry lot never closes. Detection: after the
+ * walk, an open lot whose symbol has NO live position — or whose side
+ * contradicts the live side — is a ghost the tape couldn't explain. Callers
+ * widen the tape (older pages) and re-walk until every lot maps to a live
+ * position or a cap is reached; a REAL short position (sell lot + short
+ * side) is consistent and never flagged.
+ * @param openLots matchFifo's open lots (keys are normed symbols)
+ * @param positions the account's CURRENT live positions (raw broker shape)
+ */
+export function ghostLotSymbols(
+  openLots: Map<string, OpenLot[]>,
+  positions: { symbol: string; side: string }[],
+): string[] {
+  const byNorm = new Map<string, string>()
+  for (const p of positions) byNorm.set(queueKey(p.symbol), p.side)
+  const ghosts: string[] = []
+  for (const [sym, lots] of openLots) {
+    const lotSide = lots[0]?.side
+    if (!lotSide) continue
+    const posSide = byNorm.get(sym)
+    if (!posSide) {
+      ghosts.push(sym) // lot with NO live position at all — the tape missed its exit
+      continue
+    }
+    // side contradiction: a buy lot under a short position (or vice versa)
+    const lotLong = lotSide === 'buy'
+    const posLong = posSide !== 'short'
+    if (lotLong !== posLong) ghosts.push(sym)
+  }
+  return ghosts
 }
 
 /** Resolve algo run refs (8-char AlgoRun id prefixes) → strategy display

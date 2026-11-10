@@ -59,6 +59,8 @@ interface TradeFetchResult<T> {
   data: T | null
   status: number
   error?: string
+  /** v2.12.28 — raw Link response header (Alpaca pagination cursor), when present */
+  link?: string | null
 }
 
 // ---- 401 auth circuit breaker (Task 36) ----
@@ -187,7 +189,7 @@ async function tradeFetch<T>(
       return { data: parsed as T, status: res.status, error: msg }
     }
     clearAuthBreaker(userId, mode) // a success proves the keys work again
-    return { data: parsed as T, status: res.status }
+    return { data: parsed as T, status: res.status, link: res.headers.get('link') }
   } catch (e) {
     console.error(`Trading ${mode} ${path} failed:`, e instanceof Error ? e.message : e)
     return { data: null, status: 0, error: e instanceof Error ? e.message : 'network error' }
@@ -395,7 +397,7 @@ export async function getOpenOrders(userId: string, mode: TradeMode, symbol?: st
   return { ...flat, data: [...byId.values()] }
 }
 
-export async function getClosedOrders(userId: string, mode: TradeMode, limit = 30) {
+export async function getClosedOrders(userId: string, mode: TradeMode, limit = 30, maxPages = 1) {
   // HISTORY BUG (v1.94.1) — the same Alpaca gotcha getOpenOrders works around
   // (see its long comment): the DEFAULT (nested=false) list hides bracket/OCO
   // legs — a closed bracket parent comes back with legs=null (verified live
@@ -449,7 +451,63 @@ export async function getClosedOrders(userId: string, mode: TradeMode, limit = 3
       }
     }
   }
+  // v2.12.28 — WIDEN: the newest-500 tape truncates the FIFO window; a
+  // position straddling the boundary mints phantom lots that poison HELD/P&L
+  // (see ghostLotSymbols). Callers that detect ghosts re-call with
+  // maxPages>1: older NESTED pages (page_token from the Link header) are
+  // appended, legs flattened, and the walk re-runs over the wider tape.
+  // Each extra page is ONE broker call; a page that errors or lacks a next
+  // token stops the loop (best effort — page 1 alone is the old behavior).
+  if (maxPages > 1) {
+    let pageToken = linkPageToken(nested.link)
+    for (let page = 2; page <= maxPages && pageToken; page++) {
+      const more = await fetchClosedNestedPage(userId, mode, limit, pageToken)
+      if (!more.rows.length) break
+      for (const p of more.rows) {
+        if (byId.has(p.id)) continue
+        byId.set(p.id, p)
+        merged.push(p)
+        for (const leg of p.legs ?? []) {
+          if (!byId.has(leg.id)) {
+            byId.set(leg.id, leg)
+            merged.push(leg)
+          }
+        }
+      }
+      pageToken = more.nextPageToken
+    }
+  }
   return { ...flat, data: merged }
+}
+
+/** v2.12.28 — the page_token inside a Link header's rel="next" URL
+ * (`<…page_token=X>; rel="next"`), or null when absent/unparseable. */
+function linkPageToken(link: string | null | undefined): string | null {
+  if (!link) return null
+  const m = /<[^>]*[?&]page_token=([A-Za-z0-9%._-]+)[^>]*>;\s*rel="next"/.exec(link)
+  return m ? decodeURIComponent(m[1]) : null
+}
+
+/** v2.12.28 — ONE older page of the closed nested tape (page_token cursor).
+ * Returns the raw parent rows (legs flattened by the caller) + the next token. */
+async function fetchClosedNestedPage(userId: string, mode: TradeMode, limit: number, pageToken: string): Promise<{ rows: TradingOrder[]; nextPageToken: string | null }> {
+  try {
+    const keys = await getAlpacaKeysForMode(userId, mode)
+    if (!keys || keys.unreadable || !keys.keyId) return { rows: [], nextPageToken: null }
+    const q = new URLSearchParams({ status: 'closed', limit: String(limit), direction: 'desc', nested: 'true' })
+    q.set('page_token', pageToken)
+    const res = await fetch(`${TRADE_BASE[mode]}/v2/orders?${q.toString()}`, {
+      headers: { 'APCA-API-KEY-ID': keys.keyId, 'APCA-API-SECRET-KEY': keys.secret, accept: 'application/json' },
+      cache: 'no-store',
+    })
+    if (!res.ok) return { rows: [], nextPageToken: null }
+    const rows = (await res.json()) as TradingOrder[]
+    const link = res.headers.get('link') ?? res.headers.get('Link')
+    const m = link ? /<[^>]*[?&]page_token=([A-Za-z0-9%._-]+)[^>]*>;\s*rel="next"/.exec(link) : null
+    return { rows: Array.isArray(rows) ? rows : [], nextPageToken: m ? decodeURIComponent(m[1]) : null }
+  } catch {
+    return { rows: [], nextPageToken: null }
+  }
 }
 
 // ---- asset tradability (v2.12.23) ----

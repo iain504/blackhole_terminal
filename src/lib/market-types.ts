@@ -223,6 +223,18 @@ export function fmtPrice(p: number): string {
 
 // ---------- Closed (round-trip) trades ----------
 
+/** v2.12.28 — WHY a trade closed (or an order cancelled), resolved
+ * server-side from the exit order's role/grammar + the AI steward's action
+ * log. `label` is the short badge text; `detail` (optional) is the long
+ * human reason (e.g. the steward's verdict sentence) that the history table
+ * renders truncated with a [更多] expand toggle. */
+export interface TradeReason {
+  /** machine code: tp | sl | trail | tp_ai | sl_ai | ai_close | manual_close | grid_exit | algo_exit | ai_cancel | manual_cancel | grid_cancel | algo_cancel | expired */
+  code: string
+  label: string
+  detail?: string
+}
+
 /** One realized round-trip: a FIFO-matched entry fill + exit fill(s). */
 export interface ClosedTrade {
   /** deterministic id: `entry:exit:n` (partial fills can split pairs) */
@@ -256,6 +268,32 @@ export interface ClosedTrade {
   runRef?: string | null
   /** when source === 'algo': resolved strategy display name (server-side join with AlgoRun) */
   strategy?: string
+  /** v2.12.28 — why this trade closed (TP/SL hit, AI-steward close, manual
+   * close, grid/algo engine exit…). Optional: pre-reason clients ignore it. */
+  reason?: TradeReason
+}
+
+/** v2.12.28 — one CANCELED/expired (zero-fill) order surfaced in the Trade
+ * history table: it vanished from the Pending list without a trace before.
+ * `reason` explains who cancelled it (user / AI steward / engine lifecycle). */
+export interface CanceledOrderRow {
+  id: string
+  /** chart-style symbol (BTC/USD for crypto) */
+  symbol: string
+  side: 'buy' | 'sell'
+  /** ordered qty (zero-fill cancel — nothing executed) */
+  qty: number
+  /** limit/stop price when the order had one (market cancels → null) */
+  price: number | null
+  type: string
+  /** 'canceled' | 'expired' */
+  status: string
+  createdAt: string
+  /** last update ≈ the cancel/expiry moment */
+  canceledAt: string
+  /** placement source, decoded from the client_order_id grammar */
+  source: 'manual' | 'algo' | 'grid' | 'ai'
+  reason: TradeReason
 }
 
 /** "2d 4h" / "3h 12m" / "5m 20s" — compact held-duration label. */
