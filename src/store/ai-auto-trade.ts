@@ -60,6 +60,7 @@ import {
   registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
   type AiOpsRunnerInfo,
 } from '@/lib/ai-ops-sync'
+import { dynamicThresholds as regimeDynamicThresholds, concentrationCheck, type GateRegime } from '@/lib/ai-trade-gates'
 
 // ---- config ----------------------------------------------------------------
 
@@ -81,6 +82,14 @@ export interface AiAutoConfig {
    *  (report − 2d … report + 20h). Deterministic — does not depend on the
    *  model noticing. Fail-open when the date is unknown. Default ON. */
   blockEarnings: boolean
+  /** v2.12.33 — regime-dynamic entry thresholds: RISK_OFF longs / RISK_ON
+   *  shorts pay +10 confidence and ×1.25 R:R over the configured base. */
+  dynamicThresholds: boolean
+  /** v2.12.33 — concentration gate: block a candidate that correlates
+   *  ≥ 0.85 with a same-direction holding, or when same-direction holdings
+   *  already reached maxCorrelated. */
+  blockConcentration: boolean
+  maxCorrelated: number
 }
 
 export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
@@ -98,6 +107,9 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   watchlistId: null,
   excludedSymbols: [],
   blockEarnings: true,
+  dynamicThresholds: true,
+  blockConcentration: true,
+  maxCorrelated: 2,
 }
 
 const LS_KEY = 'bh-ai-auto-cfg-v1'
@@ -132,6 +144,9 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     // undefined (old saved config) → default ON — the gap-risk gate must not
     // silently vanish for existing users
     blockEarnings: j.blockEarnings === undefined ? d.blockEarnings : Boolean(j.blockEarnings),
+    dynamicThresholds: j.dynamicThresholds === undefined ? d.dynamicThresholds : Boolean(j.dynamicThresholds),
+    blockConcentration: j.blockConcentration === undefined ? d.blockConcentration : Boolean(j.blockConcentration),
+    maxCorrelated: Math.round(clampN(num(j.maxCorrelated, d.maxCorrelated), 1, 10)),
   }
 }
 
@@ -201,6 +216,9 @@ export interface AiAutoVerdict {
   passed: boolean
   rejectReason: string | null
   dryRunNote: string | null
+  /** v2.12.33 — attribution ledger status for NON-FLAT verdicts: what
+   *  actually happened to this call (fired / dry-run / gated). */
+  verdictStatus?: 'fired' | 'dry-run' | 'gated' | null
 }
 
 export interface AiAutoFired {
@@ -408,7 +426,8 @@ function scanInstruction(n: number): string {
     `- 近期表現：這是本引擎最近已平倉交易的真實成績。用它校準 confidence — 勝率低於 45% 時全面調低信心並提高 flat 比例；某方向勝率明顯差時對該方向更保守。`,
     `- entry 取現價附近；stop 掛在最近支撐之下 / 最近阻力之上（結構外），距離參考 ATR — 不可緊貼現價；target 放在到達下一個 S/R 之前。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
     `- 財報/事件：快照標明「財報臨近（block）」的標的必然被終端硬閘拒絕 — 直接給 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55（跳空風險）；共用區列出的 48 小時內高影響事件同樣壓低所有相關方向信心。`,
-    `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）。`,
+    `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）；[集中風險] 標明 ⚠ 的持倉對彼此高度相關，不要再建議與其同向的新標的。`,
+    `- 覆盤統計：這是本引擎過往判斷 24 小時後的真實對帳結果（依 regime×方向分組）。用它選擇證據組合 — 某組合勝率明顯差時，同組合的新訊號給 flat 或低 confidence。`,
     `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
     `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）與 52 週區間位置 — 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason。`,
     `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
@@ -551,12 +570,18 @@ export async function runScan(): Promise<void> {
     const w52BySym = new Map<string, { high: number | null; low: number | null }>()
     const sentBySym = new Map<string, { score: number; momentum: number | null; headlines: number }>()
     let regimeLine: string | null = null
+    let regimeState: GateRegime = null
     let calendarLine: string | null = null
     let perfLine: string | null = null
     let holdingsLine: string | null = null
+    let concLine: string | null = null
+    let retroLine: string | null = null
+    // holdings live OUTSIDE the fetch block — the concentration gate below
+    // reuses them (declared here so its scope reaches section 5.5)
+    const heldRaw: { symbol: string; side: 'long' | 'short'; qty: string; uplPct: number | null }[] = []
     {
       const normSym = (s: string) => s.replace('/', '').toUpperCase()
-      const [regRes, calRes, senRes, eaRes, qRes, hRes] = await Promise.all([
+      const [regRes, calRes, senRes, eaRes, qRes, hRes, vRes] = await Promise.all([
         fetchJson('/api/agent/regime', { signal: sig }).catch(() => ({ status: 0, j: null })),
         fetchJson('/api/market/calendar', { signal: sig }).catch(() => ({ status: 0, j: null })),
         fetchJson('/api/sentiment?scope=market', { signal: sig }).catch(() => ({ status: 0, j: null })),
@@ -566,10 +591,14 @@ export async function runScan(): Promise<void> {
           body: JSON.stringify({ symbols: scanSyms.slice(0, 30) }), signal: sig,
         }).then((r) => r.json() as Promise<Record<string, unknown> | null>).catch(() => null),
         fetchJson(`/api/trading/history?mode=${cfg.mode}&limit=150`, { signal: sig }).catch(() => ({ status: 0, j: null })),
+        // v2.12.33 — 24h reconciliation pass + resolved history for the
+        // [覆盤統計] pack line (server-side; no due rows → cheap no-op)
+        fetchJson('/api/ai-trade/verdicts?resolve=1&history=1', { signal: sig }).catch(() => ({ status: 0, j: null })),
       ])
       // regime — RISK_ON/NEUTRAL/RISK_OFF + why (server-cached 15 min)
       const reg = regRes.j as { regime?: string; stale?: boolean; reasons?: string[] } | null
       if (reg?.regime && reg.regime !== 'UNKNOWN') {
+        regimeState = (reg.regime === 'RISK_ON' || reg.regime === 'RISK_OFF' || reg.regime === 'NEUTRAL') ? reg.regime : 'UNKNOWN'
         const why = (Array.isArray(reg.reasons) ? reg.reasons : []).slice(0, 2).join('；')
         regimeLine = `regime: ${reg.regime}${reg.stale ? '（資料過期）' : ''}${why ? ` — ${why}` : ''}`
       }
@@ -642,10 +671,62 @@ export async function runScan(): Promise<void> {
         perfLine = `近 ${ts.length} 筆已平倉：勝率 ${Math.round((wins.length / ts.length) * 100)}% · 平均獲利 $${avgWin.toFixed(0)} / 平均虧損 $${avgLoss.toFixed(0)} · 盈虧比 ${pf == null ? 'n/a' : pf.toFixed(2)} · 目前連續 ${streak ?? 'n/a'} · 做多勝率 ${wr(longs) == null ? 'n/a' : `${wr(longs)}%`} · 做空勝率 ${wr(shorts) == null ? 'n/a' : `${wr(shorts)}%`}`
       }
       // current holdings — correlation-aware entries
-      const held = (posJ?.positions ?? [])
-        .filter((p) => typeof p.symbol === 'string' && p.symbol)
-        .map((p) => `${String(p.symbol).replace('/', '')} ${p.side === 'short' ? '空' : '多'} ${String(p.qty ?? '')}${typeof p.uplPct === 'number' ? `（${p.uplPct >= 0 ? '+' : ''}${p.uplPct.toFixed(1)}%）` : ''}`)
-      if (held.length > 0) holdingsLine = held.join(' · ')
+      for (const p of (posJ?.positions ?? [])) {
+        if (typeof p.symbol !== 'string' || !p.symbol) continue
+        heldRaw.push({
+          symbol: String(p.symbol).replace('/', '').toUpperCase(),
+          side: p.side === 'short' ? 'short' : 'long',
+          qty: String(p.qty ?? ''),
+          uplPct: typeof p.uplPct === 'number' ? p.uplPct : null,
+        })
+      }
+      if (heldRaw.length > 0) holdingsLine = heldRaw.map((h) => `${h.symbol} ${h.side === 'short' ? '空' : '多'} ${h.qty}${h.uplPct != null ? `（${h.uplPct >= 0 ? '+' : ''}${h.uplPct.toFixed(1)}%）` : ''}`).join(' · ')
+      // v2.12.33 — holdings↔holdings price correlation (concentration
+      // context for the model; the candidate gate fetches its own matrix
+      // below, only when a candidate survives the numeric gates)
+      if (heldRaw.length >= 2 && cfg.blockConcentration) {
+        try {
+          const corr = await fetchJson(`/api/market/correlation?symbols=${encodeURIComponent(heldRaw.slice(0, 8).map((h) => h.symbol).join(','))}`, { signal: sig })
+          const mx = (corr.j as { matrix?: Record<string, Record<string, number>>; source?: string } | null)?.matrix
+          if (mx && (corr.j as { source?: string }).source === 'real') {
+            const pairs: { a: string; b: string; r: number }[] = []
+            for (let x = 0; x < heldRaw.length; x++) for (let y = x + 1; y < heldRaw.length; y++) {
+              const r = mx[heldRaw[x].symbol]?.[heldRaw[y].symbol]
+              if (typeof r === 'number' && Number.isFinite(r)) pairs.push({ a: heldRaw[x].symbol, b: heldRaw[y].symbol, r })
+            }
+            pairs.sort((p, q) => q.r - p.r)
+            if (pairs.length > 0) {
+              concLine = `持倉相關性：${pairs.slice(0, 3).map((p) => `${p.a}↔${p.b} r=${p.r.toFixed(2)}${p.r >= 0.85 ? ' ⚠' : ''}`).join(' · ')}`
+            }
+          }
+        } catch { /* correlation context is best-effort */ }
+      }
+      // v2.12.33 — 覆盤統計 from the resolved verdict ledger (24h mark-to-market)
+      {
+        const hist = vRes.j as { resolved?: number; lessonsWritten?: number; history?: { symbol: string; direction: string; confidence: number; regime: string | null; status: string; outcome: string | null; pnlPct: number | null }[] } | null
+        const histRows = Array.isArray(hist?.history) ? hist.history : []
+        const resolvedNow = typeof hist?.resolved === 'number' ? hist.resolved : 0
+        if (histRows.length > 0) {
+          const wins = histRows.filter((r) => r.outcome === 'win').length
+          const losses = histRows.filter((r) => r.outcome === 'loss').length
+          const decided = wins + losses
+          const avgPnl = histRows.filter((r) => typeof r.pnlPct === 'number')
+          const avg = avgPnl.length ? avgPnl.reduce((a, r) => a + (r.pnlPct ?? 0), 0) / avgPnl.length : null
+          // regime×direction buckets (≥3 samples only)
+          const buckets = new Map<string, { n: number; w: number }>()
+          for (const r of histRows) {
+            if (!r.regime || r.outcome === 'flat') continue
+            const key = `${r.regime} ${r.direction === 'short' ? '做空' : '做多'}`
+            const b = buckets.get(key) ?? { n: 0, w: 0 }
+            b.n++
+            if (r.outcome === 'win') b.w++
+            buckets.set(key, b)
+          }
+          const top = [...buckets.entries()].filter(([, b]) => b.n >= 3).sort((a, b) => b[1].n - a[1].n).slice(0, 3)
+          retroLine = `近 ${histRows.length} 筆已對帳${decided > 0 ? `（贏 ${wins} / 輸 ${losses}，勝率 ${Math.round((wins / decided) * 100)}%）` : ''}${avg != null ? ` · 平均 24h ${avg >= 0 ? '+' : ''}${avg.toFixed(1)}%` : ''}${top.length > 0 ? ` · ${top.map(([k, b]) => `${k} ${b.w}/${b.n} 勝`).join(' · ')}` : ''}`
+          if (resolvedNow > 0) { const lw = typeof hist?.lessonsWritten === 'number' ? hist.lessonsWritten : 0; st0.addLog('info', `覆盤對帳 — ${resolvedNow} 筆 24h 前的判斷已歸檔${lw > 0 ? `，寫入永久教訓 ${lw} 條` : ''}`) }
+        }
+      }
     }
     // per-symbol context lines appended to every snapshot
     const snapshotExtras = (sym: string, lastClose: number): string => {
@@ -671,6 +752,8 @@ export async function runScan(): Promise<void> {
       regimeLine ? `[市場環境] ${regimeLine}` : null,
       calendarLine ? `[事件] ${calendarLine}` : null,
       perfLine ? `[近期表現（本引擎真實成績 — 校準 confidence 用）] ${perfLine}` : null,
+      retroLine ? `[覆盤統計（24h 標記對帳）] ${retroLine}` : null,
+      concLine ? `[集中風險] ${concLine}` : null,
       holdingsLine ? `[目前持倉] ${holdingsLine}` : '[目前持倉] 無',
     ].filter(Boolean).join('\n')
     if (regimeLine) st0.addLog('info', `市場環境 — ${regimeLine}`)
@@ -798,11 +881,23 @@ export async function runScan(): Promise<void> {
       v.rr = Number.isFinite(rr) && rr > 0 ? rr : null
       if (v.rr == null) { v.rejectReason = 'R:R 無法計算'; return v }
 
-      const confOk = confidence >= cfg.minConfidence
-      const rrOk = v.rr >= cfg.minRR
-      if (!confOk && !rrOk) v.rejectReason = `信心與 R:R 均未達門檻`
-      else if (!confOk) v.rejectReason = `信心未達 ${cfg.minConfidence}%`
-      else if (!rrOk) v.rejectReason = `R:R 未達 1:${cfg.minRR}`
+      // v2.12.33 — REGIME-DYNAMIC thresholds: the base config values are what
+      // a NEUTRAL tape demands; the against-the-wind direction pays more
+      // (RISK_OFF longs / RISK_ON shorts: +10 confidence, ×1.25 R:R) because
+      // counter-trend entries into a hostile tape are the classic win-rate
+      // killer. Toggleable — off = the raw config thresholds.
+      const dyn = cfg.dynamicThresholds
+        ? regimeDynamicThresholds(cfg.minConfidence, cfg.minRR, regimeState, direction)
+        : { minConfidence: cfg.minConfidence, minRR: cfg.minRR, note: null }
+      const effMinConf = dyn.minConfidence
+      const effMinRR = dyn.minRR
+      const dynNote = dyn.note
+
+      const confOk = confidence >= effMinConf
+      const rrOk = v.rr >= effMinRR
+      if (!confOk && !rrOk) v.rejectReason = `信心與 R:R 均未達門檻${dynNote ? `（動態：${dynNote}）` : ''}`
+      else if (!confOk) v.rejectReason = `信心未達 ${effMinConf}%${dynNote ? `（動態：${dynNote}）` : ''}`
+      else if (!rrOk) v.rejectReason = `R:R 未達 1:${effMinRR}${dynNote ? `（動態：${dynNote}）` : ''}`
       if (!confOk || !rrOk) return v
 
       // passed the numeric gate — execution checks
@@ -818,6 +913,36 @@ export async function runScan(): Promise<void> {
       passCount++
       return v
     })
+
+    // 5.5) v2.12.33 — CONCENTRATION GATE (deterministic): a candidate that
+    // correlates ≥ 0.85 with a same-direction holding is the same trade in
+    // disguise; and same-direction stacking beyond maxCorrelated is refused
+    // even without correlation data (count rule). ONE correlation fetch for
+    // all surviving candidates × holdings (cached 30min server-side); sim
+    // data fails open for the correlation rule (the count rule stands).
+    if (cfg.blockConcentration && verdicts.some((v) => v.passed) && heldRaw.length > 0) {
+      try {
+        const cands = verdicts.filter((v) => v.passed)
+        const syms = [...new Set([...cands.map((v) => v.symbol.replace('/', '').toUpperCase()), ...heldRaw.slice(0, 8).map((h) => h.symbol)])].slice(0, 8)
+        const corr = await fetchJson(`/api/market/correlation?symbols=${encodeURIComponent(syms.join(','))}`, { signal: sig })
+        const mx = (corr.j as { matrix?: Record<string, Record<string, number>>; source?: string } | null)?.matrix
+        for (const v of cands) {
+          const csym = v.symbol.replace('/', '').toUpperCase()
+          const cdir = v.direction as 'long' | 'short'
+          const sameDir = heldRaw.filter((h) => h.side === cdir).map((h) => ({
+            symbol: h.symbol,
+            r: mx && mx[csym] && typeof mx[csym][h.symbol] === 'number' ? mx[csym][h.symbol] : null,
+          }))
+          const chk = concentrationCheck(csym, cdir, sameDir, cfg.maxCorrelated)
+          if (chk.blocked) {
+            v.passed = false
+            v.rejectReason = chk.note
+            passCount--
+            st0.addLog('info', `${v.symbol} — ${chk.note}`)
+          }
+        }
+      } catch { /* concentration check must never fail the scan */ }
+    }
 
     useAiAutoStore.setState({ verdicts })
     const shortSkips = verdicts.filter((v) => v.rejectReason?.includes('不可做空')).length
@@ -858,6 +983,7 @@ export async function runScan(): Promise<void> {
       if (cfg.dryRun) {
         v.dryRunNote = `試運行：${v.direction === 'long' ? 'buy' : 'sell'} ${qty} @市價 · TP ${v.target} / SL ${v.stop}`
         st0.addLog('info', `${v.symbol} ${v.dryRunNote}（試運行 — 未送單）`)
+        v.verdictStatus = 'dry-run'
         continue
       }
       const side = v.direction === 'long' ? 'buy' : 'sell'
@@ -884,6 +1010,7 @@ export async function runScan(): Promise<void> {
         const ok = status === 200 && Array.isArray((j as { orders?: unknown[] } | null)?.orders) && ((j as { orders: unknown[] }).orders.length > 0)
         if (ok) {
           fireCount++
+          v.verdictStatus = 'fired'
           // v2.12.25 — commit this order's cost against the in-round budget
           if (bpLeft != null) bpLeft = Math.max(0, bpLeft - qty * price)
           const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: v.symbol, side, qty, price, stop: v.stop!, target: v.target!, confidence: v.confidence, rr: v.rr!, mode: cfg.mode }
@@ -900,6 +1027,38 @@ export async function runScan(): Promise<void> {
         v.rejectReason = e instanceof DOMException && e.name === 'AbortError' ? '掃描被取消' : '下單連線失敗'
         st0.addLog('error', `${v.symbol} ${v.rejectReason}`)
         if (v.rejectReason !== '掃描被取消') classifyOrderFailure(v.symbol, v.rejectReason)
+      }
+    }
+
+    // 6.5) v2.12.33 — POST-HOC ATTRIBUTION LEDGER: every NON-FLAT verdict is
+    // persisted with the context it was decided under (regime, earnings,
+    // fired/dry-run/gated + the gate note); the server reconciles them
+    // against live quotes after 24h and distills 「自動交易覆盤」 lines into
+    // the PERMANENT lesson memory — so "which evidence combinations actually
+    // win" is fed back into every future review instead of evaporating.
+    {
+      const rows = verdicts
+        .filter((v) => v.direction !== 'flat' && v.rejectReason !== '評估失敗（模型組失敗或漏答）')
+        .map((v) => ({
+          symbol: v.symbol,
+          direction: v.direction as 'long' | 'short',
+          confidence: v.confidence,
+          entry: v.entry,
+          stop: v.stop,
+          target: v.target,
+          rr: v.rr,
+          regime: regimeState,
+          earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
+          status: v.verdictStatus ?? 'gated',
+          gateNote: v.rejectReason,
+        }))
+      if (rows.length > 0) {
+        void fetchJson('/api/ai-trade/verdicts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ verdicts: rows }),
+          signal: sig,
+        }).catch(() => { /* the ledger is best-effort */ })
       }
     }
 

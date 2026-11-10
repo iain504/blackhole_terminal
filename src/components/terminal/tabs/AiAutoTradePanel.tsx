@@ -89,11 +89,13 @@ export default function AiAutoTradePanel() {
   const [minRR, setMinRR] = useState(String(cfg.minRR))
   const [riskPct, setRiskPct] = useState(String(cfg.riskPct))
   const [maxOpen, setMaxOpen] = useState(String(cfg.maxOpenAuto))
+  const [maxCorr, setMaxCorr] = useState(String(cfg.maxCorrelated))
   useEffect(() => {
     setMinConf(String(cfg.minConfidence))
     setMinRR(String(cfg.minRR))
     setRiskPct(String(cfg.riskPct))
     setMaxOpen(String(cfg.maxOpenAuto))
+    setMaxCorr(String(cfg.maxCorrelated))
   }, [cfg])
 
   const commitNum = (raw: string, apply: (n: number) => void) => {
@@ -294,6 +296,28 @@ export default function AiAutoTradePanel() {
             避開財報窗口
           </label>
           <span className="text-[9px] text-zinc-600">發布前 2 天至發布後禁止開新倉（跳空風險 · 日期未知時放行）</span>
+        </div>
+        {/* v2.12.33 — regime-dynamic thresholds + concentration gate */}
+        <div className="col-span-2 flex items-center justify-between gap-2">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-zinc-400">
+            <Switch checked={cfg.dynamicThresholds} onCheckedChange={(v) => updateConfig({ dynamicThresholds: v })} aria-label="動態門檻" />
+            動態門檻（依 regime）
+          </label>
+          <span className="text-[9px] text-zinc-600">RISK_OFF 做多 / RISK_ON 做空：信心 +10 · R:R ×1.25</span>
+        </div>
+        <div className="col-span-2 flex items-center justify-between gap-2">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-zinc-400">
+            <Switch checked={cfg.blockConcentration} onCheckedChange={(v) => updateConfig({ blockConcentration: v })} aria-label="避開集中風險" />
+            避開集中風險
+          </label>
+          <span className="flex items-center gap-1 text-[9px] text-zinc-600">
+            與同向持倉相關 ≥ 0.85 拒單 · 同向上限
+            <Input
+              inputMode="numeric" value={maxCorr} onChange={(e) => setMaxCorr(e.target.value)}
+              onBlur={() => commitNum(maxCorr, (n) => updateConfig({ maxCorrelated: Math.round(Math.min(Math.max(n, 1), 10)) }))}
+              className="h-5 w-9 border-zinc-800 bg-zinc-900/80 px-1 text-center text-[10px] text-zinc-100" aria-label="同向持倉上限"
+            />
+          </span>
         </div>
       </div>
 

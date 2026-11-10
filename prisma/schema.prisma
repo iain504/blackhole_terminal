@@ -697,3 +697,33 @@ model AiOpsState {
   @@unique([userId, kind])
   @@index([userId])
 }
+
+// v2.12.33 — post-hoc attribution for the AI Trade auto-trader. Every
+// non-flat scan verdict is persisted (fired / dry-run / gated + the gate
+// note + the regime & earnings context it was decided under); ~24h later a
+// reconciliation pass marks the outcome (24h mark-to-market P&L%) and
+// distills a 「自動交易覆盤」 line into the PERMANENT AiStewardLesson memory —
+// so "which evidence combinations actually win" is fed back into every
+// future review instead of evaporating with the scan logs.
+model AiTradeVerdict {
+  id         String    @id @default(cuid())
+  userId     String
+  symbol     String
+  direction  String // 'long' | 'short'
+  confidence Int
+  entry      Float?
+  stop       Float?
+  target     Float?
+  rr         Float?
+  regime     String? // RISK_ON | NEUTRAL | RISK_OFF | UNKNOWN at decision time
+  earnings   String? // 'block' | '<daysAway>' | 'unknown'
+  status     String // 'fired' | 'dry-run' | 'gated'
+  gateNote   String? // reject reason when status = 'gated'
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+  outcome    String? // 'win' | 'loss' | 'flat' (24h mark-to-market)
+  pnlPct     Float?
+
+  @@index([userId, resolvedAt])
+  @@index([userId, createdAt])
+}
