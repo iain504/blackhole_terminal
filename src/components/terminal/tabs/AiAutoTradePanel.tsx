@@ -6,11 +6,12 @@
 // tab is unmounted. Honesty contract: every candidate shows WHY it passed or
 // was rejected; the log never hides a failed order.
 import { useEffect, useMemo, useState } from 'react'
-import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks } from 'lucide-react'
+import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw } from 'lucide-react'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { AI_TRADE_MODELS } from '@/lib/ai-trade'
 import { TIMEFRAMES } from '@/lib/market-types'
+import type { ScreenerResult } from '@/lib/screener'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -38,6 +39,12 @@ function fmtCountdown(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
+
+// v2.12.34 — compact formatters for the auto-watchlist table
+const fmtUsdVol = (n: number | null | undefined): string =>
+  n == null ? '—' : n >= 1e9 ? `$${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `$${Math.round(n / 1e6)}M` : `$${Math.round(n / 1e3)}K`
+const fmtPct1 = (v: number | null | undefined, sign = false): string =>
+  v == null ? '—' : `${sign && v > 0 ? '+' : ''}${v.toFixed(1)}%`
 
 export default function AiAutoTradePanel() {
   const cfg = useAiAutoStore((s) => s.config)
@@ -110,8 +117,51 @@ export default function AiAutoTradePanel() {
 
   // selected watchlist + its symbol items (separators become group labels)
   const selectedList = watchlists.find((l) => l.id === cfg.watchlistId) ?? watchlists[0] ?? null
+  const watchSyms = useMemo(() => watchlistSymbols(selectedList?.items ?? []), [selectedList])
+
+  // v2.12.34 — AUTO WATCHLIST (US-universe screener Top-50) fetch state.
+  // Loaded lazily when the pool source needs it; 「立即篩選」 forces a fresh
+  // server-side screen (?sync=1 — the first real run can take 10–30 s).
+  // One busy flag + guarded effect: no in-flight dedup key means a deps churn
+  // can never strand a response (the alive-flag cleanup race never fires a
+  // state set that already belonged to this mount).
+  const [screener, setScreener] = useState<ScreenerResult | null>(null)
+  const [scrBusy, setScrBusy] = useState<'idle' | 'loading' | 'syncing'>('idle')
+  const [scrError, setScrError] = useState<string | null>(null)
+
+  const applyScreener = (p: Promise<Response>, kind: 'loading' | 'syncing') => {
+    setScrBusy(kind)
+    setScrError(null)
+    p.then(async (r) => {
+      const j = await r.json().catch(() => null) as ScreenerResult | { error?: string } | null
+      if (!r.ok) throw new Error((j as { error?: string } | null)?.error ?? `HTTP ${r.status}`)
+      setScreener(j as ScreenerResult)
+    })
+      .catch((e) => setScrError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setScrBusy('idle'))
+  }
+
+  const syncScreener = () => {
+    if (scrBusy !== 'idle') return
+    applyScreener(fetch('/api/market/screener?sync=1'), 'syncing')
+  }
+
+  useEffect(() => {
+    if (cfg.poolSource === 'watchlist' || screener || scrBusy !== 'idle') return
+    applyScreener(fetch('/api/market/screener'), 'loading')
+  }, [cfg.poolSource, screener, scrBusy])
+
+  // pool-aware scan list: auto = screener Top-50; union = the watchlist
+  // first with the picks filling the remainder; watchlist = as before
+  const pickSyms = useMemo(() => (screener?.picks ?? []).map((p) => p.symbol), [screener])
+  const scanSymbols = useMemo(
+    () =>
+      cfg.poolSource === 'auto' ? pickSyms
+        : cfg.poolSource === 'union' ? [...watchSyms, ...pickSyms.filter((s) => !watchSyms.includes(s))]
+        : watchSyms,
+    [cfg.poolSource, pickSyms, watchSyms],
+  )
   const scanItems = selectedList?.items ?? []
-  const scanSymbols = useMemo(() => watchlistSymbols(scanItems), [scanItems])
   const excluded = cfg.excludedSymbols
   const toggleSymbol = (sym: string) => {
     const next = excluded.includes(sym) ? excluded.filter((s) => s !== sym) : [...excluded, sym]
@@ -197,6 +247,34 @@ export default function AiAutoTradePanel() {
               ))}
             </SelectContent>
           </Select>
+        </div>
+        {/* v2.12.34 — pool source: hand-picked watchlist / auto screener Top-50 / merged */}
+        <div className="col-span-2 space-y-1">
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">掃描池來源</Label>
+          <div className="flex gap-1" role="radiogroup" aria-label="掃描池來源">
+            {([['watchlist', '關注清單'], ['auto', '自動選股'], ['union', '合併']] as const).map(([v, label]) => (
+              <button
+                key={v}
+                type="button"
+                role="radio"
+                aria-checked={cfg.poolSource === v}
+                onClick={() => updateConfig({ poolSource: v })}
+                className={cn(
+                  'h-6 flex-1 rounded border px-1.5 text-[10px] transition-colors',
+                  cfg.poolSource === v
+                    ? 'border-violet-500/60 bg-violet-500/15 text-violet-200'
+                    : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-zinc-200',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[9px] leading-3.5 text-zinc-600">
+            {cfg.poolSource === 'watchlist' && '以你選的關注清單作為候選池。'}
+            {cfg.poolSource === 'auto' && '候選池 = 全美股自動篩選 Top 50（波動+流動性），不看關注清單。'}
+            {cfg.poolSource === 'union' && '關注清單優先，剩餘名額由自動選股 Top 50 補滿。'}
+          </p>
         </div>
         <div className="space-y-1">
           <Label className="text-[9px] uppercase tracking-wider text-zinc-500">K線時間框架</Label>
@@ -352,11 +430,17 @@ export default function AiAutoTradePanel() {
         </div>
         {scanSymbols.length === 0 ? (
           <p className="mt-1 text-[10px] text-zinc-600">
-            {selectedList ? `「${selectedList.name}」沒有可掃描的符號` : '尚未選擇關注清單'}
+            {cfg.poolSource !== 'watchlist'
+              ? scrBusy === 'loading'
+                ? '自動選股載入中…首次篩選約需 10–30 秒'
+                : '自動選股清單為空 — 按下方「立即篩選」生成'
+              : selectedList
+                ? `「${selectedList.name}」沒有可掃描的符號`
+                : '尚未選擇關注清單'}
           </p>
         ) : (
           <ul className="terminal-scroll mt-1 max-h-36 space-y-0.5 overflow-y-auto pr-1">
-            {scanItems.map((item) => {
+            {(cfg.poolSource === 'watchlist' ? scanItems : scanSymbols).map((item) => {
               if (item.startsWith('#')) {
                 return (
                   <li key={item} className="pt-1 text-[9px] font-semibold uppercase tracking-wider text-zinc-600">
@@ -388,6 +472,94 @@ export default function AiAutoTradePanel() {
           </ul>
         )}
       </div>
+
+      {/* v2.12.34 — auto watchlist card: the screener Top-50 with the metrics
+          that earned each row its rank; [立即篩選] forces a fresh server-side
+          screen (rate-limited 2/min — one run costs ~110 snapshot calls) */}
+      {cfg.poolSource !== 'watchlist' && (
+        <div className="mt-2 rounded border border-zinc-800/80 bg-zinc-950/40 p-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-widest text-zinc-500">
+              <Radar className="h-3 w-3" aria-hidden />
+              自動選股 Top 50
+              {screener && (
+                <span
+                  className={cn(
+                    'rounded px-1 py-px text-[8px] font-normal',
+                    screener.source === 'real' ? 'bg-emerald-500/15 text-emerald-400' : 'bg-amber-500/15 text-amber-400',
+                  )}
+                >
+                  {screener.source === 'real' ? '即時篩選' : '模擬宇宙'}
+                </span>
+              )}
+            </span>
+            <button
+              type="button"
+              onClick={syncScreener}
+              disabled={scrBusy !== 'idle'}
+              className="flex items-center gap-1 rounded border border-zinc-800 bg-zinc-900/80 px-1.5 py-0.5 text-[9px] text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+              aria-label="立即重新篩選美股宇宙"
+            >
+              <RefreshCw className={cn('h-2.5 w-2.5', scrBusy === 'syncing' && 'animate-spin')} aria-hidden />
+              {scrBusy === 'syncing' ? '篩選中…' : '立即篩選'}
+            </button>
+          </div>
+          {screener && (
+            <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
+              宇宙 {screener.universeSize.toLocaleString()} 檔 · 通過 {screener.filteredSize.toLocaleString()} · 深篩 {screener.stage2Size}
+              {screener.feed ? ` · feed ${screener.feed}` : ''}
+              {' · '}{new Date(screener.computedAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })} 更新
+              {screener.note ? ` · ${screener.note}` : ''}
+            </p>
+          )}
+          {scrError && (
+            <p className="mt-1 text-[9px] leading-3.5 text-rose-400">篩選失敗：{scrError}（掃描會退回關注清單）</p>
+          )}
+          {scrBusy === 'loading' && !screener && (
+            <p className="mt-1.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
+              <TaijiSpinner className="h-3 w-3" aria-hidden /> 首次篩選整個美股宇宙，約需 10–30 秒…
+            </p>
+          )}
+          {screener && screener.picks.length > 0 && (
+            <>
+              <div className="terminal-scroll mt-1 max-h-56 overflow-y-auto pr-1">
+                <table className="w-full border-collapse font-mono text-[9.5px] leading-4">
+                  <thead>
+                    <tr className="text-zinc-600">
+                      <th className="w-6 py-0.5 text-left font-normal">#</th>
+                      <th className="py-0.5 text-left font-normal">Symbol</th>
+                      <th className="py-0.5 text-right font-normal" title="ATR14 佔價百分比（波動因子，權重 40%）">ATR14%</th>
+                      <th className="py-0.5 text-right font-normal" title="前一日成交量 ÷ 20 日均量（權重 15%）">量比</th>
+                      <th className="py-0.5 text-right font-normal" title="前一日成交金額（流動性因子，權重 30%）">成交額</th>
+                      <th className="py-0.5 text-right font-normal">日漲跌</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {screener.picks.map((p) => (
+                      <tr key={p.symbol} className="border-t border-zinc-900 text-zinc-300">
+                        <td className="text-zinc-600">{p.rank}</td>
+                        <td>
+                          {p.symbol}
+                          {p.kind === 'etf' && <span className="ml-1 rounded bg-zinc-800 px-0.5 text-[8px] text-zinc-400">ETF</span>}
+                        </td>
+                        <td className="text-right">{fmtPct1(p.atrPct)}</td>
+                        <td className="text-right">{p.relVol != null ? `${p.relVol.toFixed(1)}×` : '—'}</td>
+                        <td className="text-right">{fmtUsdVol(p.dollarVol)}</td>
+                        <td className={cn('text-right', p.chgPct != null ? (p.chgPct >= 0 ? 'text-emerald-400/90' : 'text-rose-400/90') : 'text-zinc-600')}>
+                          {fmtPct1(p.chgPct, true)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
+                評分 = ATR波動40% + 成交額30% + 量比15% + 日內振幅15%（橫斷面百分位）· 伺服器快取 15 分鐘 · 每輪掃描自動帶入，排除清單同樣生效。
+              </p>
+            </>
+          )}
+        </div>
+      )}
 
       {/* sizing explainer + gate reminder */}
       <p className="mt-2 text-[9px] leading-3.5 text-zinc-600">

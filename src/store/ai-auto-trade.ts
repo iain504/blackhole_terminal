@@ -77,6 +77,11 @@ export interface AiAutoConfig {
   mode: 'paper' | 'live'
   dryRun: boolean // evaluate + log what WOULD fire, place nothing
   watchlistId: string | null // which watchlist feeds the scan (null = first)
+  /** v2.12.34 — scan pool source: the hand-picked watchlist, the AUTO
+   *  WATCHLIST (US-universe screener Top-50 by volatility + liquidity), or
+   *  both merged (watchlist first). A screener failure degrades to the
+   *  watchlist — never a dead scan. */
+  poolSource: 'watchlist' | 'auto' | 'union'
   excludedSymbols: string[] // per-symbol opt-out from the scan list
   /** v2.12.32 — hard-gate new entries inside the earnings danger window
    *  (report − 2d … report + 20h). Deterministic — does not depend on the
@@ -105,6 +110,7 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   mode: 'paper',
   dryRun: false,
   watchlistId: null,
+  poolSource: 'watchlist',
   excludedSymbols: [],
   blockEarnings: true,
   dynamicThresholds: true,
@@ -138,6 +144,7 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     mode: j.mode === 'live' ? 'live' : 'paper',
     dryRun: Boolean(j.dryRun),
     watchlistId: typeof j.watchlistId === 'string' && j.watchlistId ? j.watchlistId : null,
+    poolSource: j.poolSource === 'auto' || j.poolSource === 'union' ? j.poolSource : 'watchlist',
     excludedSymbols: Array.isArray(j.excludedSymbols)
       ? j.excludedSymbols.filter((s): s is string => typeof s === 'string' && /^[A-Z0-9./:-]{1,15}$/.test(s)).slice(0, 100)
       : [],
@@ -429,7 +436,7 @@ function scanInstruction(n: number): string {
     `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）；[集中風險] 標明 ⚠ 的持倉對彼此高度相關，不要再建議與其同向的新標的。`,
     `- 覆盤統計：這是本引擎過往判斷 24 小時後的真實對帳結果（依 regime×方向分組）。用它選擇證據組合 — 某組合勝率明顯差時，同組合的新訊號給 flat 或低 confidence。`,
     `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
-    `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）與 52 週區間位置 — 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason。`,
+    `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）、52 週區間位置，以及「選股」行（全宇宙篩選排名 · ATR14% 波動 · 量比 · 成交額）— 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason；高 ATR 標的的停損距離需按波動放寬，量比爆量代表事件驅動行情、留意假突破。`,
     `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
   ].join('\n')
 }
@@ -448,6 +455,19 @@ async function fetchJson(url: string, init?: RequestInit): Promise<{ status: num
   return { status: res.status, j }
 }
 
+/** v2.12.34 — why a symbol made the auto-watchlist cut (screener metrics).
+ *  Filled from /api/market/screener when the pool source is auto/union. */
+interface PickMeta {
+  rank: number | null
+  atrPct: number | null
+  relVol: number | null
+  dollarVol: number | null
+  chgPct: number | null
+  kind: 'stock' | 'etf' | null
+}
+
+const fmtM = (n: number): string => (n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${Math.round(n / 1e6)}M` : `${Math.round(n / 1e3)}K`)
+
 export async function runScan(): Promise<void> {
   const st0 = useAiAutoStore.getState()
   if (scanning) return
@@ -458,23 +478,70 @@ export async function runScan(): Promise<void> {
   const t0 = Date.now()
   setScanning(true)
   st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · ${cfg.model}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
+  // v2.12.34 — auto-watchlist pool state (declared here so snapshotExtras
+  // and the context pack below can read it): symbol → why it made the cut.
+  const pickBySym = new Map<string, PickMeta>()
+  let poolNote = ''
 
   try {
-    // 1) watchlist symbols — user-selected list (null = first), '#Group'
-    //    separators filtered out, then the panel's per-symbol exclusions
+    // 1) scan pool — v2.12.34: the user's watchlist, the AUTO WATCHLIST
+    //    (US-universe screener Top-50 by volatility+liquidity), or both
+    //    merged (watchlist first). Every source fails open: a screener
+    //    failure degrades to the watchlist with an honest log line, never
+    //    a dead scan. '#Group' separators and the panel's per-symbol
+    //    exclusions apply to whichever pool was chosen.
     const lists = useTerminal.getState().watchlists
     const list = lists.find((l) => l.id === cfg.watchlistId) ?? lists[0]
     const excl = new Set(cfg.excludedSymbols)
-    const symbols = watchlistSymbols(list?.items ?? [])
+    const watchSyms = watchlistSymbols(list?.items ?? [])
+    let poolSyms: string[] = watchSyms
+    if (cfg.poolSource !== 'watchlist') {
+      const scr = await fetchJson('/api/market/screener', { signal: sig }).catch(() => ({ status: 0, j: null as Record<string, unknown> | null }))
+      const rawPicks = Array.isArray((scr.j as { picks?: unknown[] } | null)?.picks) ? ((scr.j as { picks: Record<string, unknown>[] }).picks) : []
+      for (const p of rawPicks) {
+        if (!p || typeof p.symbol !== 'string') continue
+        const sym = p.symbol.toUpperCase()
+        pickBySym.set(sym, {
+          rank: Number.isFinite(Number(p.rank)) ? Number(p.rank) : null,
+          atrPct: Number.isFinite(Number(p.atrPct)) ? Number(p.atrPct) : null,
+          relVol: Number.isFinite(Number(p.relVol)) ? Number(p.relVol) : null,
+          dollarVol: Number.isFinite(Number(p.dollarVol)) ? Number(p.dollarVol) : null,
+          chgPct: Number.isFinite(Number(p.chgPct)) ? Number(p.chgPct) : null,
+          kind: p.kind === 'etf' ? 'etf' : p.kind === 'stock' ? 'stock' : null,
+        })
+      }
+      const syms = [...pickBySym.keys()]
+      if (syms.length === 0) {
+        st0.addLog('warn', '自動選股清單不可用（篩選失敗或仍在運算）— 退回關注清單。')
+      } else {
+        poolSyms = cfg.poolSource === 'union'
+          ? [...watchSyms, ...syms.filter((s) => !watchSyms.includes(s))]
+          : syms
+        const meta = (scr.j ?? {}) as { universeSize?: unknown; feed?: unknown; computedAt?: unknown }
+        const uni = Number(meta.universeSize) || 0
+        const t = typeof meta.computedAt === 'string' ? new Date(meta.computedAt) : null
+        const hhmm = t && !Number.isNaN(t.getTime()) ? t.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' }) : '?'
+        poolNote = `自動選股 Top ${syms.length}${uni ? `（篩選自 ${uni} 檔美股）` : ''} · 更新 ${hhmm}`
+        if ((scr.j as { source?: unknown } | null)?.source !== 'real') {
+          st0.addLog('warn', '自動選股為模擬宇宙（無真實行情 / 未經篩選）— 僅供流程驗證。')
+        }
+      }
+    }
+    const symbols = poolSyms
       .filter((s) => !excl.has(s))
       .slice(0, cfg.maxSymbols)
+    // honest pool label: a screener failure falls back to the watchlist, so
+    // the log must name what ACTUALLY got scanned
+    const poolLabel = cfg.poolSource === 'watchlist' || pickBySym.size === 0
+      ? list?.name ?? '?'
+      : poolNote
     if (symbols.length === 0) {
-      st0.addLog('warn', list
-        ? `清單「${list.name}」沒有可掃描標的（空、全被排除或只剩分隔線）。`
-        : '沒有關注清單 — 先在圖表建立清單並加入符號。')
+      st0.addLog('warn', list || pickBySym.size > 0
+        ? `掃描池「${poolLabel}」沒有可掃描標的（空、全被排除或只剩分隔線）。`
+        : '沒有關注清單 — 先在圖表建立清單並加入符號，或在下方改用自動選股池。')
       return
     }
-    st0.addLog('info', `掃描清單「${list?.name ?? '?'}」— ${symbols.length} 標的${excl.size ? `（排除 ${excl.size} 個）` : ''}`)
+    st0.addLog('info', `掃描池「${poolLabel}」— ${symbols.length} 標的${excl.size ? `（排除 ${excl.size} 個）` : ''}`)
 
     // v2.12.23 — cooldown + static tradability filters BEFORE anything else
     const nowTs = Date.now()
@@ -732,6 +799,19 @@ export async function runScan(): Promise<void> {
     const snapshotExtras = (sym: string, lastClose: number): string => {
       const lines: string[] = []
       const key = sym.replace('/', '').toUpperCase()
+      // v2.12.34 — auto-watchlist credentials: rank + the liquidity/volatility
+      // profile that earned it, so the model knows it is trading an active,
+      // tradeable name (and how wide its stops must breathe)
+      const pk = pickBySym.get(key)
+      if (pk) {
+        const parts = [`選股 #${pk.rank ?? '?'}/${pickBySym.size}`]
+        if (pk.atrPct != null) parts.push(`ATR14 ${pk.atrPct.toFixed(1)}%`)
+        if (pk.relVol != null) parts.push(`量比 ${pk.relVol.toFixed(1)}×`)
+        if (pk.dollarVol != null) parts.push(`額 $${fmtM(pk.dollarVol)}`)
+        if (pk.chgPct != null) parts.push(`日 ${pk.chgPct >= 0 ? '+' : ''}${pk.chgPct.toFixed(1)}%`)
+        if (pk.kind) parts.push(pk.kind === 'etf' ? 'ETF' : '股票')
+        lines.push(parts.join(' · '))
+      }
       const ea = earningsBySym.get(key)
       if (ea) {
         if (ea.known && ea.daysAway != null) lines.push(ea.inBlock ? `earnings: 財報臨近（block，${ea.daysAway} 天後）` : `earnings: ${ea.daysAway} 天後`)
@@ -755,6 +835,7 @@ export async function runScan(): Promise<void> {
       retroLine ? `[覆盤統計（24h 標記對帳）] ${retroLine}` : null,
       concLine ? `[集中風險] ${concLine}` : null,
       holdingsLine ? `[目前持倉] ${holdingsLine}` : '[目前持倉] 無',
+      poolNote ? `[選股池] ${poolNote} · 標準 ATR波動40%+成交額30%+量比15%+日內振幅15%（橫斷面百分位）— 全宇宙流動性+波動候選，非投資建議` : null,
     ].filter(Boolean).join('\n')
     if (regimeLine) st0.addLog('info', `市場環境 — ${regimeLine}`)
     if (calendarLine) st0.addLog('info', `事件 — ${calendarLine}`)

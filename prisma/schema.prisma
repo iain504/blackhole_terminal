@@ -727,3 +727,32 @@ model AiTradeVerdict {
   @@index([userId, resolvedAt])
   @@index([userId, createdAt])
 }
+
+// v2.12.34 — AUTO WATCHLIST: the AI auto-trader's candidate pool, screened
+// from the whole US-listed equity universe instead of only the user's hand
+//picked watchlist. One row per (user, symbol), ≤ 50 rows per user, refreshed
+// whenever the screener route runs (GET /api/market/screener — server caches
+// the heavy market-wide compute 15 min across users, persistence here is
+// per-account best-effort). Metrics ride the row so the panel and the model
+// pack can show WHY each name made the cut without refetching anything.
+model ScreenerPick {
+  id        String   @id @default(cuid())
+  userId    String
+  symbol    String
+  name      String? // company/ETF name from the Alpaca asset record
+  rank      Int // 1 = best score
+  score     Float // 0-100 composite percentile (ATR 40% / $vol 30% / relVol 15% / range 15%)
+  price     Float?
+  atrPct    Float? // ATR14 as % of close (volatility factor)
+  rangePct  Float? // (dayHigh-dayLow)/prevClose (intraday amplitude)
+  dollarVol Float? // close × day volume (liquidity factor)
+  relVol    Float? // today volume ÷ 20-day average
+  chgPct    Float? // today % change
+  ret20     Float? // 20-session return (momentum context, reported not scored)
+  kind      String? // 'stock' | 'etf' (name-heuristic)
+  source    String // 'real' | 'sim' (sim = no Alpaca keys — static universe, metrics unknown)
+  capturedAt DateTime @default(now())
+
+  @@unique([userId, symbol])
+  @@index([userId, rank])
+}
