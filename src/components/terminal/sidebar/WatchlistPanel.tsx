@@ -42,6 +42,11 @@ interface QuoteRow {
   price: number
   change: number
   changePct: number
+  /** v2.12.25 — sim-filled REST row (the real feed couldn't answer). */
+  sim?: boolean
+  /** v2.12.27 — seeded from a live tick before any REST quote landed; the
+   * next REST response must replace it wholesale (daily-change baseline). */
+  seeded?: boolean
 }
 
 interface SuggRow {
@@ -135,14 +140,27 @@ export function WatchlistPanel() {
         const at = Date.now()
         const next: Record<string, QuoteRow> = {}
         for (const q of json.quotes || []) {
-          if (streamFresh(q.symbol, at)) continue // a cached REST snapshot must not yank a live tick backwards
-          next[q.symbol] = { symbol: q.symbol, price: q.price, change: q.change, changePct: q.changePct }
+          next[q.symbol] = { symbol: q.symbol, price: q.price, change: q.change, changePct: q.changePct, sim: q.sim === true }
         }
+        // v2.12.27 — merge per target symbol (the old code skipped REST rows
+        // for stream-fresh symbols outright, which deadlocked 24/7 crypto:
+        // the first tick always beat the first REST merge, no row ever formed,
+        // and the tick handler drops ticks for row-less symbols → '—' forever).
         setQuotes((prev) => {
-          const merged: Record<string, QuoteRow> = { ...next }
+          const merged: Record<string, QuoteRow> = {}
           for (const s of syms) {
-            // rows with a fresh live tick keep their streamed value
-            if (!merged[s] && prev[s] && streamFresh(s, at)) merged[s] = prev[s]
+            const prevRow = prev[s]
+            const restRow = next[s]
+            const liveRow = prevRow && (prevRow.seeded || streamFresh(s, at))
+            if (prevRow && liveRow && restRow?.sim) {
+              merged[s] = prevRow // real ticks prove a live upstream — a sim-filled REST row must never poison the price/baseline
+            } else if (prevRow && streamFresh(s, at) && !prevRow.seeded) {
+              merged[s] = prevRow // established live row wins — a cached REST snapshot must not yank a live tick backwards
+            } else if (restRow) {
+              merged[s] = restRow // seeds missing rows AND corrects a seeded row's daily-change baseline
+            } else if (prevRow) {
+              merged[s] = prevRow // REST answered nothing for it — keep the last known value instead of flashing '—'
+            }
           }
           return merged
         })
@@ -171,7 +189,27 @@ export function WatchlistPanel() {
       tickAtRef.current.set(t.s, Date.now())
       setQuotes((prev) => {
         const row = prev[t.s]
-        if (!row) return prev
+        if (!row) {
+          // v2.12.27 — SEED the row from the first live tick: the old code
+          // dropped ticks for row-less symbols, so a streaming symbol whose
+          // first tick beat the first REST merge could never display (24/7
+          // crypto always lost that race). change stays 0 until the next REST
+          // response replaces the seeded row with the real daily baseline.
+          return {
+            ...prev,
+            [t.s]: { symbol: t.s, price: t.p, change: 0, changePct: 0, seeded: true },
+          }
+        }
+        if (row.sim) {
+          // v2.12.27 — the REST baseline was sim-filled (feed couldn't answer)
+          // but a REAL tick just proved a live upstream: drop the fictional
+          // baseline and re-seed (change 0, honest) instead of computing the
+          // daily change against a made-up prev close (displayed −22% garbage).
+          return {
+            ...prev,
+            [t.s]: { symbol: t.s, price: t.p, change: 0, changePct: 0, sim: false, seeded: true },
+          }
+        }
         const prevClose = row.price - row.change // implied by the last REST row
         const change = t.p - prevClose
         return {
@@ -179,8 +217,8 @@ export function WatchlistPanel() {
           [t.s]: {
             ...row,
             price: t.p,
-            change,
-            changePct: prevClose ? (change / prevClose) * 100 : row.changePct,
+            change: row.seeded ? 0 : change, // a seeded row has no baseline yet — hold change at 0 until REST lands
+            changePct: row.seeded ? 0 : prevClose ? (change / prevClose) * 100 : row.changePct,
           },
         }
       })

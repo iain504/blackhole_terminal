@@ -1,6 +1,6 @@
 {
   "name": "blackhole_terminal",
-  "version": "2.12.26",
+  "version": "2.12.27",
   "private": true,
   "scripts": {
     "predev": "bun scripts/stamp-version.mjs",

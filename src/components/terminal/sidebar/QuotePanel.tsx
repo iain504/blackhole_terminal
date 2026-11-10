@@ -18,6 +18,11 @@ interface FullQuote {
   prevClose: number
   volume: number
   ts: number
+  /** v2.12.25 — sim-filled REST row (the real feed couldn't answer). */
+  sim?: boolean
+  /** v2.12.27 — seeded from a live tick before any REST quote landed; the
+   * next REST response must replace it wholesale (daily-change baseline). */
+  seeded?: boolean
 }
 
 export function QuotePanel({ symbol }: { symbol: string }) {
@@ -43,15 +48,19 @@ export function QuotePanel({ symbol }: { symbol: string }) {
         const json = await res.json()
         const quote = json.quotes?.[0]
         if (quote && alive) {
-          if (streaming()) {
-            // stream is primary — only refresh the prev-close anchor so a
-            // cached REST snapshot never yanks the live price backwards
-            setState((prev) =>
-              prev?.key === symbol ? { key: symbol, q: { ...prev.q, prevClose: quote.prevClose } } : prev,
-            )
-          } else {
-            setState({ key: symbol, q: quote })
-          }
+          setState((prev) => {
+            // stream is primary — refresh only the prev-close anchor so a
+            // cached REST snapshot never yanks the live price backwards; a
+            // SEEDED tick row (no REST baseline yet) still takes the FULL
+            // REST quote so the daily change/OHLC finally land (v2.12.27 —
+            // the old code kept a null state forever when the first tick
+            // beat the first REST merge → the crypto quote card stayed empty).
+            if (streaming() && prev?.key === symbol) {
+              if (quote.sim) return prev // v2.12.27 — real ticks prove a live upstream; a sim-filled REST row must never poison it
+              if (!prev.q.seeded) return { key: symbol, q: { ...prev.q, prevClose: quote.prevClose } }
+            }
+            return { key: symbol, q: quote }
+          })
         }
       } catch { /* offline */ }
     }
@@ -78,7 +87,62 @@ export function QuotePanel({ symbol }: { symbol: string }) {
         tickAtRef.current = Date.now()
         setState((prev) => {
           const base = prev?.key === symbol ? prev.q : null
-          if (!base) return prev
+          if (!base) {
+            // v2.12.27 — SEED from the first live tick: the old code dropped
+            // ticks for a symbol with no REST state yet, so a streaming pair
+            // whose first tick beat the first REST merge could never display.
+            // prevClose is pinned to the seed price (change reads 0) until
+            // the next REST response replaces the seeded row wholesale.
+            return {
+              key: symbol,
+              q: {
+                price: t.p,
+                change: 0,
+                changePct: 0,
+                open: t.o ?? t.p,
+                high: t.h ?? t.p,
+                low: t.l ?? t.p,
+                prevClose: t.p,
+                volume: t.v ?? 0,
+                ts: t.t,
+                seeded: true,
+              },
+            }
+          }
+          if (base.sim) {
+            // v2.12.27 — REST baseline was sim-filled but a REAL tick just
+            // proved a live upstream: drop the fictional baseline and re-seed
+            // (change 0, honest) instead of a made-up daily change.
+            return {
+              key: symbol,
+              q: {
+                price: t.p,
+                change: 0,
+                changePct: 0,
+                open: t.o ?? t.p,
+                high: t.h ?? t.p,
+                low: t.l ?? t.p,
+                prevClose: t.p,
+                volume: t.v ?? base.volume,
+                ts: t.t,
+                seeded: true,
+              },
+            }
+          }
+          if (base.seeded) {
+            // still awaiting the REST baseline — move the price, keep change at 0
+            return {
+              key: symbol,
+              q: {
+                ...base,
+                price: t.p,
+                high: Math.max(base.high, t.p),
+                low: Math.min(base.low, t.p),
+                volume: t.v ?? base.volume,
+                ts: t.t,
+              },
+            }
+          }
           const change = t.p - base.prevClose
           return {
             key: symbol,
