@@ -35,6 +35,7 @@ export const BACKUP_TABLE_KEYS = [
   'calendarAlarms',
   'gridTrades',
   'gridFills',
+  'aiStewardLessons',
 ] as const
 
 export interface BackupEnvelope {
@@ -225,6 +226,14 @@ const SPECS: Record<string, Record<string, FieldSpec>> = {
     orderId: { t: 's', max: 64 },
     note: { t: 's', max: 500 },
     ts: { t: 'd' },
+  },
+  // v2.12.30 — the AI steward's PERMANENT lesson memory (never retention-
+  // purged in the live DB) rides the backup too, so a redeploy/restore keeps
+  // what the steward learned and what the user pinned by hand.
+  aiStewardLesson: {
+    text: { t: 's', req: true, max: 200 },
+    createdAt: { t: 'd' },   // first learned
+    lastSeenAt: { t: 'd' },  // last reinforced
   },
 }
 
@@ -483,6 +492,28 @@ export async function restoreBackupData(
       })
     }
     counts.gridFills = rows.length
+  }
+
+  // v2.12.30 — AI steward permanent lessons. @@unique([userId, text]) —
+  // dedupe by text so one duplicated row can't fail the whole createMany
+  // (same guard as calendarAlarms' eventKey). Delete-first mirrors the other
+  // sections: the file IS the memory (manual ✕ deletions restore 1:1).
+  if (has('aiStewardLessons')) {
+    const rows = buildRows(data.aiStewardLessons as unknown[], 'aiStewardLesson')
+    const seen = new Set<string>()
+    const unique = rows.filter((r) => {
+      const key = typeof r.text === 'string' ? r.text : ''
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    await tx.aiStewardLesson.deleteMany({ where: { userId } })
+    if (unique.length) {
+      await tx.aiStewardLesson.createMany({
+        data: unique.map((r) => ({ ...r, userId })) as unknown as Prisma.AiStewardLessonCreateManyInput[],
+      })
+    }
+    counts.aiStewardLessons = unique.length
   }
 
   return counts

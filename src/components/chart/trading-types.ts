@@ -13,6 +13,30 @@ export interface ExitInfo {
   /** Alpaca order status — 'held' marks the ARMED sibling of a live OCO
    * family (editable only after it activates when the sibling fills) */
   status?: string
+  /** v2.12.30 — broker client_order_id (`tte-<entryId>-tp|sl` for
+   * supervisor-placed legs, `ttp-…` for user-attached crypto legs) */
+  clientOrderId?: string | null
+  createdAt?: string | null
+}
+
+/** v2.12.30 — an OPEN exit-side (TP/SL/protection) order row (mirrors the
+ * API's ExitOrderRow): rendered in the Positions tab with linkage to its
+ * position and a per-leg Cancel button. `position` null = orphan. */
+export interface ExitOrderInfo {
+  orderId: string
+  symbol: string
+  side: string
+  type: string
+  qty: number
+  limitPrice: number | null
+  stopPrice: number | null
+  trailPercent: number | null
+  status: string
+  kind: 'tp' | 'sl' | 'exit'
+  position: { side: string; qty: number; avgEntry: number } | null
+  source: 'manual' | 'algo' | 'grid' | 'ai' | null
+  clientOrderId: string | null
+  createdAt: string | null
 }
 
 /** Open (unfilled) entry order + its planned/attached TP/SL, for chart lines. */
@@ -54,6 +78,8 @@ export interface PositionsData {
   positions: PositionRow[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderInfo[]
+  /** v2.12.30 — open TP/SL protection orders (legs + orphans) */
+  exitOrders?: ExitOrderInfo[]
 }
 
 /** Chart symbol (BTC/USD) <-> trading symbol (BTCUSD) key. */

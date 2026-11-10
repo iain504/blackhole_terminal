@@ -278,3 +278,35 @@ export async function getBinanceBars(symbol: string, timeframe: Timeframe, endTi
   }
   return clean
 }
+
+// --------------------------- 52-week high / low ------------------------------
+
+const W52_TTL_MS = 60 * 60_000 // 1h — a 52-week range barely moves intraday
+const w52Cache = new Map<string, CacheEntry<{ high: number; low: number } | null>>()
+
+/**
+ * v2.12.30 — trailing 52-week high/low from Binance weekly klines (54 × 1w
+ * covers any year boundary). One small free call per symbol, cached 1h.
+ * Returns null when Binance is unreachable / the pair is unknown.
+ */
+export async function getBinanceWeek52(symbol: string): Promise<{ high: number; low: number } | null> {
+  const pair = toBinanceSymbol(symbol)
+  if (!pair) return null
+  const hit = w52Cache.get(pair)
+  if (hit && Date.now() - hit.at < W52_TTL_MS) return hit.data
+  const data = await binanceFetch<Kline[]>(`/api/v3/klines?symbol=${pair}&interval=1w&limit=54`)
+  let out: { high: number; low: number } | null = null
+  if (Array.isArray(data) && data.length > 0) {
+    let high = 0
+    let low = Infinity
+    for (const k of data) {
+      const h = num(k[2] as string)
+      const l = num(k[3] as string)
+      if (h > high) high = h
+      if (l > 0 && l < low) low = l
+    }
+    if (high > 0 && Number.isFinite(low) && low > 0) out = { high, low }
+  }
+  w52Cache.set(pair, { at: Date.now(), data: out })
+  return out
+}

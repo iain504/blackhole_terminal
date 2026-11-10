@@ -423,7 +423,7 @@ export default function AiStewardPanel() {
       </div>
 
       <p className="mt-2 text-[9px] leading-4 text-zinc-600">
-        安全：只動手動來源的倉/單（algo/grid 引擎管理中的不碰）；每個動作須過信心門檻與方位/幅度檢查；每輪有動作上限。AI 建議僅供參考，不構成投資建議。
+        安全：只動手動來源的倉/單（運行中的 algo/grid 引擎管理中的不碰；已移除/停止的引擎倉位視同手動，由護倉接管保護）；每個動作須過信心門檻與方位/幅度檢查；每輪有動作上限。AI 建議僅供參考，不構成投資建議。
       </p>
     </div>
   )

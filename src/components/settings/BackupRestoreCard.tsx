@@ -50,6 +50,7 @@ const TABLE_LABELS: Record<string, string> = {
   calendarAlarms: 'calendar alarm(s)',
   gridTrades: 'grid trade(s)',
   gridFills: 'grid fill(s)',
+  aiStewardLessons: 'AI 護倉教訓（永久記憶）',
 };
 
 interface ExportDlg {
@@ -68,6 +69,7 @@ interface RestoreSummary {
   calendarAlarms?: number;
   gridTrades?: number;
   gridFills?: number;
+  aiStewardLessons?: number;
   [key: string]: number | undefined;
 }
 

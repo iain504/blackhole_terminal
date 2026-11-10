@@ -11,7 +11,7 @@ import {
   isCryptoSymbol,
 } from './market-types'
 import { simBars, simQuote, simNews, simMarkers } from './simulator'
-import { getBinanceBars, getBinanceQuotes } from './binance'
+import { getBinanceBars, getBinanceQuotes, getBinanceWeek52 } from './binance'
 import { saveBars, loadBars, hasCoverage } from './bar-store'
 
 const DATA_BASE = 'https://data.alpaca.markets'
@@ -1052,6 +1052,86 @@ export async function getQuotes(
     ? (usedBinance ? 'binance+sim-fill' : 'alpaca+sim-fill')
     : usedBinance && usedAlpaca ? 'binance+alpaca' : usedBinance ? 'binance' : 'alpaca'
   return { quotes, demo: false, source: source2 }
+}
+
+// --------------------------- 52-week high / low ------------------------------
+
+export interface Week52Range {
+  weekHigh: number
+  weekLow: number
+}
+
+const W52_TTL_MS = 30 * 60_000 // 30min — the annual range barely moves intraday
+const w52Cache = new Map<string, { at: number; data: Record<string, Week52Range> }>()
+
+/**
+ * v2.12.30 — trailing 52-week high/low per symbol. Stocks (keyed): ONE
+ * multi-symbol Alpaca v2 weekly-bars call per 30-symbol chunk (52 weekly
+ * bars each — a single page, ≤3 pages followed defensively); crypto: Binance
+ * 1w klines via getBinanceWeek52 (works without keys). Fail-open per leg —
+ * a missing entry simply means the UI doesn't render the range.
+ */
+export async function get52WeekRanges(symbols: string[], userId?: string): Promise<Record<string, Week52Range>> {
+  if (symbols.length === 0) return {}
+  const key = `${symbols.slice().sort().join(',')}:${userId ?? 'anon'}`
+  const hit = w52Cache.get(key)
+  if (hit && Date.now() - hit.at < W52_TTL_MS) return hit.data
+
+  const cryptos = symbols.filter((s) => isCryptoSymbol(s))
+  const stocks = symbols.filter((s) => !isCryptoSymbol(s))
+  const out: Record<string, Week52Range> = {}
+
+  await Promise.all([
+    // crypto — Binance weekly klines, no keys needed
+    (async () => {
+      for (const c of cryptos) {
+        try {
+          const r = await getBinanceWeek52(c)
+          if (r) out[c] = { weekHigh: r.high, weekLow: r.low }
+        } catch { /* fail-open: no range for this symbol */ }
+      }
+    })(),
+    // stocks — Alpaca multi-symbol weekly bars (keyed only; keyless stocks
+    // are simulator rows that must not grow a fake 52-week range)
+    (async () => {
+      if (stocks.length === 0) return
+      const keys = await getAlpacaKeys(userId)
+      if (!keys) return
+      const start = new Date(Date.now() - 370 * 86400_000).toISOString().slice(0, 19) + 'Z'
+      const end = new Date().toISOString().slice(0, 19) + 'Z'
+      for (let i = 0; i < stocks.length; i += 30) {
+        const chunk = stocks.slice(i, i + 30)
+        const acc = new Map<string, { high: number; low: number }>()
+        let pageToken: string | undefined
+        try {
+          for (let page = 0; page < 3; page++) {
+            const path =
+              `/v2/stocks/bars?symbols=${encodeURIComponent(chunk.join(','))}&timeframe=1Week` +
+              `&start=${start}&end=${end}&limit=10000&adjustment=split&feed=iex` +
+              (pageToken ? `&page_token=${encodeURIComponent(pageToken)}` : '')
+            const { data } = await alpacaFetch<{ bars?: Record<string, AlpacaBar[]>; next_page_token?: string }>(path, keys)
+            if (!data) break
+            for (const [sym, raw] of Object.entries(data.bars ?? {})) {
+              const cur = acc.get(sym) ?? { high: 0, low: Infinity }
+              for (const b of raw ?? []) {
+                if (b.h > cur.high) cur.high = b.h
+                if (b.l > 0 && b.l < cur.low) cur.low = b.l
+              }
+              acc.set(sym, cur)
+            }
+            pageToken = data.next_page_token
+            if (!pageToken) break
+          }
+        } catch { /* fail-open: chunk skipped */ }
+        for (const [sym, r] of acc) {
+          if (r.high > 0 && Number.isFinite(r.low) && r.low > 0) out[sym] = { weekHigh: r.high, weekLow: r.low }
+        }
+      }
+    })(),
+  ])
+
+  w52Cache.set(key, { at: Date.now(), data: out })
+  return out
 }
 
 // ---------- News ----------

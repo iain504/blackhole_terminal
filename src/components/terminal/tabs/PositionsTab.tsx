@@ -29,7 +29,7 @@ import {
 import { useToast } from '@/hooks/use-toast'
 import { fetchAtr, atrExitPrice, fmtAtrExit, ATR_TF_OPTIONS, type AtrInfo } from '@/lib/atr-client'
 import { fmtPrice, fmtHeldDuration, ClosedTrade, CanceledOrderRow, TradeReason } from '@/lib/market-types'
-import { ExitInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
+import { ExitInfo, ExitOrderInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import { useTerminal } from '@/store/terminal'
 import AccountOverview from './AccountOverview'
 import { cn } from '@/lib/utils'
@@ -41,6 +41,10 @@ interface ModeData {
   positions: PositionRowExt[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderInfo[]
+  /** v2.12.30 — open TP/SL protection orders (OCO legs, managed tte-/ttp-
+   *  legs, orphan stops): rendered as rows in the pending table with
+   *  position linkage + per-leg Cancel. */
+  exitOrders: ExitOrderInfo[]
   error?: string
   /** Task 36 — set when Alpaca rejected the saved keys (401) for this mode;
    *  rendered as an actionable banner. Polling continues so the banner
@@ -212,7 +216,7 @@ function histRangeQuery(range: HistRange, fromStr: string, toStr: string): strin
  *  "Manual" — a wrong attribution. It now shows a dim "—" like other unknown
  *  columns; only a decoded `ttb-`/external coid renders "Manual". Task 81 —
  *  an optional qty label (shown only on multi-source rows) sizes each slice. */
-function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | 'ai' | undefined; strategy?: string; qty?: number }) {
+function SourceBadge({ source, strategy, qty }: { source: 'manual' | 'algo' | 'grid' | 'ai' | null | undefined; strategy?: string; qty?: number }) {
   const qtyLabel = qty != null ? ` ${fmtQtyLabel(qty)}` : ''
   if (source === 'ai') {
     return (
@@ -352,8 +356,8 @@ export default function PositionsTab() {
   const panelSizes = useTerminal((s) => s.positionsPanelSizes)
   const commitPanelSizes = useTerminal((s) => s.setPositionsPanelSizes)
   const [data, setData] = useState<Record<Mode, ModeData>>({
-    paper: { mode: 'paper', positions: [], exits: {}, pending: [], loaded: false },
-    live: { mode: 'live', positions: [], exits: {}, pending: [], loaded: false },
+    paper: { mode: 'paper', positions: [], exits: {}, pending: [], exitOrders: [], loaded: false },
+    live: { mode: 'live', positions: [], exits: {}, pending: [], exitOrders: [], loaded: false },
   })
   const [history, setHistory] = useState<Record<Mode, HistoryData>>({
     paper: { trades: [], canceled: [], configured: true, loaded: false },
@@ -468,7 +472,7 @@ export default function PositionsTab() {
       try {
         const res = await fetch(`/api/trading/positions?mode=${mode}`)
         if (!res.ok) {
-          return { mode, positions: [], exits: {}, pending: [], error: `HTTP ${res.status}`, loaded: true }
+          return { mode, positions: [], exits: {}, pending: [], exitOrders: [], error: `HTTP ${res.status}`, loaded: true }
         }
         const json = await res.json()
         const errs: string[] | undefined = json.errors
@@ -479,6 +483,8 @@ export default function PositionsTab() {
           positions: (json.positions || []) as PositionRowExt[],
           exits: (json.exits || {}) as Record<string, { sl?: ExitInfo; tp?: ExitInfo }>,
           pending: (json.pending || []) as PendingOrderInfo[],
+          // v2.12.30 — TP/SL protection orders (legs + orphans)
+          exitOrders: (json.exitOrders || []) as ExitOrderInfo[],
           // the auth banner replaces the raw repeating 401 error string
           error: authError || keysMissing ? undefined : errs?.length ? errs.join(', ') : undefined,
           authError: authError ?? undefined,
@@ -486,7 +492,7 @@ export default function PositionsTab() {
           loaded: true,
         }
       } catch {
-        return { mode, positions: [], exits: {}, pending: [], error: 'network error', loaded: true }
+        return { mode, positions: [], exits: {}, pending: [], exitOrders: [], error: 'network error', loaded: true }
       }
     }
     const hist = async (mode: Mode): Promise<HistoryData> => {
@@ -556,6 +562,50 @@ export default function PositionsTab() {
     })),
   )
   const pendingRows = MODES.flatMap((m) => (data[m].pending || []).map((p) => ({ mode: m as Mode, p })))
+  // v2.12.30 — TP/SL protection orders render as rows in the SAME table:
+  // both shapes normalize into one view model so sort/filter/Cancel are
+  // shared. Exit rows carry their position linkage (null = orphan).
+  interface PendRowView {
+    key: string
+    mode: Mode
+    kind: 'entry' | 'exit'
+    orderId: string
+    symbol: string
+    side: string
+    type: string
+    qty: number
+    filledQty: number | null
+    limitPrice: number | null
+    tpPrice: number | null
+    slPrice: number | null
+    status: string
+    createdAt: string | null
+    managed: boolean
+    source: 'manual' | 'algo' | 'grid' | 'ai' | null
+    strategy?: string
+    entry?: PendingOrderInfo
+    exit?: ExitOrderInfo
+  }
+  const pendViews: PendRowView[] = [
+    ...pendingRows.map(({ mode, p }) => ({
+      key: `e:${mode}:${p.orderId}`, mode, kind: 'entry' as const, orderId: p.orderId,
+      symbol: p.symbol, side: p.side, type: p.type, qty: p.qty, filledQty: p.filledQty,
+      limitPrice: p.limitPrice, tpPrice: p.tpPrice, slPrice: p.slPrice, status: p.status,
+      createdAt: p.createdAt, managed: p.managed, source: p.source as PendRowView['source'],
+      strategy: p.strategy, entry: p,
+    })),
+    ...MODES.flatMap((m) =>
+      (data[m].exitOrders || []).map((x) => ({
+        key: `x:${m}:${x.orderId}`, mode: m as Mode, kind: 'exit' as const, orderId: x.orderId,
+        symbol: x.symbol, side: x.side, type: x.type, qty: x.qty, filledQty: null,
+        limitPrice: x.limitPrice,
+        tpPrice: x.kind === 'tp' ? x.limitPrice : null,
+        slPrice: x.kind !== 'tp' ? (x.stopPrice ?? x.limitPrice) : null,
+        status: x.status, createdAt: x.createdAt, managed: false,
+        source: x.source, exit: x,
+      })),
+    ),
+  ]
   // realized round-trips across both modes (newest first from the API)
   const historyRows = MODES.flatMap((m) =>
     (history[m].trades || []).map((t) => ({ mode: m as Mode, t })),
@@ -589,19 +639,20 @@ export default function PositionsTab() {
       default: return null
     }
   })
-  const sortedPending = sortRows(pendingRows, pendSort, ({ mode, p }) => {
+  const sortedPending = sortRows(pendViews, pendSort, (v) => {
     switch (pendSort?.key) {
-      case 'symbol': return p.symbol
-      case 'market': return mode
-      case 'side': return p.side
-      case 'type': return p.type
-      case 'qty': return numOr(p.qty)
-      case 'filled': return numOr(p.filledQty)
-      case 'limit': return p.limitPrice ?? null
-      case 'tp': return p.tpPrice ?? null
-      case 'sl': return p.slPrice ?? null
-      case 'status': return p.status
-      case 'placed': return p.createdAt ? new Date(p.createdAt).getTime() || null : null
+      case 'symbol': return v.symbol
+      case 'market': return v.mode
+      case 'source': return v.source ?? null
+      case 'side': return v.side
+      case 'type': return v.kind === 'exit' ? v.exit!.kind : v.type
+      case 'qty': return v.qty
+      case 'filled': return v.filledQty
+      case 'limit': return v.limitPrice
+      case 'tp': return v.tpPrice
+      case 'sl': return v.slPrice
+      case 'status': return v.status
+      case 'placed': return v.createdAt ? new Date(v.createdAt).getTime() || null : null
       default: return null
     }
   })
@@ -872,14 +923,40 @@ export default function PositionsTab() {
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-emerald-300">
                     {r.tp?.limitPrice != null ? (
-                      fmtPrice(r.tp.limitPrice)
+                      <span className="inline-flex items-center justify-end gap-1">
+                        {fmtPrice(r.tp.limitPrice)}
+                        {/* v2.12.30 — the TP leg is a REAL order: remove it here */}
+                        <button
+                          type="button"
+                          className="rounded px-1 text-[10px] text-zinc-600 hover:bg-rose-500/10 hover:text-rose-400"
+                          disabled={canceling === r.tp.orderId}
+                          onClick={() => void cancelPending(r.mode, r.tp!.orderId, `TP ${r.pos.tradeSymbol}`)}
+                          aria-label={`Remove TP order for ${r.pos.tradeSymbol} (${r.mode})`}
+                          title="移除 TP 掛單 — 股票 OCO 家族會一併取消兄弟腿（護倉 AI 之後可重新掛上）"
+                        >
+                          ✕
+                        </button>
+                      </span>
                     ) : (
                       <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="tp" side={r.pos.qty > 0 ? 'buy' : 'sell'} basis={r.pos.current > 0 ? r.pos.current : r.pos.avgEntry} onAdded={() => void refresh()} />
                     )}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums text-rose-300">
                     {r.sl && (r.sl.stopPrice != null || r.sl.limitPrice != null) ? (
-                      fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)
+                      <span className="inline-flex items-center justify-end gap-1">
+                        {fmtPrice((r.sl.stopPrice ?? r.sl.limitPrice)!)}
+                        {/* v2.12.30 — the SL leg is a REAL order: remove it here */}
+                        <button
+                          type="button"
+                          className="rounded px-1 text-[10px] text-zinc-600 hover:bg-rose-500/10 hover:text-rose-400"
+                          disabled={canceling === r.sl.orderId}
+                          onClick={() => void cancelPending(r.mode, r.sl!.orderId, `SL ${r.pos.tradeSymbol}`)}
+                          aria-label={`Remove SL order for ${r.pos.tradeSymbol} (${r.mode})`}
+                          title="移除 SL 掛單 — 移除後持倉無停損保護（全倉清盤風險），股票 OCO 家族會一併取消兄弟腿"
+                        >
+                          ✕
+                        </button>
+                      </span>
                     ) : (
                       <AddExitCell mode={r.mode} tradeSymbol={r.pos.tradeSymbol} kind="sl" side={r.pos.qty > 0 ? 'buy' : 'sell'} basis={r.pos.current > 0 ? r.pos.current : r.pos.avgEntry} onAdded={() => void refresh()} />
                     )}
@@ -928,9 +1005,9 @@ export default function PositionsTab() {
         className="flex min-h-[130px] flex-col rounded-md border border-zinc-800/80 bg-zinc-900/70"
       >
         <div className="flex items-center gap-2 border-b border-zinc-800/80 px-3 py-1.5">
-          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Pending orders</span>
-          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{pendingRows.length}</Badge>
-          <span className="ml-auto text-[10px] text-zinc-600">unfilled entries · TP/SL plan shown until filled</span>
+          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Pending & protection orders</span>
+          <Badge variant="outline" className="border-zinc-700 text-[10px] text-zinc-500">{pendViews.length}</Badge>
+          <span className="ml-auto text-[10px] text-zinc-600">unfilled entries + live TP/SL legs · Position 欄顯示關聯持倉（orphan = 無持倉）</span>
         </div>
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
           <table className="w-full min-w-[920px] border-collapse text-xs">
@@ -941,6 +1018,7 @@ export default function PositionsTab() {
                 <SortTh label="Source" k="source" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Side" k="side" sort={pendSort} onSort={setPendSort} />
                 <SortTh label="Type" k="type" sort={pendSort} onSort={setPendSort} />
+                <th className="px-3 py-1.5 text-left font-semibold">Position</th>
                 <SortTh label="Qty" k="qty" sort={pendSort} onSort={setPendSort} align="right" />
                 <SortTh label="Filled" k="filled" sort={pendSort} onSort={setPendSort} align="right" />
                 <SortTh label="Limit" k="limit" sort={pendSort} onSort={setPendSort} align="right" />
@@ -954,14 +1032,16 @@ export default function PositionsTab() {
             <tbody>
               {sortedPending.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="px-3 py-6 text-center text-zinc-600">
-                    No pending orders.
+                  <td colSpan={14} className="px-3 py-6 text-center text-zinc-600">
+                    No pending or protection orders.
                   </td>
                 </tr>
               )}
-              {sortedPending.map(({ mode, p }) => (
-                <tr key={`${mode}:${p.orderId}`} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
-                  <td className="px-3 py-1.5 font-semibold text-zinc-100">{p.symbol}</td>
+              {sortedPending.map((v) => {
+                const mode = v.mode
+                return (
+                <tr key={v.key} className={cn('border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40', v.kind === 'exit' && 'bg-zinc-900/40')}>
+                  <td className="px-3 py-1.5 font-semibold text-zinc-100">{v.symbol}</td>
                   <td className="px-3 py-1.5">
                     <Badge
                       variant="outline"
@@ -971,37 +1051,84 @@ export default function PositionsTab() {
                     </Badge>
                   </td>
                   <td className="px-3 py-1.5">
-                    <SourceBadge source={p.source} strategy={p.strategy} />
+                    <SourceBadge source={v.source ?? null} strategy={v.strategy} />
                   </td>
-                  <td className={cn('px-3 py-1.5 font-medium', p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
-                    {p.side.toUpperCase()}
+                  <td className={cn('px-3 py-1.5 font-medium', v.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
+                    {v.side.toUpperCase()}
                   </td>
                   <td className="px-3 py-1.5 text-zinc-300">
-                    {p.type.toUpperCase()}
-                    {p.managed ? <span className="ml-1 text-[9px] text-amber-400/80">OCO</span> : null}
+                    {v.kind === 'exit' ? (
+                      // v2.12.30 — a protection leg: label its ROLE, not just the order type
+                      <span
+                        className={cn(
+                          'rounded border px-1 text-[9px] font-semibold uppercase',
+                          v.exit!.kind === 'tp' ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                            : v.exit!.kind === 'sl' ? 'border-rose-500/40 bg-rose-500/10 text-rose-400'
+                            : 'border-zinc-700 text-zinc-400',
+                        )}
+                        title={`保護單（${v.type.toUpperCase()}）· client_order_id ${v.exit!.clientOrderId ?? '—'}`}
+                      >
+                        {v.exit!.kind === 'exit' ? 'EXIT' : v.exit!.kind.toUpperCase()} · {v.type.toUpperCase()}
+                      </span>
+                    ) : (
+                      <>
+                        {v.type.toUpperCase()}
+                        {v.managed ? <span className="ml-1 text-[9px] text-amber-400/80">OCO</span> : null}
+                      </>
+                    )}
                   </td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{p.qty}</td>
-                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{p.filledQty || '—'}</td>
+                  <td className="px-3 py-1.5 text-[10px] text-zinc-400">
+                    {v.kind === 'exit' ? (
+                      // v2.12.30 — the linkage the user asked for: which position
+                      // does this TP/SL protect? (null = orphan, removable stray)
+                      v.exit!.position ? (
+                        <span
+                          className={cn('font-medium', v.exit!.position.side === 'long' ? 'text-emerald-400/90' : 'text-rose-400/90')}
+                          title={`保護對象：${v.exit!.position.side.toUpperCase()} ${v.exit!.position.qty} ${v.symbol} @ 進場 ${fmtPrice(v.exit!.position.avgEntry)}`}
+                        >
+                          {v.exit!.position.side === 'long' ? 'LONG' : 'SHORT'} {fmtQtyLabel(v.exit!.position.qty)} @ {fmtPrice(v.exit!.position.avgEntry)}
+                        </span>
+                      ) : (
+                        <span className="text-amber-400/80" title="此保護單沒有關聯的當前持倉（持倉已平倉，或屬於尚未成交的掛單家族）— 可直接取消清理">
+                          orphan · 無持倉
+                        </span>
+                      )
+                    ) : (
+                      <span className="text-zinc-600">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">{v.qty}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-zinc-500">{v.kind === 'entry' ? (v.filledQty || '—') : '—'}</td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-zinc-300">
-                    {p.type === 'limit' || p.limitPrice != null ? (
-                      <PendingPriceCell mode={mode} p={p} field="entry" onSaved={() => void refresh()} />
+                    {v.kind === 'entry' && (v.entry!.type === 'limit' || v.limitPrice != null) ? (
+                      <PendingPriceCell mode={mode} p={v.entry!} field="entry" onSaved={() => void refresh()} />
+                    ) : v.kind === 'exit' ? (
+                      v.limitPrice != null ? fmtPrice(v.limitPrice) : '—'
                     ) : (
                       '—'
                     )}
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-emerald-300">
-                    <PendingPriceCell mode={mode} p={p} field="tp" onSaved={() => void refresh()} />
+                    {v.kind === 'entry' ? (
+                      <PendingPriceCell mode={mode} p={v.entry!} field="tp" onSaved={() => void refresh()} />
+                    ) : (
+                      v.tpPrice != null ? fmtPrice(v.tpPrice) : '—'
+                    )}
                   </td>
                   <td className="px-3 py-1.5 text-right tabular-nums text-rose-300">
-                    <PendingPriceCell mode={mode} p={p} field="sl" onSaved={() => void refresh()} />
+                    {v.kind === 'entry' ? (
+                      <PendingPriceCell mode={mode} p={v.entry!} field="sl" onSaved={() => void refresh()} />
+                    ) : (
+                      v.slPrice != null ? fmtPrice(v.slPrice) : '—'
+                    )}
                   </td>
-                  <td className="px-3 py-1.5 text-zinc-400">{p.status}</td>
+                  <td className="px-3 py-1.5 text-zinc-400">{v.status}</td>
                   <td
                     className="whitespace-nowrap px-3 py-1.5 text-zinc-400"
-                    title={p.createdAt ? `Placed ${p.createdAt}` : undefined}
+                    title={v.createdAt ? `Placed ${v.createdAt}` : undefined}
                   >
-                    {p.createdAt ? (
-                      fmtCompactDT(p.createdAt)
+                    {v.createdAt ? (
+                      fmtCompactDT(v.createdAt)
                     ) : (
                       <span className="text-zinc-600">—</span>
                     )}
@@ -1010,15 +1137,24 @@ export default function PositionsTab() {
                     <Button
                       size="sm"
                       className="h-5 border border-zinc-700 bg-transparent px-2 text-[10px] font-semibold text-zinc-400 hover:bg-rose-500/10 hover:text-rose-400"
-                      disabled={canceling === p.orderId}
-                      onClick={() => void cancelPending(mode, p.orderId, `${p.side} ${p.type} ${p.symbol}`)}
-                      aria-label={`Cancel pending ${p.side} ${p.type} ${p.symbol}`}
+                      disabled={canceling === v.orderId}
+                      onClick={() =>
+                        void cancelPending(
+                          mode,
+                          v.orderId,
+                          v.kind === 'exit'
+                            ? `${v.exit!.kind.toUpperCase()} ${v.type} ${v.symbol}`
+                            : `${v.side} ${v.type} ${v.symbol}`,
+                        )
+                      }
+                      aria-label={`Cancel ${v.kind === 'exit' ? `protection order (${v.exit!.kind})` : 'pending'} ${v.side} ${v.type} ${v.symbol}`}
                     >
-                      {canceling === p.orderId ? <TaijiSpinner className="h-3 w-3" /> : 'Cancel'}
+                      {canceling === v.orderId ? <TaijiSpinner className="h-3 w-3" /> : 'Cancel'}
                     </Button>
                   </td>
                 </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         </div>

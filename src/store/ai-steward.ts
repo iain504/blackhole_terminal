@@ -417,6 +417,9 @@ interface PositionRow {
   openedAt: string | null
   source?: 'manual' | 'algo' | 'grid' | 'ai'
   strategy?: string
+  /** v2.12.30 — per-source inventory slices (server decays removed/stopped
+   * engine slices to 'manual' via the engine-liveness check) */
+  sources?: { source: 'manual' | 'algo' | 'grid' | 'ai'; qty: number; runRef?: string | null; strategy?: string }[]
 }
 
 interface ClosedTrade {
@@ -489,7 +492,20 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
 // auto-trader fires a bracket and never revisits it, so the steward is the
 // follow-up caretaker for 'ai' inventory too. Algo/grid keep their own
 // engines — the steward never touches those.
-const isManual = (src?: string) => src === undefined || src === null || src === 'manual' || src === 'ai'
+// v2.12.30 — the server now DECAYS removed/stopped-engine slices to 'manual'
+// (engine-liveness check on AlgoRun/GridTrade rows), so a deleted algo/grid
+// no longer blocks the steward. The slice-aware helpers make MIXED inventory
+// safe too: protection actions (reattach SL/TP) may act when ANY slice is
+// unmanaged (a naked half must not hide behind a live engine half — adding
+// protection is always safe), while inventory actions (exit/close) still
+// require EVERY slice to be unmanaged so a running engine's inventory is
+// never killed out from under it.
+const manualSrc = (src?: string) => src === undefined || src === null || src === 'manual' || src === 'ai'
+const isManual = manualSrc
+const protectionManageable = (p: PositionRow) =>
+  p.sources?.length ? p.sources.some((s) => manualSrc(s.source)) : manualSrc(p.source)
+const fullyManageable = (p: PositionRow) =>
+  p.sources?.length ? p.sources.every((s) => manualSrc(s.source)) : manualSrc(p.source)
 const isCryptoSym = (s: string) => s.includes('/') || s.endsWith('USD') && /^[A-Z0-9]{2,5}USD$/.test(s)
 
 export async function runStewardOnce(): Promise<void> {
@@ -551,7 +567,10 @@ export async function runStewardOnce(): Promise<void> {
       : session === 'open24' ? '24小時交易（crypto）'
       : '未知'
     const slMissingRows = positions.filter((p) => {
-      if (!isManual(p.source)) return false // algo/grid engines protect their own
+      // v2.12.30 — slice-aware: a position with ANY unmanaged slice (incl.
+      // dead-engine slices the server decayed to manual) must be guarded;
+      // live algo/grid engines still protect their own
+      if (!protectionManageable(p)) return false
       const ex = exits[p.symbol] ?? exits[p.tradeSymbol] ?? {}
       return !ex.sl
     })
@@ -696,7 +715,11 @@ export async function runStewardOnce(): Promise<void> {
       if (!row) continue // model named a symbol we don't hold — ignore silently
       if (action === 'hold') continue // no DB row — holds are the default
       const kindBase = { kind: 'position' as const, symbol: row.tradeSymbol || row.symbol, detail: reason, payload: { from: 'model', confidence: conf, action } }
-      if (!isManual(row.source)) {
+      // v2.12.30 — slice-aware refusal: exit/close kills the whole position
+      // (needs EVERY slice engine-free), protection edits only ADD safety
+      // (any unmanaged slice is enough)
+      const manageable = action === 'exit' ? fullyManageable(row) : protectionManageable(row)
+      if (!manageable) {
         skipped++
         drafts.push({ ...kindBase, action: 'hold', status: 'skipped', detail: `${reason || '模型建議'} — 拒絕：${row.source} 引擎管理中，護倉不碰` })
         continue

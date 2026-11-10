@@ -11,6 +11,7 @@ import { Bot, Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAl
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
 import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
+import { fmtPrice } from '@/lib/market-types'
 import { visibleAwareInterval } from '@/lib/visible-poll'
 import AiAutoTradePanel from './AiAutoTradePanel'
 import AiStewardPanel from './AiStewardPanel'
@@ -24,7 +25,7 @@ import { cn } from '@/lib/utils'
 interface CtxState {
   accountLine: string | null
   positions: { symbol: string; side: string; qty: number; avgEntry: number; current: number; upl: number; uplPct: number }[]
-  quotes: { symbol: string; price: number; changePct: number; sim?: boolean }[]
+  quotes: { symbol: string; price: number; changePct: number; sim?: boolean; weekHigh?: number; weekLow?: number }[]
   fetchedAt: number | null
   note: string | null // honest degradations (no keys, watchlist empty, …)
 }
@@ -202,11 +203,13 @@ export default function AiTradeTab() {
         if (qRes.ok) {
           const j = await qRes.json().catch(() => null)
           out.quotes = (Array.isArray(j?.quotes) ? j.quotes : [])
-            .map((q: { symbol?: string; price?: number; changePct?: number; sim?: boolean }) => ({
+            .map((q: { symbol?: string; price?: number; changePct?: number; sim?: boolean; weekHigh?: number; weekLow?: number }) => ({
               symbol: String(q.symbol ?? ''),
               price: Number(q.price) || 0,
               changePct: Number(q.changePct) || 0,
               sim: Boolean(q.sim),
+              weekHigh: typeof q.weekHigh === 'number' && q.weekHigh > 0 ? q.weekHigh : undefined,
+              weekLow: typeof q.weekLow === 'number' && q.weekLow > 0 ? q.weekLow : undefined,
             }))
             .filter((q: { symbol: string }) => q.symbol)
           // honest degradation: rows the real feed couldn't answer were
@@ -571,25 +574,52 @@ export default function AiTradeTab() {
               <p className="text-[11px] text-zinc-600">{ctx.quotes.length === 0 && ctx.note ? ctx.note : '無資料'}</p>
             ) : (
               <ul className="space-y-1">
-                {ctx.quotes.map((q) => (
-                  <li key={q.symbol} className="flex items-center justify-between font-mono text-[11px]">
-                    <span className="text-zinc-300">{q.symbol}</span>
-                    <span className="flex items-center gap-2">
-                      {q.sim && (
-                        <span
-                          className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] font-medium text-amber-400"
-                          title="模擬價 — 真實行情來源沒有此標的，數值由模擬器生成，不可作為交易依據"
-                        >
-                          模擬
+                {ctx.quotes.map((q) => {
+                  // v2.12.30 — 52-week range position (0–100%) when the REST
+                  // quote carried the annual range
+                  const w52Pct =
+                    q.weekHigh != null && q.weekLow != null && q.weekHigh > q.weekLow && q.price > 0
+                      ? Math.min(100, Math.max(0, ((q.price - q.weekLow) / (q.weekHigh - q.weekLow)) * 100))
+                      : null
+                  return (
+                    <li key={q.symbol} className="font-mono text-[11px]">
+                      <div className="flex items-center justify-between">
+                        <span className="text-zinc-300">{q.symbol}</span>
+                        <span className="flex items-center gap-2">
+                          {q.sim && (
+                            <span
+                              className="rounded border border-amber-500/40 bg-amber-500/10 px-1 text-[9px] font-medium text-amber-400"
+                              title="模擬價 — 真實行情來源沒有此標的，數值由模擬器生成，不可作為交易依據"
+                            >
+                              模擬
+                            </span>
+                          )}
+                          <span className="text-zinc-500">{q.price}</span>
+                          <span className={cn(q.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
+                            {q.changePct >= 0 ? '+' : ''}{q.changePct.toFixed(2)}%
+                          </span>
                         </span>
+                      </div>
+                      {w52Pct != null && (
+                        <div
+                          className="mt-0.5 flex items-center gap-1.5"
+                          title={`52 週區間：${fmtPrice(q.weekLow!)} – ${fmtPrice(q.weekHigh!)}（現價位於區間 ${w52Pct.toFixed(0)}%）`}
+                        >
+                          <span className="text-[9px] text-zinc-600">52w</span>
+                          <div className="relative h-0.5 flex-1 rounded-full bg-zinc-800">
+                            <div
+                              className="absolute top-1/2 h-1.5 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-amber-400"
+                              style={{ left: `${w52Pct}%` }}
+                            />
+                          </div>
+                          <span className="text-[9px] tabular-nums text-zinc-600">
+                            {fmtPrice(q.weekLow!)}–{fmtPrice(q.weekHigh!)}
+                          </span>
+                        </div>
                       )}
-                      <span className="text-zinc-500">{q.price}</span>
-                      <span className={cn(q.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
-                        {q.changePct >= 0 ? '+' : ''}{q.changePct.toFixed(2)}%
-                      </span>
-                    </span>
-                  </li>
-                ))}
+                    </li>
+                  )
+                })}
               </ul>
             )}
           </div>

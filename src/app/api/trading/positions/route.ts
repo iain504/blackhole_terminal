@@ -26,6 +26,35 @@ export interface ExitInfo {
   type: string
   /** Alpaca status — 'held' = the ARMED sibling of a live OCO family */
   status: string
+  /** v2.12.30 — broker client_order_id (`tte-<entryId>-tp|sl` for
+   * supervisor-placed legs, `ttp-…` for user-attached crypto legs) */
+  clientOrderId: string | null
+  createdAt: string | null
+}
+
+/** v2.12.30 — an OPEN exit-side (TP/SL/protection) order as a first-class
+ * row, INCLUDING legs nested in OCO/bracket families and ORPHANS (no live
+ * position on the symbol any more). Before this, a working TP/SL appeared
+ * only as static price text on the position row (no cancel affordance) and
+ * an orphan leg was invisible AND unremovable from the Positions tab. */
+export interface ExitOrderRow {
+  orderId: string
+  symbol: string // chart-style (crypto orders keep the slash)
+  side: string
+  type: string
+  qty: number
+  limitPrice: number | null
+  stopPrice: number | null
+  trailPercent: number | null
+  status: string
+  /** classified role: tp (exit-side limit) / sl (stop family) / exit (other) */
+  kind: 'tp' | 'sl' | 'exit'
+  /** linked live position on this symbol — null = orphan (its position is gone) */
+  position: { side: string; qty: number; avgEntry: number } | null
+  /** placement source of the PROTECTED position (null when orphan) */
+  source: 'manual' | 'algo' | 'grid' | 'ai' | null
+  clientOrderId: string | null
+  createdAt: string | null
 }
 
 export interface PositionRow {
@@ -115,6 +144,9 @@ export interface PositionsResponse {
   positions: PositionRow[]
   exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
   pending: PendingOrderRow[]
+  /** v2.12.30 — open exit-side (TP/SL/protection) orders incl. OCO legs and
+   * orphans; the Positions tab renders them as rows with linkage + Cancel */
+  exitOrders: ExitOrderRow[]
   errors?: string[]
   /** set when Alpaca rejected the saved keys (401) for this mode — the UI
    *  renders it as an actionable banner instead of an unlabeled error string */
@@ -237,18 +269,68 @@ export async function GET(req: Request) {
     // of EVERY grid-placed order, so open lots placed BEFORE the `ttg-`
     // client_order_id tagging still resolve to source 'grid'. Capped to the
     // newest 2000 fills (indexed on userId) — far wider than the FIFO window
-    // this route actually walks.
-    let gridOrderIds: Set<string> | null = null
+    // this route actually walks. v2.12.30 — the map carries gridTradeId too,
+    // so retro-matched lots can be liveness-checked against their GridTrade.
+    let gridOrderGridMap: Map<string, string> | null = null
     try {
       const gfills = await db.gridFill.findMany({
         where: { userId: user.id, orderId: { not: null } },
         orderBy: { ts: 'desc' },
         take: 2000,
-        select: { orderId: true },
+        select: { orderId: true, gridTradeId: true },
       })
-      gridOrderIds = new Set(gfills.map((f) => f.orderId as string))
+      gridOrderGridMap = new Map()
+      for (const f of gfills) if (f.orderId) gridOrderGridMap.set(f.orderId, f.gridTradeId)
     } catch {
-      gridOrderIds = null // degrade to coid-only attribution
+      gridOrderGridMap = null // degrade to coid-only attribution
+    }
+
+    // v2.12.30 — ENGINE LIVENESS. Source tags are decoded from broker-side
+    // client_order_ids (and GridFill orderIds), which OUTLIVE the engine that
+    // placed them: delete a finished algo run / grid and its lots keep the
+    // 'Algo'/'Grid' badge forever, and the AI steward's isManual() check then
+    // permanently refuses to protect the position ("引擎管理中") — exactly the
+    // user-reported "removed algo/grid tags block AI 護盤 from taking care of
+    // TP/SL". Fix: every tagged slice is liveness-checked against the LIVE
+    // engine rows — AlgoRun.status==='running' / GridTrade.status==='active'
+    // ('paused' stays live: the user paused it deliberately and can resume;
+    // 'stopped'/'error'/deleted row = dead). Dead slices decay to 'manual' so
+    // the steward re-owns them. DB failure degrades to "everything live"
+    // (the old behavior) — attribution never flips on a transient error.
+    const runRefSet = new Set<string>()
+    const gridRefSet = new Set<string>()
+    for (const lots of openLotsByNorm.values()) {
+      for (const l of lots) {
+        const plan = parseCryptoPlan(l.clientOrderId)
+        if (plan?.runRef) runRefSet.add(plan.runRef)
+        if (plan?.gridRef) gridRefSet.add(plan.gridRef)
+      }
+    }
+    const pendingPlansEarly = orders.map((o) => ({ o, plan: parseCryptoPlan(o.client_order_id) }))
+    for (const { plan } of pendingPlansEarly) {
+      if (plan?.runRef) runRefSet.add(plan.runRef)
+      if (plan?.gridRef) gridRefSet.add(plan.gridRef)
+    }
+    const liveRunRefs = new Set<string>() // runRef prefixes whose AlgoRun is 'running'
+    const liveGridRefs = new Set<string>() // gridRef prefixes whose GridTrade is 'active'
+    const liveGridIds = new Set<string>() // full active GridTrade ids (retro path)
+    let enginesKnown = true
+    try {
+      const [runs, grids] = await Promise.all([
+        db.algoRun.findMany({ where: { userId: user.id }, select: { id: true, status: true } }),
+        db.gridTrade.findMany({ where: { userId: user.id }, select: { id: true, status: true } }),
+      ])
+      for (const r of runs) {
+        if (r.status !== 'running') continue
+        for (const ref of runRefSet) if (r.id.startsWith(ref)) liveRunRefs.add(ref)
+      }
+      for (const g of grids) {
+        if (g.status !== 'active') continue
+        liveGridIds.add(g.id)
+        for (const ref of gridRefSet) if (g.id.startsWith(ref)) liveGridRefs.add(ref)
+      }
+    } catch {
+      enginesKnown = false // degrade: treat every tagged slice as engine-live
     }
 
     const rows: PositionRow[] = positions
@@ -270,12 +352,29 @@ export async function GET(req: Request) {
         type LotSrc = { source: 'manual' | 'algo' | 'grid' | 'ai'; qty: number; runRef: string | null; at: number }
         const lotSrcs: LotSrc[] = lots.map((l) => {
           const plan = parseCryptoPlan(l.clientOrderId)
-          const isGrid = plan?.gridRef != null || gridOrderIds?.has(l.orderId) === true
-          const isAi = !isGrid && plan?.aiRef != null
+          const retroGridId = gridOrderGridMap?.get(l.orderId)
+          const isGridRef = plan?.gridRef != null
+          const isRetroGrid = !isGridRef && retroGridId != null
+          // v2.12.30 — a grid/algo tag with NO live engine behind it decays to
+          // 'manual': the dead badge must not block the AI steward, and the
+          // slice list must reflect who is ACTUALLY managing the inventory.
+          const gridLive = isGridRef
+            ? !enginesKnown || liveGridRefs.has(plan!.gridRef!)
+            : isRetroGrid
+              ? !enginesKnown || liveGridIds.has(retroGridId!)
+              : false
+          const isAi = !isGridRef && !isRetroGrid && plan?.aiRef != null
+          const isAlgoRef = !isGridRef && !isRetroGrid && !isAi && plan?.runRef != null
+          const algoLive = isAlgoRef && (!enginesKnown || liveRunRefs.has(plan!.runRef!))
+          const source: LotSrc['source'] =
+            (isGridRef || isRetroGrid) ? (gridLive ? 'grid' : 'manual')
+            : isAi ? 'ai'
+            : isAlgoRef ? (algoLive ? 'algo' : 'manual')
+            : 'manual'
           return {
-            source: isGrid ? ('grid' as const) : isAi ? ('ai' as const) : plan?.runRef ? ('algo' as const) : ('manual' as const),
+            source,
             qty: l.qty,
-            runRef: !isGrid && !isAi && plan?.runRef ? plan.runRef : null,
+            runRef: source === 'algo' && plan?.runRef ? plan.runRef : null,
             at: new Date(l.entryTime).getTime() || 0,
           }
         })
@@ -364,6 +463,8 @@ export async function GET(req: Request) {
             side: o.side,
             type: o.type,
             status: o.status,
+            clientOrderId: o.client_order_id || null,
+            createdAt: o.created_at ?? null,
           }
         } else if (o.type === 'limit' && isExitSide) {
           bucket.tp = {
@@ -376,6 +477,8 @@ export async function GET(req: Request) {
             side: o.side,
             type: o.type,
             status: o.status,
+            clientOrderId: o.client_order_id || null,
+            createdAt: o.created_at ?? null,
           }
         }
         exits[key] = bucket
@@ -437,6 +540,16 @@ export async function GET(req: Request) {
         if (plan.tp != null) tpPrice = plan.tp
         if (plan.sl != null) slPrice = plan.sl
       }
+      // v2.12.30 — engine liveness for the SOURCE tag too: a pending entry
+      // whose algo run / grid was removed is a stray order the steward must
+      // be allowed to babysit/cancel, not a sacred engine-owned row.
+      const pGridLive = plan?.gridRef != null && (!enginesKnown || liveGridRefs.has(plan.gridRef))
+      const pRunLive = plan?.runRef != null && (!enginesKnown || liveRunRefs.has(plan.runRef))
+      const pSource: PendingOrderRow['source'] =
+        plan?.gridRef != null ? (pGridLive ? 'grid' : 'manual')
+        : plan?.aiRef != null ? 'ai'
+        : plan?.runRef != null ? (pRunLive ? 'algo' : 'manual')
+        : 'manual'
       pending.push({
         orderId: o.id,
         symbol: o.symbol,
@@ -449,13 +562,67 @@ export async function GET(req: Request) {
         tpPrice,
         slPrice,
         managed: Boolean(plan) || (o.legs?.length ?? 0) > 0,
-        source: plan?.gridRef ? 'grid' : plan?.aiRef ? 'ai' : plan?.runRef ? 'algo' : 'manual',
-        strategy: plan?.runRef ? stratNames.get(plan.runRef) : undefined,
+        source: pSource,
+        strategy: plan?.runRef && pRunLive ? stratNames.get(plan.runRef) : undefined,
         createdAt: o.created_at,
       })
     }
 
-    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, errors: errors.length ? errors : undefined, authError, keysMissing })
+    // ---- v2.12.30 — exit-side (TP/SL/protection) orders as first-class rows
+    // ---- (the user report: pending TP/SL orders were neither visible nor
+    // ---- removable in the Positions tab and carried no linkage to the
+    // ---- position they protect). Collected SEPARATELY from `pending` — the
+    // ---- steward babysits entries via that array, and exit legs must never
+    // ---- leak into it (the model would cancel real protection thinking it
+    // ---- is a stray entry).
+    const exitOrders: ExitOrderRow[] = []
+    const seenExit = new Set<string>()
+    const isStopType = (t: string) => t === 'stop' || t === 'stop_limit' || t === 'trailing_stop'
+    const visitExit = (o: TradingOrder) => {
+      if (o.status === 'filled') return
+      if (seenExit.has(o.id)) return // legs appear BOTH nested and flat (held sweep)
+      seenExit.add(o.id)
+      const key = normSymbol(o.symbol)
+      if (symbolParam && key !== normSymbol(symbolParam)) return
+      const pos = byTradeSym.get(key)
+      const coid = o.client_order_id || ''
+      const managedLeg = coid.startsWith('tte-') || coid.startsWith('ttp-')
+      const isExitSide = pos ? (pos.side === 'short' ? o.side === 'buy' : o.side === 'sell') : null
+      // entry-side orders of an open position belong to `pending`; a plain
+      // limit with no position is an entry too (also `pending`, status quo).
+      // Everything else — exit-side stops/limits of a live position, managed
+      // tte-/ttp- legs, orphan stops — is PROTECTION the user must be able
+      // to see and cancel.
+      if (pos && isExitSide === false && !managedLeg) return
+      if (!pos && !managedLeg && !isStopType(o.type)) return
+      const kind: ExitOrderRow['kind'] = managedLeg
+        ? coid.endsWith('-tp') ? 'tp' : coid.endsWith('-sl') ? 'sl' : 'exit'
+        : isExitSide
+          ? isStopType(o.type) ? 'sl' : o.type === 'limit' ? 'tp' : 'exit'
+          : isStopType(o.type) ? 'sl' : 'exit'
+      exitOrders.push({
+        orderId: o.id,
+        symbol: o.symbol,
+        side: o.side,
+        type: o.type,
+        qty: parseFloat(o.qty) || 0,
+        limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
+        stopPrice: o.stop_price ? parseFloat(o.stop_price) : null,
+        trailPercent: o.trail_percent ? parseFloat(o.trail_percent) : null,
+        status: o.status,
+        kind,
+        position: pos ? { side: pos.side, qty: pos.qty, avgEntry: pos.avgEntry } : null,
+        source: pos ? (pos.source ?? null) : null,
+        clientOrderId: coid || null,
+        createdAt: o.created_at ?? null,
+      })
+    }
+    for (const o of orders) {
+      visitExit(o)
+      for (const leg of o.legs || []) visitExit(leg)
+    }
+
+    return NextResponse.json({ mode, positions: enrichedRows, exits, pending, exitOrders, errors: errors.length ? errors : undefined, authError, keysMissing })
   } catch (e) {
     return handleError(e)
   }

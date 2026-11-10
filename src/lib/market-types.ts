@@ -35,6 +35,12 @@ export interface Quote {
   // Optional everywhere: absent = feed didn't return a usable quote.
   bid?: number
   ask?: number
+  /** v2.12.30 — trailing 52-week high/low (≈1 year of weekly bars, computed
+   * server-side: Alpaca v2 weekly bars for stocks, Binance 1w klines for
+   * crypto). Optional everywhere: absent = the source couldn't compute it
+   * (no keys for stocks, Binance unreachable, simulator rows). */
+  weekHigh?: number
+  weekLow?: number
   /** v2.12.25 — true when this row was synthesized by the simulator
    * (sim-fill for a symbol the real feed couldn't answer, or a no-keys demo
    * snapshot). Truthful consumers (AI Trade Adviser context) must NOT treat

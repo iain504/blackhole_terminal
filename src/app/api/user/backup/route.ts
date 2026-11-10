@@ -55,7 +55,7 @@ export async function GET() {
     const user = await db.user.findUnique({ where: { id: session.id } })
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-    const [layout, watchlists, drawings, alerts, strategyRules, algoRuns, algoLogs, calendarAlarms, gridTrades, gridFills, algoRecoCache] =
+    const [layout, watchlists, drawings, alerts, strategyRules, algoRuns, algoLogs, calendarAlarms, gridTrades, gridFills, algoRecoCache, aiStewardLessons] =
       await Promise.all([
         db.layout.findUnique({ where: { userId: user.id } }),
         db.watchlist.findMany({ where: { userId: user.id }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] }),
@@ -73,6 +73,9 @@ export async function GET() {
         // per-user sweep cache row (Task 9-m ids: algo-reco:<userId>) — NOT
         // the global baked row
         db.algoRecoCache.findUnique({ where: { id: `algo-reco:${user.id}` } }),
+        // v2.12.30 — the AI steward's PERMANENT lesson memory (never purged
+        // by the live retention prune) ships with the backup too
+        db.aiStewardLesson.findMany({ where: { userId: user.id }, orderBy: [{ lastSeenAt: 'desc' }, { createdAt: 'asc' }] }),
       ])
 
     // A section with no row (layout never autosaved, the per-user algo-reco
@@ -92,6 +95,7 @@ export async function GET() {
       gridTrades,
       gridFills: gridFills.reverse(),
       algoRecoCache,
+      aiStewardLessons,
     }
     for (const k of Object.keys(data)) {
       if (data[k] === null) delete data[k]

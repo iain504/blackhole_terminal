@@ -23,6 +23,11 @@ interface FullQuote {
   /** v2.12.27 — seeded from a live tick before any REST quote landed; the
    * next REST response must replace it wholesale (daily-change baseline). */
   seeded?: boolean
+  /** v2.12.30 — trailing 52-week high/low (REST rows only; absent = the
+   * source couldn't compute it). Stream ticks spread the base row, so the
+   * range survives live updates. */
+  weekHigh?: number
+  weekLow?: number
 }
 
 export function QuotePanel({ symbol }: { symbol: string }) {
@@ -212,6 +217,25 @@ export function QuotePanel({ symbol }: { symbol: string }) {
               }}
             />
           </div>
+          {/* v2.12.30 — 52-week range: same bar, annual window. Rendered only
+              when the REST quote actually carried the range (no fake bars). */}
+          {q.weekHigh != null && q.weekLow != null && q.weekHigh > q.weekLow && (
+            <div className="mt-2">
+              <div className="mb-1 flex justify-between text-[10px] text-zinc-500">
+                <span>{fmtPrice(q.weekLow)}</span>
+                <span>52-week range</span>
+                <span>{fmtPrice(q.weekHigh)}</span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-zinc-800">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-rose-500/70 via-amber-400/70 to-emerald-500/70"
+                  style={{
+                    width: `${Math.min(100, Math.max(2, ((q.price - q.weekLow) / Math.max(q.weekHigh - q.weekLow, 1e-9)) * 100))}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
