@@ -210,6 +210,11 @@ function classifyOrderFailure(symbol: string, msg: string) {
 
 export type AiAutoDirection = 'long' | 'short' | 'flat'
 
+/** v2.12.35 — the exact string a verdict carries when its model group call
+ *  failed (or the model skipped the symbol). Shared by the store and the
+ *  panel so the UI can tell "honest neutral" apart from "not evaluated". */
+export const AI_EVAL_FAIL_REASON = '評估失敗（模型組失敗或漏答）'
+
 export interface AiAutoVerdict {
   symbol: string
   direction: AiAutoDirection
@@ -435,7 +440,8 @@ function scanInstruction(n: number): string {
     `- 財報/事件：快照標明「財報臨近（block）」的標的必然被終端硬閘拒絕 — 直接給 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55（跳空風險）；共用區列出的 48 小時內高影響事件同樣壓低所有相關方向信心。`,
     `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）；[集中風險] 標明 ⚠ 的持倉對彼此高度相關，不要再建議與其同向的新標的。`,
     `- 覆盤統計：這是本引擎過往判斷 24 小時後的真實對帳結果（依 regime×方向分組）。用它選擇證據組合 — 某組合勝率明顯差時，同組合的新訊號給 flat 或低 confidence。`,
-    `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 全部填 0，並在 reason 說明原因。`,
+    `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 與 confidence 全部填 0，reason 必須說出為何不交易的關鍵原因（如：證據不足/互相矛盾、區間中段無優勢、量價背離、事件風險）。`,
+    `- 本引擎以勝率優先：大多數標的判 flat 是正常且預期的輸出（寧可錯過、不可做錯），不要為了凑 non-flat 而放寬證據標準；只有證據充分、風險可控的少數標的才給 non-flat。`,
     `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）、52 週區間位置，以及「選股」行（全宇宙篩選排名 · ATR14% 波動 · 量比 · 成交額）— 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason；高 ATR 標的的停損距離需按波動放寬，量比爆量代表事件驅動行情、留意假突破。`,
     `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
   ].join('\n')
@@ -871,42 +877,74 @@ export async function runScan(): Promise<void> {
     // 4) batched verdict calls — 6 enriched snapshots + the shared context
     //    pack per call (keeps the DATA block inside the route's 8k context
     //    clamp), up to 2 calls in flight; a failed chunk degrades honestly:
-    //    its symbols report 評估失敗
+    //    its symbols report 評估失敗.
+    //    v2.12.35 — a 50-symbol pool means ~9 model calls in quick succession;
+    //    a single 429/timeout/parse hiccup used to cost SIX symbols their
+    //    evaluation with NO second chance. Each chunk now retries twice with
+    //    backoff (3s → 8s) before it is allowed to fail, and symbols the
+    //    model silently skipped inside a SUCCESSFUL reply (漏答) are named
+    //    in the log instead of failing anonymously.
     const groups = chunk(snaps, SCAN_CHUNK)
     const bySym = new Map<string, Partial<Record<'symbol' | 'direction' | 'confidence' | 'entry' | 'stop' | 'target' | 'reason', unknown>>>()
+    const answered = new Set<string>()
+    const CHUNK_ATTEMPTS = 3
+    const CHUNK_BACKOFF_MS = [3_000, 8_000]
+    const sleepAbortable = (ms: number) => new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, ms)
+      sig.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+    })
+    const callChunk = async (grp: Snap[]): Promise<void> => {
+      const dataBlock = (contextPack ? `${contextPack}\n\n` : '') + grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
+      const res = await fetch('/api/ai-trade/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: cfg.model,
+          messages: [{ role: 'user', content: scanInstruction(grp.length) }] as AiChatMsg[],
+          context: dataBlock,
+          maxTokens: Math.min(2000, 200 * grp.length + 300),
+        }),
+        signal: sig,
+      })
+      const j = await res.json().catch(() => null) as { ok?: boolean; content?: string; error?: string } | null
+      if (!res.ok || !j?.ok || typeof j.content !== 'string') throw new Error(j?.error || `HTTP ${res.status}`)
+      const raw = parseJsonArray(j.content)
+      if (!raw) throw new Error('模型回覆無法解析為 JSON 陣列')
+      for (const it of raw) {
+        if (it && typeof it === 'object') {
+          const s = String((it as Record<string, unknown>).symbol ?? '').toUpperCase()
+          if (s) { bySym.set(s, it as Record<string, unknown>); answered.add(s) }
+        }
+      }
+    }
+    const evalChunkWithRetry = async (grp: Snap[]): Promise<void> => {
+      let lastErr: unknown = null
+      for (let attempt = 0; attempt < CHUNK_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+          st0.addLog('warn', `評估組重試（${attempt}/${CHUNK_ATTEMPTS - 1}）— ${lastErr instanceof Error ? lastErr.message : String(lastErr)} · ${grp.map((s) => s.symbol).join('、')}`)
+          await sleepAbortable(CHUNK_BACKOFF_MS[Math.min(attempt - 1, CHUNK_BACKOFF_MS.length - 1)])
+        }
+        try {
+          await callChunk(grp)
+          return
+        } catch (e) {
+          lastErr = e
+          if (sig.aborted) throw e
+        }
+      }
+      throw lastErr
+    }
     let okChunks = 0
     let failChunks = 0
+    const failedSyms = new Set<string>()
     for (const pair of chunk(groups, 2)) {
-      const settled = await Promise.allSettled(
-        pair.map(async (grp) => {
-          const dataBlock = (contextPack ? `${contextPack}\n\n` : '') + grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
-          const res = await fetch('/api/ai-trade/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: cfg.model,
-              messages: [{ role: 'user', content: scanInstruction(grp.length) }] as AiChatMsg[],
-              context: dataBlock,
-              maxTokens: Math.min(2000, 200 * grp.length + 300),
-            }),
-            signal: sig,
-          })
-          const j = await res.json().catch(() => null) as { ok?: boolean; content?: string; error?: string } | null
-          if (!res.ok || !j?.ok || typeof j.content !== 'string') throw new Error(j?.error || `HTTP ${res.status}`)
-          const raw = parseJsonArray(j.content)
-          if (!raw) throw new Error('模型回覆無法解析為 JSON 陣列')
-          for (const it of raw) {
-            if (it && typeof it === 'object') {
-              const s = String((it as Record<string, unknown>).symbol ?? '').toUpperCase()
-              if (s) bySym.set(s, it as Record<string, unknown>)
-            }
-          }
-        }),
-      )
-      for (const r of settled) {
+      const settled = await Promise.allSettled(pair.map((grp) => evalChunkWithRetry(grp)))
+      for (let i = 0; i < settled.length; i++) {
+        const r = settled[i]
         if (r.status === 'fulfilled') okChunks++
         else {
           failChunks++
+          for (const s of pair[i]) failedSyms.add(s.symbol)
           st0.addLog('warn', `評估組失敗 — ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`)
         }
       }
@@ -916,6 +954,8 @@ export async function runScan(): Promise<void> {
       return
     }
     if (failChunks > 0) st0.addLog('warn', `部分評估組失敗（${failChunks}/${okChunks + failChunks} 組）— 相關標的記為「評估失敗」`)
+    const missedSyms = snaps.filter((s) => !failedSyms.has(s.symbol) && !answered.has(s.symbol)).map((s) => s.symbol)
+    if (missedSyms.length > 0) st0.addLog('warn', `模型漏答 ${missedSyms.length} 標的（回覆中缺少對應項目）— 記為「評估失敗」：${missedSyms.join('、')}`)
 
     // 5) parse + validate (geometry checked HERE, not trusted from the model)
     let passCount = 0
@@ -931,7 +971,7 @@ export async function runScan(): Promise<void> {
 
       const v: AiAutoVerdict = { symbol: snap.symbol, direction, confidence, entry, stop, target, rr: null, reason, demoBars: snap.demo, passed: false, rejectReason: null, dryRunNote: null }
 
-      if (!it) { v.rejectReason = '評估失敗（模型組失敗或漏答）'; return v }
+      if (!it) { v.rejectReason = AI_EVAL_FAIL_REASON; return v }
       if (direction === 'flat') { v.rejectReason = '模型判中性'; return v }
       // v2.12.32 — earnings gap-risk gate (DETERMINISTIC, not model-dependent):
       // an entry inside [report − 2d, report + 20h] owns the overnight
@@ -1119,7 +1159,7 @@ export async function runScan(): Promise<void> {
     // win" is fed back into every future review instead of evaporating.
     {
       const rows = verdicts
-        .filter((v) => v.direction !== 'flat' && v.rejectReason !== '評估失敗（模型組失敗或漏答）')
+        .filter((v) => v.direction !== 'flat' && v.rejectReason !== AI_EVAL_FAIL_REASON)
         .map((v) => ({
           symbol: v.symbol,
           direction: v.direction as 'long' | 'short',
@@ -1144,7 +1184,15 @@ export async function runScan(): Promise<void> {
     }
 
     const secs = ((Date.now() - t0) / 1000).toFixed(1)
-    st0.addLog('info', `掃描完成 — 評估 ${verdicts.length} 標的 · 達標 ${passCount} · 觸發 ${fireCount} 筆${cfg.dryRun ? '（試運行）' : ''} · 耗時 ${secs}s`)
+    const flatCount = verdicts.filter((v) => v.direction === 'flat' && v.rejectReason !== AI_EVAL_FAIL_REASON).length
+    const failCount = verdicts.filter((v) => v.rejectReason === AI_EVAL_FAIL_REASON).length
+    st0.addLog('info', `掃描完成 — 評估 ${verdicts.length} 標的 · 中性 ${flatCount} · 達標 ${passCount} · 觸發 ${fireCount} 筆${failCount > 0 ? ` · 評估失敗 ${failCount}` : ''}${cfg.dryRun ? '（試運行）' : ''} · 耗時 ${secs}s`)
+    // v2.12.35 — a no-fire round with a wall of neutrals is the engine
+    // working as designed (win-rate first), not a malfunction. Say so once,
+    // where the user is actually looking.
+    if (fireCount === 0 && passCount === 0 && flatCount >= Math.max(3, Math.ceil(verdicts.length * 0.5))) {
+      st0.addLog('info', '本輪無觸發 — 大多數標的證據不足判中性，屬預期行為（寧可錯過、不可做錯）；引擎只在證據充分且 R:R 達標時出手。')
+    }
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') st0.addLog('warn', '掃描已取消')
     else st0.addLog('error', `掃描異常 — ${e instanceof Error ? e.message : String(e)}`)

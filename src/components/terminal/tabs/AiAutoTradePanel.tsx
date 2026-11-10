@@ -7,7 +7,7 @@
 // was rejected; the log never hides a failed order.
 import { useEffect, useMemo, useState } from 'react'
 import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw } from 'lucide-react'
-import { useAiAutoStore } from '@/store/ai-auto-trade'
+import { useAiAutoStore, AI_EVAL_FAIL_REASON } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { AI_TRADE_MODELS } from '@/lib/ai-trade'
 import { TIMEFRAMES } from '@/lib/market-types'
@@ -591,16 +591,39 @@ export default function AiAutoTradePanel() {
       </div>
 
       {/* last scan verdicts */}
-      {verdicts.length > 0 && (
+      {verdicts.length > 0 && (() => {
+        // v2.12.35 — distribution header: a wall of neutrals is the engine
+        // working as designed (win-rate first); make that readable at a
+        // glance instead of a list of scary 0% rows.
+        const flatN = verdicts.filter((v) => v.direction === 'flat' && v.rejectReason !== AI_EVAL_FAIL_REASON).length
+        const longN = verdicts.filter((v) => v.direction === 'long').length
+        const shortN = verdicts.filter((v) => v.direction === 'short').length
+        const failN = verdicts.filter((v) => v.rejectReason === AI_EVAL_FAIL_REASON).length
+        return (
         <div className="mt-2">
-          <span className="mb-1 block text-[9px] font-semibold uppercase tracking-widest text-zinc-500">上輪評估（{verdicts.length}）</span>
+          <div className="mb-1 flex items-baseline justify-between gap-2">
+            <span className="text-[9px] font-semibold uppercase tracking-widest text-zinc-500">上輪評估（{verdicts.length}）</span>
+            <span className="font-mono text-[9px] leading-3 text-zinc-500" aria-label="評估分佈">
+              <span className="text-zinc-400">中性 {flatN}</span>
+              <span className="mx-1 text-zinc-700">·</span>
+              <span className={longN > 0 ? 'text-emerald-400' : 'text-zinc-600'}>偏多 {longN}</span>
+              <span className="mx-1 text-zinc-700">·</span>
+              <span className={shortN > 0 ? 'text-rose-400' : 'text-zinc-600'}>偏空 {shortN}</span>
+              {failN > 0 ? (<>
+                <span className="mx-1 text-zinc-700">·</span>
+                <span className="text-amber-400">失敗 {failN}</span>
+              </>) : null}
+            </span>
+          </div>
           <ul className="terminal-scroll max-h-44 space-y-1 overflow-y-auto pr-1">
-            {verdicts.map((v) => (
+            {verdicts.map((v) => {
+              const evalFailed = v.rejectReason === AI_EVAL_FAIL_REASON
+              return (
               <li key={v.symbol} className="flex items-center justify-between gap-2 rounded border border-zinc-800/80 bg-zinc-950/60 px-2 py-1">
                 <span className="flex min-w-0 items-center gap-1.5 font-mono text-[10px] text-zinc-200">
                   {v.passed ? (
                     <CircleCheck className="h-3 w-3 shrink-0 text-emerald-400" aria-hidden />
-                  ) : v.direction === 'flat' ? (
+                  ) : v.direction === 'flat' && !evalFailed ? (
                     <Minus className="h-3 w-3 shrink-0 text-zinc-600" aria-hidden />
                   ) : (
                     <CircleX className="h-3 w-3 shrink-0 text-zinc-600" aria-hidden />
@@ -614,19 +637,27 @@ export default function AiAutoTradePanel() {
                   </span>
                 </span>
                 <span className="shrink-0 text-right font-mono text-[9px] leading-3">
-                  <span className="text-zinc-400">信心 {v.confidence}%</span>
+                  {/* v2.12.35 — confidence is a TRADE-conviction number: it only
+                      means something on a directional call. A flat row now shows
+                      the model's own reason (why no trade) instead of a misleading
+                      「信心 0%」，and a failed row shows only the failure. */}
+                  {v.direction !== 'flat' ? <span className="text-zinc-400">信心 {v.confidence}%</span> : null}
                   {v.rr != null ? <span className="ml-1 text-zinc-400">R:R 1:{v.rr.toFixed(1)}</span> : null}
                   {v.passed ? (
                     <span className="ml-1 text-emerald-400">{v.dryRunNote ? '試運行' : '已觸發'}</span>
+                  ) : v.direction === 'flat' && !evalFailed ? (
+                    <span className="ml-1 text-zinc-500" title={v.reason || v.rejectReason || ''}>{v.reason || v.rejectReason}</span>
                   ) : (
-                    <span className="ml-1 text-zinc-600">{v.rejectReason}</span>
+                    <span className={cn('ml-1', evalFailed ? 'text-amber-500' : 'text-zinc-600')}>{v.rejectReason}</span>
                   )}
                 </span>
               </li>
-            ))}
+              )
+            })}
           </ul>
         </div>
-      )}
+        )
+      })()}
 
       {/* activity log */}
       <div className="mt-2">
