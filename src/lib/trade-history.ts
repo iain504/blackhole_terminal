@@ -70,6 +70,14 @@ export interface FifoMatch {
   trades: ClosedTrade[]
   /** remaining open entry lots per symbol, OLDEST first ([0] = oldest lot) */
   openLots: Map<string, OpenLot[]>
+  /** v2.12.36 — fills that closed NOTHING (the FIFO queue was empty at their
+   * moment), keyed by normed symbol with the FILL's side. Either a legitimate
+   * position OPEN from flat, or an EXIT whose entry lot fell OUTSIDE the
+   * fetched orders window (tape truncation) — callers cross-check the live
+   * positions to tell the two apart (see consumedPhantomSymbols). A fill that
+   * closed at least ONE lot is never recorded: its pairing is real regardless
+   * of what else the fill did. */
+  unanchored: Map<string, Set<'buy' | 'sell'>>
 }
 
 /** Trim binary-float residue from qty arithmetic (0.000453760000000009 → 0.00045376). */
@@ -138,6 +146,7 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
 
   const lots = new Map<string, Lot[]>() // per symbol FIFO queue
   const trades: ClosedTrade[] = []
+  const unanchored = new Map<string, Set<'buy' | 'sell'>>() // v2.12.36 — fills that closed nothing
   let seq = 0
 
   for (const o of filled) {
@@ -154,6 +163,20 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
     let remaining = parseFloat(o.filled_qty)
     const key = queueKey(o.symbol)
     const q = lots.get(key) ?? []
+
+    // v2.12.36 — a fill with an EMPTY queue at its moment closed NOTHING: it
+    // either OPENED a position from flat (legitimate — a first buy/first
+    // short) or it is an EXIT whose entry lot fell OUTSIDE the fetched
+    // orders window (tape truncation — the window-truncation ghost's sibling).
+    // Recorded so callers can widen the tape when the shape contradicts the
+    // live positions. A same-side queue front (pyramiding) is NOT recorded:
+    // the lot it adds to was opened by an earlier in-tape fill, whose own
+    // anchoring was recorded (or not) when it was processed.
+    if (q.length === 0) {
+      const sides = unanchored.get(key) ?? new Set<'buy' | 'sell'>()
+      sides.add(o.side === 'sell' ? 'sell' : 'buy')
+      unanchored.set(key, sides)
+    }
 
     // close the oldest opposing lots first
     while (remaining > EPS && q.length > 0 && q[0].side !== o.side) {
@@ -231,6 +254,7 @@ export function matchFifo(orders: TradingOrder[], max = 200): FifoMatch {
       .sort((a, b) => new Date(b.exitAt).getTime() - new Date(a.exitAt).getTime())
       .slice(0, max),
     openLots,
+    unanchored,
   }
 }
 
@@ -279,6 +303,42 @@ export function ghostLotSymbols(
     if (lotLong !== posLong) ghosts.push(sym)
   }
   return ghosts
+}
+
+/** v2.12.36 — CONSUMED-PHANTOM suspects: symbols where an UNANCHORED fill
+ * (closed nothing — see matchFifo's `unanchored`) sits OPPOSITE to the
+ * symbol's LIVE side. The fill can never have opened what is live now, so
+ * the only tape that explains the account is one where the fill CLOSED an
+ * entry lot that fell OUTSIDE the fetched window — and the walk, blind to
+ * that lot, minted a phantom from the fill and PAIRED it with whatever came
+ * later. That is exactly the shape that (a) erases a real cross-day
+ * round-trip from history ("position opened in previous trade date closed
+ * today cannot be found in today trade history") and (b) replaces it with a
+ * bogus opposite-side trade, while leaving the leftover open lots LOOKING
+ * consistent with the live position — the v2.12.28 ghost check is
+ * structurally blind to it because nothing contradictory survives the walk.
+ * Same-side shapes are never flagged (a real short: unanchored sell + live
+ * short; a plain long re-open: unanchored buy + live long), and flat
+ * symbols (no live position) remain the ghost check's territory — so this
+ * trigger is near-zero-false-positive and the widening it requests always
+ * adds information.
+ * @param unanchored matchFifo's unanchored fills (keys are normed symbols)
+ * @param positions the account's CURRENT live positions (raw broker shape)
+ */
+export function consumedPhantomSymbols(
+  unanchored: Map<string, Set<'buy' | 'sell'>>,
+  positions: { symbol: string; side: string }[],
+): string[] {
+  const byNorm = new Map<string, string>()
+  for (const p of positions) byNorm.set(queueKey(p.symbol), p.side)
+  const suspects: string[] = []
+  for (const [sym, sides] of unanchored) {
+    const posSide = byNorm.get(sym)
+    if (!posSide) continue // no live position → the ghost check's territory
+    const posLong = posSide !== 'short'
+    if (sides.has(posLong ? 'sell' : 'buy')) suspects.push(sym)
+  }
+  return suspects
 }
 
 /** Resolve algo run refs (8-char AlgoRun id prefixes) → strategy display

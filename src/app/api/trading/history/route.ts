@@ -2,10 +2,21 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, getPositions, resolveTradeMode, isNoKeysError, isKeysUnreadableError, authBackoffMsLeft, parseCryptoPlan, type TradingOrder } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
-import { matchFifo, ghostLotSymbols, resolveRunStrategyNames, displaySymbolOf } from '@/lib/trade-history'
+import { matchFifo, ghostLotSymbols, consumedPhantomSymbols, resolveRunStrategyNames, displaySymbolOf } from '@/lib/trade-history'
 import { loadStewardActions, resolveTradeReason, resolveCancelReason } from '@/lib/trade-reasons'
 import type { CanceledOrderRow, ClosedTrade } from '@/lib/market-types'
 import { handleError } from '@/lib/api-helpers'
+
+// v2.12.36 — the suspect→widen path re-pages the broker; a suspect the
+// widening cannot heal (an entry older than the page cap) must not re-page
+// on EVERY history poll (the tab polls every ~15s), so each account+mode's
+// widen attempt is remembered for a minute.
+const WIDEN_MEMO_MS = 60_000
+const widenMemo = new Map<string, number>()
+function widenRecently(key: string): boolean {
+  const at = widenMemo.get(key)
+  return at != null && Date.now() - at < WIDEN_MEMO_MS
+}
 
 // GET /api/trading/history?mode=paper&limit=100 — realized round-trip trades
 // (FIFO-matched from the broker's filled closed orders) with realized P&L.
@@ -97,22 +108,38 @@ export async function GET(req: Request) {
     // v2.12.28 — GHOST CHECK → WIDEN: walk the tape; if the leftover open
     // lots can't be explained by the live positions (no position for the
     // symbol, or the side contradicts), the newest-500 window truncated a
-    // straddling position — refetch with up to 2 OLDER pages and re-walk.
-    // The walk is cheap; the extra broker calls only happen on the rare
-    // ghost path. At the cap we accept the best-effort tape.
+    // straddling position — refetch with OLDER pages and re-walk.
+    // v2.12.36 — second suspect class: CONSUMED PHANTOMS. An unanchored exit
+    // (a fill that closed nothing) on a symbol whose LIVE side is OPPOSITE
+    // the fill can only be explained by an entry lot outside the window —
+    // the walk minted a phantom from that fill and a later re-entry fill
+    // consumed it (the AI auto-trader re-enters the same symbols across
+    // days), so a real cross-day round-trip vanished from history and a
+    // bogus opposite-side trade took its place while the open lots LOOKED
+    // consistent — the ghost check alone is structurally blind to it. Both
+    // classes widen the tape (up to 4 pages, one broker call per page, only
+    // on the suspect path, rate-limited once per WIDEN_MEMO_MS per
+    // account+mode) and re-walk. At the cap we accept the best-effort tape.
     let orderList = Array.isArray(r.data) ? r.data : []
     const positions = Array.isArray(posRes.data) ? (posRes.data as { symbol: string; side: string }[]) : []
     let fm = matchFifo(orderList, 1000)
     try {
-      if (ghostLotSymbols(fm.openLots, positions).length > 0) {
-        const wider = await getClosedOrders(user.id, mode, 500, 3)
+      const suspects = new Set<string>([
+        ...ghostLotSymbols(fm.openLots, positions),
+        ...consumedPhantomSymbols(fm.unanchored, positions),
+      ])
+      const memoKey = `${user.id}:${mode}`
+      if (suspects.size > 0 && !widenRecently(memoKey)) {
+        widenMemo.set(memoKey, Date.now())
+        if (widenMemo.size > 200) for (const [k, at] of widenMemo) if (Date.now() - at > 10 * WIDEN_MEMO_MS) widenMemo.delete(k)
+        const wider = await getClosedOrders(user.id, mode, 500, 4)
         if (Array.isArray(wider.data) && wider.data.length > orderList.length) {
           orderList = wider.data
           fm = matchFifo(orderList, 1000)
         }
       }
     } catch {
-      // ghost check must never fail the history
+      // suspect check must never fail the history
     }
 
     // reason sources: the AI steward's recent executed actions (best-effort)
