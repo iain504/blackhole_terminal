@@ -16,6 +16,13 @@
 //      carries full-liquidation risk (全倉清盤). The steward audits every
 //      open position EVERY cycle and re-attaches missing protection.
 //
+//   3. v2.12.39 — the user's standing moral: "Plan your trade, trade your
+//      plan." Every entry/exit starts as a PLAN (trigger/entry, TP, SL,
+//      size) and the market — not improvisation — decides which plan runs:
+//      price through the plan → follow it; price against the plan → the
+//      plan's stop stands. No plan, no order. This is the React > Respond >
+//      Review entry protocol stated as the trader's oath.
+//
 // This module is PURE (no server imports) — both the API routes and the
 // client panel import from it.
 
@@ -23,6 +30,7 @@
 export const CORE_DISCIPLINES: readonly string[] = [
   '延長交易時段（Pre-market 04:00-09:30 ET / Post-market 16:00-20:00 ET）Alpaca 不接受市價單 — 市價單會被靜默擱置到下次 regular session 開市才提交。延長時段內一切進出場必須用限價單（終端會自動把市價單轉為限價）。',
   'TP/SL 保護單可能在護倉修改後、或由 regular 轉入 pre/post 時段後消失。每輪必須核對每個持倉的 SL/TP 是否仍存在（顯示「無」＝缺失）。SL 缺失＝全倉清盤風險，必須立即提出 reattach 重新掛上保護，不可忽略。',
+  'Plan your trade, trade your plan（計劃你的交易，交易你的計劃）：任何進出場必須先有完整計劃（進場/觸發價、TP、SL、倉位），再按計劃執行 — 市場順計劃方向走就跟進（trade the plan），市場反向則按計劃停損離場，嚴禁無計劃下單、嚴禁臨場即興改變已定的進出場依據。',
 ]
 
 /** Marketable-limit band for a market ENTRY converted during extended

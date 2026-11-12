@@ -549,7 +549,7 @@ const SCAN_CHUNK = 6
 
 function scanInstruction(n: number, minConf: number, minRR: number): string {
   return [
-    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化評估引擎，逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
+    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化評估引擎，遵循紀律 Plan your trade, trade your plan（先計劃後交易：entry/stop/target 就是你開出的作戰計劃，終端按此執行與護倉），逐一判斷短期（此時間框架）方向，只輸出 JSON 陣列，禁止任何其他文字或說明：`,
     `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"entry":<數字>,"stop":<數字>,"target":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
     `規則：`,
     `- 證據計數：方向需要「至少 2 類獨立證據同向」才可 non-flat（趨勢/動量、量能、結構 S/R、高週期、情緒/環境）。證據互相矛盾或只有單一訊號 → 誠實 flat 或低 confidence。`,
@@ -590,7 +590,7 @@ function scanInstructionPlans(
     ? `終端門檻（買賣計劃相同）：${g(longGate)}`
     : `終端門檻（依 regime 分方向）：buy 計劃 ${g(longGate)} · sell 計劃 ${g(shortGate)}`
   return [
-    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化作戰規劃引擎，遵循紀律 React > Respond > Review：先分析、出「條件作戰計劃」；終端會監控市場，價格觸及計劃觸發價才跟進下單，市場反向則計劃作廢。只輸出 JSON 陣列，禁止任何其他文字：`,
+    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化作戰規劃引擎，遵循紀律 Plan your trade, trade your plan — React > Respond > Review：先分析、出「條件作戰計劃」（無計劃不下單）；終端會監控市場，價格觸及計劃觸發價才跟進下單，市場反向則計劃作廢。只輸出 JSON 陣列，禁止任何其他文字：`,
     `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"buyTrigger":<數字>,"buyTp":<數字>,"buySl":<數字>,"sellTrigger":<數字>,"sellTp":<數字>,"sellSl":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
     `計劃規則：`,
     `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (buyTp − buyTrigger) ÷ (buyTrigger − buySl)；sell R:R = (sellTrigger − sellTp) ÷ (sellSl − sellTrigger)。例：現價 100，buyTrigger 100.5 / buySl 99 / buyTp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。送出前先代入算式自查；達不到門檻的側直接填 0（不要送會被拒的幾何）。`,

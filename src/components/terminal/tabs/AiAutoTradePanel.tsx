@@ -255,7 +255,7 @@ export default function AiAutoTradePanel() {
       {/* v2.12.37 — the entry discipline, stated where the user is looking */}
       {cfg.entryMode === 'react' && (
         <p className="mt-1 font-mono text-[9px] leading-3.5 text-violet-400/80">
-          React &gt; Respond &gt; Review — 分析建計劃 · 市場確認才跟進 · 事後覆盤
+          Plan your trade, trade your plan — React &gt; Respond &gt; Review：分析建計劃 · 市場確認才跟進 · 事後覆盤
         </p>
       )}
 
@@ -827,7 +827,7 @@ export default function AiAutoTradePanel() {
             </ul>
           )}
           <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
-            React &gt; Respond &gt; Review — 價格觸及觸發價才跟進（附計劃 TL/SL）；先碰停損區則反向作廢；48h 逾期作廢。作廢/逾期計劃 24h 後覆盤「等待正確 / 錯過」並寫入永久教訓。
+            Plan your trade, trade your plan — React &gt; Respond &gt; Review：價格觸及觸發價才跟進（附計劃 TL/SL）；先碰停損區則反向作廢；48h 逾期作廢。作廢/逾期計劃 24h 後覆盤「等待正確 / 錯過」並寫入永久教訓。
           </p>
         </div>
         )
