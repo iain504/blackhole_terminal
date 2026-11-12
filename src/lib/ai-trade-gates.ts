@@ -113,10 +113,37 @@ export function verdictLessonText(v: {
  *  the model planning chases >5% away from reality. */
 export const PLAN_BAND = { up: 0.05, down: 0.05 } as const
 
+/** v2.12.38 — mechanical-TP cap: a repaired target may not sit further than
+ *  this % from the trigger. Beyond that the required risk distance is too
+ *  wide for the band — the plan is refused instead of given a fantasy TP. */
+export const PLAN_TP_CAP_PCT = 8
+
 export interface PlanGeometry {
   ok: boolean
   rr: number | null
   reason: string | null
+}
+
+/** v2.12.38 — GEOMETRY REPAIR. A small planner often nails the direction and
+ *  the structural stop but submits a TP far too close (measured in the wild:
+ *  R:R 0.30 against a 1.88 floor). Rather than silently killing every
+ *  well-aimed plan, the terminal — which never trusted model arithmetic in
+ *  the first place — re-derives the target as the MECHANICAL R-multiple that
+ *  exactly clears the floor, keeping the model's trigger and structural SL.
+ *  Discipline lives in code, not in prompt compliance. Returns null when the
+ *  required move exceeds the cap (risk too wide — refuse, don't fantasize). */
+export function repairPlanTp(
+  side: 'buy' | 'sell',
+  trigger: number,
+  sl: number,
+  minRR: number,
+): { tp: number; rr: number } | null {
+  const risk = side === 'buy' ? trigger - sl : sl - trigger
+  if (!(risk > 0) || !Number.isFinite(risk)) return null
+  const move = minRR * risk
+  if (move > trigger * (PLAN_TP_CAP_PCT / 100)) return null
+  const tp = side === 'buy' ? trigger + move : trigger - move
+  return { tp, rr: minRR }
 }
 
 /** Validate ONE conditional plan side against the planning price.

@@ -7,7 +7,7 @@
 // was rejected; the log never hides a failed order.
 import { useEffect, useMemo, useState } from 'react'
 import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw, Crosshair, TrendingUp, TrendingDown } from 'lucide-react'
-import { useAiAutoStore, AI_EVAL_FAIL_REASON } from '@/store/ai-auto-trade'
+import { useAiAutoStore, AI_EVAL_FAIL_REASON, baseThresholds } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { AI_TRADE_MODELS } from '@/lib/ai-trade'
 import { TIMEFRAMES } from '@/lib/market-types'
@@ -124,14 +124,18 @@ export default function AiAutoTradePanel() {
   }, [cfg.entryMode])
 
   // number fields kept as strings so partial typing doesn't fight the clamps
-  const [minConf, setMinConf] = useState(String(cfg.minConfidence))
-  const [minRR, setMinRR] = useState(String(cfg.minRR))
+  // v2.12.38 — the gate inputs edit the fields THIS entry mode enforces
+  // (react → reactMinConfidence/reactMinRR, instant → minConfidence/minRR)
+  const isReact = cfg.entryMode === 'react'
+  const gate = baseThresholds(cfg)
+  const [minConf, setMinConf] = useState(String(gate.minConfidence))
+  const [minRR, setMinRR] = useState(String(gate.minRR))
   const [riskPct, setRiskPct] = useState(String(cfg.riskPct))
   const [maxOpen, setMaxOpen] = useState(String(cfg.maxOpenAuto))
   const [maxCorr, setMaxCorr] = useState(String(cfg.maxCorrelated))
   useEffect(() => {
-    setMinConf(String(cfg.minConfidence))
-    setMinRR(String(cfg.minRR))
+    setMinConf(String(baseThresholds(cfg).minConfidence))
+    setMinRR(String(baseThresholds(cfg).minRR))
     setRiskPct(String(cfg.riskPct))
     setMaxOpen(String(cfg.maxOpenAuto))
     setMaxCorr(String(cfg.maxCorrelated))
@@ -385,18 +389,22 @@ export default function AiAutoTradePanel() {
           </Select>
         </div>
         <div className="space-y-1">
-          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">最低信心 %</Label>
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">最低信心 %{isReact ? '（計劃）' : ''}</Label>
           <Input
             inputMode="decimal" value={minConf} onChange={(e) => setMinConf(e.target.value)}
-            onBlur={() => commitNum(minConf, (n) => updateConfig({ minConfidence: Math.min(Math.max(n, 0), 100) }))}
+            onBlur={() => commitNum(minConf, (n) => updateConfig(isReact
+              ? { reactMinConfidence: Math.min(Math.max(n, 0), 100) }
+              : { minConfidence: Math.min(Math.max(n, 0), 100) }))}
             className="h-7 border-zinc-800 bg-zinc-900/80 px-2 text-[11px] text-zinc-100" aria-label="最低信心百分比"
           />
         </div>
         <div className="space-y-1">
-          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">最低 R:R（1:x）</Label>
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">最低 R:R（1:x{isReact ? ' 計劃' : ''}）</Label>
           <Input
             inputMode="decimal" value={minRR} onChange={(e) => setMinRR(e.target.value)}
-            onBlur={() => commitNum(minRR, (n) => updateConfig({ minRR: Math.min(Math.max(n, 0.1), 100) }))}
+            onBlur={() => commitNum(minRR, (n) => updateConfig(isReact
+              ? { reactMinRR: Math.min(Math.max(n, 0.1), 100) }
+              : { minRR: Math.min(Math.max(n, 0.1), 100) }))}
             className="h-7 border-zinc-800 bg-zinc-900/80 px-2 text-[11px] text-zinc-100" aria-label="最低風險回報比"
           />
         </div>
@@ -627,10 +635,10 @@ export default function AiAutoTradePanel() {
         </div>
       )}
 
-      {/* sizing explainer + gate reminder */}
+      {/* sizing explainer + gate reminder — v2.12.38 mode-aware effective gates */}
       <p className="mt-2 text-[9px] leading-3.5 text-zinc-600">
-        門檻：信心 ≥ {cfg.minConfidence}% 且 R:R ≥ 1:{cfg.minRR}（R:R 由終端以{cfg.entryMode === 'react' ? '觸發價' : '停損/目標'}重算，不信任模型算術）。
-        {cfg.entryMode === 'react'
+        門檻：信心 ≥ {gate.minConfidence}% 且 R:R ≥ 1:{gate.minRR}{isReact ? '（計劃建立門檻 — 觸發價的市場確認才是硬閘；信心較低的計劃倉位自動縮小）' : ''}（R:R 由終端以{isReact ? '觸發價' : '停損/目標'}重算，不信任模型算術）。
+        {isReact
           ? `計劃：風險金額 = 權益 × ${cfg.riskPct}% × 信心/100，數量 = 風險金額 ÷ |觸發−停損|，名目上限 50% 權益；市場確認觸發時以市價單跟進並附 TL/SL。`
           : `倉位：風險金額 = 權益 × ${cfg.riskPct}% × 信心/100，數量 = 風險金額 ÷ |現價−停損|，名目上限 50% 權益；市價單附 TL/SL。`}
       </p>
