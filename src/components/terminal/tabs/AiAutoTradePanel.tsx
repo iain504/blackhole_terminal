@@ -6,7 +6,7 @@
 // tab is unmounted. Honesty contract: every candidate shows WHY it passed or
 // was rejected; the log never hides a failed order.
 import { useEffect, useMemo, useState } from 'react'
-import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw } from 'lucide-react'
+import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw, Crosshair, TrendingUp, TrendingDown } from 'lucide-react'
 import { useAiAutoStore, AI_EVAL_FAIL_REASON } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { AI_TRADE_MODELS } from '@/lib/ai-trade'
@@ -35,6 +35,21 @@ const TF_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1D'] as const
 // save; kept as a literal so this panel doesn't pull the dialog module in.
 const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
 
+const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
+
+// v2.12.37 — plan lifecycle counts from the ledger (polled every 60s)
+interface PlanStats {
+  waiting: number
+  executed: number
+  invalidated: number
+  expired: number
+  gated: number
+  superseded: number
+  goodWait: number
+  missedRun: number
+  neutral: number
+}
+
 function fmtCountdown(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
@@ -53,6 +68,7 @@ export default function AiAutoTradePanel() {
   const nextScanAt = useAiAutoStore((s) => s.nextScanAt)
   const verdicts = useAiAutoStore((s) => s.verdicts)
   const fired = useAiAutoStore((s) => s.fired)
+  const plans = useAiAutoStore((s) => s.plans)
   const log = useAiAutoStore((s) => s.log)
   const updateConfig = useAiAutoStore((s) => s.updateConfig)
   const setEnabled = useAiAutoStore((s) => s.setEnabled)
@@ -90,6 +106,22 @@ export default function AiAutoTradePanel() {
     const t = setInterval(() => tickTock((x) => x + 1), 1000)
     return () => clearInterval(t)
   }, [cfg.enabled, nextScanAt])
+
+  // v2.12.37 — plan review stats (60s poll; resolve=1 also drives the 24h
+  // review pass server-side, same pattern as the verdict reconciliation)
+  const [planStats, setPlanStats] = useState<PlanStats | null>(null)
+  useEffect(() => {
+    if (cfg.entryMode !== 'react') { setPlanStats(null); return }
+    let alive = true
+    const pull = () =>
+      fetch('/api/ai-trade/plans?resolve=1&history=1')
+        .then((r) => r.json())
+        .then((j: { stats?: PlanStats }) => { if (alive && j?.stats) setPlanStats(j.stats) })
+        .catch(() => {})
+    pull()
+    const t = setInterval(pull, 60_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [cfg.entryMode])
 
   // number fields kept as strings so partial typing doesn't fight the clamps
   const [minConf, setMinConf] = useState(String(cfg.minConfidence))
@@ -216,6 +248,13 @@ export default function AiAutoTradePanel() {
         {!remoteRunner && fired.length > 0 ? ` · 已觸發 ${fired.length} 筆` : ''}
       </p>
 
+      {/* v2.12.37 — the entry discipline, stated where the user is looking */}
+      {cfg.entryMode === 'react' && (
+        <p className="mt-1 font-mono text-[9px] leading-3.5 text-violet-400/80">
+          React &gt; Respond &gt; Review — 分析建計劃 · 市場確認才跟進 · 事後覆盤
+        </p>
+      )}
+
       {/* config grid */}
       <div className="mt-2.5 grid grid-cols-2 gap-x-3 gap-y-2">
         <div className="space-y-1">
@@ -274,6 +313,33 @@ export default function AiAutoTradePanel() {
             {cfg.poolSource === 'watchlist' && '以你選的關注清單作為候選池。'}
             {cfg.poolSource === 'auto' && '候選池 = 全美股自動篩選 Top 50（波動+流動性），不看關注清單。'}
             {cfg.poolSource === 'union' && '關注清單優先，剩餘名額由自動選股 Top 50 補滿。'}
+          </p>
+        </div>
+        {/* v2.12.37 — entry protocol: React plan-wait vs legacy instant fire */}
+        <div className="col-span-2 space-y-1">
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">進場模式（React &gt; Respond &gt; Review）</Label>
+          <div className="flex gap-1" role="radiogroup" aria-label="進場模式">
+            {([['react', 'React 計劃'], ['instant', '即時下單']] as const).map(([v, label]) => (
+              <button
+                key={v}
+                type="button"
+                role="radio"
+                aria-checked={cfg.entryMode === v}
+                onClick={() => updateConfig({ entryMode: v })}
+                className={cn(
+                  'h-6 flex-1 rounded border px-1.5 text-[10px] transition-colors',
+                  cfg.entryMode === v
+                    ? 'border-violet-500/60 bg-violet-500/15 text-violet-200'
+                    : 'border-zinc-800 bg-zinc-900/80 text-zinc-400 hover:text-zinc-200',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[9px] leading-3.5 text-zinc-600">
+            {cfg.entryMode === 'react' && '模型先出買/賣觸發計劃（觸發價 + TP/SL）→ 終端監控市場，價格觸及才跟進；反向否定或 48h 逾期作廢並覆盤。'}
+            {cfg.entryMode === 'instant' && '達標候選立即以市價單進場（舊制 — 不等市場確認）。'}
           </p>
         </div>
         <div className="space-y-1">
@@ -563,8 +629,10 @@ export default function AiAutoTradePanel() {
 
       {/* sizing explainer + gate reminder */}
       <p className="mt-2 text-[9px] leading-3.5 text-zinc-600">
-        門檻：信心 ≥ {cfg.minConfidence}% 且 R:R ≥ 1:{cfg.minRR}（R:R 由終端以停損/目標重算，不信任模型算術）。
-        倉位：風險金額 = 權益 × {cfg.riskPct}% × 信心/100，數量 = 風險金額 ÷ |現價−停損|，名目上限 50% 權益；市價單附 TL/SL。
+        門檻：信心 ≥ {cfg.minConfidence}% 且 R:R ≥ 1:{cfg.minRR}（R:R 由終端以{cfg.entryMode === 'react' ? '觸發價' : '停損/目標'}重算，不信任模型算術）。
+        {cfg.entryMode === 'react'
+          ? `計劃：風險金額 = 權益 × ${cfg.riskPct}% × 信心/100，數量 = 風險金額 ÷ |觸發−停損|，名目上限 50% 權益；市場確認觸發時以市價單跟進並附 TL/SL。`
+          : `倉位：風險金額 = 權益 × ${cfg.riskPct}% × 信心/100，數量 = 風險金額 ÷ |現價−停損|，名目上限 50% 權益；市價單附 TL/SL。`}
       </p>
 
       {liveDanger && (
@@ -643,8 +711,25 @@ export default function AiAutoTradePanel() {
                       「信心 0%」，and a failed row shows only the failure. */}
                   {v.direction !== 'flat' ? <span className="text-zinc-400">信心 {v.confidence}%</span> : null}
                   {v.rr != null ? <span className="ml-1 text-zinc-400">R:R 1:{v.rr.toFixed(1)}</span> : null}
+                  {/* v2.12.37 — react mode: the conditional plans this verdict
+                      produced; rejected sides show strikethrough + reason */}
+                  {v.plans && v.plans.length > 0 && (
+                    <span className="ml-1 inline-flex gap-1 align-baseline">
+                      {v.plans.map((p) => (
+                        <span
+                          key={p.side}
+                          title={p.note ?? `${p.side} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}`}
+                          className={p.status === 'created'
+                            ? (p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')
+                            : 'text-zinc-600 line-through'}
+                        >
+                          {p.side === 'buy' ? '▲' : '▼'}{p.status === 'created' ? fmtPx(p.trigger) : '拒'}
+                        </span>
+                      ))}
+                    </span>
+                  )}
                   {v.passed ? (
-                    <span className="ml-1 text-emerald-400">{v.dryRunNote ? '試運行' : '已觸發'}</span>
+                    <span className="ml-1 text-emerald-400">{v.dryRunNote ? '試運行' : cfg.entryMode === 'react' ? '計劃已建' : '已觸發'}</span>
                   ) : v.direction === 'flat' && !evalFailed ? (
                     <span className="ml-1 text-zinc-500" title={v.reason || v.rejectReason || ''}>{v.reason || v.rejectReason}</span>
                   ) : (
@@ -655,6 +740,87 @@ export default function AiAutoTradePanel() {
               )
             })}
           </ul>
+        </div>
+        )
+      })()}
+
+      {/* v2.12.37 — REACT: the plan waiting room + lifecycle + review stats */}
+      {cfg.entryMode === 'react' && (() => {
+        const waitingPlans = plans.filter((p) => p.status === 'WAITING')
+        const closedPlans = plans.filter((p) => p.status !== 'WAITING').slice(0, 10)
+        return (
+        <div className="mt-2">
+          <div className="mb-1 flex items-baseline justify-between gap-2">
+            <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-widest text-zinc-500">
+              <Crosshair className="h-3 w-3" aria-hidden />
+              計劃等候區（{waitingPlans.length}）
+            </span>
+            {planStats && (
+              <span className="font-mono text-[9px] leading-3 text-zinc-500" aria-label="計劃覆盤統計">
+                <span className="text-emerald-400">執行 {planStats.executed}</span>
+                <span className="mx-1 text-zinc-700">·</span>
+                <span className="text-zinc-400">等待正確 {planStats.goodWait}</span>
+                <span className="mx-1 text-zinc-700">·</span>
+                <span className={planStats.missedRun > 0 ? 'text-amber-400' : 'text-zinc-600'}>錯過 {planStats.missedRun}</span>
+              </span>
+            )}
+          </div>
+          {waitingPlans.length === 0 && closedPlans.length === 0 ? (
+            <p className="text-[10px] text-zinc-600">尚無計劃 — 掃描後模型會在這裡留下買/賣觸發計劃，市場確認才跟進。</p>
+          ) : (
+            <ul className="terminal-scroll max-h-44 space-y-1 overflow-y-auto pr-1">
+              {waitingPlans.map((p) => {
+                const dist = p.refPrice > 0 ? ((p.trigger - p.refPrice) / p.refPrice) * 100 : null
+                const age = Date.now() - p.createdAt
+                const ageLabel = age >= 3600_000 ? `${Math.floor(age / 3600_000)}h` : `${Math.max(1, Math.floor(age / 60_000))}m`
+                return (
+                  <li key={p.id} className="flex items-center justify-between gap-2 rounded border border-zinc-800/80 bg-zinc-950/60 px-2 py-1">
+                    <span className="flex min-w-0 items-center gap-1.5 font-mono text-[10px] text-zinc-200">
+                      {p.side === 'buy'
+                        ? <TrendingUp className="h-3 w-3 shrink-0 text-emerald-400" aria-hidden />
+                        : <TrendingDown className="h-3 w-3 shrink-0 text-rose-400" aria-hidden />}
+                      {p.symbol}
+                      <span className={cn('shrink-0 text-[9px]', p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
+                        {p.side === 'buy' ? '▲等上攻' : '▼等跌破'}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-right font-mono text-[9px] leading-3 text-zinc-400">
+                      觸發 {fmtPx(p.trigger)}
+                      <span className="ml-1 text-zinc-500">TL {fmtPx(p.tp)}/SL {fmtPx(p.sl)}</span>
+                      {p.rr > 0 && <span className="ml-1 text-zinc-500">R:R 1:{p.rr.toFixed(1)}</span>}
+                      {dist != null && <span className="ml-1 text-violet-300" title="計劃時現價距觸發價的百分比">距 {dist >= 0 ? '+' : ''}{dist.toFixed(1)}%</span>}
+                      <span className="ml-1 text-zinc-600">{ageLabel}</span>
+                    </span>
+                  </li>
+                )
+              })}
+              {closedPlans.map((p) => (
+                <li key={p.id} className="flex items-center justify-between gap-2 rounded border border-zinc-900 bg-zinc-950/40 px-2 py-0.5">
+                  <span className="flex min-w-0 shrink-0 items-center gap-1.5 font-mono text-[9.5px] text-zinc-400">
+                    {p.symbol}
+                    <span className={cn(
+                      'shrink-0 text-[9px]',
+                      p.status === 'EXECUTED' ? 'text-emerald-400'
+                        : p.status === 'GATED' ? 'text-amber-400'
+                        : 'text-zinc-500',
+                    )}>
+                      {p.status === 'EXECUTED' ? '已執行'
+                        : p.status === 'INVALIDATED' ? '反向作廢'
+                        : p.status === 'EXPIRED' ? '逾期'
+                        : p.status === 'GATED' ? '閘門擋下'
+                        : p.status === 'SUPERSEDED' ? '已更新' : p.status}
+                    </span>
+                  </span>
+                  <span className="min-w-0 truncate text-right font-mono text-[9px] text-zinc-600" title={p.statusNote ?? ''}>
+                    {p.statusNote ?? ''}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
+            React &gt; Respond &gt; Review — 價格觸及觸發價才跟進（附計劃 TL/SL）；先碰停損區則反向作廢；48h 逾期作廢。作廢/逾期計劃 24h 後覆盤「等待正確 / 錯過」並寫入永久教訓。
+          </p>
         </div>
         )
       })()}

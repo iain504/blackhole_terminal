@@ -728,6 +728,47 @@ model AiTradeVerdict {
   @@index([userId, createdAt])
 }
 
+// v2.12.37 — AI TRADE PLAN LEDGER (React > Respond > Review). The entry
+// protocol no longer converts a confident verdict into an immediate market
+// order. Instead the model outputs CONDITIONAL PLANS (buy/sell trigger +
+// corresponding TP/SL), the terminal persists them WAITING, and a reactor
+// loop watches the market: price rising through a buy trigger (market went
+// up) FOLLOWS the plan; price falling through the plan's stop first
+// INVALIDATES it (market went against — stand aside); 48h without a
+// resolution EXPIRES it. Every closed plan gets a 24h review pass — was the
+// wait right (good-wait: price kept falling / would have stopped out) or did
+// discipline cost the move (missed-run: price crossed the trigger after the
+// plan died) — distilled into the permanent lesson memory so future planning
+// learns from what waiting actually achieved.
+model AiTradePlan {
+  id         String    @id @default(cuid())
+  userId     String
+  symbol     String
+  side       String // 'buy' (reacts to UP-move through trigger) | 'sell' (reacts to DOWN-move)
+  bias       String // model lean when planned: 'long' | 'short' | 'flat'
+  confidence Int
+  trigger    Float
+  tp         Float
+  sl         Float
+  rr         Float // terminal-computed at plan time (never trusted from the model)
+  refPrice   Float // last close when the plan was written — the 距觸發% anchor
+  reason     String?
+  regime     String? // RISK_ON | NEUTRAL | RISK_OFF | UNKNOWN at plan time
+  earnings   String? // 'block' | '<daysAway>' | 'unknown'
+  mode       String // 'paper' | 'live' at plan time
+  status     String // WAITING | EXECUTED | INVALIDATED | EXPIRED | GATED | CANCELLED | SUPERSEDED
+  statusNote String?
+  createdAt  DateTime  @default(now())
+  closedAt   DateTime?
+  resolvedAt DateTime? // review pass done (24h after close)
+  outcome    String? // 'missed-run' | 'good-wait' | 'neutral'
+  pnlPct     Float?
+
+  @@index([userId, status])
+  @@index([userId, symbol, side, status])
+  @@index([userId, closedAt])
+}
+
 // v2.12.34 — AUTO WATCHLIST: the AI auto-trader's candidate pool, screened
 // from the whole US-listed equity universe instead of only the user's hand
 //picked watchlist. One row per (user, symbol), ≤ 50 rows per user, refreshed

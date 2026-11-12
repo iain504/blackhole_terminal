@@ -1,4 +1,4 @@
-// v2.12.33 — AI auto-trade decision-gate math (PURE, client-safe).
+// v2.12.37 — AI auto-trade decision-gate math (PURE, client-safe).
 //
 // Three win-rate mechanisms the terminal enforces ON TOP of the model's raw
 // verdict, so the discipline lives in code, not in prompt compliance:
@@ -94,4 +94,98 @@ export function verdictLessonText(v: {
   const ea = v.earnings === 'block' ? ' · 財報臨近' : v.earnings && v.earnings !== 'unknown' ? ` · 財報${v.earnings}天後` : ''
   const pnl = v.pnlPct != null && Number.isFinite(v.pnlPct) ? ` → 24h 標記 ${v.pnlPct > 0 ? '+' : ''}${v.pnlPct.toFixed(1)}%（${v.pnlPct > 0.5 ? '贏' : v.pnlPct < -0.5 ? '輸' : '平'}）` : ' → 24h 無法標記'
   return `自動交易覆盤：${dirZh} ${v.symbol} · 信心${v.confidence}${v.regime ? ` · regime ${v.regime}` : ''}${ea} · ${statusZh}${pnl}`
+}
+
+// ---------------------------------------------------------------------------
+// v2.12.37 — REACT > RESPOND > REVIEW plan math (PURE, client-safe).
+//
+// The entry protocol: the model plans CONDITIONAL entries (trigger + TP/SL
+// per side), the terminal validates the geometry (never trusts model
+// arithmetic), a reactor watches the market, and ONLY a market that moves
+// THROUGH the trigger follows the plan. These helpers are the shared math
+// for the scan (plan validation) and the 24h review pass (was waiting right).
+// ---------------------------------------------------------------------------
+
+/** Trigger bands: a BUY plan must sit ABOVE the planning price (it confirms
+ *  only when the market goes UP into it) and a SELL plan BELOW (confirms on
+ *  a down-move) — otherwise it would "trigger" instantly and the whole
+ *  wait-for-confirmation discipline would be theater. The outer bound stops
+ *  the model planning chases >5% away from reality. */
+export const PLAN_BAND = { up: 0.05, down: 0.05 } as const
+
+export interface PlanGeometry {
+  ok: boolean
+  rr: number | null
+  reason: string | null
+}
+
+/** Validate ONE conditional plan side against the planning price.
+ *  R:R is computed HERE from trigger/tp/sl — the model's own ratio is never
+ *  trusted. buy: sl < trigger < tp with refPrice < trigger ≤ ref×(1+up).
+ *  sell: tp < trigger < sl with ref×(1−down) ≤ trigger < refPrice. */
+export function validatePlanSide(
+  side: 'buy' | 'sell',
+  refPrice: number,
+  trigger: number,
+  tp: number,
+  sl: number,
+): PlanGeometry {
+  const nums = [refPrice, trigger, tp, sl]
+  if (nums.some((n) => !Number.isFinite(n) || n <= 0)) return { ok: false, rr: null, reason: '計劃數字無效' }
+  if (side === 'buy') {
+    if (!(sl < trigger && trigger < tp)) return { ok: false, rr: null, reason: 'buy 方位不合理（需 SL < 觸發 < TP）' }
+    if (!(trigger > refPrice * 1.0005)) return { ok: false, rr: null, reason: 'buy 觸發價必須高於現價（等市場上攻確認）' }
+    if (trigger > refPrice * (1 + PLAN_BAND.up)) return { ok: false, rr: null, reason: `buy 觸發價偏離現價 >${Math.round(PLAN_BAND.up * 100)}%` }
+    const rr = (tp - trigger) / (trigger - sl)
+    return { ok: true, rr: Number.isFinite(rr) && rr > 0 ? rr : null, reason: null }
+  }
+  if (!(tp < trigger && trigger < sl)) return { ok: false, rr: null, reason: 'sell 方位不合理（需 TP < 觸發 < SL）' }
+  if (!(trigger < refPrice * 0.9995)) return { ok: false, rr: null, reason: 'sell 觸發價必須低於現價（等市場跌破確認）' }
+  if (trigger < refPrice * (1 - PLAN_BAND.down)) return { ok: false, rr: null, reason: `sell 觸發價偏離現價 >${Math.round(PLAN_BAND.down * 100)}%` }
+  const rr = (trigger - tp) / (sl - trigger)
+  return { ok: true, rr: Number.isFinite(rr) && rr > 0 ? rr : null, reason: null }
+}
+
+export type PlanReviewOutcome = 'missed-run' | 'good-wait' | 'neutral'
+
+/** 24h review verdict for a CLOSED (never executed) plan: did the discipline
+ *  avoid a loss (good-wait — price went on to breach the stop) or cost the
+ *  move (missed-run — price went on to cross the trigger)? pnlPct is the
+ *  would-be P&L% at the current price relative to the trigger. */
+export function planReviewOutcome(
+  side: 'buy' | 'sell',
+  trigger: number,
+  sl: number,
+  priceNow: number,
+): { outcome: PlanReviewOutcome; pnlPct: number | null } {
+  if (![trigger, sl, priceNow].every((n) => Number.isFinite(n) && n > 0)) return { outcome: 'neutral', pnlPct: null }
+  const pnlPct = side === 'buy'
+    ? ((priceNow - trigger) / trigger) * 100
+    : ((trigger - priceNow) / trigger) * 100
+  const crossed = side === 'buy' ? priceNow >= trigger : priceNow <= trigger
+  const stopped = side === 'buy' ? priceNow <= sl : priceNow >= sl
+  if (crossed) return { outcome: 'missed-run', pnlPct }
+  if (stopped) return { outcome: 'good-wait', pnlPct }
+  return { outcome: 'neutral', pnlPct }
+}
+
+/** Permanent-memory lesson line for a reviewed plan (≤200 chars). */
+export function planLessonText(p: {
+  symbol: string
+  side: 'buy' | 'sell'
+  trigger: number
+  confidence: number
+  status: string
+  regime?: string | null
+}, outcome: PlanReviewOutcome, pnlPct: number | null): string {
+  const dirZh = p.side === 'buy' ? '做多' : '做空'
+  const statusZh = p.status === 'INVALIDATED' ? '市場反向否定' : p.status === 'EXPIRED' ? '逾期作廢' : p.status === 'SUPERSEDED' ? '新計劃取代' : '閘門拒絕'
+  const pnl = pnlPct != null && Number.isFinite(pnlPct) ? `${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(1)}%` : '?'
+  if (outcome === 'missed-run') {
+    return `計劃覆盤：${dirZh} ${p.symbol}（觸發 ${p.trigger} · 信心${p.confidence}）${statusZh} → 24h 後價格已越過觸發價 ${pnl} — 等待錯過行情，此類計劃門檻可考慮放寬`
+  }
+  if (outcome === 'good-wait') {
+    return `計劃覆盤：${dirZh} ${p.symbol}（觸發 ${p.trigger} · 信心${p.confidence}）${statusZh} → 24h 後價格已跌破停損區 ${pnl} — 等待正確，確認紀律避開了虧損`
+  }
+  return `計劃覆盤：${dirZh} ${p.symbol}（觸發 ${p.trigger}）${statusZh} → 24h 後仍在觸發與停損之間 — 情勢未明`
 }

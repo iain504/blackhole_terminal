@@ -49,6 +49,19 @@
 // other devices show 「其他裝置運行中」 and never double-fire orders. An enabled
 // scanner auto-resumes after reload via resumeAiAutoIfNeeded() (called from
 // TerminalRoot once the user session is known).
+// v2.12.37 — REACT > RESPOND > REVIEW ENTRY PROTOCOL (default). A confident
+// verdict used to fire a market order the moment the scan finished — the
+// entry price was whatever the tape looked like mid-scan, and "confidence"
+// alone decided. Now the model plans CONDITIONAL ENTRIES: per symbol up to
+// one BUY plan (trigger above price — fires when the market goes UP through
+// it) and one SELL plan (trigger below — fires on a DOWN-move), each with
+// its own TP/SL. Plans persist WAITING in the AiTradePlan ledger; a reactor
+// loop (20s) watches quotes: market confirms the trigger → follow the plan
+// (Respond); price breaches the plan's stop first → plan invalidated
+// (market went against — stand aside); 48h without resolution → expired.
+// Every dead plan gets a 24h review pass (good-wait vs missed-run) distilled
+// into the permanent lesson memory. entryMode 'instant' keeps the legacy
+// immediate-fire behavior for A/B.
 import { create } from 'zustand'
 import {
   AI_TRADE_DEFAULT_MODEL, buildChartSnapshot, snapshotToText,
@@ -60,7 +73,10 @@ import {
   registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
   type AiOpsRunnerInfo,
 } from '@/lib/ai-ops-sync'
-import { dynamicThresholds as regimeDynamicThresholds, concentrationCheck, type GateRegime } from '@/lib/ai-trade-gates'
+import {
+  dynamicThresholds as regimeDynamicThresholds, concentrationCheck,
+  validatePlanSide, type GateRegime,
+} from '@/lib/ai-trade-gates'
 
 // ---- config ----------------------------------------------------------------
 
@@ -76,6 +92,13 @@ export interface AiAutoConfig {
   maxSymbols: number // watchlist symbols evaluated per scan
   mode: 'paper' | 'live'
   dryRun: boolean // evaluate + log what WOULD fire, place nothing
+  /** v2.12.37 — React > Respond > Review entry protocol. 'react' (default):
+   *  the model plans conditional buy/sell entries (trigger + TP/SL), the
+   *  terminal watches the market and only FOLLOWS the plan when price moves
+   *  through the trigger (market confirms); a move against the plan's stop
+   *  first invalidates it; 48h expires it. 'instant': legacy behavior — a
+   *  passing verdict fires a market order immediately. */
+  entryMode: 'react' | 'instant'
   watchlistId: string | null // which watchlist feeds the scan (null = first)
   /** v2.12.34 — scan pool source: the hand-picked watchlist, the AUTO
    *  WATCHLIST (US-universe screener Top-50 by volatility + liquidity), or
@@ -109,6 +132,7 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   maxSymbols: 6,
   mode: 'paper',
   dryRun: false,
+  entryMode: 'react',
   watchlistId: null,
   poolSource: 'watchlist',
   excludedSymbols: [],
@@ -143,6 +167,9 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     maxSymbols: Math.round(clampN(num(j.maxSymbols, d.maxSymbols), 1, 50)),
     mode: j.mode === 'live' ? 'live' : 'paper',
     dryRun: Boolean(j.dryRun),
+    // undefined (old saved config) → 'react' — the React > Respond > Review
+    // protocol is the default entry discipline for existing users too
+    entryMode: j.entryMode === 'instant' ? 'instant' : 'react',
     watchlistId: typeof j.watchlistId === 'string' && j.watchlistId ? j.watchlistId : null,
     poolSource: j.poolSource === 'auto' || j.poolSource === 'union' ? j.poolSource : 'watchlist',
     excludedSymbols: Array.isArray(j.excludedSymbols)
@@ -231,6 +258,49 @@ export interface AiAutoVerdict {
   /** v2.12.33 — attribution ledger status for NON-FLAT verdicts: what
    *  actually happened to this call (fired / dry-run / gated). */
   verdictStatus?: 'fired' | 'dry-run' | 'gated' | null
+  /** v2.12.37 — react mode: the conditional plans this verdict produced. */
+  plans?: AiVerdictPlan[]
+  /** v2.12.37 — last close when evaluated; the plan's 距觸發% anchor. */
+  refPrice?: number
+}
+
+/** v2.12.37 — one conditional entry side parsed from a react-mode verdict.
+ *  status 'created' = plan validated + persisted WAITING; 'rejected' rows
+ *  keep the terminal's honest reason (geometry / threshold / shortability). */
+export interface AiVerdictPlan {
+  side: 'buy' | 'sell'
+  trigger: number
+  tp: number
+  sl: number
+  rr: number
+  status: 'created' | 'rejected'
+  note: string | null
+}
+
+export type AiPlanStatus = 'WAITING' | 'EXECUTED' | 'INVALIDATED' | 'EXPIRED' | 'GATED' | 'CANCELLED' | 'SUPERSEDED'
+
+/** v2.12.37 — one conditional entry plan the terminal is watching (react
+ *  mode). Hydrated from the AiTradePlan ledger so plans survive reloads and
+ *  runner hand-over; transitions are PATCHed back best-effort. */
+export interface AiPlanVM {
+  id: string
+  symbol: string
+  side: 'buy' | 'sell'
+  confidence: number
+  trigger: number
+  tp: number
+  sl: number
+  rr: number
+  refPrice: number
+  reason: string | null
+  regime: string | null
+  mode: string
+  status: AiPlanStatus
+  statusNote: string | null
+  createdAt: number
+  closedAt: number | null
+  /** dry-run notice logged once per plan (the tick loop would spam) */
+  dryRunNoted?: boolean
 }
 
 export interface AiAutoFired {
@@ -262,6 +332,8 @@ interface AiAutoState {
   log: AiAutoLogEntry[]
   verdicts: AiAutoVerdict[] // latest finished scan
   fired: AiAutoFired[]
+  /** v2.12.37 — react mode: plans this session created/adopted + lifecycle */
+  plans: AiPlanVM[]
   /** v2.12.24 — who is the elected runner for this engine (cross-device
    *  sync). null = unknown/disabled; isMe:false = another device runs it. */
   runnerInfo: AiOpsRunnerInfo | null
@@ -296,6 +368,7 @@ export const useAiAutoStore = create<AiAutoState>((set, get) => ({
   log: [],
   verdicts: [],
   fired: [],
+  plans: [],
   runnerInfo: null,
   addLog: (level, text) => set((s) => ({ log: [...s.log, { id: ++logSeq, at: Date.now(), level, text }].slice(-250) })),
   updateConfig: (patch) => {
@@ -305,6 +378,11 @@ export const useAiAutoStore = create<AiAutoState>((set, get) => ({
     // v2.12.24 — push the edit to the account (debounced; no runner claim:
     // editing the interval on device 2 must not yank execution off device 1)
     queueAiOpsConfigPut('auto-trade')
+    // v2.12.37 — entry-mode flips re-arm or disarm the reactor mid-flight
+    if (patch.entryMode !== undefined) {
+      if (next.entryMode === 'instant') stopReactor('進場模式改為即時下單 — React 反應器停止')
+      else ensureReactorArmed()
+    }
     // a period change while running reschedules the pending tick from now
     if (patch.intervalSec !== undefined && timer && next.enabled && !scanning) {
       if (timer) { clearTimeout(timer); timer = null }
@@ -365,6 +443,7 @@ function startScanner(immediate: boolean, opts?: { fromSync?: boolean; note?: st
   // runner slot for this device; sync-driven starts skip the PUT (the server
   // row is already enabled — that's why we're starting).
   if (!opts?.fromSync) void pushAiOpsState('auto-trade', { claim: true })
+  ensureReactorArmed()
   if (immediate) {
     void runScan()
   } else {
@@ -379,6 +458,7 @@ function stopScanner(opts?: { fromSync?: boolean; reason?: 'synced-off' | 'yield
   if (!timer && !scanning) return
   if (timer) { clearTimeout(timer); timer = null }
   if (scanning) scanAbort?.abort() // honest stop mid-flight too
+  stopReactor()
   useAiAutoStore.setState({ nextScanAt: null })
   useAiAutoStore.getState().addLog(
     'info',
@@ -447,6 +527,32 @@ function scanInstruction(n: number): string {
   ].join('\n')
 }
 
+/** v2.12.37 — react-mode planning instruction (React > Respond > Review).
+ *  Same DATA block as the instant scan, but the model now outputs
+ *  CONDITIONAL PLANS instead of a market-order command: per symbol a bias +
+ *  confidence + up to ONE buy plan (fires when the market goes UP through
+ *  the trigger) and ONE sell plan (fires on a DOWN-move through it), each
+ *  with its own TP/SL. The terminal validates geometry, watches the market,
+ *  and only follows a plan the market actually confirms — then reviews. */
+function scanInstructionPlans(n: number): string {
+  return [
+    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化作戰規劃引擎，遵循紀律 React > Respond > Review：先分析、出「條件作戰計劃」；終端會監控市場，價格觸及計劃觸發價才跟進下單，市場反向則計劃作廢。只輸出 JSON 陣列，禁止任何其他文字：`,
+    `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"buyTrigger":<數字>,"buyTp":<數字>,"buySl":<數字>,"sellTrigger":<數字>,"sellTp":<數字>,"sellSl":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
+    `計劃規則：`,
+    `- buy 計劃 = 突破/動能確認：buyTrigger 必須高於現價（+0.3% ~ +4%），市場「上攻」觸及才成立；buySl 掛在最近支撐之下（結構外，距離參考 ATR — 不可緊貼現價），buyTp 放在到達下一個阻力之前。`,
+    `- sell 計劃 = 跌破確認：sellTrigger 必須低於現價（−0.3% ~ −4%），市場「跌破」觸及才成立；sellSl 掛在最近阻力之上，sellTp 放在到達下一個支撐之前。`,
+    `- 只給證據支持的側：偏多證據給 buy 計劃、偏空證據給 sell 計劃；區間且雙向證據都成立時可同時給兩側（市場自己選方向，we follow the plan）。無計劃的一側該組數字填 0。`,
+    `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準。`,
+    `- R:R 由終端以觸發價重算（|TP−觸發| ÷ |觸發−SL|），低於門檻的計劃不會被建立 — 寧可少給、不可濫給。`,
+    `- 證據計數：non-flat 方向需要「至少 2 類獨立證據同向」（趨勢/動量、量能、結構 S/R、高週期、情緒/環境）；證據互相矛盾或只有單一訊號 → 誠實 flat，所有數字填 0，reason 說明關鍵原因。`,
+    `- 市場環境：RISK_OFF 做多、RISK_ON 做空屬逆風 — 計劃門檻需更嚴；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）假突破多 — buyTrigger 需更貼近確認位。`,
+    `- 近期表現/覆盤統計：這是本引擎真實成績與過往判斷 24 小時後的對帳結果。用它校準 confidence 並選擇證據組合 — 某組合勝率明顯差時同組合新訊號給 flat。`,
+    `- 財報/事件：「財報臨近（block）」標的必然被終端硬閘拒絕 — 直接 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55；共用區列出的 48 小時內高影響事件同樣壓低相關方向信心。`,
+    `- 目前持倉：已持有標的不會再進場；避免與現有持倉高度相關的新方向；[集中風險] 標明 ⚠ 的持倉對不要再建同向計劃。`,
+    `- 數字只能取自 DATA 區，不可杜撰資料；每個標的都要有對應項目；大多數標的判 flat 屬預期輸出（寧可錯過、不可做錯），不要為了凑 non-flat 而放寬證據標準。`,
+  ].join('\n')
+}
+
 // ---- one scan round ---------------------------------------------------------
 
 const chunk = <T,>(xs: T[], n: number): T[][] => {
@@ -482,8 +588,10 @@ export async function runScan(): Promise<void> {
   const sig = scanAbort.signal
   const cfg = st0.config
   const t0 = Date.now()
+  // v2.12.37 — which entry protocol this round runs under
+  const useReact = cfg.entryMode === 'react'
   setScanning(true)
-  st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · ${cfg.model}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
+  st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · ${cfg.model}${useReact ? ' · React 計劃模式' : ''}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
   // v2.12.34 — auto-watchlist pool state (declared here so snapshotExtras
   // and the context pack below can read it): symbol → why it made the cut.
   const pickBySym = new Map<string, PickMeta>()
@@ -900,9 +1008,9 @@ export async function runScan(): Promise<void> {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: cfg.model,
-          messages: [{ role: 'user', content: scanInstruction(grp.length) }] as AiChatMsg[],
+          messages: [{ role: 'user', content: useReact ? scanInstructionPlans(grp.length) : scanInstruction(grp.length) }] as AiChatMsg[],
           context: dataBlock,
-          maxTokens: Math.min(2000, 200 * grp.length + 300),
+          maxTokens: useReact ? Math.min(2400, 240 * grp.length + 400) : Math.min(2000, 200 * grp.length + 300),
         }),
         signal: sig,
       })
@@ -969,7 +1077,7 @@ export async function runScan(): Promise<void> {
       const target = it?.target != null && Number.isFinite(Number(it.target)) && Number(it.target) > 0 ? Number(it.target) : null
       const reason = String(it?.reason ?? '').slice(0, 80)
 
-      const v: AiAutoVerdict = { symbol: snap.symbol, direction, confidence, entry, stop, target, rr: null, reason, demoBars: snap.demo, passed: false, rejectReason: null, dryRunNote: null }
+      const v: AiAutoVerdict = { symbol: snap.symbol, direction, confidence, entry, stop, target, rr: null, reason, demoBars: snap.demo, passed: false, rejectReason: null, dryRunNote: null, refPrice: snap.lastClose }
 
       if (!it) { v.rejectReason = AI_EVAL_FAIL_REASON; return v }
       if (direction === 'flat') { v.rejectReason = '模型判中性'; return v }
@@ -984,6 +1092,48 @@ export async function runScan(): Promise<void> {
           v.rejectReason = `財報窗口（${ea.daysAway ?? '?'} 天後發布）— 跳空風險，禁止開新倉`
           return v
         }
+      }
+      // v2.12.37 — REACT MODE: the verdict becomes conditional PLANS instead
+      // of a market-order command. Each side the model supplied is validated
+      // HERE (geometry + trigger band + terminal R:R — never the model's
+      // arithmetic), gated per side (dyn thresholds, shortability, holdings,
+      // demo bars), and surviving plans go WAITING in the ledger — the
+      // reactor executes only when the market actually confirms.
+      if (useReact) {
+        const plans: AiVerdictPlan[] = []
+        for (const side of ['buy', 'sell'] as const) {
+          const raw = reactPlanFromItem(it, side)
+          if (!raw) continue
+          const geo = validatePlanSide(side, snap.lastClose, raw.trigger, raw.tp, raw.sl)
+          const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note })
+          if (!geo.ok || geo.rr == null) { reject(geo.reason ?? '計劃未通過驗證'); continue }
+          const dyn = cfg.dynamicThresholds
+            ? regimeDynamicThresholds(cfg.minConfidence, cfg.minRR, regimeState, side === 'buy' ? 'long' : 'short')
+            : { minConfidence: cfg.minConfidence, minRR: cfg.minRR }
+          if (confidence < dyn.minConfidence) { reject(`信心未達 ${dyn.minConfidence}%`); continue }
+          if (geo.rr < dyn.minRR) { reject(`R:R 未達 1:${dyn.minRR}`); continue }
+          if (side === 'sell' && noShort.has(snap.symbol)) { reject(`該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''}`); continue }
+          if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { reject('已有該標的持倉'); continue }
+          if (snap.demo) { reject('⚠示範K線 — 非真實行情'); continue }
+          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null })
+        }
+        v.plans = plans
+        const created = plans.filter((p) => p.status === 'created')
+        if (created.length === 0) {
+          v.rejectReason = plans.length > 0 ? (plans[0].note ?? '計劃未通過驗證') : '模型未給有效計劃（數字缺失）'
+          return v
+        }
+        // ledger levels = the bias-side plan (falls back to the first created)
+        // so the 24h reconciliation keeps measuring the CALL's quality
+        const primary = created.find((p) => p.side === (direction === 'long' ? 'buy' : 'sell')) ?? created[0]
+        v.entry = primary.trigger
+        v.stop = primary.sl
+        v.target = primary.tp
+        v.rr = primary.rr
+        v.passed = true
+        v.verdictStatus = 'dry-run' // evaluated, NOT ordered — ordering waits for the market
+        passCount++
+        return v
       }
       // geometry: long stop<entry<target / short target<entry<stop
       const geoOk = entry != null && stop != null && target != null && (
@@ -1056,9 +1206,21 @@ export async function runScan(): Promise<void> {
           }))
           const chk = concentrationCheck(csym, cdir, sameDir, cfg.maxCorrelated)
           if (chk.blocked) {
-            v.passed = false
-            v.rejectReason = chk.note
-            passCount--
+            // react mode: reject only the matching SIDE's plan, not the
+            // whole verdict — the other side (if any) may still be valid
+            if (useReact && v.plans) {
+              const pl = v.plans.find((x) => x.side === (cdir === 'long' ? 'buy' : 'sell') && x.status === 'created')
+              if (pl) { pl.status = 'rejected'; pl.note = chk.note }
+              if (!v.plans.some((x) => x.status === 'created')) {
+                v.passed = false
+                v.rejectReason = chk.note
+                passCount--
+              }
+            } else {
+              v.passed = false
+              v.rejectReason = chk.note
+              passCount--
+            }
             st0.addLog('info', `${v.symbol} — ${chk.note}`)
           }
         }
@@ -1071,9 +1233,66 @@ export async function runScan(): Promise<void> {
     const demoSkips = verdicts.filter((v) => v.rejectReason?.includes('示範K線')).length
     if (demoSkips > 0) st0.addLog('warn', `示範K線 — ${demoSkips} 個訊號僅評估不下單（非真實行情）`)
 
-    // 6) fire the passes (sizing by confidence → bracket order)
+    // 6) v2.12.37 — react mode: persist the WAITING plans + arm the reactor
+    //    (NO orders here — ordering is the reactor's job when the market
+    //    confirms). instant mode: fire the passes unchanged below.
+    let plansCreated = 0
+    let createdBuy = 0
+    let createdSell = 0
+    if (useReact) {
+      const payload = verdicts.flatMap((v) => (v.plans ?? [])
+        .filter((p) => p.status === 'created')
+        .map((p) => ({
+          symbol: v.symbol,
+          side: p.side,
+          bias: v.direction,
+          confidence: v.confidence,
+          trigger: p.trigger,
+          tp: p.tp,
+          sl: p.sl,
+          rr: p.rr,
+          refPrice: v.refPrice ?? 0,
+          reason: v.reason,
+          regime: regimeState,
+          earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
+          mode: cfg.mode,
+        })))
+      if (payload.length > 0) {
+        const post = await fetchJson('/api/ai-trade/plans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ plans: payload }),
+          signal: sig,
+        }).catch(() => ({ status: 0, j: null as Record<string, unknown> | null }))
+        if (post.status === 200) {
+          plansCreated = payload.length
+          createdBuy = payload.filter((p) => p.side === 'buy').length
+          createdSell = payload.length - createdBuy
+          await hydratePlans(sig)
+          st0.addLog('info', `計劃已建立 ${plansCreated} 筆（▲buy ${createdBuy} / ▼sell ${createdSell}）— React 反應器監控市場，確認觸發才跟進`)
+          for (const v of verdicts) {
+            for (const p of v.plans ?? []) {
+              if (p.status !== 'created') continue
+              const dist = v.refPrice ? ((p.trigger - v.refPrice) / v.refPrice) * 100 : 0
+              st0.addLog('info', `${v.symbol} ${p.side === 'buy' ? '▲buy' : '▼sell'} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}（R:R 1:${p.rr.toFixed(1)} · 距現價 ${dist >= 0 ? '+' : ''}${dist.toFixed(1)}%）`)
+            }
+          }
+          if (!cfg.enabled) st0.addLog('info', '自動交易開關未開 — 計劃保留，開啟後反應器開始監控')
+        } else {
+          st0.addLog('error', `計劃持久化失敗 HTTP ${post.status} — 本輪計劃未保存（不猜測）`)
+          for (const v of verdicts) {
+            if (v.plans?.some((p) => p.status === 'created')) {
+              v.passed = false
+              v.rejectReason = '計劃保存失敗'
+              passCount--
+            }
+          }
+        }
+      }
+    }
+    // fire the passes (sizing by confidence → bracket order) — instant mode only
     for (const v of verdicts) {
-      if (!v.passed) continue
+      if (useReact || !v.passed) continue
       st0.addLog('success', `${v.symbol} 達標 — ${dirLabel(v.direction)} · 信心 ${v.confidence}% · R:R 1:${v.rr?.toFixed(1)}${v.demoBars ? ' · ⚠示範K線' : ''}`)
       if (equity == null) { v.passed = false; v.rejectReason = '無帳戶權益 — 無法計算倉位'; continue }
       const price = v.entry!
@@ -1171,7 +1390,9 @@ export async function runScan(): Promise<void> {
           regime: regimeState,
           earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
           status: v.verdictStatus ?? 'gated',
-          gateNote: v.rejectReason,
+          gateNote: v.rejectReason ?? (useReact && v.plans?.some((p) => p.status === 'created')
+            ? `計劃 ${v.plans.filter((p) => p.status === 'created').map((p) => `${p.side === 'buy' ? '▲' : '▼'}${p.trigger}`).join(' ')}`
+            : null),
         }))
       if (rows.length > 0) {
         void fetchJson('/api/ai-trade/verdicts', {
@@ -1186,7 +1407,9 @@ export async function runScan(): Promise<void> {
     const secs = ((Date.now() - t0) / 1000).toFixed(1)
     const flatCount = verdicts.filter((v) => v.direction === 'flat' && v.rejectReason !== AI_EVAL_FAIL_REASON).length
     const failCount = verdicts.filter((v) => v.rejectReason === AI_EVAL_FAIL_REASON).length
-    st0.addLog('info', `掃描完成 — 評估 ${verdicts.length} 標的 · 中性 ${flatCount} · 達標 ${passCount} · 觸發 ${fireCount} 筆${failCount > 0 ? ` · 評估失敗 ${failCount}` : ''}${cfg.dryRun ? '（試運行）' : ''} · 耗時 ${secs}s`)
+    st0.addLog('info', useReact
+      ? `掃描完成 — 評估 ${verdicts.length} 標的 · 中性 ${flatCount} · 建計劃 ${plansCreated}${plansCreated ? `（▲${createdBuy}/▼${createdSell}）` : ''}${failCount > 0 ? ` · 評估失敗 ${failCount}` : ''}${cfg.dryRun ? '（試運行）' : ''} · 耗時 ${secs}s`
+      : `掃描完成 — 評估 ${verdicts.length} 標的 · 中性 ${flatCount} · 達標 ${passCount} · 觸發 ${fireCount} 筆${failCount > 0 ? ` · 評估失敗 ${failCount}` : ''}${cfg.dryRun ? '（試運行）' : ''} · 耗時 ${secs}s`)
     // v2.12.35 — a no-fire round with a wall of neutrals is the engine
     // working as designed (win-rate first), not a malfunction. Say so once,
     // where the user is actually looking.
@@ -1207,6 +1430,251 @@ export async function runScan(): Promise<void> {
     // manual scan on a follower device (or with the toggle off) must never
     // start a second periodic loop behind the elected runner's back.
     if (cur.enabled && (!ri || ri.isMe)) armTimer(cur.intervalSec)
+  }
+}
+
+// ---- v2.12.37 REACTOR — the 'React' in React > Respond > Review -------------
+//
+// A 20s loop (armed whenever the engine is enabled in react mode, on the
+// elected runner browser only) that watches every WAITING plan's symbol:
+//
+//   REACT   — quote each symbol every tick; the market's move decides:
+//   RESPOND — price rises through a buy trigger / falls through a sell
+//             trigger → FOLLOW the plan: re-run the execution gates at
+//             trigger time (holdings, max-open, earnings window, buying
+//             power), then a market entry with the plan's TP/SL bracket.
+//             Price breaches the plan's stop BEFORE the trigger → the plan
+//             is INVALIDATED (market went against — stand aside, no order).
+//   REVIEW  — 48h without resolution expires the plan; the ledger's 24h
+//             review pass (plans?resolve=1) grades every dead plan
+//             good-wait vs missed-run into the permanent lesson memory.
+
+const REACT_TICK_MS = 20_000
+const PLAN_TTL_MS = 48 * 3600_000
+let reactTimer: ReturnType<typeof setInterval> | null = null
+let reactBusy = false
+let plansHydrated = false
+
+const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
+
+/** v2.12.37 — extract one side's plan numbers from a react-mode model item.
+ *  Flat fields preferred (buyTrigger/buyTp/buySl); a nested {"buy":{...}}
+ *  object is tolerated. Any number missing/≤0 → no plan for that side. */
+function reactPlanFromItem(it: Record<string, unknown>, side: 'buy' | 'sell'): { trigger: number; tp: number; sl: number } | null {
+  const pick = (x: unknown) => { const n = Number(x); return Number.isFinite(n) && n > 0 ? n : 0 }
+  const nested = (it[side] ?? null)
+  const src = nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : it
+  const trigger = pick(src[side === 'buy' ? 'buyTrigger' : 'sellTrigger'] ?? src['trigger'])
+  const tp = pick(src[side === 'buy' ? 'buyTp' : 'sellTp'] ?? src['tp'])
+  const sl = pick(src[side === 'buy' ? 'buySl' : 'sellSl'] ?? src['sl'])
+  if (!trigger || !tp || !sl) return null
+  return { trigger, tp, sl }
+}
+
+/** Adopt every WAITING plan this account owns (real server ids — the PATCH
+ *  transitions need them). Called when the reactor arms, right after a scan
+ *  posts fresh plans, and once per tick until it succeeds. Session-closed
+ *  plans (EXECUTED/…) are kept for the panel's lifecycle view. */
+async function hydratePlans(sig?: AbortSignal): Promise<void> {
+  try {
+    const { j } = await fetchJson('/api/ai-trade/plans?active=1', { signal: sig })
+    const rows = (j as { plans?: Record<string, unknown>[] } | null)?.plans
+    if (!Array.isArray(rows)) return
+    const vms: AiPlanVM[] = []
+    for (const r of rows) {
+      const id = typeof r.id === 'string' ? r.id : null
+      const symbol = typeof r.symbol === 'string' ? r.symbol : null
+      const side = r.side === 'sell' ? 'sell' : r.side === 'buy' ? 'buy' : null
+      const trigger = Number(r.trigger); const tp = Number(r.tp); const sl = Number(r.sl)
+      const rr = Number(r.rr); const refPrice = Number(r.refPrice)
+      if (!id || !symbol || !side || ![trigger, tp, sl, rr, refPrice].every((n) => Number.isFinite(n) && n > 0)) continue
+      vms.push({
+        id, symbol, side, confidence: Math.round(Number(r.confidence) || 0),
+        trigger, tp, sl, rr, refPrice,
+        reason: typeof r.reason === 'string' ? r.reason : null,
+        regime: typeof r.regime === 'string' ? r.regime : null,
+        mode: r.mode === 'live' ? 'live' : 'paper',
+        status: 'WAITING', statusNote: null,
+        createdAt: Number(r.createdAt) || Date.now(),
+        closedAt: null,
+      })
+    }
+    const closedPrev = useAiAutoStore.getState().plans.filter((x) => x.status !== 'WAITING')
+    useAiAutoStore.setState({ plans: [...vms, ...closedPrev] })
+    plansHydrated = true
+  } catch { /* hydration is best-effort; the next tick retries */ }
+}
+
+function ensureReactorArmed() {
+  const cfg = useAiAutoStore.getState().config
+  if (!cfg.enabled || cfg.entryMode !== 'react') return
+  if (reactTimer) return
+  plansHydrated = false // re-adopt WAITING plans from the ledger on arm
+  reactTimer = setInterval(() => { void reactTick() }, REACT_TICK_MS)
+  useAiAutoStore.getState().addLog('info', `React 反應器啟動 — 每 ${Math.round(REACT_TICK_MS / 1000)}s 監控計劃觸發（市場確認才跟進；反向否定 · 48h 逾期作廢）`)
+}
+
+function stopReactor(reason?: string) {
+  if (!reactTimer) return
+  clearInterval(reactTimer)
+  reactTimer = null
+  reactBusy = false
+  useAiAutoStore.getState().addLog('info', reason ?? 'React 反應器停止 — 等候中計劃保留，重新啟用後繼續監控')
+}
+
+async function patchPlan(id: string, status: AiPlanStatus, note: string | null) {
+  await fetchJson('/api/ai-trade/plans', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, status, note }),
+  }).catch(() => { /* the ledger transition is best-effort */ })
+}
+
+/** One lifecycle transition: store + activity log + ledger PATCH. */
+function closePlan(p: AiPlanVM, status: AiPlanStatus, note: string) {
+  useAiAutoStore.setState((s) => ({
+    plans: s.plans.map((x) => (x.id === p.id ? { ...x, status, statusNote: note, closedAt: Date.now() } : x)),
+  }))
+  const lvl = status === 'EXECUTED' ? 'success' : status === 'GATED' ? 'warn' : 'info'
+  const verb = status === 'EXECUTED' ? '執行' : status === 'INVALIDATED' ? '反向作廢' : status === 'EXPIRED' ? '逾期作廢' : status === 'GATED' ? '閘門擋下' : '關閉'
+  useAiAutoStore.getState().addLog(lvl, `${p.symbol} ${p.side === 'buy' ? '▲' : '▼'}計劃${verb} — ${note}`)
+  void patchPlan(p.id, status, note)
+}
+
+async function reactTick(): Promise<void> {
+  if (reactBusy) return
+  const st = useAiAutoStore.getState()
+  const cfg = st.config
+  if (!cfg.enabled || cfg.entryMode !== 'react') { stopReactor(); return }
+  if (!plansHydrated) await hydratePlans()
+  let waiting = useAiAutoStore.getState().plans.filter((p) => p.status === 'WAITING')
+  if (waiting.length === 0) return
+  reactBusy = true
+  try {
+    const now = Date.now()
+    // REVIEW housekeeping — TTL expiry needs no quote
+    for (const p of waiting) {
+      if (now - p.createdAt > PLAN_TTL_MS) closePlan(p, 'EXPIRED', '48 小時未觸發 — 計劃作廢（24h 後覆盤等待是否正確）')
+    }
+    waiting = useAiAutoStore.getState().plans.filter((p) => p.status === 'WAITING')
+    if (waiting.length === 0) return
+    // one quote round for every watched symbol (crypto slash spellings both)
+    const symbols = [...new Set(waiting.map((p) => p.symbol))].slice(0, 30)
+    const { j } = await fetchJson('/api/market/quote', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbols }),
+    })
+    const priceBySym = new Map<string, number>()
+    for (const q of ((j as { quotes?: { symbol?: string; price?: number }[] } | null)?.quotes ?? [])) {
+      const px = Number(q?.price)
+      if (q?.symbol && Number.isFinite(px) && px > 0) {
+        priceBySym.set(q.symbol.toUpperCase(), px)
+        priceBySym.set(q.symbol.replace('/', '').toUpperCase(), px)
+      }
+    }
+    // REACT — invalidation first (market went against), then confirmation
+    const toExecute: { plan: AiPlanVM; last: number }[] = []
+    for (const p of waiting) {
+      const last = priceBySym.get(p.symbol) ?? priceBySym.get(p.symbol.replace('/', ''))
+      if (last == null) continue
+      if (p.side === 'buy') {
+        if (last <= p.sl) closePlan(p, 'INVALIDATED', `市場反向 — 跌破停損區 ${fmtPx(p.sl)}，等待紀律生效（24h 後覆盤）`)
+        else if (last >= p.trigger) toExecute.push({ plan: p, last })
+      } else {
+        if (last >= p.sl) closePlan(p, 'INVALIDATED', `市場反向 — 漫過停損區 ${fmtPx(p.sl)}，等待紀律生效（24h 後覆盤）`)
+        else if (last <= p.trigger) toExecute.push({ plan: p, last })
+      }
+    }
+    for (const { plan, last } of toExecute) await executePlan(plan, last)
+  } catch (e) {
+    useAiAutoStore.getState().addLog('warn', `React 監控異常 — ${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    reactBusy = false
+  }
+}
+
+/** RESPOND — the market confirmed the plan. Re-run the execution gates at
+ *  trigger time (the tape can change between planning and triggering), then
+ *  follow the plan with a market entry + the plan's TP/SL bracket. */
+async function executePlan(p: AiPlanVM, last: number): Promise<void> {
+  const st = useAiAutoStore.getState()
+  const cfg = st.config
+  const normSym = (s: string) => s.replace('/', '').toUpperCase()
+  if (cfg.dryRun) {
+    if (!p.dryRunNoted) {
+      useAiAutoStore.setState((s) => ({ plans: s.plans.map((x) => (x.id === p.id ? { ...x, dryRunNoted: true } : x)) }))
+      st.addLog('info', `${p.symbol} ${p.side === 'buy' ? '▲' : '▼'}計劃觸發 ${fmtPx(p.trigger)}（現價 ${fmtPx(last)}）— 試運行：不送單，計劃保持等候`)
+    }
+    return
+  }
+  const [pos, acc, eaRes] = await Promise.all([
+    fetchJson('/api/trading/positions').catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
+    fetchJson('/api/trading/account').catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
+    fetchJson(`/api/market/earnings?symbols=${encodeURIComponent(p.symbol)}`).catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
+  ])
+  const posJ = pos.j as { positions?: { symbol?: string }[] } | null
+  const held = (posJ?.positions ?? []).some((x) => { const s = String(x?.symbol ?? '').toUpperCase(); return s === p.symbol || s === normSym(p.symbol) })
+  if (held) { closePlan(p, 'GATED', '觸發時已有該標的持倉 — 跟進取消'); return }
+  const openCount = st.fired.length + useAiAutoStore.getState().plans.filter((x) => x.status === 'EXECUTED').length
+  if (openCount >= cfg.maxOpenAuto) { closePlan(p, 'GATED', `觸發時達自動倉上限（${cfg.maxOpenAuto}）— 跟進取消`); return }
+  const ea = eaRes.j as { events?: Record<string, { inBlock?: boolean; daysAway?: number | null }> } | null
+  const ev = ea?.events?.[normSym(p.symbol)]
+  if (cfg.blockEarnings && ev?.inBlock) { closePlan(p, 'GATED', `觸發時落入財報窗口（${ev?.daysAway ?? '?'} 天後發布）— 跳空風險取消`); return }
+  // sizing — same math as the instant path (risk budget ÷ per-risk, 50% cap)
+  const accJ = acc.j as { account?: { equity?: unknown; buyingPower?: unknown } } | null
+  const equity = Number(accJ?.account?.equity)
+  if (!Number.isFinite(equity) || equity <= 0) { closePlan(p, 'GATED', '無帳戶權益 — 無法計算倉位'); return }
+  let bp = Number(accJ?.account?.buyingPower)
+  if (!Number.isFinite(bp) || bp <= 0) bp = equity
+  const price = p.trigger
+  const riskAmt = equity * (cfg.riskPct / 100) * (p.confidence / 100)
+  const perRisk = Math.abs(price - p.sl)
+  let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
+  const maxNotional = equity * 0.5
+  if (qty * price > maxNotional) qty = Math.floor((maxNotional / price) * 1e4) / 1e4
+  if (qty * price > bp) {
+    const scaled = Math.floor((bp / price) * 1e4) / 1e4
+    if (scaled <= 0 || scaled * price < 1) { closePlan(p, 'GATED', `Buying power 不足（餘 $${bp.toFixed(2)}）— 無法建立倉位`); return }
+    st.addLog('info', `${p.symbol} 倉位縮減 — buying power 餘 $${bp.toFixed(2)}，qty ${qty} → ${scaled}`)
+    qty = scaled
+  }
+  if (qty <= 0 || qty * price < 1) { closePlan(p, 'GATED', `風險預算太小（$${riskAmt.toFixed(2)} ÷ $${perRisk.toFixed(2)}）無法形成倉位`); return }
+  st.addLog('success', `${p.symbol} 市場確認 — ${p.side === 'buy' ? '上攻' : '跌破'}觸發 ${fmtPx(price)}（現價 ${fmtPx(last)}）— Respond：跟進計劃`)
+  try {
+    const { status, j } = await fetchJson('/api/trading/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: cfg.mode,
+        symbol: p.symbol,
+        side: p.side,
+        qty,
+        type: 'market',
+        time_in_force: 'gtc',
+        take_profit: p.tp,
+        stop_loss: p.sl,
+        sourceKind: 'ai',
+      }),
+    })
+    const ok = status === 200 && Array.isArray((j as { orders?: unknown[] } | null)?.orders) && ((j as { orders: unknown[] }).orders.length > 0)
+    if (ok) {
+      closePlan(p, 'EXECUTED', `跟進 ${p.side} ${qty} @市價 · TL ${fmtPx(p.tp)} / SL ${fmtPx(p.sl)}（${cfg.mode}）`)
+      const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: p.symbol, side: p.side, qty, price, stop: p.sl, target: p.tp, confidence: p.confidence, rr: p.rr, mode: cfg.mode }
+      useAiAutoStore.setState((s) => ({ fired: [rec, ...s.fired].slice(0, 50) }))
+      // the executed plan also feeds the verdict ledger → 24h reconciliation
+      void fetchJson('/api/ai-trade/verdicts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ verdicts: [{ symbol: p.symbol, direction: p.side === 'buy' ? 'long' : 'short', confidence: p.confidence, entry: p.trigger, stop: p.sl, target: p.tp, rr: p.rr, regime: p.regime, earnings: null, status: 'fired', gateNote: '計劃觸發跟進' }] }),
+      }).catch(() => { /* the ledger is best-effort */ })
+    } else {
+      const msg = String((j as { error?: string } | null)?.error || `下單失敗 HTTP ${status}`)
+      closePlan(p, 'GATED', `跟進失敗 — ${msg}`)
+      classifyOrderFailure(p.symbol, msg)
+    }
+  } catch {
+    closePlan(p, 'GATED', '跟進連線失敗 — 計劃關閉（避免盲試循環）')
   }
 }
 
