@@ -1733,13 +1733,31 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
   const ea = eaRes.j as { events?: Record<string, { inBlock?: boolean; daysAway?: number | null }> } | null
   const ev = ea?.events?.[normSym(p.symbol)]
   if (cfg.blockEarnings && ev?.inBlock) { closePlan(p, 'GATED', `觸發時落入財報窗口（${ev?.daysAway ?? '?'} 天後發布）— 跳空風險取消`); return }
+  // v2.12.42 — re-price the plan at the ACTUAL follow price before ordering.
+  // The planned R:R is priced at the trigger, but the tape can gap THROUGH
+  // the trigger between 20s ticks (TWST: trigger 113.77 → follow-side 110.79
+  // turns the planned 1:2.0 into a real 1:1.15 and blows the risk budget by
+  // +38%). Plan your trade, trade your plan: a fill far from the plan's
+  // entry is a DIFFERENT trade — if the real R:R at the last price is below
+  // the plan gate, refuse to chase (INVALIDATED → the 24h review pass grades
+  // it good-wait vs missed-run like any other market-discipline close).
+  const gate = baseThresholds(cfg)
+  const riskAtFill = Math.abs(last - p.sl)
+  const rewardAtFill = p.side === 'buy' ? p.tp - last : last - p.tp
+  const realRR = riskAtFill > 0 ? rewardAtFill / riskAtFill : 0
+  if (!(realRR >= gate.minRR)) {
+    closePlan(p, 'INVALIDATED', `滑價穿觸發價 — 實際跟進 R:R 1:${realRR.toFixed(2)} 低於門檻 1:${gate.minRR}（觸發 ${fmtPx(p.trigger)} → 現價 ${fmtPx(last)}）— 不追價，計劃作廢並覆盤`)
+    return
+  }
   // sizing — same math as the instant path (risk budget ÷ per-risk, 50% cap)
+  // but anchored to the REAL fill-side price so the dollar risk budget holds
+  // even when the market slipped past the trigger.
   const accJ = acc.j as { account?: { equity?: unknown; buyingPower?: unknown } } | null
   const equity = Number(accJ?.account?.equity)
   if (!Number.isFinite(equity) || equity <= 0) { closePlan(p, 'GATED', '無帳戶權益 — 無法計算倉位'); return }
   let bp = Number(accJ?.account?.buyingPower)
   if (!Number.isFinite(bp) || bp <= 0) bp = equity
-  const price = p.trigger
+  const price = last
   const riskAmt = equity * (cfg.riskPct / 100) * (p.confidence / 100)
   const perRisk = Math.abs(price - p.sl)
   let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
@@ -1752,7 +1770,9 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     qty = scaled
   }
   if (qty <= 0 || qty * price < 1) { closePlan(p, 'GATED', `風險預算太小（$${riskAmt.toFixed(2)} ÷ $${perRisk.toFixed(2)}）無法形成倉位`); return }
-  st.addLog('success', `${p.symbol} 市場確認 — ${p.side === 'buy' ? '上攻' : '跌破'}觸發 ${fmtPx(price)}（現價 ${fmtPx(last)}）— Respond：跟進計劃`)
+  // stocks fill whole shares at the broker — show/record the REAL qty
+  const qtySent = p.symbol.includes('/') ? qty : Math.floor(qty)
+  st.addLog('success', `${p.symbol} 市場確認 — ${p.side === 'buy' ? '上攻' : '跌破'}觸發 ${fmtPx(p.trigger)}（現價 ${fmtPx(last)}）— Respond：跟進計劃（實際 R:R 1:${realRR.toFixed(2)}）`)
   try {
     const { status, j } = await fetchJson('/api/trading/orders', {
       method: 'POST',
@@ -1761,7 +1781,7 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
         mode: cfg.mode,
         symbol: p.symbol,
         side: p.side,
-        qty,
+        qty: qtySent,
         type: 'market',
         time_in_force: 'gtc',
         take_profit: p.tp,
@@ -1771,14 +1791,14 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     })
     const ok = status === 200 && Array.isArray((j as { orders?: unknown[] } | null)?.orders) && ((j as { orders: unknown[] }).orders.length > 0)
     if (ok) {
-      closePlan(p, 'EXECUTED', `跟進 ${p.side} ${qty} @市價 · TL ${fmtPx(p.tp)} / SL ${fmtPx(p.sl)}（${cfg.mode}）`)
-      const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: p.symbol, side: p.side, qty, price, stop: p.sl, target: p.tp, confidence: p.confidence, rr: p.rr, mode: cfg.mode }
+      closePlan(p, 'EXECUTED', `跟進 ${p.side} ${qtySent} @市價 · TL ${fmtPx(p.tp)} / SL ${fmtPx(p.sl)}（${cfg.mode} · 實際 R:R 1:${realRR.toFixed(2)}）`)
+      const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: p.symbol, side: p.side, qty: qtySent, price, stop: p.sl, target: p.tp, confidence: p.confidence, rr: p.rr, mode: cfg.mode }
       useAiAutoStore.setState((s) => ({ fired: [rec, ...s.fired].slice(0, 50) }))
       // the executed plan also feeds the verdict ledger → 24h reconciliation
       void fetchJson('/api/ai-trade/verdicts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ verdicts: [{ symbol: p.symbol, direction: p.side === 'buy' ? 'long' : 'short', confidence: p.confidence, entry: p.trigger, stop: p.sl, target: p.tp, rr: p.rr, regime: p.regime, earnings: null, status: 'fired', gateNote: '計劃觸發跟進' }] }),
+        body: JSON.stringify({ verdicts: [{ symbol: p.symbol, direction: p.side === 'buy' ? 'long' : 'short', confidence: p.confidence, entry: p.trigger, stop: p.sl, target: p.tp, rr: p.rr, regime: p.regime, earnings: null, status: 'fired', gateNote: `計劃觸發跟進（實際 R:R 1:${realRR.toFixed(2)} @ 現價 ${fmtPx(last)}）` }] }),
       }).catch(() => { /* the ledger is best-effort */ })
     } else {
       const msg = String((j as { error?: string } | null)?.error || `下單失敗 HTTP ${status}`)
