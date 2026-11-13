@@ -15,7 +15,7 @@
 // columns sort asc/desc by clicking the header (click again cycles desc →
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
 import { ArrowDown, ArrowUp, ArrowUpDown, Ban, History, KeyRound, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -849,7 +849,7 @@ export default function PositionsTab() {
         className="flex min-h-[150px] flex-col overflow-hidden rounded-md border border-zinc-800/80 bg-zinc-900/70"
       >
         <div className="min-h-0 flex-1 overflow-auto terminal-scroll">
-        <table className="w-full min-w-[1060px] border-collapse text-xs">
+        <table className="w-full min-w-[1200px] border-collapse text-xs">
           <thead className="sticky top-0 z-10 bg-zinc-900 text-[10px] uppercase tracking-wider text-zinc-500">
             <tr className="border-b border-zinc-800">
               <SortTh label="Symbol" k="symbol" sort={posSort} onSort={setPosSort} />
@@ -864,13 +864,17 @@ export default function PositionsTab() {
               <SortTh label="SL" k="sl" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="Trailing" k="trailing" sort={posSort} onSort={setPosSort} align="right" />
               <SortTh label="P&L" k="pnl" sort={posSort} onSort={setPosSort} align="right" />
+              {/* v2.12.46 — compact price-ladder progress bar: SL/Entry/Current/TP
+                  placed at their true price positions on one small track (hover
+                  for the full ladder text); not sortable — it moves with live prices */}
+              <th className="px-3 py-2 text-center font-semibold">Progress</th>
               <th className="px-3 py-2 text-right font-semibold">Action</th>
             </tr>
           </thead>
           <tbody>
             {sortedRows.length === 0 && (
               <tr>
-                <td colSpan={13} className="px-3 py-10 text-center text-zinc-500">
+                <td colSpan={14} className="px-3 py-10 text-center text-zinc-500">
                   {data.paper.loaded && data.live.loaded ? (
                     <>
                       No open positions on paper or live.
@@ -890,12 +894,7 @@ export default function PositionsTab() {
               const up = r.pos.upl >= 0
               const trailing = r.sl?.type === 'trailing_stop' ? `${r.sl.trailPercent ?? '—'}%` : null
               return (
-            // v2.12.44 — each position renders as a PAIR of rows: the classic
-            // table row + a full-width sub-row carrying the price-ladder
-            // progress bar (SL/Entry/Current/TP placed at their true price
-            // positions — label order tells the story at a glance).
-            <Fragment key={key}>
-              <tr className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+              <tr key={key} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
                   <td className="px-3 py-2 font-semibold text-zinc-100">{r.pos.symbol}</td>
                   <td className="px-3 py-2">
                     <Badge
@@ -980,6 +979,20 @@ export default function PositionsTab() {
                       ({up ? '+' : '−'}{Math.abs(r.pos.uplPct).toFixed(2)}%)
                     </span>
                   </td>
+                  <td className="px-3 py-2">
+                    {/* v2.12.46 — the price ladder lives IN the row: compact
+                        variant (endpoint tags SL/TP + track), before Close position */}
+                    <PositionLadder
+                      variant="compact"
+                      side={long ? 'long' : 'short'}
+                      entry={r.pos.avgEntry}
+                      current={r.pos.current}
+                      sl={r.sl ?? null}
+                      tp={r.tp ?? null}
+                      symbol={r.pos.symbol}
+                      uplPct={r.pos.uplPct}
+                    />
+                  </td>
                   <td className="px-3 py-2 text-right">
                     <Button
                       size="sm"
@@ -992,23 +1005,6 @@ export default function PositionsTab() {
                     </Button>
                   </td>
               </tr>
-              {/* v2.12.44 — price-ladder sub-row (full width, subtle darker bg
-                  so the pair reads as one card; hidden entirely when the
-                  position lacks usable prices — the ladder renders null) */}
-              <tr className="border-b border-zinc-800/60 bg-zinc-950/40">
-                <td colSpan={13} className="px-3 pb-2.5 pt-1">
-                  <PositionLadder
-                    side={long ? 'long' : 'short'}
-                    entry={r.pos.avgEntry}
-                    current={r.pos.current}
-                    sl={r.sl ?? null}
-                    tp={r.tp ?? null}
-                    symbol={r.pos.symbol}
-                    uplPct={r.pos.uplPct}
-                  />
-                </td>
-              </tr>
-            </Fragment>
               )
             })}
           </tbody>

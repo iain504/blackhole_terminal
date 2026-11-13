@@ -163,6 +163,7 @@ export default function PositionLadder({
   tp,
   symbol,
   uplPct,
+  variant = 'full',
 }: {
   side: string
   entry: number
@@ -173,6 +174,12 @@ export default function PositionLadder({
   symbol?: string
   /** live unrealized P&L % — aria label context only */
   uplPct?: number
+  /** v2.12.46 — 'full' (default) renders the four nudged price labels above
+   *  the track; 'compact' fits a TABLE CELL (a narrow Progress column before
+   *  Close position): same track geometry, no price labels — just two micro
+   *  endpoint tags (SL/TP, colored by kind) and the full ladder text as a
+   *  hover title. */
+  variant?: 'full' | 'compact'
 }) {
   const geom = ladderGeometry(side, entry, current, sl, tp)
   if (!geom) return null
@@ -192,6 +199,75 @@ export default function PositionLadder({
       .map((p) => labelFor(p.kind, p.price))
       .join(', ') +
     pnlTxt
+  const compact = variant === 'compact'
+  // compact: micro endpoint tags — only the SL/TP endpoints get a tag
+  // (Entry/Current are already carried by the tick + dot); a side whose
+  // endpoint is entry/current shows no tag.
+  const first = geom.points[0]
+  const last = geom.points[geom.points.length - 1]
+  const tagKind = (pt: LadderPoint | undefined): 'sl' | 'tp' | null =>
+    pt && (pt.kind === 'sl' || pt.kind === 'tp') ? pt.kind : null
+  const leftTag = tagKind(first)
+  const rightTag = tagKind(last)
+  const track = (
+    <div className="relative h-2 rounded-full bg-zinc-800 ring-1 ring-inset ring-zinc-700/60">
+      {/* planned RISK region: entry ↔ SL */}
+      {risk && (
+        <div className="absolute inset-y-0 rounded-full bg-rose-500/20" style={{ left: risk.left, width: risk.width }} />
+      )}
+      {/* planned REWARD region: entry ↔ TP */}
+      {reward && (
+        <div className="absolute inset-y-0 rounded-full bg-emerald-500/15" style={{ left: reward.left, width: reward.width }} />
+      )}
+      {/* LIVE fill: entry ↔ current (emerald favorable / rose adverse) */}
+      {fill && (
+        <div
+          className={cn('absolute inset-y-0 rounded-full', geom.favorable ? 'bg-emerald-400/70' : 'bg-rose-500/70')}
+          style={{ left: fill.left, width: fill.width }}
+        />
+      )}
+      {/* SL / TP ticks */}
+      {geom.slPct != null && (
+        <div
+          className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-rose-400/90"
+          style={{ left: `${geom.slPct}%` }}
+        />
+      )}
+      {geom.tpPct != null && (
+        <div
+          className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400/90"
+          style={{ left: `${geom.tpPct}%` }}
+        />
+      )}
+      {/* Entry tick (neutral) */}
+      <div
+        className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-zinc-300/80"
+        style={{ left: `${geom.entryPct}%` }}
+      />
+      {/* Current price dot */}
+      <div
+        className={cn(
+          'absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-zinc-900',
+          geom.favorable ? 'bg-emerald-400' : 'bg-rose-400',
+        )}
+        style={{ left: `${geom.curPct}%` }}
+      />
+    </div>
+  )
+  if (compact) {
+    return (
+      <div role="img" aria-label={aria} title={aria} className="select-none">
+        {(leftTag || rightTag) && (
+          <div className="mb-0.5 flex items-baseline justify-between text-[9px] font-semibold leading-[10px] tracking-wide">
+            {/* missing endpoint renders EMPTY text (never the other kind's label) */}
+            <span className={leftTag === 'sl' ? 'text-rose-400' : 'text-emerald-400'}>{leftTag === 'sl' ? 'SL' : leftTag === 'tp' ? 'TP' : ''}</span>
+            <span className={rightTag === 'sl' ? 'text-rose-400' : 'text-emerald-400'}>{rightTag === 'sl' ? 'SL' : rightTag === 'tp' ? 'TP' : ''}</span>
+          </div>
+        )}
+        {track}
+      </div>
+    )
+  }
   return (
     <div role="img" aria-label={aria} className="select-none py-0.5">
       {/* label row — nudged so the four price tags never collide */}
@@ -215,50 +291,7 @@ export default function PositionLadder({
           </span>
         ))}
       </div>
-      {/* the track */}
-      <div className="relative h-2 rounded-full bg-zinc-800 ring-1 ring-inset ring-zinc-700/60">
-        {/* planned RISK region: entry ↔ SL */}
-        {risk && (
-          <div className="absolute inset-y-0 rounded-full bg-rose-500/20" style={{ left: risk.left, width: risk.width }} />
-        )}
-        {/* planned REWARD region: entry ↔ TP */}
-        {reward && (
-          <div className="absolute inset-y-0 rounded-full bg-emerald-500/15" style={{ left: reward.left, width: reward.width }} />
-        )}
-        {/* LIVE fill: entry ↔ current (emerald favorable / rose adverse) */}
-        {fill && (
-          <div
-            className={cn('absolute inset-y-0 rounded-full', geom.favorable ? 'bg-emerald-400/70' : 'bg-rose-500/70')}
-            style={{ left: fill.left, width: fill.width }}
-          />
-        )}
-        {/* SL / TP ticks */}
-        {geom.slPct != null && (
-          <div
-            className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-rose-400/90"
-            style={{ left: `${geom.slPct}%` }}
-          />
-        )}
-        {geom.tpPct != null && (
-          <div
-            className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-emerald-400/90"
-            style={{ left: `${geom.tpPct}%` }}
-          />
-        )}
-        {/* Entry tick (neutral) */}
-        <div
-          className="absolute top-1/2 h-3.5 w-[2px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-zinc-300/80"
-          style={{ left: `${geom.entryPct}%` }}
-        />
-        {/* Current price dot */}
-        <div
-          className={cn(
-            'absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-zinc-900',
-            geom.favorable ? 'bg-emerald-400' : 'bg-rose-400',
-          )}
-          style={{ left: `${geom.curPct}%` }}
-        />
-      </div>
+      {track}
     </div>
   )
 }
