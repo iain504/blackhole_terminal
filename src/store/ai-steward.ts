@@ -37,6 +37,8 @@
 import { create } from 'zustand'
 import type { AiChatMsg } from '@/lib/ai-trade'
 import { CORE_DISCIPLINES } from '@/lib/ai-steward-disciplines'
+// v2.12.43 — 保本夾緊：浮盈持倉的 SL 永不越過保本線（TWST 事故修復）
+import { clampStopToBreakeven, tightProtectiveStop } from '@/lib/steward-breakeven'
 import {
   registerAiOpsAdapter, pushAiOpsState, queueAiOpsConfigPut,
   type AiOpsRunnerInfo,
@@ -446,6 +448,7 @@ function stewardInstruction(): string {
     `- tighten=把 SL/TP 往現價收緊以鎖定保護；widen=放寬距離避開震盪。`,
     `- reattach=持倉的 SL 或 TP 缺失（DATA 顯示「無」或出現 ⚠ 保護缺失區）時重新掛上保護：SL 缺失用 new_stop（long: <現價；short: >現價），TP 缺失用 new_target（long: >現價；short: <現價），兩者皆缺可一併填。SL 缺失＝全倉清盤風險，是最高優先級動作。`,
     `- long 倉：new_stop 必須 < 現價 且 new_target 必須 > 現價；short 倉相反。禁止把 stop 移過現價。`,
+    `- 保本紀律：持倉浮盈時 new_stop 不得越過保本線 — short 須 ≤ 進場價×0.9985、long 須 ≥ 進場價×1.0015（把 SL 放到會鎖定虧損的位置＝把浮盈變虧損；終端會自動夾緊違規價）。`,
     `- 修改幅度 <0.5% 沒有意義，請勿提出。exit（市價平倉）只在風險明確時提出且 confidence ≥ 70。`,
     `- VIX 偏高或大盤急跌時傾向 tighten/exit 高風險持倉；數據不足時誠實 hold。`,
     `- 主動檢查：持倉有明顯浮盈而 SL 仍在進場價下方、或 SL 距現價 >3% → 應考慮 tighten 鎖定保護；掛單偏離現價 >3% 或形勢已變 → 除非有明確理由保留，否則提出 amend 新價或 cancel。`,
@@ -795,29 +798,40 @@ export async function runStewardOnce(): Promise<void> {
           drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `該 SL 單無可比較價格（trail 型）— 不盲改` })
         } else {
           const geoOk = long ? newStop < cur : newStop > cur
-          const moved = Math.abs(newStop - oldSl) / oldSl >= 0.0015
+          // v2.12.43 — 保本夾緊：浮盈持倉的 SL 不得越過保本線。TWST 事故：
+          // short 進場 108.99、浮盈+1.20%，模型提 SL 109.50 > 進場價 — 幾何閘
+          // 只驗現價（109.50 > 107.7 ✓）就放行，命中即把浮盈鎖成 −0.45% 虧損。
+          // 終端把價格夾回進場價±0.15%（含 spread 緩衝）；夾緊後會立即觸發
+          // （浮盈 <0.15%）則保持原 SL 不動。
+          const be = clampStopToBreakeven(long ? 'long' : 'short', row.avgEntry, cur, row.uplPct, newStop, row.assetClass === 'crypto')
+          const effStop = be && !be.skip ? be.price : newStop
+          const moved = Math.abs(effStop - oldSl) / oldSl >= 0.0015
           if (!geoOk) {
             skipped++
             drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `SL ${fmtPrice(newStop)} 方位不合法（${long ? '須低於' : '須高於'}現價 ${fmtPrice(cur)}）— ${reason}` })
+          } else if (be?.skip) {
+            skipped++
+            drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `SL ${fmtPrice(newStop)} 越過保本線（進場 ${fmtPrice(row.avgEntry)} · 浮盈 +${row.uplPct.toFixed(2)}%）— ${be.note}，保持原 SL ${fmtPrice(oldSl)} — ${reason}` })
           } else if (!moved) {
             skipped++
-            drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `SL 變動 <0.15% — 不折騰（${fmtPrice(oldSl)} → ${fmtPrice(newStop)}）` })
+            drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `SL 變動 <0.15% — 不折騰（${fmtPrice(oldSl)} → ${fmtPrice(effStop)}）` })
           } else if (actionsLeft() <= 0) {
             skipped++
             drafts.push({ ...kindBase, action: 'amend_sl', status: 'skipped', detail: `本輪動作數已達上限 — ${reason}` })
           } else {
             const body: Record<string, unknown> = { mode: cfg.mode, crypto: row.assetClass === 'crypto' }
-            if (ex.sl.stopPrice != null) body.stop_price = newStop
-            else body.limit_price = newStop
+            if (ex.sl.stopPrice != null) body.stop_price = effStop
+            else body.limit_price = effStop
+            const clampNote = be?.clamped ? `（保本夾緊：模型 ${fmtPrice(newStop)} 越過保本線）` : ''
             if (cfg.dryRun) {
-              drafts.push({ ...kindBase, action: 'amend_sl', status: 'dry_run', detail: `試運行：SL ${fmtPrice(oldSl)} → ${fmtPrice(newStop)} — ${reason}`, payload: { from: oldSl, to: newStop, confidence: conf } })
+              drafts.push({ ...kindBase, action: 'amend_sl', status: 'dry_run', detail: `試運行：SL ${fmtPrice(oldSl)} → ${fmtPrice(effStop)}${clampNote} — ${reason}`, payload: { from: oldSl, to: effStop, confidence: conf } })
             } else {
               try {
                 const r = await fetchJson(`/api/trading/orders/${ex.sl.orderId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: sig })
                 if (r.status === 200) {
                   executed++
-                  drafts.push({ ...kindBase, action: 'amend_sl', status: 'executed', detail: `SL ${fmtPrice(oldSl)} → ${fmtPrice(newStop)} — ${reason}`, payload: { from: oldSl, to: newStop, confidence: conf, orderId: ex.sl.orderId } })
-                  st0.addLog('success', `${row.tradeSymbol} SL ${fmtPrice(oldSl)} → ${fmtPrice(newStop)} — ${reason}`)
+                  drafts.push({ ...kindBase, action: 'amend_sl', status: 'executed', detail: `SL ${fmtPrice(oldSl)} → ${fmtPrice(effStop)}${clampNote} — ${reason}`, payload: { from: oldSl, to: effStop, confidence: conf, orderId: ex.sl.orderId } })
+                  st0.addLog('success', `${row.tradeSymbol} SL ${fmtPrice(oldSl)} → ${fmtPrice(effStop)}${clampNote} — ${reason}`)
                 } else {
                   failed++
                   const err = String((r.j as { error?: string } | null)?.error || `HTTP ${r.status}`)
@@ -842,6 +856,13 @@ export async function runStewardOnce(): Promise<void> {
         const sym = row.tradeSymbol || row.symbol
         const tpAlsoMissing = newTarget > 0 && !ex.tp && (long ? newTarget > cur : newTarget < cur)
         const kindAttach = { kind: 'position' as const, symbol: sym, detail: reason, payload: { from: 'model', confidence: conf, action: 'reattach_sl' } }
+        // v2.12.43 — reattach 同樣保本夾緊：SL 缺失是最高優先修復，但把越過
+        // 保本線的停損重新掛上＝重演 TWST 事故。夾緊後會立即觸發（浮盈
+        // <0.15%）時改掛現價±0.15% 的緊貼保護 — 保護即時恢復，命中約在
+        // 保本線出場，既不全裸也不會掛出會被拒的立即觸發單。
+        const beAt = clampStopToBreakeven(long ? 'long' : 'short', row.avgEntry, cur, row.uplPct, newStop, row.assetClass === 'crypto')
+        const effSl = beAt ? (beAt.skip ? tightProtectiveStop(long ? 'long' : 'short', cur, row.assetClass === 'crypto') : beAt.price) : newStop
+        const slClampNote = beAt?.skip ? `（現價緊貼保護 — 模型 ${fmtPrice(newStop)} 越過保本線）` : beAt?.clamped ? `（保本夾緊 — 模型 ${fmtPrice(newStop)} 越過保本線）` : ''
         if (!cfg.amendPositions) {
           skipped++
           drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 ${fmtPrice(newStop)} — 已停用「調整持倉 TP/SL」開關` })
@@ -852,18 +873,18 @@ export async function runStewardOnce(): Promise<void> {
           skipped++
           drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 — 本輪動作數已達上限` })
         } else if (cfg.dryRun) {
-          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'dry_run', detail: `試運行：重新掛上缺失的 SL ${fmtPrice(newStop)}${tpAlsoMissing ? ` + TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'dry_run', detail: `試運行：重新掛上缺失的 SL ${fmtPrice(effSl)}${slClampNote}${tpAlsoMissing ? ` + TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
         } else {
           try {
-            const attachBody: Record<string, unknown> = { mode: cfg.mode, sl: newStop }
+            const attachBody: Record<string, unknown> = { mode: cfg.mode, sl: effSl }
             if (tpAlsoMissing) attachBody.tp = newTarget
             const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(sym)}/exits`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(attachBody), signal: sig })
             if (r.status === 200) {
               executed++
               if (tpAlsoMissing) tpAttached = true
               slFixed.add(sym.toUpperCase())
-              drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'executed', detail: `已重新掛上缺失的 SL ${fmtPrice(newStop)}${tpAlsoMissing ? ` 與 TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
-              st0.addLog('success', `${sym} SL 重新掛上 ${fmtPrice(newStop)}${tpAlsoMissing ? ` · TP ${fmtPrice(newTarget)}` : ''} — ${reason}`)
+              drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'executed', detail: `已重新掛上缺失的 SL ${fmtPrice(effSl)}${slClampNote}${tpAlsoMissing ? ` 與 TP ${fmtPrice(newTarget)}` : ''} — ${reason}` })
+              st0.addLog('success', `${sym} SL 重新掛上 ${fmtPrice(effSl)}${slClampNote}${tpAlsoMissing ? ` · TP ${fmtPrice(newTarget)}` : ''} — ${reason}`)
             } else {
               failed++
               const err = String((r.j as { error?: string } | null)?.error || `HTTP ${r.status}`)
