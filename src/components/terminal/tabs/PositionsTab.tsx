@@ -15,7 +15,7 @@
 // columns sort asc/desc by clicking the header (click again cycles desc →
 // back to the default order). Task 70: positions gained OPENED (oldest
 // still-open FIFO entry lot) + SOURCE badges; pending orders gained PLACED.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { visibleAwareInterval } from '@/lib/visible-poll'
 import { ArrowDown, ArrowUp, ArrowUpDown, Ban, History, KeyRound, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -32,6 +32,7 @@ import { fmtPrice, fmtHeldDuration, ClosedTrade, CanceledOrderRow, TradeReason }
 import { ExitInfo, ExitOrderInfo, PendingOrderInfo, PositionRow, normSym } from '@/components/chart/trading-types'
 import { useTerminal } from '@/store/terminal'
 import AccountOverview from './AccountOverview'
+import PositionLadder from './PositionLadder'
 import { cn } from '@/lib/utils'
 
 type Mode = 'paper' | 'live'
@@ -889,7 +890,12 @@ export default function PositionsTab() {
               const up = r.pos.upl >= 0
               const trailing = r.sl?.type === 'trailing_stop' ? `${r.sl.trailPercent ?? '—'}%` : null
               return (
-                <tr key={key} className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
+            // v2.12.44 — each position renders as a PAIR of rows: the classic
+            // table row + a full-width sub-row carrying the price-ladder
+            // progress bar (SL/Entry/Current/TP placed at their true price
+            // positions — label order tells the story at a glance).
+            <Fragment key={key}>
+              <tr className="border-b border-zinc-800/60 transition-colors hover:bg-zinc-800/40">
                   <td className="px-3 py-2 font-semibold text-zinc-100">{r.pos.symbol}</td>
                   <td className="px-3 py-2">
                     <Badge
@@ -985,7 +991,24 @@ export default function PositionsTab() {
                       {closing === key ? <TaijiSpinner className="h-3 w-3" /> : 'Close position'}
                     </Button>
                   </td>
-                </tr>
+              </tr>
+              {/* v2.12.44 — price-ladder sub-row (full width, subtle darker bg
+                  so the pair reads as one card; hidden entirely when the
+                  position lacks usable prices — the ladder renders null) */}
+              <tr className="border-b border-zinc-800/60 bg-zinc-950/40">
+                <td colSpan={13} className="px-3 pb-2.5 pt-1">
+                  <PositionLadder
+                    side={long ? 'long' : 'short'}
+                    entry={r.pos.avgEntry}
+                    current={r.pos.current}
+                    sl={r.sl ?? null}
+                    tp={r.tp ?? null}
+                    symbol={r.pos.symbol}
+                    uplPct={r.pos.uplPct}
+                  />
+                </td>
+              </tr>
+            </Fragment>
               )
             })}
           </tbody>
