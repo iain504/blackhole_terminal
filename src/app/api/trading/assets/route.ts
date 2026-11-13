@@ -39,7 +39,9 @@ export async function GET(req: Request) {
       .split(',')
       .map((s) => s.trim().toUpperCase())
       .filter((s) => /^[A-Z0-9./:-]{1,15}$/.test(s))
-      .slice(0, 30) // the scanner's maxSymbols cap is 50 but the URL stays light
+      .slice(0, 50) // v2.12.40 — matches the scanner pool cap (maxSymbols 50);
+                    // the old 30 left tail symbols unprobed (crypto sells
+                    // slipped past the noShort set)
     if (symbols.length === 0) {
       return NextResponse.json({ error: 'symbols query param required (comma-separated)' }, { status: 400 })
     }

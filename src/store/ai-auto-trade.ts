@@ -76,6 +76,7 @@ import {
 import {
   dynamicThresholds as regimeDynamicThresholds, concentrationCheck,
   validatePlanSide, repairPlanTp, type GateRegime,
+  isSpotCryptoSymbol, CRYPTO_NO_SHORT_NOTE,
 } from '@/lib/ai-trade-gates'
 
 // ---- config ----------------------------------------------------------------
@@ -557,6 +558,7 @@ function scanInstruction(n: number, minConf: number, minRR: number): string {
     `- 市場環境：RISK_OFF 時做多需更高證據門檻（逆風交易勝率低）；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）時假突破多 — flat 傾向提高。`,
     `- 近期表現：這是本引擎最近已平倉交易的真實成績。用它校準 confidence — 某方向勝率明顯差時，對該方向新訊號信心降 10–15 而非一律歸零（完全停止出手會讓引擎失去校準資料）。`,
     `- entry 取現價附近；stop 掛在最近支撐之下 / 最近阻力之上（結構外），距離參考 ATR — 不可緊貼現價；target 放在到達下一個 S/R 之前。long 必須 stop < entry < target；short 必須 target < entry < stop。`,
+    `- 現貨加密（標的含「/」如 BTC/USD、ETH/USD）在 Alpaca 只能做多、不可做空：加密標的不可判 short — 看空時誠實 flat，reason 註明「加密不可做空」。`,
     `- 財報/事件：快照標明「財報臨近（block）」的標的必然被終端硬閘拒絕 — 直接給 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55（跳空風險）；共用區列出的 48 小時內高影響事件同樣壓低所有相關方向信心。`,
     `- 目前持倉：已持有標的不會再下單，但請避免建議與現有持倉高度相關的新方向（同板塊同向 = 集中風險）；[集中風險] 標明 ⚠ 的持倉對彼此高度相關，不要再建議與其同向的新標的。`,
     `- 覆盤統計：這是本引擎過往判斷 24 小時後的真實對帳結果（依 regime×方向分組）。用它選擇證據組合 — 某組合勝率明顯差時，同組合的新訊號給 flat 或低 confidence。`,
@@ -597,6 +599,7 @@ function scanInstructionPlans(
     `- R:R 幾何技巧：TP 由結構（下一個 S/R）決定後，把觸發價「貼近現價」（+0.3% ~ +1%）可同時縮小風險距離並拉高 R:R — SL 距離遠時尤其有效；若貼近後仍達不到門檻，代表 TP 空間不足，該側不給計劃。`,
     `- buy 計劃 = 突破/動能確認：buyTrigger 必須高於現價（+0.3% ~ +4%），市場「上攻」觸及才成立；buySl 掛在最近支撐之下（結構外，距離參考 ATR — 不可緊貼現價），buyTp 放在到達下一個阻力之前。`,
     `- sell 計劃 = 跌破確認：sellTrigger 必須低於現價（−0.3% ~ −4%），市場「跌破」觸及才成立；sellSl 掛在最近阻力之上，sellTp 放在到達下一個支撐之前。`,
+    `- 現貨加密（標的含「/」如 BTC/USD、ETH/USD）在 Alpaca 只能做多、不可做空：不為加密標的給 sell 計劃 — 看空時 sell 側各數字填 0，reason 註明「加密不可做空，僅觀察」。`,
     `- 只給證據支持的側：偏多證據給 buy 計劃、偏空證據給 sell 計劃；區間且雙向證據都成立時可同時給兩側（市場自己選方向，we follow the plan）。無計劃的一側該組數字填 0。`,
     `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準。`,
     `- 信心校準表：0–20 = 無優勢（flat）；25–40 = 單一證據類、投機性；45–60 = 兩類獨立證據同向且結構清楚；65–80 = 三類以上＋量能或高週期確認；85+ = 罕見（全部對齊）。誠實校準 — 證據足夠就給出對應數字，禁止把信心一律壓在 0 或 30。`,
@@ -765,7 +768,7 @@ export async function runScan(): Promise<void> {
     const assetMap = new Map<string, AssetProbe>()
     const noShort = new Set<string>()
     {
-      const probe = await fetchJson(`/api/trading/assets?mode=${cfg.mode}&symbols=${encodeURIComponent(scanSyms.slice(0, 30).join(','))}`, { signal: sig })
+      const probe = await fetchJson(`/api/trading/assets?mode=${cfg.mode}&symbols=${encodeURIComponent(scanSyms.slice(0, 50).join(','))}`, { signal: sig })
         .catch(() => ({ status: 0, j: null as Record<string, unknown> | null }))
       const assets = (probe.j as { assets?: Record<string, AssetProbe> } | null)?.assets
       if (assets && typeof assets === 'object') {
@@ -1176,6 +1179,13 @@ export async function runScan(): Promise<void> {
           const geo = validatePlanSide(side, snap.lastClose, raw.trigger, raw.tp, raw.sl)
           const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note })
           if (!geo.ok || geo.rr == null) { reject(geo.reason ?? '計劃未通過驗證'); continue }
+          // v2.12.40 — Alpaca spot crypto cannot be shorted: a sell plan the
+          // broker can NEVER take dies here with the honest reason, before any
+          // numeric gate dresses it up. The asset probe that feeds noShort is
+          // transient (auth breaker) and windowed (first N symbols), so the
+          // static slash test backs it up — Plan your trade, but never plan a
+          // trade the broker physically cannot fill.
+          if (side === 'sell' && isSpotCryptoSymbol(snap.symbol)) { reject(CRYPTO_NO_SHORT_NOTE); continue }
           // v2.12.38 — mode-aware base gates (react: 45/1.5, instant: 60/7),
           // then the regime-dynamic surcharge applies on top as before.
           const dyn = cfg.dynamicThresholds
@@ -1227,8 +1237,12 @@ export async function runScan(): Promise<void> {
       if (!geoOk) { v.rejectReason = '停損/目標方位不合理'; return v }
       // v2.12.23 — non-shortable assets (Alpaca spot crypto): reject the
       // SHORT verdict here instead of sending a SELL the broker refuses.
-      if (direction === 'short' && noShort.has(snap.symbol)) {
-        v.rejectReason = `該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''} — 偏空訊號跳過`
+      // v2.12.40 — the probe is transient + windowed, so the static slash
+      // test (crypto display spelling carries '/') backs it up.
+      if (direction === 'short' && (noShort.has(snap.symbol) || isSpotCryptoSymbol(snap.symbol))) {
+        v.rejectReason = isSpotCryptoSymbol(snap.symbol)
+          ? `${CRYPTO_NO_SHORT_NOTE} — 偏空訊號跳過`
+          : `該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''} — 偏空訊號跳過`
         return v
       }
       if (Math.abs(entry - snap.lastClose) / snap.lastClose > 0.05) { v.rejectReason = '進場價偏離現價 >5%'; return v }
@@ -1637,8 +1651,17 @@ async function reactTick(): Promise<void> {
   reactBusy = true
   try {
     const now = Date.now()
-    // REVIEW housekeeping — TTL expiry needs no quote
+    // REVIEW housekeeping — TTL expiry + broker-impossible cleanup need no quote
     for (const p of waiting) {
+      // v2.12.40 — a sell plan on Alpaca spot crypto can never be followed
+      // (the broker refuses every crypto SELL): close it GATED with the
+      // honest remark — the ledger records WHY the plan was ignored, and the
+      // 24h review pass skips broker-impossible closures (crypto physics is
+      // not a discipline lesson). Sweeps legacy plans created before the gate.
+      if (p.side === 'sell' && isSpotCryptoSymbol(p.symbol)) {
+        closePlan(p, 'GATED', `${CRYPTO_NO_SHORT_NOTE} — 此計劃無法被跟進，作廢`)
+        continue
+      }
       if (now - p.createdAt > PLAN_TTL_MS) closePlan(p, 'EXPIRED', '48 小時未觸發 — 計劃作廢（24h 後覆盤等待是否正確）')
     }
     waiting = useAiAutoStore.getState().plans.filter((p) => p.status === 'WAITING')
@@ -1686,6 +1709,10 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
   const st = useAiAutoStore.getState()
   const cfg = st.config
   const normSym = (s: string) => s.replace('/', '').toUpperCase()
+  // v2.12.40 — broker-impossible, checked FIRST (even dry-run never notes it):
+  // Alpaca spot crypto cannot be shorted, so a sell plan on a slash symbol
+  // must never reach the order lane, no matter how it got here.
+  if (p.side === 'sell' && isSpotCryptoSymbol(p.symbol)) { closePlan(p, 'GATED', CRYPTO_NO_SHORT_NOTE); return }
   if (cfg.dryRun) {
     if (!p.dryRunNoted) {
       useAiAutoStore.setState((s) => ({ plans: s.plans.map((x) => (x.id === p.id ? { ...x, dryRunNoted: true } : x)) }))

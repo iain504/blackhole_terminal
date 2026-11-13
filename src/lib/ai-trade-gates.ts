@@ -118,6 +118,23 @@ export const PLAN_BAND = { up: 0.05, down: 0.05 } as const
  *  wide for the band — the plan is refused instead of given a fantasy TP. */
 export const PLAN_TP_CAP_PCT = 8
 
+// v2.12.40 — ALPACA SPOT CRYPTO CANNOT BE SHORTED. The broker refuses every
+// SELL-on-crypto order ("insufficient balance … available: 0"), so a sell
+// plan on a crypto symbol is not a trade — it is a plan the market can
+// never let the terminal follow. The scanner's broker asset probe (which
+// feeds the noShort set) is transient (auth breaker / network) and only
+// covers a window of symbols, so the terminal also needs a static test:
+// the display spelling of crypto carries the slash (BTC/USD — v2.12.27 put
+// crypto rows in the Chart watchlist with the slash) and NO US equity ever
+// contains '/', which makes the slash a zero-false-positive crypto test.
+export const CRYPTO_NO_SHORT_NOTE = 'Alpaca 現貨加密不可做空 — sell 計劃不成立（crypto 僅能做多）'
+
+/** Static crypto test for the no-short rule: slash-carrying symbols
+ *  (BTC/USD, ETH/USD …) are Alpaca spot crypto — shorts are impossible. */
+export function isSpotCryptoSymbol(symbol: string): boolean {
+  return typeof symbol === 'string' && symbol.includes('/')
+}
+
 export interface PlanGeometry {
   ok: boolean
   rr: number | null

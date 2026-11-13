@@ -73,6 +73,14 @@ function sanitizePlan(p: PlanIn) {
   const regime = ['RISK_ON', 'NEUTRAL', 'RISK_OFF', 'UNKNOWN'].includes(regimeRaw) ? regimeRaw : null
   const earningsRaw = typeof p.earnings === 'string' ? p.earnings : ''
   const earnings = earningsRaw === 'block' || earningsRaw === 'unknown' || /^\d{1,3}$/.test(earningsRaw) ? earningsRaw : null
+  // v2.12.40 — SERVER-SIDE birth gate: a sell plan on Alpaca spot crypto is
+  // broker-impossible (the broker refuses every crypto SELL — "insufficient
+  // balance … available: 0"). Rather than storing it WAITING (where a reactor
+  // could chase it), it is born GATED with the honest remark: the ledger
+  // acknowledges WHY the plan is ignored no matter which client created it.
+  // The slash test is exact — crypto display spelling carries '/' (BTC/USD),
+  // no US equity ever does.
+  const cryptoNoShort = side === 'sell' && symbol.includes('/')
   return {
     symbol,
     side,
@@ -87,7 +95,9 @@ function sanitizePlan(p: PlanIn) {
     regime,
     earnings,
     mode: p.mode === 'live' ? 'live' : 'paper',
-    status: 'WAITING' as const,
+    status: cryptoNoShort ? ('GATED' as const) : ('WAITING' as const),
+    statusNote: cryptoNoShort ? 'Alpaca 現貨加密不可做空 — 計劃出生即作廢（crypto 僅能做多）' : null,
+    ...(cryptoNoShort ? { closedAt: new Date() } : {}),
   }
 }
 
@@ -191,12 +201,18 @@ export async function GET(req: Request) {
     let lessonsWritten = 0
     if (wantResolve) {
       try {
+        // v2.12.40 — grade ONLY the market-discipline closures (INVALIDATED =
+        // market went against the plan, EXPIRED = never confirmed). Gate
+        // closures (GATED — broker-impossible crypto shorts, trigger-time
+        // holdings/earnings refusals) are administrative: their "wait" was
+        // not a decision, and grading them 'missed-run' would distill the
+        // misleading lesson 「門檻可考慮放寬」 into the permanent memory.
         const due = await db.aiTradePlan.findMany({
           where: {
             userId: user.id,
             resolvedAt: null,
             closedAt: { not: null, lte: new Date(Date.now() - RESOLVE_AFTER_MS) },
-            status: { not: 'WAITING' },
+            status: { in: ['INVALIDATED', 'EXPIRED'] },
           },
           orderBy: { closedAt: 'asc' },
           take: RESOLVE_BATCH,
@@ -246,7 +262,7 @@ export async function GET(req: Request) {
     }
 
     interface HistRow {
-      symbol: string; side: string; status: string; trigger: number
+      id: string; symbol: string; side: string; status: string; trigger: number
       outcome: string | null; pnlPct: number | null; closedAt: string | null; statusNote: string | null
     }
     let stats = { waiting: 0, executed: 0, invalidated: 0, expired: 0, gated: 0, superseded: 0, goodWait: 0, missedRun: 0, neutral: 0 }
@@ -257,7 +273,7 @@ export async function GET(req: Request) {
           where: { userId: user.id },
           orderBy: { createdAt: 'desc' },
           take: 300,
-          select: { symbol: true, side: true, status: true, trigger: true, outcome: true, pnlPct: true, closedAt: true, statusNote: true },
+          select: { id: true, symbol: true, side: true, status: true, trigger: true, outcome: true, pnlPct: true, closedAt: true, statusNote: true },
         })
         stats = {
           waiting: rows.filter((r) => r.status === 'WAITING').length,
@@ -274,6 +290,7 @@ export async function GET(req: Request) {
           .filter((r) => r.status !== 'WAITING')
           .slice(0, 12)
           .map((r) => ({
+            id: r.id,
             symbol: r.symbol, side: r.side, status: r.status, trigger: r.trigger,
             outcome: r.outcome, pnlPct: r.pnlPct,
             closedAt: r.closedAt ? r.closedAt.toISOString() : null,

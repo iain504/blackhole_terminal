@@ -50,6 +50,20 @@ interface PlanStats {
   neutral: number
 }
 
+// v2.12.40 — recent closed rows from the ledger: the lifecycle view reflects
+// LEDGER truth, not just this session's transitions — server-side closures
+// (e.g. a crypto sell plan born GATED by the no-short birth gate) and rows
+// closed on another device/reload still show their status + remark.
+interface PlanRecentRow {
+  id: string
+  symbol: string
+  status: string
+  statusNote: string | null
+}
+
+/** minimal shape the lifecycle renderer needs (session rows carry more) */
+type LifecycleRow = { id: string; symbol: string; status: string; statusNote: string | null }
+
 function fmtCountdown(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
@@ -110,13 +124,18 @@ export default function AiAutoTradePanel() {
   // v2.12.37 — plan review stats (60s poll; resolve=1 also drives the 24h
   // review pass server-side, same pattern as the verdict reconciliation)
   const [planStats, setPlanStats] = useState<PlanStats | null>(null)
+  // v2.12.40 — recent ledger-closed rows (lifecycle view shows ledger truth)
+  const [planRecent, setPlanRecent] = useState<PlanRecentRow[]>([])
   useEffect(() => {
-    if (cfg.entryMode !== 'react') { setPlanStats(null); return }
+    if (cfg.entryMode !== 'react') { setPlanStats(null); setPlanRecent([]); return }
     let alive = true
     const pull = () =>
       fetch('/api/ai-trade/plans?resolve=1&history=1')
         .then((r) => r.json())
-        .then((j: { stats?: PlanStats }) => { if (alive && j?.stats) setPlanStats(j.stats) })
+        .then((j: { stats?: PlanStats; recent?: PlanRecentRow[] }) => {
+          if (alive && j?.stats) setPlanStats(j.stats)
+          if (alive && Array.isArray(j?.recent)) setPlanRecent(j.recent)
+        })
         .catch(() => {})
     pull()
     const t = setInterval(pull, 60_000)
@@ -755,7 +774,16 @@ export default function AiAutoTradePanel() {
       {/* v2.12.37 — REACT: the plan waiting room + lifecycle + review stats */}
       {cfg.entryMode === 'react' && (() => {
         const waitingPlans = plans.filter((p) => p.status === 'WAITING')
-        const closedPlans = plans.filter((p) => p.status !== 'WAITING').slice(0, 10)
+        // v2.12.40 — session-closed rows first, then ledger rows this session
+        // doesn't know (server-gated / other-device closures), deduped by id
+        const knownIds = new Set(plans.map((p) => p.id))
+        const ledgerClosed = (planRecent ?? [])
+          .filter((r) => !knownIds.has(r.id))
+          .slice(0, 10)
+        const closedPlans: LifecycleRow[] = [
+          ...plans.filter((p) => p.status !== 'WAITING').slice(0, 10),
+          ...ledgerClosed,
+        ].slice(0, 12)
         return (
         <div className="mt-2">
           <div className="mb-1 flex items-baseline justify-between gap-2">
