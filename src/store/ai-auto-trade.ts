@@ -752,11 +752,17 @@ export async function runScan(): Promise<void> {
     const bpRaw = accJ?.account?.buyingPower
     if (bpRaw != null) { const n = Number(bpRaw); if (Number.isFinite(n) && n > 0) bpLeft = n }
     if (bpLeft == null && equity != null) bpLeft = equity // no BP field — degrade to equity
-    const posJ = pos.j as { positions?: { symbol?: string; side?: string; qty?: number | string; uplPct?: number }[] } | null
+    const posJ = pos.j as { positions?: { symbol?: string; side?: string; qty?: number | string; uplPct?: number; source?: string; sources?: { source?: string }[] }[] } | null
     // POSITION symbols drop the crypto slash (BTCUSD) while ORDER/watchlist
     // symbols keep it (BTC/USD) — index BOTH spellings so a held BTC position
     // actually blocks a new BTC/USD entry (v2.12.23).
     for (const p of posJ?.positions ?? []) { const s = String(p.symbol ?? '').toUpperCase(); if (s) { openSyms.add(s); openSyms.add(s.replace('/', '')) } }
+    // v2.12.44 — LIVE AI-managed position count: the cap's semantic is "max
+    // concurrent positions opened by the auto trader", so it must count the
+    // broker's live positions tagged source=ai — NOT the session's fired
+    // bookkeeping, which never decrements when a position closes (TWST/ALAB
+    // closed at 14:46 yet still counted at 17:44 → META gated with empty seats).
+    const liveAiCount = posJ ? (posJ.positions ?? []).filter(isAiPosition).length : null
     if (equity == null) st0.addLog('warn', '取得帳戶權益失敗 — 候選即使達標也無法計算倉位')
 
     // 2.5) broker tradability probe — one batched call, server-cached 6h
@@ -1272,8 +1278,11 @@ export async function runScan(): Promise<void> {
 
       // passed the numeric gate — execution checks
       if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { v.rejectReason = '已有該標的持倉'; return v }
-      const openAuto = st0.fired.length + fireCount
-      if (openAuto >= cfg.maxOpenAuto) { v.rejectReason = `達自動倉上限（${cfg.maxOpenAuto}）`; return v }
+      // v2.12.44 — cap counts live AI positions (fetch failed → old fired
+      // bookkeeping as the conservative fallback); + fireCount for orders this
+      // round that just became live positions.
+      const openAuto = (liveAiCount ?? st0.fired.length) + fireCount
+      if (openAuto >= cfg.maxOpenAuto) { v.rejectReason = `達自動倉上限（${openAuto}/${cfg.maxOpenAuto} 個 AI 持倉）`; return v }
       // v2.12.23 — demo bars are evaluation-only: firing an order on
       // synthetic data (upstream rate-limited → generated fallback) would
       // trade a market that does not exist. The verdict still shows the
@@ -1556,6 +1565,13 @@ let plansHydrated = false
 
 const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
 
+/** v2.12.44 — does this broker position belong to the AI auto trader?
+ *  Multi-source inventory (an AI slice + an algo slice on one position) is
+ *  AI's too — check the winner badge AND every source slice. */
+function isAiPosition(p: { source?: string; sources?: { source?: string }[] }): boolean {
+  return p.source === 'ai' || (Array.isArray(p.sources) && p.sources.some((s) => s.source === 'ai'))
+}
+
 /** v2.12.37 — extract one side's plan numbers from a react-mode model item.
  *  Flat fields preferred (buyTrigger/buyTp/buySl); a nested {"buy":{...}}
  *  object is tolerated. Any number missing/≤0 → no plan for that side. */
@@ -1725,11 +1741,20 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     fetchJson('/api/trading/account').catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
     fetchJson(`/api/market/earnings?symbols=${encodeURIComponent(p.symbol)}`).catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
   ])
-  const posJ = pos.j as { positions?: { symbol?: string }[] } | null
-  const held = (posJ?.positions ?? []).some((x) => { const s = String(x?.symbol ?? '').toUpperCase(); return s === p.symbol || s === normSym(p.symbol) })
+  const posJ = pos.j as { positions?: { symbol?: string; source?: string; sources?: { source?: string }[] }[] } | null
+  const posArr = posJ?.positions ?? []
+  const held = posArr.some((x) => { const s = String(x?.symbol ?? '').toUpperCase(); return s === p.symbol || s === normSym(p.symbol) })
   if (held) { closePlan(p, 'GATED', '觸發時已有該標的持倉 — 跟進取消'); return }
-  const openCount = st.fired.length + useAiAutoStore.getState().plans.filter((x) => x.status === 'EXECUTED').length
-  if (openCount >= cfg.maxOpenAuto) { closePlan(p, 'GATED', `觸發時達自動倉上限（${cfg.maxOpenAuto}）— 跟進取消`); return }
+  // v2.12.44 — the cap counts LIVE AI-managed positions straight off the
+  // broker payload. The old heuristic (fired records + EXECUTED plans) was
+  // session bookkeeping: every successful follow was counted TWICE (once in
+  // each list) and closed positions kept occupying seats forever — five
+  // follows (even all closed) saturated a cap of 10 and META got 「跟進取消」
+  // with the desk effectively empty. Positions fetch failed → fall back to
+  // the larger of the two bookkeeping lists (no double-count, still ≥ live).
+  const liveAi = posJ ? posArr.filter(isAiPosition).length : null
+  const openCount = liveAi ?? Math.max(st.fired.length, useAiAutoStore.getState().plans.filter((x) => x.status === 'EXECUTED').length)
+  if (openCount >= cfg.maxOpenAuto) { closePlan(p, 'GATED', `觸發時達自動倉上限（${openCount}/${cfg.maxOpenAuto} 個 AI 持倉）— 跟進取消`); return }
   const ea = eaRes.j as { events?: Record<string, { inBlock?: boolean; daysAway?: number | null }> } | null
   const ev = ea?.events?.[normSym(p.symbol)]
   if (cfg.blockEarnings && ev?.inBlock) { closePlan(p, 'GATED', `觸發時落入財報窗口（${ev?.daysAway ?? '?'} 天後發布）— 跳空風險取消`); return }
