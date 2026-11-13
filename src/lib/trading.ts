@@ -632,7 +632,15 @@ export async function placeOrderWithExits(
   }
   if (type === 'limit') {
     if (!body.limit_price) return { results: [], errors: ['Limit price required for limit orders'] }
-    entry.limit_price = String(body.limit_price)
+    // v2.12.41 — the extended-hours conversion computes the marketable limit
+    // off a LIVE quote (401.95 × 1.01 band = 405.9695 float), and every other
+    // pipeline (manual ticket, AI plan follow, algo, grid) can hand over raw
+    // floats too. String() forwarded them verbatim → Alpaca 422 "invalid
+    // limit_price 405.9695. sub-penny increment does not fulfill minimum
+    // pricing criteria" and the whole AI follow died as 跟進失敗（閘門擋下）.
+    // fmtPx quantizes exactly like every exit leg already does: stocks penny
+    // 2dp (>=1) / 4dp (<1), crypto 6dp (>=1) / 8dp (<1).
+    entry.limit_price = fmtPx(body.limit_price, isCrypto)
   }
   // v2.12.29 — extended-hours execution flag (stocks only, see PlaceOrderBody)
   if (!isCrypto && body.extended_hours) entry.extended_hours = true
@@ -652,8 +660,11 @@ export async function placeOrderWithExits(
     const hasSl = typeof body.stop_loss === 'number' && body.stop_loss > 0
     if (hasTp || hasSl) {
       entry.order_class = hasTp && hasSl ? 'bracket' : 'oto'
-      if (hasTp) entry.take_profit = { limit_price: body.take_profit!.toFixed(2) }
-      if (hasSl) entry.stop_loss = { stop_price: body.stop_loss!.toFixed(2) }
+      // v2.12.41 — legs ride the same fmtPx quantizer as the entry (2dp for
+      // >= $1 — unchanged for normal names; sub-dollar plans keep 4dp
+      // precision instead of being snapped to a whole penny).
+      if (hasTp) entry.take_profit = { limit_price: fmtPx(body.take_profit!, false) }
+      if (hasSl) entry.stop_loss = { stop_price: fmtPx(body.stop_loss!, false) }
       // encode the plan for the chart's pending display: Alpaca materializes
       // bracket LEGS only when the entry activates, so a queued (weekend /
       // pre-market) bracket would otherwise render without its TP/SL lines
@@ -823,7 +834,7 @@ async function placeCryptoExitLegs(
         side: exitSide,
         type: 'limit',
         time_in_force: 'gtc',
-        limit_price: tp.toFixed(tp < 1 ? 6 : 2),
+        limit_price: fmtPx(tp, true),
         client_order_id: exitLegClientId(entry.id, 'tp'),
       }),
     })
@@ -840,8 +851,8 @@ async function placeCryptoExitLegs(
         side: exitSide,
         type: 'stop_limit',
         time_in_force: 'gtc',
-        stop_price: sl.toFixed(sl < 1 ? 6 : 2),
-        limit_price: limP.toFixed(limP < 1 ? 6 : 2),
+        stop_price: fmtPx(sl, true),
+        limit_price: fmtPx(limP, true),
         client_order_id: exitLegClientId(entry.id, 'sl'),
       }),
     })
