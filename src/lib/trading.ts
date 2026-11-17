@@ -2068,6 +2068,14 @@ export async function attachExitsToPosition(
   mode: TradeMode,
   symbol: string,
   exits: { tp?: number; sl?: number },
+  // v2.12.47 — extended-hours doctrine (set by the exits route when the US
+  // session is pre/post): the TP leg becomes a resting EXTENDED-HOURS limit
+  // (tif=day + extended_hours=true) so it can actually fill in the thin
+  // extended book. Deliberately NOT applied to the OCO pair: day+extended
+  // would kill BOTH legs at 20:00 ET — the SL leg must survive overnight and
+  // re-arm at the next regular open (a naked overnight gap beats an extended
+  // TP fill; the doctrine's resting-TP applies to the TP-only attach).
+  opts?: { extendedTp?: boolean },
 ): Promise<AttachExitsResult> {
   const tSym = tradeSymbol(symbol)
   const hasTp = typeof exits.tp === 'number' && exits.tp > 0
@@ -2176,6 +2184,7 @@ export async function attachExitsToPosition(
     const slPx = hasSl ? exits.sl! : Number.isFinite(sibSl) ? sibSl : undefined
 
     if (tpPx != null && slPx != null) {
+      // OCO parent stays GTC on purpose (see the opts doc above)
       const r = await post({
         symbol: orderSymbol,
         qty: String(qtyAvail),
@@ -2195,9 +2204,15 @@ export async function attachExitsToPosition(
       return { results, errors }
     }
     if (tpPx != null) {
+      // v2.12.47 — extended-hours doctrine: the resting TP rides a DAY limit
+      // flagged extended_hours so it can fill in the extended session (a gtc
+      // limit sits the extended book out entirely). GTC remains the default
+      // during regular hours — it survives overnight and every session after.
+      const ext = Boolean(opts?.extendedTp)
       const r = await post({
         symbol: orderSymbol, qty: String(qtyAvail), side: exitSide, type: 'limit',
-        time_in_force: 'gtc', limit_price: fmtPx(tpPx),
+        time_in_force: ext ? 'day' : 'gtc', limit_price: fmtPx(tpPx),
+        ...(ext ? { extended_hours: true } : {}),
       })
       if (r.data && (r.data as TradingOrder).id) results.push(r.data)
       else {

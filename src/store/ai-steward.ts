@@ -36,7 +36,9 @@
 // show 「其他裝置運行中」 and never double-run the steward.
 import { create } from 'zustand'
 import type { AiChatMsg } from '@/lib/ai-trade'
-import { CORE_DISCIPLINES } from '@/lib/ai-steward-disciplines'
+// v2.12.47 — isSlCrossed/estimateTrailStop power the DETERMINISTIC synthetic
+// SL (extended-hours doctrine: the engine, never the model, is the trigger)
+import { CORE_DISCIPLINES, estimateTrailStop, isSlCrossed } from '@/lib/ai-steward-disciplines'
 // v2.12.43 — 保本夾緊：浮盈持倉的 SL 永不越過保本線（TWST 事故修復）
 import { clampStopToBreakeven, tightProtectiveStop } from '@/lib/steward-breakeven'
 import {
@@ -450,6 +452,7 @@ function stewardInstruction(): string {
     `- long 倉：new_stop 必須 < 現價 且 new_target 必須 > 現價；short 倉相反。禁止把 stop 移過現價。`,
     `- 保本紀律：持倉浮盈時 new_stop 不得越過保本線 — short 須 ≤ 進場價×0.9985、long 須 ≥ 進場價×1.0015（把 SL 放到會鎖定虧損的位置＝把浮盈變虧損；終端會自動夾緊違規價）。`,
     `- 修改幅度 <0.5% 沒有意義，請勿提出。exit（市價平倉）只在風險明確時提出且 confidence ≥ 70。`,
+    `- 延長時段（Pre/Post）規則：原生 SL/TP 盤外不觸發 — 本地合成 SL 正在監控（DATA 標 ⚠ 合成停損者由機制處理：勿重複提出 exit，僅評估是否該 widen 放寬緩衝 1%→2.5% 防假穿針）；收盤前（⏱）對將有盤後財報/重大事件的持倉判斷 Hold vs Flatten；盤前（⏱）清理殘存延時限價；合成平倉進行中的持倉勿提出 reattach/amend。exit 會自動轉為帶上限限價（賣出 ≤ 現價×0.985）。`,
     `- VIX 偏高或大盤急跌時傾向 tighten/exit 高風險持倉；數據不足時誠實 hold。`,
     `- 主動檢查：持倉有明顯浮盈而 SL 仍在進場價下方、或 SL 距現價 >3% → 應考慮 tighten 鎖定保護；掛單偏離現價 >3% 或形勢已變 → 除非有明確理由保留，否則提出 amend 新價或 cancel。`,
     `- orders：現價已遠離掛單價（>3%）或形勢改變 → amend 新價或 cancel；reason 必須引用 DATA 區數字。`,
@@ -558,7 +561,7 @@ export async function runStewardOnce(): Promise<void> {
     // killer (DAY-tif legs die at the session close) and a steward cancel-
     // replace failure can leave a position naked too — a missing SL carries
     // full-liquidation risk (全倉清盤), so it is audited EVERY cycle.
-    const hoursJ = hoursRes.j as { hours?: Record<string, { state?: string }> } | null
+    const hoursJ = hoursRes.j as { hours?: Record<string, { state?: string }>; us?: { nextOpen?: string; nextClose?: string } } | null
     const session = hoursJ?.hours?.SPY?.state ?? 'unknown'
     const prevPhase = lastSessionPhase
     const sessionChanged = prevPhase !== null && session !== 'unknown' && session !== prevPhase
@@ -609,12 +612,59 @@ export async function runStewardOnce(): Promise<void> {
     if (posJ?.keysMissing) st0.addLog('warn', `${cfg.mode} 模式未設定 Alpaca keys — 持倉/訂單資料為空，僅能回顧歷史。`)
     if (posJ?.authError) st0.addLog('warn', 'Alpaca 認證問題 — 持倉/訂單可能不完整（見持倉頁橫幅）。')
 
+    // action budget shared by the DETERMINISTIC guard (below) and the model
+    // actions — mechanical risk management goes first, the model gets what
+    // is left
+    const actionsLeft = () => cfg.maxActionsPerCycle - executed - failed
+
+    // v2.12.47 — checkpoint clock (extended-hours doctrine §5): the AI's
+    // contextual checkpoints ride the same session state — pre-close
+    // (regular session, ≤45 min to the close → hold-vs-flatten) and
+    // extended-session re-arm awareness (time to the next regular open).
+    const usClock = hoursJ?.us
+    const minsToClose = usClock?.nextClose && session === 'regular'
+      ? Math.round((Date.parse(usClock.nextClose) - Date.now()) / 60000)
+      : null
+    const minsToOpen = usClock?.nextOpen && (session === 'pre' || session === 'post')
+      ? Math.round((Date.parse(usClock.nextOpen) - Date.now()) / 60000)
+      : null
+
+    // v2.12.47 — SYNTHETIC CLOSE-IN-FLIGHT detection (extended hours): a
+    // working ADVERSE-side limit on a position's exit side can only be a
+    // synthetic close fired by an earlier cycle (a resting TP sits on the
+    // FAVORABLE side; a marketable adverse limit would have filled). Used to
+    // (a) never double-fire the synthetic SL and (b) suppress the naked-SL
+    // complaint while that close order is honestly working toward the fill.
+    const closeInFlight = new Set<string>()
+    if (session === 'pre' || session === 'post') {
+      for (const p of positions) {
+        if (p.assetClass === 'crypto' || isCryptoSym(p.tradeSymbol || p.symbol)) continue
+        const sym = (p.tradeSymbol || p.symbol).toUpperCase()
+        const q = qOf(p.tradeSymbol || p.symbol)
+        if (!q || !(q.price > 0)) continue
+        const long = p.side !== 'short'
+        const exitSide = long ? 'sell' : 'buy'
+        const working = pending.some((o) =>
+          o.symbol.toUpperCase() === sym &&
+          o.side === exitSide &&
+          o.type === 'limit' &&
+          o.limitPrice != null &&
+          (long ? o.limitPrice <= q.price : o.limitPrice >= q.price),
+        )
+        if (working) closeInFlight.add(sym)
+      }
+    }
+
     // v2.12.29 — persistent guard events + warn logs for every NAKED
     // position (no SL). Recorded even if the model call fails below — the
     // detection is deterministic and must not depend on the model. Dropped
     // later only if this same cycle re-attaches the missing leg.
     if (sessionChanged) st0.addLog('warn', `市場時段轉換：${prevPhase} → ${session} — 本輪強制複查所有持倉的 TP/SL 保護單`)
     for (const p of slMissingRows) {
+      // v2.12.47 — a synthetic close is in flight for this symbol: the naked
+      // complaint would be a false alarm while the extended-hours close order
+      // works toward the fill
+      if (closeInFlight.has((p.tradeSymbol || p.symbol).toUpperCase())) continue
       drafts.push({
         kind: 'position',
         action: 'sl_missing',
@@ -624,6 +674,84 @@ export async function runStewardOnce(): Promise<void> {
         payload: { from: 'guard', session },
       })
       st0.addLog('warn', `⚠ ${p.tradeSymbol || p.symbol} SL 缺失 — 無停損保護（每輪提醒直至修復）`)
+    }
+
+    // v2.12.47 — SYNTHETIC STOP-LOSS (the deterministic risk layer of the
+    // extended-hours doctrine): during pre/post market NO native stop leg can
+    // trigger — an SL on paper protects nothing at 18:00 ET. The ENGINE
+    // itself (never the model — API latency and token generation are too
+    // slow for thin extended-books) compares the live quote with the SL line
+    // every cycle; a cross fires the capped extended-hours limit close via
+    // the DELETE positions route (which converts to a marketable limit,
+    // band ±1.5% = sell ≤ bid×0.985 — the slippage cap). Respects the
+    // terminal's standing gates (dry-run / 允許平倉 / action cap / engine-
+    // managed inventory) and posts the same honest events as the model path.
+    interface SynthRow { p: PositionRow; sym: string; slPx: number; est: boolean; q: number; long: boolean; outcome: string | null }
+    const synthRows: SynthRow[] = []
+    if (session === 'pre' || session === 'post') {
+      for (const p of positions) {
+        if (p.assetClass === 'crypto' || isCryptoSym(p.tradeSymbol || p.symbol)) continue
+        const sym = (p.tradeSymbol || p.symbol).toUpperCase()
+        if (closeInFlight.has(sym)) continue // close already working — never double-fire
+        if (!fullyManageable(p)) continue // engine-managed inventory: never killed
+        const ex = exits[p.symbol] ?? exits[p.tradeSymbol] ?? {}
+        const slInfo = ex.sl
+        let slPx: number | null = slInfo ? (slInfo.stopPrice ?? slInfo.limitPrice) : null
+        let est = false
+        if (slPx == null && slInfo?.trailPercent) {
+          // trailing stop with no absolute price — estimate the live trigger
+          slPx = estimateTrailStop(p.side !== 'short' ? 'long' : 'short', p.current, slInfo.trailPercent)
+          est = true
+        }
+        if (slPx == null) continue
+        const q = qOf(p.tradeSymbol || p.symbol)
+        if (!q || !(q.price > 0)) continue
+        const long = p.side !== 'short'
+        if (isSlCrossed(long ? 'long' : 'short', slPx, q.price)) {
+          synthRows.push({ p, sym: p.tradeSymbol || p.symbol, slPx, est, q: q.price, long, outcome: null })
+        }
+      }
+    }
+    for (const s of synthRows) {
+      const crossed = `SL ${fmtPrice(s.slPx)}${s.est ? '（trail 推算）' : ''} 已被現價 ${fmtPrice(s.q)} 穿越`
+      const kindBase = { kind: 'position' as const, symbol: s.sym, detail: '', payload: { from: 'synthetic_sl', sl: s.slPx, price: s.q, side: s.long ? 'long' : 'short' } }
+      if (!cfg.closePositions) {
+        s.outcome = '已停用「允許平倉」開關 — 持倉仍暴露'
+        skipped++
+        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'skipped', detail: `合成停損觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理或開啟開關` })
+        st0.addLog('warn', `⚠ ${s.sym} 合成停損觸發（${crossed}）— 已停用平倉開關，持倉仍暴露`)
+        continue
+      }
+      if (actionsLeft() <= 0) {
+        s.outcome = '本輪動作數已達上限 — 下輪重試'
+        skipped++
+        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'skipped', detail: `合成停損觸發（延長時段 · ${crossed}）— ${s.outcome}` })
+        continue
+      }
+      if (cfg.dryRun) {
+        s.outcome = '試運行（不動單）'
+        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'dry_run', detail: `試運行：合成停損離場（延長時段 · ${crossed}）— 以帶上限限價平倉（賣出 ≤ 現價×0.985）` })
+        continue
+      }
+      try {
+        const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(s.sym)}?mode=${cfg.mode}`, { method: 'DELETE', signal: sig })
+        if (r.status === 200) {
+          executed++
+          s.outcome = '已觸發離場（帶上限延時限價平倉掛出）'
+          const extNote = String((r.j as { extendedNote?: string } | null)?.extendedNote || '')
+          drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'executed', detail: `合成停損已執行（延長時段 · ${crossed}）— ${s.outcome}${extNote ? `（${extNote}）` : ''}` })
+          st0.addLog('success', `${s.sym} 合成停損離場 — ${crossed}${extNote ? `（${extNote}）` : ''}`)
+        } else {
+          failed++
+          s.outcome = `離場失敗（HTTP ${r.status}）`
+          drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'failed', detail: `合成停損離場失敗（延長時段 · ${crossed}）— ${s.outcome}` })
+          st0.addLog('error', `${s.sym} 合成停損離場失敗 HTTP ${r.status}`)
+        }
+      } catch {
+        failed++
+        s.outcome = '離場連線失敗'
+        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'failed', detail: `合成停損離場連線失敗（延長時段 · ${crossed}）` })
+      }
     }
 
     // 3) build the DATA block (everything the model may cite)
@@ -636,7 +764,19 @@ export async function runStewardOnce(): Promise<void> {
     lines.push('')
     lines.push(`交易時段: ${sessionLabel}`)
     if (session === 'pre' || session === 'post') {
-      lines.push('- ⚠ 延長交易時段：Alpaca 不接受市價單（會被靜默擱置至下次 regular session）— exit 建議仍可提出，終端會自動轉為限價執行。')
+      lines.push('- ⚠ 延長交易時段：Alpaca 不接受市價單（會被靜默擱置至下次 regular session）；原生 SL/TP 觸發盤外不生效 — 停損由本地合成 SL 監控（穿越即以帶上限限價離場），TP 限價單仍可成交。exit 建議仍可提出，終端會自動轉為帶上限限價執行。')
+      if (closeInFlight.size > 0) {
+        lines.push(`- 合成平倉進行中：${[...closeInFlight].join('、')} — 帶上限的延時限價平倉單已掛出；勿對這些持倉提出 reattach/amend/exit。`)
+      }
+    }
+    if (session === 'regular' && minsToClose != null && Number.isFinite(minsToClose) && minsToClose >= 0 && minsToClose <= 45) {
+      lines.push(`- ⏱ 收盤前檢查點（約 ${minsToClose} 分鐘後收盤）：評估每個持倉 Hold vs Flatten — 有盤後財報/重大事件的持倉應考慮先離場；DAY 保護腿收盤即失效，延時段防護由本地合成 SL 接手。`)
+    }
+    if (session === 'pre' && minsToOpen != null && Number.isFinite(minsToOpen) && minsToOpen >= 0) {
+      lines.push(`- ⏱ 盤前檢查點（約 ${minsToOpen} 分鐘後開盤）：檢查殘存的延時限價單（該取消的取消）；保護腿將於 09:30 重新上崗，留意隔夜跳空。`)
+    }
+    if (session === 'post' && minsToOpen != null && Number.isFinite(minsToOpen) && minsToOpen >= 0) {
+      lines.push(`- ⏱ 盤後時段（距下次開盤約 ${minsToOpen >= 60 ? `${Math.round(minsToOpen / 60)} 小時` : `${minsToOpen} 分鐘`}）：SL 原生觸發已停 — 本地合成 SL 監控中；TP 延時限價仍可成交。`)
     }
     if (sessionChanged) {
       lines.push(`- ⚠ 時段剛轉換（${prevPhase} → ${session}）— 這類轉換常令 TP/SL 保護單消失，必須逐倉複查下面每個持倉的 SL/TP 是否仍在。`)
@@ -645,7 +785,18 @@ export async function runStewardOnce(): Promise<void> {
       lines.push('')
       lines.push('⚠ 保護缺失（最高優先級 — 必須處理）:')
       for (const p of slMissingRows) {
+        // v2.12.47 — a synthetic close is already working toward the fill for
+        // this symbol — advertising the naked SL here would push the model
+        // into a reattach that cancels that close order
+        if (closeInFlight.has((p.tradeSymbol || p.symbol).toUpperCase())) continue
         lines.push(`- ${p.tradeSymbol || p.symbol}（${p.side.toUpperCase()} ${p.qty}股，現價 ${fmtPrice(p.current)}）：SL 無 — 全倉清盤風險。請以 action=reattach + new_stop 重新掛上停損。`)
+      }
+    }
+    if (synthRows.length > 0) {
+      lines.push('')
+      lines.push('⚠ 合成停損監控（延長時段 · 本地觸發條件已成立）:')
+      for (const s of synthRows) {
+        lines.push(`- ${s.sym}（${s.long ? 'LONG' : 'SHORT'} ${s.p.qty}股）：SL ${fmtPrice(s.slPx)}${s.est ? '（trail 推算）' : ''} 已被現價 ${fmtPrice(s.q)} 穿越 — 本地機制${s.outcome ?? '已觸發離場'}（帶上限限價，賣出 ≤ 現價×0.985）；AI 僅評估情境（是否該 widen 緩衝防假穿針），勿重複提出 exit。`)
       }
     }
     lines.push('')
@@ -703,7 +854,8 @@ export async function runStewardOnce(): Promise<void> {
     st0.addLog('info', `模型回覆：持倉建議 ${pvArrAll.length} · 掛單建議 ${ovArrAll.length} · 教訓 ${lessonArrAll.length}`)
 
     // 5) execute validated actions — the terminal re-checks everything
-    const actionsLeft = () => cfg.maxActionsPerCycle - executed - failed
+    // (actionsLeft is defined earlier — the deterministic synthetic-SL guard
+    // draws from the same per-cycle budget BEFORE the model actions)
     interface PosVerdict { symbol?: unknown; action?: unknown; new_stop?: unknown; new_target?: unknown; confidence?: unknown; reason?: unknown }
     interface OrdVerdict { id?: unknown; action?: unknown; new_entry?: unknown; new_tp?: unknown; new_sl?: unknown; confidence?: unknown; reason?: unknown }
 
@@ -859,11 +1011,19 @@ export async function runStewardOnce(): Promise<void> {
         // v2.12.43 — reattach 同樣保本夾緊：SL 缺失是最高優先修復，但把越過
         // 保本線的停損重新掛上＝重演 TWST 事故。夾緊後會立即觸發（浮盈
         // <0.15%）時改掛現價±0.15% 的緊貼保護 — 保護即時恢復，命中約在
-        // 保本線出場，既不全裸也不會掛出會被拒的立即觸發單。
+        // 保本線出場，既不全裸也不會掛出會被拒的立即觸發單。（純計算 —
+        // 即使本輪因合成平倉進行中而跳過，也無副作用。）
         const beAt = clampStopToBreakeven(long ? 'long' : 'short', row.avgEntry, cur, row.uplPct, newStop, row.assetClass === 'crypto')
         const effSl = beAt ? (beAt.skip ? tightProtectiveStop(long ? 'long' : 'short', cur, row.assetClass === 'crypto') : beAt.price) : newStop
         const slClampNote = beAt?.skip ? `（現價緊貼保護 — 模型 ${fmtPrice(newStop)} 越過保本線）` : beAt?.clamped ? `（保本夾緊 — 模型 ${fmtPrice(newStop)} 越過保本線）` : ''
-        if (!cfg.amendPositions) {
+        // v2.12.47 — a synthetic close is IN FLIGHT for this symbol (working
+        // adverse-side extended-hours limit): attaching legs now would CANCEL
+        // that close order (the attach route rebuilds exits) and strand the
+        // position again. Refuse honestly.
+        if (closeInFlight.has(sym.toUpperCase())) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `合成平倉進行中（延時限價已掛出）— 不重掛 SL（重掛會取消進行中的平倉單）` })
+        } else if (!cfg.amendPositions) {
           skipped++
           drafts.push({ ...kindAttach, action: 'reattach_sl', status: 'skipped', detail: `SL 缺失，需重新掛上 ${fmtPrice(newStop)} — 已停用「調整持倉 TP/SL」開關` })
         } else if (conf < cfg.minConfidence) {
@@ -949,7 +1109,13 @@ export async function runStewardOnce(): Promise<void> {
       if (!tpAttached && newTarget > 0 && !ex.tp && (long ? newTarget > cur : newTarget < cur)) {
         const sym = row.tradeSymbol || row.symbol
         const kindAttach = { kind: 'position' as const, symbol: sym, detail: reason, payload: { from: 'model', confidence: conf, action: 'reattach_tp' } }
-        if (!cfg.amendPositions) {
+        // v2.12.47 — synthetic close in flight: attaching a TP would cancel
+        // the working extended-hours close order (the attach route rebuilds
+        // exits) — refuse honestly
+        if (closeInFlight.has(sym.toUpperCase())) {
+          skipped++
+          drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'skipped', detail: `合成平倉進行中（延時限價已掛出）— 不重掛 TP（重掛會取消進行中的平倉單）` })
+        } else if (!cfg.amendPositions) {
           skipped++
           drafts.push({ ...kindAttach, action: 'reattach_tp', status: 'skipped', detail: `TP 缺失，需重新掛上 ${fmtPrice(newTarget)} — 已停用「調整持倉 TP/SL」開關` })
         } else if (conf < cfg.minConfidence) {

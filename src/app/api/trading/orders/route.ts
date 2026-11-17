@@ -110,9 +110,17 @@ export async function POST(req: Request) {
     // Session truth = the shared Alpaca-clock service (30s cache; also knows
     // holidays/weekends, unlike a naive ET clock). Fail-open: if the session
     // or quote check throws, place the order as-is.
+    // v2.12.47 — extended-hours doctrine hardening: (1) the converted limit
+    // also carries extended_hours=true — a DAY limit WITHOUT the flag does
+    // not participate in the extended session (it rests until the next
+    // regular open — exactly the silent queue this conversion exists to
+    // avoid); (2) an explicit LIMIT order placed during pre/post is flagged
+    // extended_hours=true + tif=day too (a gtc limit is converted and
+    // disclosed, not left to 422 at the broker — Alpaca rejects
+    // extended_hours with any other tif).
     let extendedNote: string | undefined
     if (
-      (body.type === 'market' || body.type === undefined) &&
+      (body.type === 'market' || body.type === 'limit') &&
       typeof body.trail_percent !== 'number' &&
       qty > 0 &&
       !isCryptoSymbol(symbol)
@@ -121,13 +129,20 @@ export async function POST(req: Request) {
         const mh = await getMarketHours(['SPY'], user.id)
         const st = mh.hours['SPY']?.state
         if (st === 'pre' || st === 'post') {
-          const { quotes } = await getQuotes([symbol], user.id)
-          const ref = Number(quotes[0]?.price)
-          if (Number.isFinite(ref) && ref > 0 && !quotes[0]?.sim) {
-            const lp = extendedLimitPrice(body.side, ref, EXTENDED_ENTRY_BAND_PCT)
-            body = { ...body, type: 'limit', limit_price: lp, time_in_force: 'day' }
-            const refStr = ref >= 100 ? ref.toFixed(2) : ref >= 1 ? ref.toFixed(3) : ref.toFixed(5)
-            extendedNote = `延長交易時段（${st === 'pre' ? 'Pre' : 'Post'}-market）不接受市價單，已自動轉為限價 ${fmtLimitPx(lp)}（現價 ${refStr} ±${EXTENDED_ENTRY_BAND_PCT}%，本交易日有效）`
+          const phase = st === 'pre' ? 'Pre' : 'Post'
+          if (body.type === 'market' || body.type === undefined) {
+            const { quotes } = await getQuotes([symbol], user.id)
+            const ref = Number(quotes[0]?.price)
+            if (Number.isFinite(ref) && ref > 0 && !quotes[0]?.sim) {
+              const lp = extendedLimitPrice(body.side, ref, EXTENDED_ENTRY_BAND_PCT)
+              body = { ...body, type: 'limit', limit_price: lp, time_in_force: 'day', extended_hours: true }
+              const refStr = ref >= 100 ? ref.toFixed(2) : ref >= 1 ? ref.toFixed(3) : ref.toFixed(5)
+              extendedNote = `延長交易時段（${phase}-market）不接受市價單，已自動轉為限價 ${fmtLimitPx(lp)}（現價 ${refStr} ±${EXTENDED_ENTRY_BAND_PCT}%，本交易日有效，可於延時段成交）`
+            }
+          } else {
+            const wasGtc = body.time_in_force === 'gtc'
+            body = { ...body, extended_hours: true, time_in_force: 'day' }
+            extendedNote = `延長交易時段（${phase}-market）：限價單已標記 extended_hours=true（tif=day${wasGtc ? '，原 gtc 改為 day' : ''}）— 未標記的單不參與延時撮合，會閒置到下次常規時段`
           }
         }
       } catch { /* session/quote unavailable — place as-is (honest queue) */ }
