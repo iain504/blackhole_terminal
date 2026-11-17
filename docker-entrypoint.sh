@@ -48,24 +48,6 @@ fi
 
 echo "[entrypoint] DATABASE_URL=$DATABASE_URL"
 
-# ---- Z.AI credentials (v2.12.51) --------------------------------------------
-# z-ai-web-dev-sdk reads .z-ai-config from cwd / home / /etc ONLY — none exist
-# in a fresh container (the file carries a session token and is gitignored).
-# Without it every LLM feature (sentiment engine, pre-trade veto gate, the
-# post-trade AI auditor) dies with "Configuration file not found or invalid".
-# If the deployment provides the JSON via ZAI_CONFIG_JSON (Render Dashboard →
-# Environment — same discipline as the Alpaca keys: dashboard, never git),
-# materialize it to /app/.z-ai-config (the standalone server's cwd).
-# Runtime fallback if this write fails: src/lib/zai.ts retries in-process.
-if [ -n "${ZAI_CONFIG_JSON:-}" ]; then
-  if printf '%s' "$ZAI_CONFIG_JSON" > /app/.z-ai-config 2>/dev/null; then
-    chmod 600 /app/.z-ai-config 2>/dev/null || true
-    echo "[entrypoint] ZAI_CONFIG_JSON materialized to /app/.z-ai-config — AI features enabled"
-  else
-    echo "[entrypoint] ⚠ could not write /app/.z-ai-config — the app will retry at runtime (src/lib/zai.ts)"
-  fi
-fi
-
 # ---- fresh-database hint (ephemeral Render disk = fresh on every deploy) ---
 if [ ! -f "$db_path" ]; then
   echo "[entrypoint] fresh database — create your account via the UI after boot"

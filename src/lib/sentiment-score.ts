@@ -12,12 +12,12 @@
 // FinBERT carries a non-commercial licence — check before commercial use.
 import { clampScore, labelOf } from './sentiment-news'
 import type { SentimentLabel } from './sentiment-types'
-// v2.12.51 — shared bootstrap (getZai from @/lib/zai): on Render the SDK's
-// .z-ai-config file never exists; credentials ride the ZAI_CONFIG_JSON env var
-// (materialized by docker-entrypoint.sh at boot with a runtime fallback). An
-// init failure here still degrades to the offline lexicon scorer below — the
-// pipeline never dies, per the engine's design note above.
-import { getZai } from '@/lib/zai'
+// v2.12.52 — standalone transport (llmChat from @/lib/llm): no vendor SDK. The
+// container speaks OpenAI-compatible HTTP to any provider the operator sets
+// (LLM_API_URL / LLM_API_KEY / LLM_MODEL); in the dev sandbox it falls back to
+// the internal API. An init/call failure here still degrades to the offline
+// lexicon scorer below — the pipeline never dies, per the design note above.
+import { llmChat } from '@/lib/llm'
 
 export interface ScoredHeadline {
   label: SentimentLabel
@@ -124,15 +124,15 @@ async function callLlmBatch(userMsg: string): Promise<string> {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       return await enqueueLlm(async () => {
-        const zai = await getZai()
-        const completion = await (zai as any).chat.completions.create({
+        const completion = await llmChat({
           messages: [
             { role: 'assistant', content: SYSTEM_PROMPT },
             { role: 'user', content: userMsg },
           ],
           thinking: { type: 'disabled' },
         })
-        const content = (completion as any)?.choices?.[0]?.message?.content
+        const content = (completion as { choices?: { message?: { content?: string } }[] })
+          ?.choices?.[0]?.message?.content
         if (typeof content !== 'string' || content.length === 0) throw new Error('empty LLM response')
         return content
       })

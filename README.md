@@ -180,6 +180,7 @@ Open **http://localhost:3000** — the landing page's **Login** button takes you
 | `ALLOW_REGISTRATION` | `false` | Allow new signups after the first bootstrap account |
 | `ALLOW_SHARED_BROKER` | `false` | Permit trading with the env-configured shared Alpaca keys when a user has none of their own |
 | `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | — | Optional *shared* Alpaca keys (paper recommended) |
+| `LLM_API_URL` / `LLM_API_KEY` / `LLM_MODEL` | — | Standalone LLM transport for the AI features (post-trade auditor, pre-trade veto gate, sentiment, rule consolidation) — ANY OpenAI-compatible provider: OpenAI, DeepSeek, Groq, OpenRouter, self-hosted vLLM/ollama `/v1`. `LLM_MODEL` auto-defaults for well-known cloud hosts; required for self-hosted endpoints. Unset → AI routes 503 fast, sentiment degrades to the offline lexicon, gate stays fail-closed |
 | `ENABLE_METRICS` | `0` | `1` exposes `GET /api/metrics` (Prometheus text format) — keep off unless you scrape it |
 | `LOG_LEVEL` | `info` | Structured JSON log level: `debug` / `info` / `warn` / `error` |
 | `DEBUG_DB` | — | Set to `1` to log Prisma queries |

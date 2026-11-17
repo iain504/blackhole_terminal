@@ -7,6 +7,7 @@ import {
   rankCandidates, parseAuditOutput,
   type ParsedRule,
 } from '@/lib/trade-review'
+import { llmChat } from '@/lib/llm'
 
 // v2.12.49 — Trade-review RULE lifecycle (closing the loop). The auditor
 // stores CANDIDATE guardrails; this route promotes/discards them one by one
@@ -27,18 +28,8 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   llmQueue = run.then(gap, gap)
   return run
 }
-let zaiPromise: Promise<unknown> | null = null
-async function getZai() {
-  if (!zaiPromise) {
-    zaiPromise = (async () => {
-      const mod = await import('z-ai-web-dev-sdk')
-      const ZAI = (mod as unknown as { default: unknown }).default ?? (mod as unknown)
-      return await (ZAI as { create(): Promise<unknown> }).create()
-    })()
-  }
-  return zaiPromise
-}
-type ChatSdk = { chat: { completions: { create: (o: Record<string, unknown>) => Promise<unknown> } } }
+// v2.12.52 — standalone transport (llmChat): no vendor SDK; the consolidation
+// pass rides the same LLM_API_URL/KEY/MODEL provider the auditor uses.
 function extractContent(completion: unknown): string {
   const content = (completion as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message?.content
   if (typeof content !== 'string' || content.length === 0) throw new Error('empty LLM response')
@@ -47,17 +38,16 @@ function extractContent(completion: unknown): string {
 
 async function callConsolidator(system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const zai = (await getZai()) as ChatSdk
     const msgs = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]
     try {
-      return extractContent(await zai.chat.completions.create({ messages: msgs, temperature: 0.2, thinking: { type: 'disabled' } }))
+      return extractContent(await llmChat({ messages: msgs, temperature: 0.2, thinking: { type: 'disabled' } }))
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       if (/temperature/i.test(msg)) {
-        return extractContent(await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } }))
+        return extractContent(await llmChat({ messages: msgs, thinking: { type: 'disabled' } }))
       }
       throw e
     }

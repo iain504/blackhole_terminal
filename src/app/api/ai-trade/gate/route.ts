@@ -13,12 +13,17 @@ import {
   dailyAtr14, rvolFromBars, htfAlignment,
   type GateCandidateInput, type GateMarketContext, type GateVerdict,
 } from '@/lib/trade-gate'
-import { ensureZaiConfig, getZai, zaiSetupHint } from '@/lib/zai'
+import { llmChat, llmSetupHint, llmStatus } from '@/lib/llm'
 
 export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
 export const maxDuration = 120
 
+// v2.12.52 — STANDALONE LLM transport: z-ai-web-dev-sdk is gone; the gate
+// speaks OpenAI-compatible HTTP to any provider (LLM_API_URL/KEY/MODEL).
+// Fail-closed semantics unchanged — an unresolvable provider 503s BEFORE the
+// deterministic snapshot is built, and no ERROR gate-log row is burned.
+//
 // v2.12.51 — Z.AI credentials fix for HOSTED deployments: the SDK resolves
 // .z-ai-config (cwd/home//etc) which never exists on Render — the credentials
 // now ride the ZAI_CONFIG_JSON env var (materialized by docker-entrypoint.sh
@@ -101,32 +106,25 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-type ChatSdk = { chat: { completions: { create: (o: Record<string, unknown>) => Promise<unknown> } } }
-
 /** One gatekeeper call @ temperature 0.1 (deterministic JSON before the order
- *  lane, per the veto-gate spec). A backend that rejects the temperature PARAM
- *  falls back to its default rather than failing the gate. */
+ *  lane, per the veto-gate spec) through the standalone llmChat transport. A
+ *  provider that rejects the temperature/max_tokens PARAMs falls back to its
+ *  defaults rather than failing the gate. */
 async function callGatekeeper(system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const zai = (await getZai()) as ChatSdk
     const msgs = [
       { role: 'system', content: system },
       { role: 'user', content: user },
     ]
     try {
-      const completion = await zai.chat.completions.create({
+      const completion = await llmChat({
         messages: msgs, temperature: 0.1, max_tokens: 700, thinking: { type: 'disabled' },
       })
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      // v2.12.51 — the SDK's cryptic file-not-found text becomes the actionable
-      // hint (belt to the pre-flight; can only fire if files changed mid-run)
-      if (/Configuration file not found/i.test(msg)) {
-        throw new Error('Z.AI credentials missing — set ZAI_CONFIG_JSON and redeploy')
-      }
       if (/temperature|max_tokens/i.test(msg)) {
-        const completion = await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } })
+        const completion = await llmChat({ messages: msgs, thinking: { type: 'disabled' } })
         return extractContent(completion)
       }
       throw e
@@ -265,13 +263,13 @@ export async function POST(req: Request) {
     }
     const { candidate, planId } = parsed
 
-    // v2.12.51 pre-flight — the gate verdict must never silently degrade on a
-    // deployment without LLM credentials: answer with ONE actionable 503
+    // v2.12.52 pre-flight — the gate verdict must never silently degrade on a
+    // deployment without an LLM provider: answer with ONE actionable 503
     // (fail-closed, and no ERROR gate-log row is burned per signal).
-    const zaiStatus = await ensureZaiConfig()
-    if (!zaiStatus.configured) {
+    const llmProbe = await llmStatus()
+    if (!llmProbe.configured) {
       return NextResponse.json(
-        { error: `Pre-trade gate unavailable — ${zaiSetupHint(zaiStatus)}` },
+        { error: `Pre-trade gate unavailable — ${llmSetupHint(llmProbe)}` },
         { status: 503 },
       )
     }

@@ -12,9 +12,15 @@ import {
   parseAuditOutput, ruleDedupeKey,
   type EnrichedTrade,
 } from '@/lib/trade-review'
-import { ensureZaiConfig, getZai, zaiSetupHint } from '@/lib/zai'
+import { llmChat, llmSetupHint, llmStatus } from '@/lib/llm'
 import type { Bar } from '@/lib/market-types'
 
+// v2.12.52 — STANDALONE LLM transport: the z-ai-web-dev-sdk dependency is GONE.
+// The container now speaks plain OpenAI-compatible HTTP to any provider the
+// operator sets (LLM_API_URL + LLM_API_KEY + LLM_MODEL — OpenAI, DeepSeek,
+// Groq, OpenRouter, self-hosted vLLM/ollama); the sandbox internal API is only
+// a local-dev fallback. No vendor SDK, no .z-ai-config requirement in Docker.
+//
 // v2.12.51 — Z.AI credentials fix: the SDK reads .z-ai-config from cwd/home//etc
 // only, which never exists on Render (gitignored). Credentials now ride the
 // ZAI_CONFIG_JSON env var (materialized at boot by docker-entrypoint.sh, with
@@ -53,32 +59,24 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-type ChatSdk = { chat: { completions: { create: (o: Record<string, unknown>) => Promise<unknown> } } }
-
 /** One auditor call @ temperature 0.15 (analytical consistency, per the audit
- *  spec). Temperature is passed when the backend accepts it; a rejection of
- *  the PARAM falls back to the default temperature rather than failing the run. */
+ *  spec) through the standalone llmChat transport. A provider that rejects the
+ *  temperature PARAM falls back to its default rather than failing the run. */
 async function callAuditor(system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const zai = (await getZai()) as ChatSdk
     const msgs = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]
     try {
-      const completion = await zai.chat.completions.create({
+      const completion = await llmChat({
         messages: msgs, temperature: 0.15, thinking: { type: 'disabled' },
       })
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      // v2.12.51 — the SDK's cryptic file-not-found text becomes the actionable
-      // hint (belt to the pre-flight; can only fire if files changed mid-run)
-      if (/Configuration file not found/i.test(msg)) {
-        throw new Error('Z.AI credentials missing — set ZAI_CONFIG_JSON and redeploy')
-      }
       if (/temperature/i.test(msg)) {
-        const completion = await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } })
+        const completion = await llmChat({ messages: msgs, thinking: { type: 'disabled' } })
         return extractContent(completion)
       }
       throw e
@@ -201,13 +199,13 @@ export async function POST(req: Request) {
     const body = (await req.json().catch(() => ({}))) as { mode?: string; limit?: number }
     const mode = await resolveTradeMode(user.id, body.mode)
 
-    // 0) v2.12.51 pre-flight — the LLM credentials must exist BEFORE we pull
-    //    orders and burn a run; a misconfigured deployment answers with ONE
-    //    actionable 503 instead of a failed batch row per LLM call.
-    const zaiStatus = await ensureZaiConfig()
-    if (!zaiStatus.configured) {
+    // 0) v2.12.52 pre-flight — the LLM provider must be resolvable BEFORE we
+    //    pull orders and burn a run; a misconfigured deployment answers with
+    //    ONE actionable 503 instead of a failed batch row per LLM call.
+    const llmProbe = await llmStatus()
+    if (!llmProbe.configured) {
       return NextResponse.json(
-        { mode, error: `AI audit unavailable — ${zaiSetupHint(zaiStatus)}` },
+        { mode, error: `AI audit unavailable — ${llmSetupHint(llmProbe)}` },
         { status: 503 },
       )
     }

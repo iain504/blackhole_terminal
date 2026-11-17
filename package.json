@@ -1,6 +1,6 @@
 {
   "name": "blackhole_terminal",
-  "version": "2.12.51",
+  "version": "2.12.52",
   "private": true,
   "scripts": {
     "predev": "bun scripts/stamp-version.mjs",
@@ -68,7 +68,6 @@
     "tailwind-merge": "^3.3.1",
     "tailwindcss-animate": "^1.0.7",
     "vaul": "^1.1.2",
-    "z-ai-web-dev-sdk": "^0.0.18",
     "zod": "^4.0.2",
     "zustand": "^5.0.6"
   },
