@@ -64,6 +64,35 @@ interface PlanRecentRow {
 /** minimal shape the lifecycle renderer needs (session rows carry more) */
 type LifecycleRow = { id: string; symbol: string; status: string; statusNote: string | null }
 
+// v2.12.50 — pre-trade veto gate stats (30d decisions + gatekeeper audit)
+interface GateStats {
+  total: number
+  approve: number
+  reduced: number
+  reject: number
+  error: number
+}
+interface GateAudit {
+  vetoed: number
+  graded: number
+  goodWait: number
+  missedRun: number
+  neutral: number
+  tooStrict: boolean
+}
+interface GateLogRow {
+  id: string
+  symbol: string
+  side: string
+  decision: string
+  confidenceScore: number | null
+  sizeMultiplier: number | null
+  rationale: string | null
+  error: string | null
+  cited: string[]
+  createdAt: number
+}
+
 function fmtCountdown(ms: number): string {
   const s = Math.max(0, Math.ceil(ms / 1000))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
@@ -141,6 +170,29 @@ export default function AiAutoTradePanel() {
     const t = setInterval(pull, 60_000)
     return () => { alive = false; clearInterval(t) }
   }, [cfg.entryMode])
+
+  // v2.12.50 — pre-trade veto gate: decision stats + gatekeeper audit + the
+  // recent evaluations (60s poll, both entry modes — the gate is orthogonal
+  // to the plan-vs-instant entry protocol)
+  const [gateStats, setGateStats] = useState<GateStats | null>(null)
+  const [gateAudit, setGateAudit] = useState<GateAudit | null>(null)
+  const [gateLogs, setGateLogs] = useState<GateLogRow[]>([])
+  useEffect(() => {
+    let alive = true
+    const pull = () =>
+      fetch('/api/ai-trade/gate')
+        .then((r) => r.json())
+        .then((j: { stats?: GateStats; gateAudit?: GateAudit; logs?: GateLogRow[] }) => {
+          if (!alive) return
+          if (j?.stats) setGateStats(j.stats)
+          if (j?.gateAudit) setGateAudit(j.gateAudit)
+          if (Array.isArray(j?.logs)) setGateLogs(j.logs)
+        })
+        .catch(() => {})
+    pull()
+    const t = setInterval(pull, 60_000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
 
   // number fields kept as strings so partial typing doesn't fight the clamps
   // v2.12.38 — the gate inputs edit the fields THIS entry mode enforces
@@ -490,6 +542,67 @@ export default function AiAutoTradePanel() {
             />
           </span>
         </div>
+        {/* v2.12.50 — PRE-TRADE VETO GATE (Risk & Regime Filter) */}
+        <div className="col-span-2 flex items-center justify-between gap-2">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-zinc-400">
+            <Switch checked={cfg.gateEnabled} onCheckedChange={(v) => updateConfig({ gateEnabled: v })} aria-label="Pre-Trade AI 閘門" />
+            Pre-Trade AI 閘門
+          </label>
+          <span className="text-[9px] text-zinc-600">送單前守門：制度/價差/波動/regime + 複盤護欄；預設否決，只可縮量</span>
+        </div>
+        {cfg.gateEnabled && (
+          <div className="col-span-2 rounded border border-zinc-800/80 bg-zinc-950/40 px-2 py-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[9px] font-semibold uppercase tracking-widest text-zinc-500">閘門統計（30 天）</span>
+              {gateStats && (
+                <span className="font-mono text-[9px] leading-3 text-zinc-500" aria-label="閘門決策統計">
+                  <span className="text-emerald-400">批准 {gateStats.approve}</span>
+                  <span className="mx-1 text-zinc-700">·</span>
+                  <span className="text-sky-400">縮量 {gateStats.reduced}</span>
+                  <span className="mx-1 text-zinc-700">·</span>
+                  <span className={gateStats.reject > 0 ? 'text-amber-400' : 'text-zinc-600'}>否決 {gateStats.reject}</span>
+                  {gateStats.error > 0 && <span className="ml-1 text-rose-400">離線 {gateStats.error}</span>}
+                </span>
+              )}
+            </div>
+            {gateAudit && gateAudit.vetoed > 0 && (
+              <p className={cn('mt-1 text-[9px] leading-3.5', gateAudit.tooStrict ? 'text-amber-400' : 'text-zinc-500')}>
+                閘門覆盤（否決 {gateAudit.vetoed} 筆）：等待正確 {gateAudit.goodWait} · 錯過 {gateAudit.missedRun} · 未明 {gateAudit.neutral}
+                {gateAudit.tooStrict && ' — ⚠ 過半否決錯過行情：部分護欄可能過嚴，請於智慧複盤複查'}
+              </p>
+            )}
+            {gateLogs.length > 0 && (
+              <ul className="terminal-scroll mt-1 max-h-24 space-y-0.5 overflow-y-auto pr-1" aria-label="最近的閘門評估">
+                {gateLogs.slice(0, 6).map((g) => (
+                  <li key={g.id} className="flex items-start justify-between gap-2 font-mono text-[9px] leading-3.5">
+                    <span className="flex min-w-0 shrink-0 items-center gap-1">
+                      <span className={cn(
+                        g.decision === 'APPROVE' ? 'text-emerald-400'
+                          : g.decision === 'APPROVE_REDUCED_SIZE' ? 'text-sky-400'
+                          : g.decision === 'REJECT' ? 'text-amber-400'
+                          : 'text-rose-400',
+                      )}>
+                        {g.decision === 'APPROVE' ? '批准'
+                          : g.decision === 'APPROVE_REDUCED_SIZE' ? `縮量×${g.sizeMultiplier?.toFixed(2) ?? '?'}`
+                          : g.decision === 'REJECT' ? '否決'
+                          : '錯誤'}
+                      </span>
+                      <span className="text-zinc-300">{g.symbol}</span>
+                      <span className={g.side === 'buy' ? 'text-emerald-400/70' : 'text-rose-400/70'}>{g.side === 'buy' ? '▲' : '▼'}</span>
+                      {g.cited.length > 0 && <span className="text-violet-300" title="引用的複盤護欄">{g.cited.join(',')}</span>}
+                    </span>
+                    <span className="min-w-0 truncate text-right text-zinc-600" title={g.error ?? g.rationale ?? ''}>
+                      {g.error ?? g.rationale ?? '—'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {gateLogs.length === 0 && (
+              <p className="mt-1 text-[9px] text-zinc-600">尚無評估紀錄 — 下一次跟進/觸發送單前，閘門會先審：session 限制、NBBO 價差 vs 停損距、RVOL、HTF 對齊、持倉曝險與歷史覆盤護欄。</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* custom AI Agent endpoint note (overrides the built-in model lane) */}
@@ -761,6 +874,20 @@ export default function AiAutoTradePanel() {
                     <span className="ml-1 text-zinc-500" title={v.reason || v.rejectReason || ''}>{v.reason || v.rejectReason}</span>
                   ) : (
                     <span className={cn('ml-1', evalFailed ? 'text-amber-500' : 'text-zinc-600')}>{v.rejectReason}</span>
+                  )}
+                  {/* v2.12.50 — instant-path gate verdict marker */}
+                  {v.gateDecision && (
+                    <span
+                      className={cn(
+                        'ml-1 shrink-0 rounded px-1 text-[8.5px]',
+                        v.gateDecision === 'REJECT' ? 'bg-amber-500/15 text-amber-400'
+                          : v.gateDecision === 'APPROVE_REDUCED_SIZE' ? 'bg-sky-500/15 text-sky-400'
+                          : 'bg-emerald-500/15 text-emerald-400',
+                      )}
+                      title={v.gateNote ?? ''}
+                    >
+                      閘門
+                    </span>
                   )}
                 </span>
               </li>

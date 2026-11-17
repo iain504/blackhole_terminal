@@ -758,6 +758,7 @@ model AiTradePlan {
   mode       String // 'paper' | 'live' at plan time
   status     String // WAITING | EXECUTED | INVALIDATED | EXPIRED | GATED | CANCELLED | SUPERSEDED
   statusNote String?
+  gateVeto   Boolean @default(false) // v2.12.50 — closed GATED by the pre-trade AI veto gate (shadow-tracked)
   createdAt  DateTime  @default(now())
   closedAt   DateTime?
   resolvedAt DateTime? // review pass done (24h after close)
@@ -870,4 +871,48 @@ model ReviewRule {
 
   @@index([userId, status])
   @@index([userId, dedupeKey])
+}
+
+// v2.12.50 — PRE-TRADE VETO GATE (Risk & Regime Filter): every candidate the
+// engine is about to execute is evaluated by a gatekeeper LLM @ temp 0.1
+// BEFORE the order lane. One row per evaluation: the decision, the confidence,
+// the deterministic size multiplier, the computed microstructure snapshot
+// (session / NBBO spread vs ATR / RVOL / HTF alignment / portfolio exposure)
+// and the historical audit guardrails that fired. The closed feedback loop:
+// APPROVE rows link the Alpaca order id; REJECT rows link the (shadow-tracked)
+// plan id so the 24h review can grade the gatekeeper itself — a veto whose
+// shadow trade would have won flags the guardrail as possibly too strict.
+model PreTradeGateLog {
+  id              String   @id @default(cuid())
+  userId          String
+  mode            String // paper | live
+  symbol          String
+  side            String // buy | sell
+  entry           Float? // price the order would have chased
+  stop            Float?
+  target          Float?
+  rr              Float?
+  decision        String // APPROVE | APPROVE_REDUCED_SIZE | REJECT | ERROR
+  confidenceScore Float? // 0-1 gatekeeper conviction
+  sizeMultiplier  Float? // 0-1 (hard-capped at 1.0 — the gate may only shrink risk)
+  sessionTag      String? // pre | regular | post | overnight | weekend | crypto-24h
+  minutesToClose  Int? // regular-session minutes remaining at decision time
+  spreadPct       Float? // NBBO spread as % of price
+  spreadAtrPct    Float? // spread as % of ATR(14)
+  spreadToStop    Float? // spread ÷ stop distance (the friction veto input)
+  rvol            Float? // last-bar volume vs prior-20 mean
+  htfAlignment    String? // ALIGNED | NEUTRAL | COUNTER_TREND (computed)
+  dailyDrawdown   Float? // (equity − last_equity) / last_equity %
+  openPositions   Int? // broker positions at decision time
+  guardrails      String? // JSON: [{rule_id, condition, action}] injected + the cited ids
+  rationale       String? // gatekeeper explanation (bounded)
+  planId          String? // AiTradePlan row (react follow) — shadow-track anchor
+  orderId         String? // Alpaca order id filled in after execution (approved trades)
+  error           String? // ERROR decisions only
+  candidateJson   String? // full candidate_setup snapshot (audit/export)
+  responseJson    String? // full gatekeeper response (audit/export)
+  createdAt       DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, symbol, decision])
 }

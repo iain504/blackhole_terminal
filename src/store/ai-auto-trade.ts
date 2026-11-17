@@ -78,6 +78,9 @@ import {
   validatePlanSide, repairPlanTp, type GateRegime,
   isSpotCryptoSymbol, CRYPTO_NO_SHORT_NOTE,
 } from '@/lib/ai-trade-gates'
+import {
+  gateDecisionNote, type GateDecision, type GateVerdict,
+} from '@/lib/trade-gate'
 
 // ---- config ----------------------------------------------------------------
 
@@ -130,6 +133,16 @@ export interface AiAutoConfig {
    *  already reached maxCorrelated. */
   blockConcentration: boolean
   maxCorrelated: number
+  /** v2.12.50 — PRE-TRADE VETO GATE: every execution the engine is about to
+   *  send is evaluated by the gatekeeper LLM (Risk & Regime Filter) FIRST —
+   *  session/Alpaca constraints, NBBO spread friction vs stop distance, RVOL,
+   *  higher-timeframe alignment, portfolio exposure, and the ACTIVE
+   *  post-trade audit guardrails (veto + cite rule_id). Default stance REJECT;
+   *  the gate may only SHRINK size (multiplier hard-capped ≤ 1.0 in code).
+   *  Vetoed follows close GATED with gateVeto=true and are shadow-tracked:
+   *  the 24h review grades the GATEKEEPER (a veto that would have won flags
+   *  the guardrail as possibly too strict). */
+  gateEnabled: boolean
 }
 
 export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
@@ -160,6 +173,7 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   dynamicThresholds: true,
   blockConcentration: true,
   maxCorrelated: 2,
+  gateEnabled: true,
 }
 
 const LS_KEY = 'bh-ai-auto-cfg-v1'
@@ -205,6 +219,9 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     dynamicThresholds: j.dynamicThresholds === undefined ? d.dynamicThresholds : Boolean(j.dynamicThresholds),
     blockConcentration: j.blockConcentration === undefined ? d.blockConcentration : Boolean(j.blockConcentration),
     maxCorrelated: Math.round(clampN(num(j.maxCorrelated, d.maxCorrelated), 1, 10)),
+    // undefined (old saved config) → default ON — the veto gate is the
+    // capital-preservation layer and must not silently vanish on upgrade
+    gateEnabled: j.gateEnabled === undefined ? d.gateEnabled : Boolean(j.gateEnabled),
   }
 }
 
@@ -297,6 +314,9 @@ export interface AiAutoVerdict {
   plans?: AiVerdictPlan[]
   /** v2.12.37 — last close when evaluated; the plan's 距觸發% anchor. */
   refPrice?: number
+  /** v2.12.50 — pre-trade veto gate verdict (instant mode fires through it). */
+  gateDecision?: GateDecision | null
+  gateNote?: string | null
 }
 
 /** v2.12.37 — one conditional entry side parsed from a react-mode verdict.
@@ -339,6 +359,9 @@ export interface AiPlanVM {
   closedAt: number | null
   /** dry-run notice logged once per plan (the tick loop would spam) */
   dryRunNoted?: boolean
+  /** v2.12.50 — PreTradeGateLog row of the gate verdict that approved the
+   *  follow; the Alpaca order id is linked back to it after execution. */
+  gateLogId?: string
 }
 
 export interface AiAutoFired {
@@ -1435,6 +1458,40 @@ export async function runScan(): Promise<void> {
         continue
       }
       const side = v.direction === 'long' ? 'buy' : 'sell'
+      // v2.12.50 — PRE-TRADE VETO GATE (instant path): the last deterministic
+      // check before the order lane. A REJECT marks the verdict gated (the
+      // attribution ledger already stores gated rows for the 24h loop); a
+      // reduced-size verdict scales the computed qty down (≤ 1.0 in code).
+      let gateMult = 1
+      let gateLogId: string | null = null
+      if (cfg.gateEnabled) {
+        const g = await callGate({
+          symbol: v.symbol, side, entry: price, stop: v.stop!, target: v.target!,
+          confidence: v.confidence, timeframe: cfg.timeframe, reason: v.reason,
+          regime: regimeState, planId: null, mode: cfg.mode, sig,
+        })
+        if (g && g.verdict) {
+          const mult = applyGateVerdict(g.verdict, v.symbol, side, g.citedDetail)
+          if (mult == null) {
+            v.passed = false
+            v.gateDecision = 'REJECT'
+            v.gateNote = g.verdict.rationale
+            v.verdictStatus = 'gated'
+            continue
+          }
+          gateMult = mult
+          gateLogId = g.logId ?? null
+          v.gateDecision = g.verdict.decision
+          v.gateNote = g.verdict.rationale
+          if (gateMult < 1 && qty > 0) {
+            const scaled = Math.floor((qty * gateMult) * 1e4) / 1e4
+            st0.addLog('info', `${v.symbol} 閘門縮量 — qty ${qty} → ${scaled}（×${gateMult.toFixed(2)}）`)
+            qty = scaled
+          }
+        } else {
+          st0.addLog('warn', `${v.symbol} 閘門離線（${g?.error ?? 'transport failed'}）— 機械閘門已通過，依原判斷跟進`)
+        }
+      }
       try {
         const { status, j } = await fetchJson('/api/trading/orders', {
           method: 'POST',
@@ -1461,6 +1518,15 @@ export async function runScan(): Promise<void> {
           v.verdictStatus = 'fired'
           // v2.12.25 — commit this order's cost against the in-round budget
           if (bpLeft != null) bpLeft = Math.max(0, bpLeft - qty * price)
+          // v2.12.50 — link the gate verdict row to the Alpaca order id
+          const oid = ((j as { orders?: { order_id?: string; id?: string }[] } | null)?.orders ?? [])[0]?.order_id
+            ?? ((j as { orders?: { order_id?: string; id?: string }[] } | null)?.orders ?? [])[0]?.id
+          if (gateLogId && typeof oid === 'string' && oid) {
+            void fetchJson('/api/ai-trade/gate', {
+              method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: gateLogId, orderId: oid }),
+            }).catch(() => { /* the linkage is best-effort */ })
+          }
           const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: v.symbol, side, qty, price, stop: v.stop!, target: v.target!, confidence: v.confidence, rr: v.rr!, mode: cfg.mode }
           useAiAutoStore.setState((s) => ({ fired: [rec, ...s.fired].slice(0, 50) }))
           st0.addLog('success', `已下單 ${v.symbol} ${side} ${qty} @市價 · TL ${v.target} / SL ${v.stop}（信心 ${v.confidence}% · R:R 1:${v.rr?.toFixed(1)} · ${cfg.mode}）`)
@@ -1637,23 +1703,90 @@ function stopReactor(reason?: string) {
   useAiAutoStore.getState().addLog('info', reason ?? 'React 反應器停止 — 等候中計劃保留，重新啟用後繼續監控')
 }
 
-async function patchPlan(id: string, status: AiPlanStatus, note: string | null) {
+async function patchPlan(id: string, status: AiPlanStatus, note: string | null, gateVeto = false) {
   await fetchJson('/api/ai-trade/plans', {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id, status, note }),
+    body: JSON.stringify({ id, status, note, ...(gateVeto ? { gateVeto: true } : {}) }),
   }).catch(() => { /* the ledger transition is best-effort */ })
 }
 
 /** One lifecycle transition: store + activity log + ledger PATCH. */
-function closePlan(p: AiPlanVM, status: AiPlanStatus, note: string) {
+function closePlan(p: AiPlanVM, status: AiPlanStatus, note: string, gateVeto = false) {
   useAiAutoStore.setState((s) => ({
     plans: s.plans.map((x) => (x.id === p.id ? { ...x, status, statusNote: note, closedAt: Date.now() } : x)),
   }))
   const lvl = status === 'EXECUTED' ? 'success' : status === 'GATED' ? 'warn' : 'info'
   const verb = status === 'EXECUTED' ? '執行' : status === 'INVALIDATED' ? '反向作廢' : status === 'EXPIRED' ? '逾期作廢' : status === 'GATED' ? '閘門擋下' : '關閉'
   useAiAutoStore.getState().addLog(lvl, `${p.symbol} ${p.side === 'buy' ? '▲' : '▼'}計劃${verb} — ${note}`)
-  void patchPlan(p.id, status, note)
+  void patchPlan(p.id, status, note, gateVeto)
+}
+
+// ---- v2.12.50 PRE-TRADE VETO GATE (client → /api/ai-trade/gate) -------------
+
+interface GateCallResult {
+  logId: string | null
+  verdict: GateVerdict | null
+  error: string | null
+  citedDetail: { rule_id: string; condition: string; action: string }[]
+}
+
+/** Ask the gatekeeper BEFORE the order lane. Returns null on transport failure
+ *  (the caller fails open with an honest log — the mechanical gates already
+ *  ran; a dead gate must not silently veto every trade forever). */
+async function callGate(args: {
+  symbol: string
+  side: 'buy' | 'sell'
+  entry: number
+  stop: number
+  target: number
+  confidence: number
+  timeframe: string
+  reason: string
+  regime: string | null
+  planId?: string | null
+  mode: string
+  sig?: AbortSignal
+}): Promise<GateCallResult | null> {
+  try {
+    const { status, j } = await fetchJson('/api/ai-trade/gate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: args.mode,
+        planId: args.planId ?? null,
+        candidate: {
+          symbol: args.symbol, side: args.side, entry: args.entry, stop: args.stop,
+          target: args.target, confidence: args.confidence, timeframe: args.timeframe,
+          reason: args.reason, regime: args.regime,
+        },
+      }),
+      signal: args.sig,
+    })
+    if (status !== 200 || !j) return null
+    const r = j as { ok?: boolean; logId?: string; verdict?: GateVerdict | null; error?: string | null; guardrailsDetail?: GateCallResult['citedDetail'] }
+    if (!r.ok) return null
+    return { logId: r.logId ?? null, verdict: r.verdict ?? null, error: r.error ?? null, citedDetail: r.guardrailsDetail ?? [] }
+  } catch {
+    return null
+  }
+}
+
+/** Apply a gate verdict to ONE execution path. Returns the size multiplier to
+ *  apply (1 when approved full), or null when the verdict vetoes the trade
+ *  (caller must NOT order; already logged). `who` names the path for logs. */
+function applyGateVerdict(v: GateVerdict, symbol: string, side: 'buy' | 'sell', cited: { rule_id: string; condition: string }[]): number | null {
+  const citedIds = cited.map((c) => c.rule_id)
+  const note = gateDecisionNote(v, symbol, side, { sizeMult: v.sizeMultiplier, rules: citedIds })
+  if (v.decision === 'REJECT') {
+    useAiAutoStore.getState().addLog('warn', `${symbol} — ${note}`)
+    return null
+  }
+  const mult = v.decision === 'APPROVE_REDUCED_SIZE' && Number.isFinite(v.sizeMultiplier) && v.sizeMultiplier > 0 && v.sizeMultiplier <= 1
+    ? v.sizeMultiplier
+    : 1
+  useAiAutoStore.getState().addLog(mult < 1 ? 'info' : 'success', `${symbol} — ${note}`)
+  return mult
 }
 
 async function reactTick(): Promise<void> {
@@ -1774,6 +1907,32 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     closePlan(p, 'INVALIDATED', `滑價穿觸發價 — 實際跟進 R:R 1:${realRR.toFixed(2)} 低於門檻 1:${gate.minRR}（觸發 ${fmtPx(p.trigger)} → 現價 ${fmtPx(last)}）— 不追價，計劃作廢並覆盤`)
     return
   }
+  // v2.12.50 — PRE-TRADE VETO GATE: the market confirmed the plan and every
+  // mechanical gate passed, but before the order lane the gatekeeper weighs
+  // session constraints, spread friction, regime alignment and the ACTIVE
+  // post-trade audit guardrails. A REJECT closes the plan GATED with
+  // gateVeto=true — the 24h shadow review then grades the GATEKEEPER itself
+  // (missed-run = a guardrail may be too strict; good-wait = capital saved).
+  let gateMult = 1
+  let gateLogId: string | null = null
+  if (cfg.gateEnabled) {
+    const g = await callGate({
+      symbol: p.symbol, side: p.side, entry: last, stop: p.sl, target: p.tp,
+      confidence: p.confidence, timeframe: '1h', reason: p.reason ?? '',
+      regime: p.regime, planId: p.id, mode: cfg.mode,
+    })
+    if (g && g.verdict) {
+      const mult = applyGateVerdict(g.verdict, p.symbol, p.side, g.citedDetail)
+      if (mult == null) {
+        closePlan(p, 'GATED', `Pre-Trade 閘門否決 — ${g.verdict.rationale}`, true)
+        return
+      }
+      gateMult = mult
+      gateLogId = g.logId ?? null
+    } else {
+      st.addLog('warn', `${p.symbol} 閘門離線（${g?.error ?? 'transport failed'}）— 機械閘門已通過，依原計劃跟進`)
+    }
+  }
   // sizing — same math as the instant path (risk budget ÷ per-risk, 50% cap)
   // but anchored to the REAL fill-side price so the dollar risk budget holds
   // even when the market slipped past the trigger.
@@ -1786,6 +1945,13 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
   const riskAmt = equity * (cfg.riskPct / 100) * (p.confidence / 100)
   const perRisk = Math.abs(price - p.sl)
   let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
+  // v2.12.50 — the gate may only SHRINK risk: APPROVE_REDUCED_SIZE scales the
+  // sizing down by the validated multiplier (≤ 1.0 enforced at parse time)
+  if (gateMult < 1 && qty > 0) {
+    const scaled = Math.floor((qty * gateMult) * 1e4) / 1e4
+    st.addLog('info', `${p.symbol} 閘門縮量 — qty ${qty} → ${scaled}（×${gateMult.toFixed(2)}）`)
+    qty = scaled
+  }
   const maxNotional = equity * 0.5
   if (qty * price > maxNotional) qty = Math.floor((maxNotional / price) * 1e4) / 1e4
   if (qty * price > bp) {
@@ -1816,7 +1982,17 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     })
     const ok = status === 200 && Array.isArray((j as { orders?: unknown[] } | null)?.orders) && ((j as { orders: unknown[] }).orders.length > 0)
     if (ok) {
-      closePlan(p, 'EXECUTED', `跟進 ${p.side} ${qtySent} @市價 · TL ${fmtPx(p.tp)} / SL ${fmtPx(p.sl)}（${cfg.mode} · 實際 R:R 1:${realRR.toFixed(2)}）`)
+      closePlan(p, 'EXECUTED', `跟進 ${p.side} ${qtySent} @市價 · TL ${fmtPx(p.tp)} / SL ${fmtPx(p.sl)}（${cfg.mode} · 實際 R:R 1:${realRR.toFixed(2)}）${gateMult < 1 ? ' · 閘門縮量' : ''}`)
+      // v2.12.50 — close the loop: the gate verdict row gets the Alpaca order
+      // id so every executed trade is traceable back to its gate evaluation
+      const oid = ((j as { orders?: { order_id?: string; id?: string }[] } | null)?.orders ?? [])[0]?.order_id
+        ?? ((j as { orders?: { order_id?: string; id?: string }[] } | null)?.orders ?? [])[0]?.id
+      if (gateLogId && typeof oid === 'string' && oid) {
+        void fetchJson('/api/ai-trade/gate', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: gateLogId, orderId: oid }),
+        }).catch(() => { /* the linkage is best-effort */ })
+      }
       const rec: AiAutoFired = { id: ++fireSeq, at: Date.now(), symbol: p.symbol, side: p.side, qty: qtySent, price, stop: p.sl, target: p.tp, confidence: p.confidence, rr: p.rr, mode: cfg.mode }
       useAiAutoStore.setState((s) => ({ fired: [rec, ...s.fired].slice(0, 50) }))
       // the executed plan also feeds the verdict ledger → 24h reconciliation

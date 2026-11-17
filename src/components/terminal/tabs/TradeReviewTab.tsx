@@ -71,6 +71,49 @@ interface PatternRow {
   estimated_pnl_impact: string
 }
 
+// v2.12.50 — pre-trade veto gate: the gatekeeper audit lives next to the
+// guardrails it enforces (the closed loop: post-trade rules → pre-trade veto
+// → shadow-tracked veto outcomes → guardrail-too-strict flag)
+interface GateEvalRow {
+  id: string
+  symbol: string
+  side: string
+  decision: string
+  confidenceScore: number | null
+  sizeMultiplier: number | null
+  sessionTag: string | null
+  spreadPct: number | null
+  rvol: number | null
+  htfAlignment: string | null
+  rationale: string | null
+  error: string | null
+  orderId: string | null
+  cited: string[]
+  createdAt: number
+}
+interface GateStatsRow {
+  total: number
+  approve: number
+  reduced: number
+  reject: number
+  error: number
+}
+interface GateAuditData {
+  vetoed: number
+  graded: number
+  goodWait: number
+  missedRun: number
+  neutral: number
+  tooStrict: boolean
+  recent: { symbol: string; side: string; outcome: string | null; resolved: boolean; note: string | null }[]
+}
+interface GatePayload {
+  stats?: GateStatsRow
+  topCited?: { id: string; condition: string; count: number }[]
+  gateAudit?: GateAuditData
+  logs?: GateEvalRow[]
+}
+
 const QUADRANT_META: Record<string, { label: string; short: string; cls: string; note: string }> = {
   GOOD_PROCESS_WIN: { label: 'Good Process · Win', short: 'GW', cls: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400', note: 'Valid setup + profitable' },
   GOOD_PROCESS_LOSS: { label: 'Good Process · Loss', short: 'GL', cls: 'border-zinc-500/40 bg-zinc-500/10 text-zinc-300', note: 'Valid setup stopped by variance — do NOT change strategy' },
@@ -104,6 +147,11 @@ export default function TradeReviewTab() {
   const [auditing, setAuditing] = useState(false)
   const [consolidating, setConsolidating] = useState(false)
   const [actingRule, setActingRule] = useState<string | null>(null)
+  // v2.12.50 — pre-trade veto gate state
+  const [gateStats, setGateStats] = useState<GateStatsRow | null>(null)
+  const [gateTopCited, setGateTopCited] = useState<{ id: string; condition: string; count: number }[]>([])
+  const [gateAudit, setGateAudit] = useState<GateAuditData | null>(null)
+  const [gateLogs, setGateLogs] = useState<GateEvalRow[]>([])
 
   const loadHistory = useCallback(async (m: Mode) => {
     try {
@@ -130,12 +178,27 @@ export default function TradeReviewTab() {
     } catch { /* rules are secondary — silent */ }
   }, [])
 
+  // v2.12.50 — gate evaluations + gatekeeper audit for THIS mode
+  const loadGate = useCallback(async (m: Mode) => {
+    try {
+      const res = await fetch(`/api/ai-trade/gate?mode=${m}`, { cache: 'no-store' })
+      const json = (await res.json().catch(() => null)) as GatePayload | null
+      if (res.ok && json) {
+        setGateStats(json.stats ?? null)
+        setGateTopCited(Array.isArray(json.topCited) ? json.topCited : [])
+        setGateAudit(json.gateAudit ?? null)
+        setGateLogs(Array.isArray(json.logs) ? json.logs : [])
+      }
+    } catch { /* gate panel is secondary — silent */ }
+  }, [])
+
   useEffect(() => {
     setLoaded(false)
     setBatches([])
     void loadHistory(mode)
     void loadRules()
-  }, [mode, loadHistory, loadRules])
+    void loadGate(mode)
+  }, [mode, loadHistory, loadRules, loadGate])
 
   const latest = batches[0] ?? null
   const latestAudits = latest?.audits ?? []
@@ -494,6 +557,104 @@ export default function TradeReviewTab() {
           </div>
         </section>
       </div>
+
+      {/* v2.12.50 — GATE AUDIT: the veto gate enforces these guardrails
+          pre-trade; this section audits the gatekeeper itself. Shadow-tracked
+          vetoes grade 24h later — a majority of missed-runs means the
+          guardrails are choking off would-be winners and need relaxing. */}
+      {(gateStats || gateLogs.length > 0) && (
+        <section className="rounded-md border border-zinc-800/80 bg-zinc-900/70" aria-label="Pre-trade gate audit">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/80 px-3 py-2">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+              Pre-trade gate audit <span className="font-normal normal-case text-zinc-500">— shadow-tracked vetoes grade the gatekeeper</span>
+            </h2>
+            {gateStats && (
+              <span className="flex items-center gap-1.5 font-mono text-[10px] text-zinc-500">
+                <span className="text-emerald-400">approve {gateStats.approve}</span>
+                <span className="text-sky-400">reduced {gateStats.reduced}</span>
+                <span className={gateStats.reject > 0 ? 'text-amber-400' : 'text-zinc-600'}>reject {gateStats.reject}</span>
+                {gateStats.error > 0 && <span className="text-rose-400">error {gateStats.error}</span>}
+              </span>
+            )}
+          </div>
+          {gateAudit && gateAudit.vetoed > 0 && (
+            <div className={cn('border-b border-zinc-800/80 px-3 py-2 text-[11px] leading-snug', gateAudit.tooStrict ? 'text-amber-400' : 'text-zinc-400')}>
+              <span className="font-semibold">Gatekeeper audit:</span> {gateAudit.vetoed} veto(s) shadow-tracked · {gateAudit.graded} graded —
+              {' '}good-wait {gateAudit.goodWait} (capital preserved) · missed-run {gateAudit.missedRun} (would have run) · neutral {gateAudit.neutral}
+              {gateAudit.tooStrict && (
+                <p className="mt-1 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-amber-400">
+                  ⚠ Majority of graded vetoes were missed-runs — one or more ACTIVE guardrails is likely too restrictive. Relax the cited rules below or promote fewer candidates.
+                </p>
+              )}
+            </div>
+          )}
+          {gateTopCited.length > 0 && (
+            <div className="border-b border-zinc-800/80 px-3 py-2">
+              <p className="mb-1 text-[10px] uppercase tracking-wider text-zinc-500">Most-cited guardrails (30d)</p>
+              <ul className="flex flex-col gap-0.5">
+                {gateTopCited.map((c, i) => (
+                  <li key={i} className="flex items-center gap-2 text-[11px] text-zinc-400">
+                    <Badge variant="outline" className="shrink-0 border-violet-500/40 text-[10px] text-violet-300">{c.id}</Badge>
+                    <span className="min-w-0 flex-1 truncate" title={c.condition}>{c.condition}</span>
+                    <span className="shrink-0 font-mono text-zinc-500">×{c.count}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="max-h-64 overflow-y-auto terminal-scroll">
+            {gateLogs.length === 0 ? (
+              <p className="px-3 py-5 text-center text-[11px] text-zinc-500">No gate evaluations yet — every execution the engine attempts is evaluated here first (session, spread friction, RVOL, HTF alignment, guardrails).</p>
+            ) : (
+              <table className="w-full text-left text-[11px]">
+                <thead className="sticky top-0 bg-zinc-900 text-[9px] uppercase tracking-wider text-zinc-500">
+                  <tr>
+                    <th className="px-3 py-1.5 font-medium">Time</th>
+                    <th className="px-2 py-1.5 font-medium">Candidate</th>
+                    <th className="px-2 py-1.5 font-medium">Decision</th>
+                    <th className="px-2 py-1.5 font-medium">Session</th>
+                    <th className="px-2 py-1.5 font-medium">Spread%</th>
+                    <th className="px-2 py-1.5 font-medium">RVOL</th>
+                    <th className="px-2 py-1.5 font-medium">HTF</th>
+                    <th className="px-2 py-1.5 font-medium">Guardrails</th>
+                    <th className="px-3 py-1.5 font-medium">Rationale</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/40">
+                  {gateLogs.slice(0, 12).map((g) => (
+                    <tr key={g.id} className="align-middle">
+                      <td className="whitespace-nowrap px-3 py-1.5 text-zinc-500">{new Date(g.createdAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 font-mono text-zinc-300">
+                        {g.symbol} <span className={g.side === 'buy' ? 'text-emerald-400' : 'text-rose-400'}>{g.side === 'buy' ? '▲' : '▼'}</span>
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5">
+                        <Badge variant="outline" className={cn(
+                          'text-[10px]',
+                          g.decision === 'APPROVE' ? 'border-emerald-500/40 text-emerald-400'
+                            : g.decision === 'APPROVE_REDUCED_SIZE' ? 'border-sky-500/40 text-sky-400'
+                            : g.decision === 'REJECT' ? 'border-amber-500/40 text-amber-400'
+                            : 'border-rose-500/40 text-rose-400',
+                        )}>
+                          {g.decision === 'APPROVE' ? 'APPROVE'
+                            : g.decision === 'APPROVE_REDUCED_SIZE' ? `×${g.sizeMultiplier?.toFixed(2) ?? '?'} SIZE`
+                            : g.decision === 'REJECT' ? 'REJECT'
+                            : 'ERROR'}
+                        </Badge>
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500">{g.sessionTag ?? '—'}</td>
+                      <td className="px-2 py-1.5 font-mono text-zinc-500">{g.spreadPct != null ? g.spreadPct.toFixed(2) : '—'}</td>
+                      <td className="px-2 py-1.5 font-mono text-zinc-500">{g.rvol != null ? g.rvol.toFixed(2) : '—'}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-[10px] text-zinc-500">{g.htfAlignment ?? '—'}</td>
+                      <td className="px-2 py-1.5 font-mono text-[10px] text-violet-300">{g.cited.length > 0 ? g.cited.join(',') : '—'}</td>
+                      <td className="max-w-[280px] truncate px-3 py-1.5 text-zinc-400" title={g.error ?? g.rationale ?? ''}>{g.error ?? g.rationale ?? '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </section>
+      )}
 
       {/* prior runs */}
       {batches.length > 1 && (

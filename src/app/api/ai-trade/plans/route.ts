@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { getQuotes } from '@/lib/alpaca'
 import { normalizeLessonText, trimAiStewardLessons } from '@/lib/ai-steward-lessons'
 import { planLessonText, planReviewOutcome } from '@/lib/ai-trade-gates'
+import { gateShadowLessonText } from '@/lib/trade-gate'
 
 export const dynamic = 'force-dynamic'
 
@@ -28,12 +29,34 @@ export const dynamic = 'force-dynamic'
 //     and each verdict distilled into ONE 「計劃覆盤」 line UPSERTED into the
 //     PERMANENT AiStewardLesson memory. history=1 — lifecycle counts + the
 //     recent closed rows for the panel's review stats.
+//     v2.12.50 — gate-vetoed plans (closed GATED by the pre-trade veto gate,
+//     gateVeto=true) join the resolve pass with GATEKEEPER-flavored lessons:
+//     a veto whose shadow trade would have crossed the trigger flags the
+//     guardrail as possibly too strict (audit-the-gatekeeper loop).
 
 const PLAN_KEEP = 150
 const RESOLVE_AFTER_MS = 24 * 3600_000
 const RESOLVE_BATCH = 20
 
 const PLAN_STATUSES = ['WAITING', 'EXECUTED', 'INVALIDATED', 'EXPIRED', 'GATED', 'CANCELLED', 'SUPERSEDED'] as const
+
+/** v2.12.50 — the guardrail ids the veto gate cited for one plan (from the
+ *  latest PreTradeGateLog row linked to it) — quoted in the gatekeeper-audit
+ *  lesson so the review can point at WHICH rule may be too strict. */
+async function citedRulesForPlan(userId: string, planId: string): Promise<string[]> {
+  try {
+    const row = await db.preTradeGateLog.findFirst({
+      where: { userId, planId },
+      orderBy: { createdAt: 'desc' },
+      select: { guardrails: true },
+    })
+    if (!row?.guardrails) return []
+    const j = JSON.parse(row.guardrails) as { cited?: unknown }
+    return Array.isArray(j.cited) ? j.cited.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
 
 interface PlanIn {
   symbol?: unknown
@@ -146,7 +169,7 @@ export async function POST(req: Request) {
 export async function PATCH(req: Request) {
   try {
     const user = await requireUser()
-    const body = await req.json().catch(() => null) as { id?: unknown; status?: unknown; note?: unknown } | null
+    const body = await req.json().catch(() => null) as { id?: unknown; status?: unknown; note?: unknown; gateVeto?: unknown } | null
     const id = typeof body?.id === 'string' ? body.id : null
     const status = typeof body?.status === 'string' ? (body.status as string) : null
     if (!id || !status || !PLAN_STATUSES.includes(status as (typeof PLAN_STATUSES)[number])) {
@@ -156,12 +179,15 @@ export async function PATCH(req: Request) {
     const row = await db.aiTradePlan.findFirst({ where: { id, userId: user.id }, select: { id: true, status: true } })
     if (!row) return NextResponse.json({ error: 'plan not found' }, { status: 404 })
     if (row.status !== 'WAITING') return NextResponse.json({ ok: true, noop: true })
+    // v2.12.50 — the pre-trade veto gate closes plans GATED with gateVeto=true
+    // so the 24h resolve pass can shadow-track the gatekeeper's own decisions
     await db.aiTradePlan.update({
       where: { id },
       data: {
         status,
         statusNote: typeof body?.note === 'string' && body.note.trim() ? body.note.trim().slice(0, 200) : null,
         ...(closed ? { closedAt: new Date() } : {}),
+        ...(closed && body?.gateVeto === true && status === 'GATED' ? { gateVeto: true } : {}),
       },
     })
     return NextResponse.json({ ok: true })
@@ -202,11 +228,13 @@ export async function GET(req: Request) {
     if (wantResolve) {
       try {
         // v2.12.40 — grade ONLY the market-discipline closures (INVALIDATED =
-        // market went against the plan, EXPIRED = never confirmed). Gate
-        // closures (GATED — broker-impossible crypto shorts, trigger-time
-        // holdings/earnings refusals) are administrative: their "wait" was
-        // not a decision, and grading them 'missed-run' would distill the
-        // misleading lesson 「門檻可考慮放寬」 into the permanent memory.
+        // market went against the plan, EXPIRED = never confirmed) plus —
+        // v2.12.50 — the pre-trade veto gate's own GATED closures
+        // (gateVeto=true): the veto IS a decision and its shadow trade is
+        // graded to AUDIT THE GATEKEEPER. Administrative gate closures
+        // (broker-impossible crypto shorts, trigger-time holdings/earnings
+        // refusals, gate offline) stay excluded — grading them would distill
+        // misleading lessons into the permanent memory.
         const due = await db.aiTradePlan.findMany({
           where: {
             userId: user.id,
@@ -217,15 +245,27 @@ export async function GET(req: Request) {
           orderBy: { closedAt: 'asc' },
           take: RESOLVE_BATCH,
         })
-        if (due.length > 0) {
-          const symbols = [...new Set(due.map((d) => d.symbol))].slice(0, 20)
+        const dueVeto = await db.aiTradePlan.findMany({
+          where: {
+            userId: user.id,
+            resolvedAt: null,
+            closedAt: { not: null, lte: new Date(Date.now() - RESOLVE_AFTER_MS) },
+            status: 'GATED',
+            gateVeto: true,
+          },
+          orderBy: { closedAt: 'asc' },
+          take: RESOLVE_BATCH,
+        })
+        const all = [...due, ...dueVeto]
+        if (all.length > 0) {
+          const symbols = [...new Set(all.map((d) => d.symbol))].slice(0, 20)
           const { quotes } = await getQuotes(symbols, user.id).catch(() => ({ quotes: [] as { symbol?: string; price?: number }[] }))
           const priceBySym = new Map<string, number>()
           for (const q of quotes) {
             const p = Number(q?.price)
             if (q?.symbol && Number.isFinite(p) && p > 0) priceBySym.set(q.symbol.toUpperCase(), p)
           }
-          for (const d of due) {
+          for (const d of all) {
             const px = priceBySym.get(d.symbol)
             const { outcome, pnlPct } = planReviewOutcome(
               d.side === 'sell' ? 'sell' : 'buy',
@@ -234,14 +274,20 @@ export async function GET(req: Request) {
             await db.aiTradePlan.update({ where: { id: d.id }, data: { resolvedAt: new Date(), outcome, pnlPct } })
             resolved++
             if (outcome !== 'neutral') {
-              const text = normalizeLessonText(planLessonText({
-                symbol: d.symbol,
-                side: d.side === 'sell' ? 'sell' : 'buy',
-                trigger: d.trigger,
-                confidence: d.confidence,
-                status: d.status,
-                regime: d.regime,
-              }, outcome, pnlPct))
+              // gate-vetoed closures speak for the GATEKEEPER, not the trader:
+              // a missed-run veto flags the cited guardrail as possibly too
+              // strict; a good-wait veto confirms capital preservation worked
+              const cited = d.gateVeto ? await citedRulesForPlan(user.id, d.id) : []
+              const text = normalizeLessonText(d.gateVeto
+                ? gateShadowLessonText(d.symbol, d.side === 'sell' ? 'sell' : 'buy', outcome, pnlPct, cited)
+                : planLessonText({
+                  symbol: d.symbol,
+                  side: d.side === 'sell' ? 'sell' : 'buy',
+                  trigger: d.trigger,
+                  confidence: d.confidence,
+                  status: d.status,
+                  regime: d.regime,
+                }, outcome, pnlPct))
               if (text) {
                 const existing = await db.aiStewardLesson.findUnique({
                   where: { userId_text: { userId: user.id, text } },
@@ -264,8 +310,9 @@ export async function GET(req: Request) {
     interface HistRow {
       id: string; symbol: string; side: string; status: string; trigger: number
       outcome: string | null; pnlPct: number | null; closedAt: string | null; statusNote: string | null
+      gateVeto: boolean
     }
-    let stats = { waiting: 0, executed: 0, invalidated: 0, expired: 0, gated: 0, superseded: 0, goodWait: 0, missedRun: 0, neutral: 0 }
+    let stats = { waiting: 0, executed: 0, invalidated: 0, expired: 0, gated: 0, superseded: 0, goodWait: 0, missedRun: 0, neutral: 0, gateVeto: 0, gateVetoGoodWait: 0, gateVetoMissedRun: 0 }
     let recent: HistRow[] = []
     if (wantHistory) {
       try {
@@ -273,8 +320,10 @@ export async function GET(req: Request) {
           where: { userId: user.id },
           orderBy: { createdAt: 'desc' },
           take: 300,
-          select: { id: true, symbol: true, side: true, status: true, trigger: true, outcome: true, pnlPct: true, closedAt: true, statusNote: true },
+          select: { id: true, symbol: true, side: true, status: true, trigger: true, outcome: true, pnlPct: true, closedAt: true, statusNote: true, gateVeto: true },
         })
+        const vetoedRows = rows.filter((r) => r.gateVeto)
+        const gradedVeto = vetoedRows.filter((r) => r.outcome != null)
         stats = {
           waiting: rows.filter((r) => r.status === 'WAITING').length,
           executed: rows.filter((r) => r.status === 'EXECUTED').length,
@@ -285,6 +334,9 @@ export async function GET(req: Request) {
           goodWait: rows.filter((r) => r.outcome === 'good-wait').length,
           missedRun: rows.filter((r) => r.outcome === 'missed-run').length,
           neutral: rows.filter((r) => r.outcome === 'neutral').length,
+          gateVeto: vetoedRows.length,
+          gateVetoGoodWait: gradedVeto.filter((r) => r.outcome === 'good-wait').length,
+          gateVetoMissedRun: gradedVeto.filter((r) => r.outcome === 'missed-run').length,
         }
         recent = rows
           .filter((r) => r.status !== 'WAITING')
@@ -295,6 +347,7 @@ export async function GET(req: Request) {
             outcome: r.outcome, pnlPct: r.pnlPct,
             closedAt: r.closedAt ? r.closedAt.toISOString() : null,
             statusNote: r.statusNote,
+            gateVeto: r.gateVeto,
           }))
       } catch { /* history is best-effort */ }
     }
