@@ -36,6 +36,14 @@ export const BACKUP_TABLE_KEYS = [
   'gridTrades',
   'gridFills',
   'aiStewardLessons',
+  // v2.12.54 — the AI trade-review pipeline (智慧複盤): the distilled ACTIVE
+  // guardrails the steward injects pre-trade, plus the compact audit evidence
+  // chain (batches are retention-pruned to the newest 10/user/mode, so these
+  // sections stay small). All three are OPTIONAL sections: files from older
+  // versions simply lack them and restore unchanged.
+  'reviewRules',
+  'tradeAuditBatches',
+  'tradeAudits',
 ] as const
 
 export interface BackupEnvelope {
@@ -234,6 +242,61 @@ const SPECS: Record<string, Record<string, FieldSpec>> = {
     text: { t: 's', req: true, max: 200 },
     createdAt: { t: 'd' },   // first learned
     lastSeenAt: { t: 'd' },  // last reinforced
+  },
+  // v2.12.54 — AI trade-review guardrails (the "Active guardrails" list the
+  // pre-trade gate + steward prompt inject). ALL lifecycle statuses ship
+  // (candidate / active / retired / discarded): retiring a rule was a human
+  // or consolidation decision, and a restore that resurrected retired rules
+  // would silently loosen the live guardrail set.
+  reviewRule: {
+    dedupeKey: { t: 's', req: true, max: 300 },
+    condition: { t: 's', req: true, max: 400 },
+    action: { t: 's', req: true, max: 400 },
+    confidence: { t: 's', max: 10 },
+    tags: { t: 's', req: true, max: 500 }, // JSON array string (whitelist vocabulary enforced upstream)
+    status: { t: 's', max: 16 },
+    frequency: { t: 'n' },
+    pnlImpact: { t: 's', max: 200 },
+    lastBatchId: { t: 's', max: 64 }, // plain reference, no FK — dangling ids are harmless
+    firstSeenAt: { t: 'd' },
+    lastSeenAt: { t: 'd' },
+    promotedAt: { t: 'd' },
+    retiredAt: { t: 'd' },
+  },
+  // The audit evidence chain. rawJson (the per-audit debug blob, several KB)
+  // is deliberately ABSENT from the spec: the structured columns carry every
+  // analysis field, and the whitelist drops unknown fields on restore anyway.
+  tradeAuditBatch: {
+    mode: { t: 's', req: true, max: 8 },
+    status: { t: 's', max: 16 },
+    tradeCount: { t: 'n' },
+    patternCount: { t: 'n' },
+    ruleCount: { t: 'n' },
+    note: { t: 's', max: 900 },
+    patternsJson: { t: 's', max: 60_000 },
+    createdAt: { t: 'd' },
+  },
+  tradeAudit: {
+    batchId: { t: 's', req: true, max: 64 }, // FK → TradeAuditBatch.id (restored first, ids preserved)
+    mode: { t: 's', req: true, max: 8 },
+    tradeKey: { t: 's', req: true, max: 120 },
+    symbol: { t: 's', req: true, max: 24 },
+    side: { t: 's', max: 8 },
+    quadrant: { t: 's', max: 40 },
+    score: { t: 'n' },
+    pnl: { t: 'n', req: true },
+    pnlPct: { t: 'n', req: true },
+    maePct: { t: 'n' },
+    mfePct: { t: 'n' },
+    maeAtr: { t: 'n' },
+    mfeAtr: { t: 'n' },
+    entrySession: { t: 's', max: 16 },
+    exitSession: { t: 's', max: 16 },
+    heldMinutes: { t: 'n' },
+    diagnosis: { t: 's', req: true, max: 800 },
+    sessionImpact: { t: 's', req: true, max: 500 },
+    rootCause: { t: 's', req: true, max: 500 },
+    createdAt: { t: 'd' },
   },
 }
 
@@ -514,6 +577,67 @@ export async function restoreBackupData(
       })
     }
     counts.aiStewardLessons = unique.length
+  }
+
+  // v2.12.54 — ACTIVE guardrails (AI trade-review rules). Independent of the
+  // audit chain (lastBatchId is a plain string, no FK): present → delete-first
+  // + recreate, all lifecycle statuses 1:1. Dedupe by dedupeKey so one
+  // duplicated row in a hand-edited file can't double-count frequency later.
+  if (has('reviewRules')) {
+    const rows = buildRows(data.reviewRules as unknown[], 'reviewRule')
+    const seen = new Set<string>()
+    const unique = rows.filter((r) => {
+      const key = typeof r.dedupeKey === 'string' ? r.dedupeKey : ''
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    await tx.reviewRule.deleteMany({ where: { userId } })
+    if (unique.length) {
+      await tx.reviewRule.createMany({
+        data: unique.map((r) => ({ ...r, userId })) as unknown as Prisma.ReviewRuleCreateManyInput[],
+      })
+    }
+    counts.reviewRules = unique.length
+  }
+
+  // Audit evidence chain — batches and audits are ONE coupled unit because of
+  // the real FK (TradeAudit.batchId → TradeAuditBatch.id, cascade): deleting
+  // batches alone would cascade-wipe audits that the file may still carry, and
+  // restoring audits alone would violate the FK. Semantics:
+  //   · batches present → delete-first BOTH (audits explicitly, then batches)
+  //     and recreate the sections the file carries; audits whose batchId does
+  //     not match a restored batch are filtered out (hallucinated/torn file).
+  //   · audits present WITHOUT batches → skipped entirely (no delete, no
+  //     create): the exporter never produces that shape, and a hostile one
+  //     must not wipe data it cannot faithfully recreate.
+  if (has('tradeAuditBatches')) {
+    const batchRows = buildRows(data.tradeAuditBatches as unknown[], 'tradeAuditBatch')
+    const seenBatch = new Set<string>()
+    const uniqueBatches = batchRows.filter((r) => {
+      const key = typeof r.id === 'string' ? r.id : ''
+      if (!key || seenBatch.has(key)) return false
+      seenBatch.add(key)
+      return true
+    })
+    await tx.tradeAudit.deleteMany({ where: { userId } })
+    await tx.tradeAuditBatch.deleteMany({ where: { userId } })
+    if (uniqueBatches.length) {
+      await tx.tradeAuditBatch.createMany({
+        data: uniqueBatches.map((r) => ({ ...r, userId })) as unknown as Prisma.TradeAuditBatchCreateManyInput[],
+      })
+    }
+    counts.tradeAuditBatches = uniqueBatches.length
+    if (has('tradeAudits')) {
+      const auditRows = buildRows(data.tradeAudits as unknown[], 'tradeAudit')
+      const kept = auditRows.filter((r) => typeof r.batchId === 'string' && seenBatch.has(r.batchId))
+      if (kept.length) {
+        await tx.tradeAudit.createMany({
+          data: kept.map((r) => ({ ...r, userId })) as unknown as Prisma.TradeAuditCreateManyInput[],
+        })
+      }
+      counts.tradeAudits = kept.length
+    }
   }
 
   return counts

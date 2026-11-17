@@ -55,7 +55,7 @@ export async function GET() {
     const user = await db.user.findUnique({ where: { id: session.id } })
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-    const [layout, watchlists, drawings, alerts, strategyRules, algoRuns, algoLogs, calendarAlarms, gridTrades, gridFills, algoRecoCache, aiStewardLessons] =
+    const [layout, watchlists, drawings, alerts, strategyRules, algoRuns, algoLogs, calendarAlarms, gridTrades, gridFills, algoRecoCache, aiStewardLessons, reviewRules, tradeAuditBatches, tradeAuditsRaw] =
       await Promise.all([
         db.layout.findUnique({ where: { userId: user.id } }),
         db.watchlist.findMany({ where: { userId: user.id }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] }),
@@ -76,7 +76,34 @@ export async function GET() {
         // v2.12.30 — the AI steward's PERMANENT lesson memory (never purged
         // by the live retention prune) ships with the backup too
         db.aiStewardLesson.findMany({ where: { userId: user.id }, orderBy: [{ lastSeenAt: 'desc' }, { createdAt: 'asc' }] }),
+        // v2.12.54 — AI trade-review guardrails (ALL lifecycle statuses —
+        // retiring a rule was a decision, and a restore must not resurrect it)
+        db.reviewRule.findMany({
+          where: { userId: user.id },
+          orderBy: { firstSeenAt: 'desc' },
+          take: MAX_ROWS_PER_TABLE,
+        }),
+        // audit evidence chain — batches first, audits coupled to THOSE batch
+        // ids so the file can never contain a torn FK edge
+        db.tradeAuditBatch.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: 'desc' },
+          take: MAX_ROWS_PER_TABLE,
+        }),
+        db.tradeAudit.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: 'desc' },
+          take: MAX_ROWS_PER_TABLE,
+        }),
       ])
+
+    // keep only audits whose batch actually ships (FK integrity in the file);
+    // strip rawJson (per-audit debug blob, several KB each) — the structured
+    // columns carry every analysis field the restore whitelist accepts
+    const batchIds = new Set(tradeAuditBatches.map((b) => b.id))
+    const tradeAudits = tradeAuditsRaw
+      .filter((a) => batchIds.has(a.batchId))
+      .map(({ rawJson: _rawJson, ...rest }) => rest)
 
     // A section with no row (layout never autosaved, the per-user algo-reco
     // sweep cache never generated — guaranteed on a fresh deploy) would be
@@ -96,6 +123,11 @@ export async function GET() {
       gridFills: gridFills.reverse(),
       algoRecoCache,
       aiStewardLessons,
+      // v2.12.54 — guardrails + audit chain, back to chronological (queries
+      // ran newest-first for the take-cap)
+      reviewRules: reviewRules.reverse(),
+      tradeAuditBatches: tradeAuditBatches.reverse(),
+      tradeAudits: tradeAudits.reverse(),
     }
     for (const k of Object.keys(data)) {
       if (data[k] === null) delete data[k]

@@ -51,6 +51,9 @@ const TABLE_LABELS: Record<string, string> = {
   gridTrades: 'grid trade(s)',
   gridFills: 'grid fill(s)',
   aiStewardLessons: 'AI 護倉教訓（永久記憶）',
+  reviewRules: 'AI trade-review guardrail(s)',
+  tradeAuditBatches: 'audit batch(es)',
+  tradeAudits: 'trade audit(s)',
 };
 
 interface ExportDlg {
@@ -70,6 +73,9 @@ interface RestoreSummary {
   gridTrades?: number;
   gridFills?: number;
   aiStewardLessons?: number;
+  reviewRules?: number;
+  tradeAuditBatches?: number;
+  tradeAudits?: number;
   [key: string]: number | undefined;
 }
 
@@ -311,9 +317,11 @@ export default function BackupRestoreCard() {
           Backup &amp; Restore
         </CardTitle>
         <CardDescription className="text-xs leading-relaxed text-zinc-500">
-          One file with your account, watchlists, charts, algo runs, alerts and
-          grid trades. Restore it after a redeploy instead of starting over —
-          from here, or from the login screen on a fresh install.
+          One file with your account, watchlists, charts, algo runs, alerts,
+          grid trades and the AI trade-review guardrails (智慧複盤 active
+          rules + audit history). Restore it after a redeploy instead of
+          starting over — from here, or from the login screen on a fresh
+          install.
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3 p-4 pt-1">
