@@ -12,8 +12,15 @@ import {
   parseAuditOutput, ruleDedupeKey,
   type EnrichedTrade,
 } from '@/lib/trade-review'
+import { ensureZaiConfig, getZai, zaiSetupHint } from '@/lib/zai'
 import type { Bar } from '@/lib/market-types'
 
+// v2.12.51 — Z.AI credentials fix: the SDK reads .z-ai-config from cwd/home//etc
+// only, which never exists on Render (gitignored). Credentials now ride the
+// ZAI_CONFIG_JSON env var (materialized at boot by docker-entrypoint.sh, with
+// a runtime fallback in src/lib/zai.ts), and a pre-flight below fails fast
+// with ONE actionable message instead of N failed batches.
+//
 // v2.12.49 — AI TRADE REVIEW auditor. POST runs the full pipeline:
 //   closed trades (FIFO) → enrichment (session / MAE-MFE vs ATR / slippage /
 //   volume ratio, POINT-IN-TIME only) → LLM batches of 5-10 @ temp 0.15 →
@@ -46,18 +53,6 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-let zaiPromise: Promise<unknown> | null = null
-async function getZai() {
-  if (!zaiPromise) {
-    zaiPromise = (async () => {
-      const mod = await import('z-ai-web-dev-sdk')
-      const ZAI = (mod as unknown as { default: unknown }).default ?? (mod as unknown)
-      return await (ZAI as { create(): Promise<unknown> }).create()
-    })()
-  }
-  return zaiPromise
-}
-
 type ChatSdk = { chat: { completions: { create: (o: Record<string, unknown>) => Promise<unknown> } } }
 
 /** One auditor call @ temperature 0.15 (analytical consistency, per the audit
@@ -77,6 +72,11 @@ async function callAuditor(system: string, user: string): Promise<string> {
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      // v2.12.51 — the SDK's cryptic file-not-found text becomes the actionable
+      // hint (belt to the pre-flight; can only fire if files changed mid-run)
+      if (/Configuration file not found/i.test(msg)) {
+        throw new Error('Z.AI credentials missing — set ZAI_CONFIG_JSON and redeploy')
+      }
       if (/temperature/i.test(msg)) {
         const completion = await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } })
         return extractContent(completion)
@@ -200,6 +200,18 @@ export async function POST(req: Request) {
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const body = (await req.json().catch(() => ({}))) as { mode?: string; limit?: number }
     const mode = await resolveTradeMode(user.id, body.mode)
+
+    // 0) v2.12.51 pre-flight — the LLM credentials must exist BEFORE we pull
+    //    orders and burn a run; a misconfigured deployment answers with ONE
+    //    actionable 503 instead of a failed batch row per LLM call.
+    const zaiStatus = await ensureZaiConfig()
+    if (!zaiStatus.configured) {
+      return NextResponse.json(
+        { mode, error: `AI audit unavailable — ${zaiSetupHint(zaiStatus)}` },
+        { status: 503 },
+      )
+    }
+
     const lockKey = `${user.id}:${mode}`
     if (runLocked(lockKey)) {
       return NextResponse.json(

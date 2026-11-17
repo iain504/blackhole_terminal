@@ -12,6 +12,12 @@
 // FinBERT carries a non-commercial licence — check before commercial use.
 import { clampScore, labelOf } from './sentiment-news'
 import type { SentimentLabel } from './sentiment-types'
+// v2.12.51 — shared bootstrap (getZai from @/lib/zai): on Render the SDK's
+// .z-ai-config file never exists; credentials ride the ZAI_CONFIG_JSON env var
+// (materialized by docker-entrypoint.sh at boot with a runtime fallback). An
+// init failure here still degrades to the offline lexicon scorer below — the
+// pipeline never dies, per the engine's design note above.
+import { getZai } from '@/lib/zai'
 
 export interface ScoredHeadline {
   label: SentimentLabel
@@ -79,19 +85,6 @@ const SYSTEM_PROMPT =
   'involves the asset. Respond with STRICT JSON only: a JSON array, one object per ' +
   'input line, in order: [{"i":<line index>,"label":"positive"|"negative"|"neutral",' +
   '"score":<-1..1>,"confidence":<0..1>}]. No markdown, no commentary.'
-
-let zaiPromise: Promise<unknown> | null = null
-
-async function getZai() {
-  if (!zaiPromise) {
-    zaiPromise = (async () => {
-      const mod = await import('z-ai-web-dev-sdk')
-      const ZAI = (mod as unknown as { default: unknown }).default ?? (mod as unknown)
-      return await (ZAI as { create(): Promise<unknown> }).create()
-    })()
-  }
-  return zaiPromise
-}
 
 function extractJsonArray(text: string): unknown[] | null {
   if (!text) return null

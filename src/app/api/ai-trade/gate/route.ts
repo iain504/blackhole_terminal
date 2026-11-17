@@ -13,11 +13,19 @@ import {
   dailyAtr14, rvolFromBars, htfAlignment,
   type GateCandidateInput, type GateMarketContext, type GateVerdict,
 } from '@/lib/trade-gate'
+import { ensureZaiConfig, getZai, zaiSetupHint } from '@/lib/zai'
 
 export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
 export const maxDuration = 120
 
+// v2.12.51 — Z.AI credentials fix for HOSTED deployments: the SDK resolves
+// .z-ai-config (cwd/home//etc) which never exists on Render — the credentials
+// now ride the ZAI_CONFIG_JSON env var (materialized by docker-entrypoint.sh
+// at boot, runtime fallback in src/lib/zai.ts) and a pre-flight in POST fails
+// fast with an actionable 503 instead of persisting an ERROR verdict row per
+// signal. Fail-closed semantics unchanged.
+//
 // v2.12.50 — PRE-TRADE VETO GATE (Risk & Regime Filter).
 //
 //   POST /api/ai-trade/gate { candidate: {...}, planId? }
@@ -93,18 +101,6 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-let zaiPromise: Promise<unknown> | null = null
-async function getZai() {
-  if (!zaiPromise) {
-    zaiPromise = (async () => {
-      const mod = await import('z-ai-web-dev-sdk')
-      const ZAI = (mod as unknown as { default: unknown }).default ?? (mod as unknown)
-      return await (ZAI as { create(): Promise<unknown> }).create()
-    })()
-  }
-  return zaiPromise
-}
-
 type ChatSdk = { chat: { completions: { create: (o: Record<string, unknown>) => Promise<unknown> } } }
 
 /** One gatekeeper call @ temperature 0.1 (deterministic JSON before the order
@@ -124,6 +120,11 @@ async function callGatekeeper(system: string, user: string): Promise<string> {
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
+      // v2.12.51 — the SDK's cryptic file-not-found text becomes the actionable
+      // hint (belt to the pre-flight; can only fire if files changed mid-run)
+      if (/Configuration file not found/i.test(msg)) {
+        throw new Error('Z.AI credentials missing — set ZAI_CONFIG_JSON and redeploy')
+      }
       if (/temperature|max_tokens/i.test(msg)) {
         const completion = await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } })
         return extractContent(completion)
@@ -263,6 +264,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'candidate (symbol, side, entry, stop, target) required' }, { status: 400 })
     }
     const { candidate, planId } = parsed
+
+    // v2.12.51 pre-flight — the gate verdict must never silently degrade on a
+    // deployment without LLM credentials: answer with ONE actionable 503
+    // (fail-closed, and no ERROR gate-log row is burned per signal).
+    const zaiStatus = await ensureZaiConfig()
+    if (!zaiStatus.configured) {
+      return NextResponse.json(
+        { error: `Pre-trade gate unavailable — ${zaiSetupHint(zaiStatus)}` },
+        { status: 503 },
+      )
+    }
 
     // 1) deterministic context + ACTIVE guardrails (parallel)
     const [{ ctx, quotesOk }, activeRules] = await Promise.all([

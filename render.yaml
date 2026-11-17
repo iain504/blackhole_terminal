@@ -76,6 +76,14 @@ services:
         sync: false
       - key: APCA_API_SECRET_KEY
         sync: false
+      # Z.AI inference credentials for every AI feature (post-trade auditor,
+      # pre-trade veto gate, sentiment engine) — v2.12.51. The SDK reads a
+      # .z-ai-config file that no hosted container has, so paste the JSON from
+      # the dev sandbox's /etc/.z-ai-config here (Environment tab), and the
+      # entrypoint materializes it to /app/.z-ai-config on boot. Never commit
+      # the value — kept out of git on purpose.
+      - key: ZAI_CONFIG_JSON
+        sync: false
       # Bun/JSC heap steering (NODE_OPTIONS alone is ignored by Bun — see
       # mem-guard.ts); kept for any Node-context tools in the image.
       - key: BUN_JSC_forceRamSize
