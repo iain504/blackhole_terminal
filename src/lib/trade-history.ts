@@ -26,6 +26,19 @@ export function displaySymbolOf(o: Pick<TradingOrder, 'symbol' | 'asset_class'>)
   return o.symbol
 }
 
+// v2.12.48 — the ONE date-range gate for the history route's TWO row kinds:
+// closed trades filter on their EXIT time (the CLOSED column) and canceled/
+// expired rows on their CANCEL time (updated_at || created_at = what the
+// same CLOSED column renders for them). `fromMs`/`toMs` are Date.parse
+// results (NaN = unbounded). A row with a malformed/missing time is KEPT —
+// never let a date filter erase rows from the filter's own blast radius.
+export function passesRange(atMs: number, fromMs: number, toMs: number): boolean {
+  if (!Number.isFinite(atMs)) return true
+  if (Number.isFinite(fromMs) && atMs < fromMs) return false
+  if (Number.isFinite(toMs) && atMs > toMs) return false
+  return true
+}
+
 /** internal alias (the FIFO walk uses it for trade rows) */
 const displaySymbol = displaySymbolOf
 

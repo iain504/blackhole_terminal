@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { getClosedOrders, getPositions, resolveTradeMode, isNoKeysError, isKeysUnreadableError, authBackoffMsLeft, parseCryptoPlan, type TradingOrder } from '@/lib/trading'
 import { describeAlpacaKeys } from '@/lib/alpaca'
-import { matchFifo, ghostLotSymbols, consumedPhantomSymbols, resolveRunStrategyNames, displaySymbolOf } from '@/lib/trade-history'
+import { matchFifo, ghostLotSymbols, consumedPhantomSymbols, resolveRunStrategyNames, displaySymbolOf, passesRange } from '@/lib/trade-history'
 import { loadStewardActions, resolveTradeReason, resolveCancelReason } from '@/lib/trade-reasons'
 import type { CanceledOrderRow, ClosedTrade } from '@/lib/market-types'
 import { handleError } from '@/lib/api-helpers'
@@ -29,6 +29,10 @@ function widenRecently(key: string): boolean {
 // recent closed-orders window, the date filter is applied BEFORE the limit
 // so a narrow range isn't crowded out by newer trades. Ranges come from the
 // client in the browser's timezone (local-midnight ISO).
+// v2.12.48 — the range ALSO governs the CANCELED/expired rows: the same
+// CLOSED column shows the cancel time (updated_at || created_at), so an old
+// manual cancel (last week) must not surface under "Today" — the leak was
+// real: canceled rows were built from the whole tape with NO date filter.
 // v2.12.28 — three additions: (1) HELD-BUG fix — after the walk the open
 // lots are checked against the LIVE positions; a lot with no backing
 // position (or a contradicting side) is a WINDOW-TRUNCATION GHOST whose
@@ -150,13 +154,9 @@ export async function GET(req: Request) {
 
     // uncapped walk (large cap — 500+ orders can't produce more): filter by
     // exit time FIRST, then cap, so a date range gets its full share
-    const matched = fm.trades.filter((t) => {
-      const at = Date.parse(t.exitAt)
-      if (!Number.isFinite(at)) return true // keep malformed-time trades out of the filter's blast radius
-      if (Number.isFinite(fromMs) && at < fromMs) return false
-      if (Number.isFinite(toMs) && at > toMs) return false
-      return true
-    })
+    const matched = fm.trades.filter((t) =>
+      passesRange(Date.parse(t.exitAt), fromMs, toMs),
+    )
     const trades = matched.slice(0, limit)
     // resolve algo run refs → strategy display names via the SHARED resolver
     // (refs are 8-char id prefixes so `startsWith` is unique in practice)
@@ -195,6 +195,12 @@ export async function GET(req: Request) {
         if (o.group_role === 'entry') return true
         return !canceledParents.has(o.group_id)
       })
+      // v2.12.48 — date range governs cancels too: filter on the cancel time
+      // (updated_at || created_at) = exactly what the CLOSED column renders
+      // for these rows, applied BEFORE the 60 cap (same trade convention —
+      // a narrow range keeps its full share). THE shared passesRange gate —
+      // malformed/missing time keeps the row.
+      .filter((o) => passesRange(Date.parse(o.updated_at || o.created_at || ''), fromMs, toMs))
       .sort((a, b) => new Date(b.updated_at || b.created_at || '').getTime() - new Date(a.updated_at || a.created_at || '').getTime())
       .slice(0, 60)
       .map((o) => ({
