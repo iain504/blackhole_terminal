@@ -797,3 +797,77 @@ model ScreenerPick {
   @@unique([userId, symbol])
   @@index([userId, rank])
 }
+
+// v2.12.49 — AI TRADE REVIEW (智慧複盤): post-trade audit pipeline. The FIFO
+// closed trades are enriched (session, MAE/MFE excursions vs ATR, slippage,
+// volume ratio — all computed with POINT-IN-TIME data only, never future bars)
+// and handed to the LLM auditor in batches of 5-10. The model grades PROCESS
+// separately from OUTCOME (2x2 quadrant matrix), proposes candidate guardrail
+// rules; a consolidation pass caps the ACTIVE list to 5-7. Active rules are
+// injected into the AI steward's live prompt when the session tag matches.
+model TradeAuditBatch {
+  id           String       @id @default(cuid())
+  userId       String
+  mode         String // paper | live
+  status       String // ok | partial | failed
+  tradeCount   Int          @default(0)
+  patternCount Int          @default(0)
+  ruleCount    Int          @default(0)
+  note         String? // failure/partial info
+  patternsJson String? // JSON array of the batches' cross-trade patterns (UI)
+  createdAt    DateTime     @default(now())
+  audits       TradeAudit[]
+
+  @@index([userId, mode, createdAt])
+}
+
+model TradeAudit {
+  id            String          @id @default(cuid())
+  batchId       String
+  batch         TradeAuditBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  userId        String
+  mode          String
+  tradeKey      String // `${mode}:${trade.id}` — dedupe/mapping anchor
+  symbol        String
+  side          String // long | short
+  quadrant      String // GOOD_PROCESS_WIN | GOOD_PROCESS_LOSS | BAD_PROCESS_WIN | BAD_PROCESS_LOSS
+  score         Int // 1-10 execution quality
+  pnl           Float
+  pnlPct        Float
+  maePct        Float?
+  mfePct        Float?
+  maeAtr        Float?
+  mfeAtr        Float?
+  entrySession  String?
+  exitSession   String?
+  heldMinutes   Int?
+  diagnosis     String // MAE/MFE + exit-timing analysis
+  sessionImpact String // regular vs extended, spread, slippage
+  rootCause     String
+  rawJson       String? // the full enriched trade + audit row (debug/export)
+  createdAt     DateTime  @default(now())
+
+  @@index([userId, mode, createdAt])
+  @@index([batchId])
+}
+
+model ReviewRule {
+  id          String    @id @default(cuid())
+  userId      String
+  dedupeKey   String // normalized condition+action — candidate re-sighting increments frequency
+  condition   String
+  action      String
+  confidence  String // HIGH | MEDIUM | LOW
+  tags        String    @default("[]") // JSON array: session:extended/regular/any, vol:high/low/any, asset:crypto/equity/any
+  status      String // candidate | active | retired | discarded
+  frequency   Int       @default(1)
+  pnlImpact   String?
+  lastBatchId String?
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  promotedAt  DateTime?
+  retiredAt   DateTime?
+
+  @@index([userId, status])
+  @@index([userId, dedupeKey])
+}

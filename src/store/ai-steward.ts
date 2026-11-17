@@ -537,12 +537,15 @@ export async function runStewardOnce(): Promise<void> {
     //    and the US session state (v2.12.29 — extended-hours discipline:
     //    pre/post bans market orders; transitions kill DAY-tif TP/SL legs)
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0)
-    const [posRes, histRes, memRes, hoursRes] = await Promise.all([
+    const [posRes, histRes, memRes, hoursRes, revRes] = await Promise.all([
       fetchJson(`/api/trading/positions?mode=${cfg.mode}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson(`/api/trading/history?mode=${cfg.mode}&from=${encodeURIComponent(midnight.toISOString())}&limit=100`, { signal: sig }).catch(() => ({ status: 0, j: null })),
       fetchJson('/api/ai-steward/lessons', { signal: sig }).catch(() => ({ status: 0, j: null })),
       // /api/market/hours is POST-only (shared with the chart session badge)
       fetchJson('/api/market/hours', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbols: ['SPY'] }), signal: sig }).catch(() => ({ status: 0, j: null })),
+      // v2.12.49 — the trade-review loop's ACTIVE guardrails (5-7 cap, rule
+      // rows tagged session:any / session:regular / session:extended)
+      fetchJson(`/api/trade-review/rules?active=1&mode=${cfg.mode}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
     ])
 
     const posJ = posRes.j as { positions?: PositionRow[]; exits?: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>; pending?: PendingRow[]; keysMissing?: unknown; authError?: unknown } | null
@@ -829,9 +832,30 @@ export async function runStewardOnce(): Promise<void> {
       lines.push('記憶（過去歸納的教訓，請遵守並避免重複）:')
       for (const l of lessons) lines.push(`- ${l}`)
     }
+    // v2.12.49 — ACTIVE trade-review guardrails, context-matched: rules tagged
+    // session:any (or matching the current session) ride along, capped at 7 —
+    // the closing loop from 智慧複盤 back into live decisions. These are
+    // CONTEXT, not commands: the model weighs them alongside the live data.
+    const revJ = revRes.j as { rules?: { condition: string; action: string; confidence: string; tags?: string | string[] }[] } | null
+    const allActive = Array.isArray(revJ?.rules) ? revJ!.rules : []
+    const sessionTag = session === 'regular' ? 'session:regular' : 'session:extended'
+    const activeRules = allActive
+      .filter((r) => {
+        let tags: string[] = []
+        try { tags = Array.isArray(r.tags) ? r.tags : typeof r.tags === 'string' ? JSON.parse(r.tags) : [] } catch { tags = [] }
+        return tags.length === 0 || tags.includes('session:any') || tags.includes(sessionTag)
+      })
+      .slice(0, 7)
+    if (activeRules.length > 0) {
+      lines.push('')
+      lines.push('複盤護欄（智慧複盤審查產生的活躍規則 — 進出場決策時請納入考量）:')
+      for (const r of activeRules) {
+        lines.push(`- 若 ${r.condition} → ${r.action}（信心 ${r.confidence}）`)
+      }
+    }
     const dataBlock = lines.join('\n')
 
-    st0.addLog('info', `送審：持倉 ${positions.length} · 待成交 ${pending.length} · 今日平倉 ${trades.length}${lessons.length ? ` · 記憶 ${lessons.length} 條` : ''}${slMissingRows.length ? ` · ⚠ SL缺失 ${slMissingRows.length}` : ''} · 時段 ${session}`)
+    st0.addLog('info', `送審：持倉 ${positions.length} · 待成交 ${pending.length} · 今日平倉 ${trades.length}${lessons.length ? ` · 記憶 ${lessons.length} 條` : ''}${activeRules.length ? ` · 複盤護欄 ${activeRules.length} 條` : ''}${slMissingRows.length ? ` · ⚠ SL缺失 ${slMissingRows.length}` : ''} · 時段 ${session}`)
 
     // 4) one batched model call
     const res = await fetch('/api/ai-trade/chat', {
