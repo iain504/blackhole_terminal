@@ -76,22 +76,11 @@ services:
         sync: false
       - key: APCA_API_SECRET_KEY
         sync: false
-      # Standalone LLM transport for every AI feature (post-trade auditor,
-      # pre-trade veto gate, sentiment engine, rule consolidation) — v2.12.52.
-      # NO vendor SDK: the app speaks OpenAI-compatible HTTP to whatever
-      # provider you point it at. Paste the values in the dashboard
-      # (Environment tab) — kept out of git on purpose.
-      #   LLM_API_URL : provider base, e.g. https://api.openai.com/v1
-      #                 (also DeepSeek / Groq / OpenRouter / vLLM / ollama /v1)
-      #   LLM_API_KEY : that provider's API key
-      #   LLM_MODEL   : model id (auto-defaulted for well-known cloud hosts,
-      #                 REQUIRED for self-hosted endpoints — e.g. llama3.1)
-      - key: LLM_API_URL
-        sync: false
-      - key: LLM_API_KEY
-        sync: false
-      - key: LLM_MODEL
-        sync: false
+      # AI features (post-trade auditor, pre-trade veto gate, sentiment
+      # engine, rule consolidation) need NO env vars — v2.12.52: they ride the
+      # platform's BUILT-IN AI config (the built-in EdgeZero lane), and each
+      # user can connect their own endpoint + model + key under
+      # Settings → AI Agent API in the UI (encrypted, with a test button).
       # Bun/JSC heap steering (NODE_OPTIONS alone is ignored by Bun — see
       # mem-guard.ts); kept for any Node-context tools in the image.
       - key: BUN_JSC_forceRamSize

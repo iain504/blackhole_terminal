@@ -1,7 +1,8 @@
 // v2.5.0 — Market Sentiment Engine · NLP scoring.
 //
 // The FinBERT slot in the reference architecture is filled by the app's
-// backend LLM (z-ai-web-dev-sdk, server-side only): batched, finance-tuned
+// backend LLM (src/lib/llm.ts — standalone OpenAI-compatible transport,
+// server-side only): batched, finance-tuned
 // headline scoring with a strict JSON contract, confidence per headline, and
 // an OFFLINE finance lexicon fallback (VADER-style) so a model outage degrades
 // scoring to a weaker-but-working signal instead of a dead pipeline.
@@ -12,11 +13,11 @@
 // FinBERT carries a non-commercial licence — check before commercial use.
 import { clampScore, labelOf } from './sentiment-news'
 import type { SentimentLabel } from './sentiment-types'
-// v2.12.52 — standalone transport (llmChat from @/lib/llm): no vendor SDK. The
-// container speaks OpenAI-compatible HTTP to any provider the operator sets
-// (LLM_API_URL / LLM_API_KEY / LLM_MODEL); in the dev sandbox it falls back to
-// the internal API. An init/call failure here still degrades to the offline
-// lexicon scorer below — the pipeline never dies, per the design note above.
+// v2.12.52 — standalone transport (llmChat from @/lib/llm): no vendor SDK, no
+// new env keys. The scan is a GLOBAL engine (no user context), so it rides the
+// built-in EdgeZero lane with its hard defaults — any container works out of
+// the box. An init/call failure here still degrades to the offline lexicon
+// scorer below — the pipeline never dies, per the design note above.
 import { llmChat } from '@/lib/llm'
 
 export interface ScoredHeadline {
@@ -129,7 +130,6 @@ async function callLlmBatch(userMsg: string): Promise<string> {
             { role: 'assistant', content: SYSTEM_PROMPT },
             { role: 'user', content: userMsg },
           ],
-          thinking: { type: 'disabled' },
         })
         const content = (completion as { choices?: { message?: { content?: string } }[] })
           ?.choices?.[0]?.message?.content

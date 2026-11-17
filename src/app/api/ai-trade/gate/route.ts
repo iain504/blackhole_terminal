@@ -13,23 +13,19 @@ import {
   dailyAtr14, rvolFromBars, htfAlignment,
   type GateCandidateInput, type GateMarketContext, type GateVerdict,
 } from '@/lib/trade-gate'
-import { llmChat, llmSetupHint, llmStatus } from '@/lib/llm'
+import { llmChat } from '@/lib/llm'
 
 export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
 export const maxDuration = 120
 
-// v2.12.52 — STANDALONE LLM transport: z-ai-web-dev-sdk is gone; the gate
-// speaks OpenAI-compatible HTTP to any provider (LLM_API_URL/KEY/MODEL).
-// Fail-closed semantics unchanged — an unresolvable provider 503s BEFORE the
-// deterministic snapshot is built, and no ERROR gate-log row is burned.
-//
-// v2.12.51 — Z.AI credentials fix for HOSTED deployments: the SDK resolves
-// .z-ai-config (cwd/home//etc) which never exists on Render — the credentials
-// now ride the ZAI_CONFIG_JSON env var (materialized by docker-entrypoint.sh
-// at boot, runtime fallback in src/lib/zai.ts) and a pre-flight in POST fails
-// fast with an actionable 503 instead of persisting an ERROR verdict row per
-// signal. Fail-closed semantics unchanged.
+// v2.12.52 — STANDALONE LLM transport on the platform's BUILT-IN config (no
+// vendor SDK, no new env keys): the user's own Settings → AI Agent endpoint
+// when saved, otherwise the built-in EdgeZero lane (hard defaults — works in
+// any fresh container out of the box). See src/lib/llm.ts for the lane order.
+// Fail-closed semantics unchanged: a dead lane surfaces as an honest ERROR
+// gate-log row + fail-open warn (the mechanical gates already ran) — never a
+// silent approve.
 //
 // v2.12.50 — PRE-TRADE VETO GATE (Risk & Regime Filter).
 //
@@ -110,21 +106,19 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
  *  lane, per the veto-gate spec) through the standalone llmChat transport. A
  *  provider that rejects the temperature/max_tokens PARAMs falls back to its
  *  defaults rather than failing the gate. */
-async function callGatekeeper(system: string, user: string): Promise<string> {
+async function callGatekeeper(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
     const msgs = [
       { role: 'system', content: system },
       { role: 'user', content: user },
     ]
     try {
-      const completion = await llmChat({
-        messages: msgs, temperature: 0.1, max_tokens: 700, thinking: { type: 'disabled' },
-      })
+      const completion = await llmChat({ userId, messages: msgs, temperature: 0.1, max_tokens: 700 })
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       if (/temperature|max_tokens/i.test(msg)) {
-        const completion = await llmChat({ messages: msgs, thinking: { type: 'disabled' } })
+        const completion = await llmChat({ userId, messages: msgs })
         return extractContent(completion)
       }
       throw e
@@ -263,17 +257,6 @@ export async function POST(req: Request) {
     }
     const { candidate, planId } = parsed
 
-    // v2.12.52 pre-flight — the gate verdict must never silently degrade on a
-    // deployment without an LLM provider: answer with ONE actionable 503
-    // (fail-closed, and no ERROR gate-log row is burned per signal).
-    const llmProbe = await llmStatus()
-    if (!llmProbe.configured) {
-      return NextResponse.json(
-        { error: `Pre-trade gate unavailable — ${llmSetupHint(llmProbe)}` },
-        { status: 503 },
-      )
-    }
-
     // 1) deterministic context + ACTIVE guardrails (parallel)
     const [{ ctx, quotesOk }, activeRules] = await Promise.all([
       buildContext(user.id, mode, candidate),
@@ -313,6 +296,7 @@ export async function POST(req: Request) {
     let errorNote: string | null = null
     try {
       const content = await callGatekeeper(
+        user.id,
         GATE_SYSTEM_PROMPT,
         GATE_USER_TEMPLATE(
           JSON.stringify(snapshot, null, 1),

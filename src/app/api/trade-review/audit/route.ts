@@ -12,20 +12,13 @@ import {
   parseAuditOutput, ruleDedupeKey,
   type EnrichedTrade,
 } from '@/lib/trade-review'
-import { llmChat, llmSetupHint, llmStatus } from '@/lib/llm'
+import { llmChat } from '@/lib/llm'
 import type { Bar } from '@/lib/market-types'
 
-// v2.12.52 — STANDALONE LLM transport: the z-ai-web-dev-sdk dependency is GONE.
-// The container now speaks plain OpenAI-compatible HTTP to any provider the
-// operator sets (LLM_API_URL + LLM_API_KEY + LLM_MODEL — OpenAI, DeepSeek,
-// Groq, OpenRouter, self-hosted vLLM/ollama); the sandbox internal API is only
-// a local-dev fallback. No vendor SDK, no .z-ai-config requirement in Docker.
-//
-// v2.12.51 — Z.AI credentials fix: the SDK reads .z-ai-config from cwd/home//etc
-// only, which never exists on Render (gitignored). Credentials now ride the
-// ZAI_CONFIG_JSON env var (materialized at boot by docker-entrypoint.sh, with
-// a runtime fallback in src/lib/zai.ts), and a pre-flight below fails fast
-// with ONE actionable message instead of N failed batches.
+// v2.12.52 — STANDALONE LLM transport on the platform's BUILT-IN config (no
+// vendor SDK, no new env keys): the user's own Settings → AI Agent endpoint
+// when saved, otherwise the built-in EdgeZero lane (hard defaults — works in
+// any fresh container out of the box). See src/lib/llm.ts for the lane order.
 //
 // v2.12.49 — AI TRADE REVIEW auditor. POST runs the full pipeline:
 //   closed trades (FIFO) → enrichment (session / MAE-MFE vs ATR / slippage /
@@ -62,21 +55,19 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
 /** One auditor call @ temperature 0.15 (analytical consistency, per the audit
  *  spec) through the standalone llmChat transport. A provider that rejects the
  *  temperature PARAM falls back to its default rather than failing the run. */
-async function callAuditor(system: string, user: string): Promise<string> {
+async function callAuditor(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
     const msgs = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]
     try {
-      const completion = await llmChat({
-        messages: msgs, temperature: 0.15, thinking: { type: 'disabled' },
-      })
+      const completion = await llmChat({ userId, messages: msgs, temperature: 0.15 })
       return extractContent(completion)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       if (/temperature/i.test(msg)) {
-        const completion = await llmChat({ messages: msgs, thinking: { type: 'disabled' } })
+        const completion = await llmChat({ userId, messages: msgs })
         return extractContent(completion)
       }
       throw e
@@ -198,17 +189,6 @@ export async function POST(req: Request) {
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     const body = (await req.json().catch(() => ({}))) as { mode?: string; limit?: number }
     const mode = await resolveTradeMode(user.id, body.mode)
-
-    // 0) v2.12.52 pre-flight — the LLM provider must be resolvable BEFORE we
-    //    pull orders and burn a run; a misconfigured deployment answers with
-    //    ONE actionable 503 instead of a failed batch row per LLM call.
-    const llmProbe = await llmStatus()
-    if (!llmProbe.configured) {
-      return NextResponse.json(
-        { mode, error: `AI audit unavailable — ${llmSetupHint(llmProbe)}` },
-        { status: 503 },
-      )
-    }
 
     const lockKey = `${user.id}:${mode}`
     if (runLocked(lockKey)) {
@@ -334,7 +314,7 @@ export async function POST(req: Request) {
         const b = batches[i]
         const validIds = new Set(b.map((e) => e.trade_id))
         try {
-          const content = await callAuditor(AUDIT_SYSTEM_PROMPT, AUDIT_USER_TEMPLATE(JSON.stringify(b, null, 1)))
+          const content = await callAuditor(user.id, AUDIT_SYSTEM_PROMPT, AUDIT_USER_TEMPLATE(JSON.stringify(b, null, 1)))
           const parsed = parseAuditOutput(content, validIds)
           if (!parsed) throw new Error('auditor returned unparseable output')
           const dropped = b.length - parsed.audits.length

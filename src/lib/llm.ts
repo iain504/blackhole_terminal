@@ -1,47 +1,42 @@
-// v2.12.52 — standalone LLM transport (server-side only). NO vendor SDK.
+// v2.12.52 — standalone LLM transport (server-side only). NO vendor SDK, NO
+// new env keys.
 //
-// WHY: z-ai-web-dev-sdk resolved credentials ONLY from a .z-ai-config FILE
-// (cwd / home / /etc) that exists in this dev sandbox but never in a hosted
-// container, and it talked to a sandbox-internal API. Hosted deployments
-// (Render/Railway/Fly Docker) must work ALONE — so the app now speaks plain,
-// dependency-free OpenAI-compatible HTTP to ANY provider the operator points
-// it at, and the sandbox's internal API survives only as a local-dev fallback.
+// Operator mandates that shaped this file:
+//   1. "docker cannot rely on z ai component — make it work alone"
+//      → the z-ai-web-dev-sdk dependency and its .z-ai-config FILE are gone;
+//        this module speaks plain OpenAI-compatible HTTP.
+//   2. "which AI model should already be built-in config — why a new env key?"
+//      → it is. The model choice resolves through config the platform already
+//        ships, in this order:
 //
-// Provider resolution (first match wins):
-//   1. LLM_API_URL + LLM_API_KEY  → 'custom'  — any OpenAI-compatible
-//      /chat/completions API: OpenAI, DeepSeek, Groq, OpenRouter, Together,
-//      Mistral, a self-hosted vLLM or ollama /v1 endpoint, …
-//      LLM_MODEL picks the model; well-known cloud hosts get a sane default.
-//   2. .z-ai-config file          → 'sandbox' — dev-sandbox fallback (the
-//      internal API accepts no model field and wants the thinking flag).
-//   3. nothing                    → not configured; LLM routes fail fast with
-//      the actionable hint, sentiment degrades to its offline lexicon engine,
-//      and the pre-trade gate stays fail-closed.
+//   Lane 1 — Settings → AI Agent API (PER-USER): the user's OWN OpenAI-
+//            compatible endpoint + model + key, stored AES-256-GCM encrypted
+//            in User.settings and managed by the existing UI
+//            (/api/settings/ai-agent, with the /test probe). When saved it
+//            overrides everything — the exact precedence /api/ai-trade/chat
+//            has used since v2.12.20.
+//   Lane 2 — the BUILT-IN lane: AI_TRADE_BASE_URL / AI_TRADE_API_KEY
+//            (pre-existing optional operator overrides) with hard defaults
+//            (https://edgezero.space-z.ai/api/v1 + 'local', model edge0-8b —
+//            the same default the AI adviser chat always had). A fresh
+//            container runs every AI feature out of the box, zero setup.
 //
-// All three AI call sites (post-trade auditor, pre-trade veto gate, sentiment
-// scorer) go through llmChat() — one timeout, one error shape, zero SDKs.
-import fs from 'node:fs/promises'
-import os from 'node:os'
-import path from 'node:path'
+// Per-user features (post-trade auditor, pre-trade veto gate, rule
+// consolidation) resolve Lane 1 → Lane 2 for their calling user; the global
+// sentiment engine has no user context and rides Lane 2. Both lanes share the
+// same /chat/completions wire format — one timeout, one honest error shape.
+// Because Lane 2 always resolves, there is no "unconfigured" state to
+// pre-flight: a broken upstream surfaces as an honest per-call error instead
+// (gate → ERROR row fail-open, audit → failed-batch note, sentiment →
+// offline lexicon degradation).
+import { readAiAgentConfig, aiAgentAuthHeaders } from '@/lib/ai-agent'
+import { AI_TRADE_DEFAULT_MODEL } from '@/lib/ai-trade'
 
 const REQUEST_TIMEOUT_MS = 90_000
-const CONFIG_FILENAME = '.z-ai-config'
-const CONFIG_SEARCH_PATHS = [
-  path.join(process.cwd(), CONFIG_FILENAME),
-  path.join(os.homedir(), CONFIG_FILENAME),
-  path.join('/etc', CONFIG_FILENAME),
-]
+const BUILTIN_BASE_DEFAULT = 'https://edgezero.space-z.ai/api/v1'
+const BUILTIN_KEY_DEFAULT = 'local'
 
-export type LlmProvider = 'custom' | 'sandbox'
-
-export interface LlmStatus {
-  configured: boolean
-  provider: LlmProvider | null
-  /** resolved model id ('default' for the sandbox internal API) */
-  model: string | null
-  /** non-null only when env vars are partially/incorrectly set */
-  error: string | null
-}
+export type LlmProvider = 'agent' | 'builtin'
 
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant'
@@ -49,11 +44,11 @@ export interface LlmMessage {
 }
 
 export interface LlmChatOptions {
+  /** per-user call sites: prefer the user's own Settings → AI Agent endpoint */
+  userId?: string
   messages: LlmMessage[]
   temperature?: number
   max_tokens?: number
-  /** sandbox internal API only — ignored (stripped) for OpenAI-compatible APIs */
-  thinking?: { type: string }
 }
 
 /** The slice of the response every call site already consumes. */
@@ -61,156 +56,87 @@ export interface LlmCompletion {
   choices?: { message?: { content?: string } }[]
 }
 
-/** Sensible models for well-known OpenAI-compatible hosts (LLM_MODEL wins). */
-const MODEL_DEFAULTS: [RegExp, string][] = [
-  [/api\.openai\.com/i, 'gpt-4o-mini'],
-  [/api\.deepseek\.com/i, 'deepseek-chat'],
-  [/api\.groq\.com/i, 'llama-3.3-70b-versatile'],
-  [/openrouter\.ai/i, 'openai/gpt-4o-mini'],
-  [/api\.mistral\.ai/i, 'mistral-small-latest'],
-  [/api\.together\.(?:xyz|ai)/i, 'meta-llama/Llama-3.3-70B-Instruct-Turbo'],
-]
-
-function defaultModelFor(url: string): string | null {
-  for (const [re, model] of MODEL_DEFAULTS) {
-    if (re.test(url)) return model
-  }
-  return null
-}
-
-interface SandboxConfig {
-  baseUrl: string
-  apiKey: string
-  chatId?: string
-  userId?: string
-  token?: string
-}
-
-async function readSandboxConfig(): Promise<SandboxConfig | null> {
-  for (const p of CONFIG_SEARCH_PATHS) {
-    try {
-      const raw = await fs.readFile(p, 'utf8')
-      const c = JSON.parse(raw) as Partial<SandboxConfig>
-      if (typeof c.baseUrl === 'string' && c.baseUrl && typeof c.apiKey === 'string' && c.apiKey) {
-        return c as SandboxConfig
-      }
-    } catch {
-      // missing or invalid — try the next location
-    }
-  }
-  return null
-}
-
-// Resolution memo — configured results are cached forever (env is fixed per
-// process); NOT-configured results are never cached, so a provider added to
-// the environment is picked up on the next call without a restart. A thrown
-// probe is retried on the next call (a failed resolution must not poison the
-// process — same pattern as every other lazy singleton in this codebase).
-let configuredPromise: Promise<LlmStatus> | null = null
-let sandboxConfig: SandboxConfig | null = null
-
-export function llmStatus(): Promise<LlmStatus> {
-  if (configuredPromise) return configuredPromise
-  const probe = (async (): Promise<LlmStatus> => {
-    const url = process.env.LLM_API_URL?.trim() ?? ''
-    const key = process.env.LLM_API_KEY?.trim() ?? ''
-    if (url || key) {
-      if (url && key) {
-        const model = process.env.LLM_MODEL?.trim() || defaultModelFor(url)
-        if (!model) {
-          return {
-            configured: false, provider: null, model: null,
-            error: `LLM_API_URL is set (${url}) but no LLM_MODEL — set one (e.g. gpt-4o-mini, deepseek-chat, llama-3.3-70b-versatile) or use a well-known provider host`,
-          }
-        }
-        return { configured: true, provider: 'custom', model, error: null }
-      }
-      return {
-        configured: false, provider: null, model: null,
-        error: url
-          ? 'LLM_API_URL is set but LLM_API_KEY is missing — set both'
-          : 'LLM_API_KEY is set but LLM_API_URL is missing — set both',
-      }
-    }
-    // sandbox dev fallback (never present in a hosted container)
-    const cfg = await readSandboxConfig()
-    if (cfg) {
-      sandboxConfig = cfg
-      return { configured: true, provider: 'sandbox', model: 'default', error: null }
-    }
-    return { configured: false, provider: null, model: null, error: null }
-  })()
-  probe.then((s) => {
-    if (s.configured) configuredPromise = probe
-  }).catch(() => { /* next call re-probes */ })
-  return probe
-}
-
-/** One actionable sentence for 4xx/5xx bodies when no LLM provider is set. */
-export function llmSetupHint(status: LlmStatus): string {
-  const fix = 'Fix: Render Dashboard → Environment → set LLM_API_URL + LLM_API_KEY (+ LLM_MODEL) to any OpenAI-compatible provider (OpenAI, DeepSeek, Groq, OpenRouter, self-hosted vLLM/ollama), then redeploy.'
-  return status.error
-    ? `LLM not usable: ${status.error}. ${fix}`
-    : `No LLM provider configured on this deployment (LLM_API_URL / LLM_API_KEY unset, no sandbox config). ${fix}`
-}
-
 function normalizeCompletionsUrl(base: string): string {
   const trimmed = base.replace(/\/+$/, '')
   return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`
 }
 
-/** POST one chat completion to the resolved provider. Throws Error with a
- *  provider-prefixed message on transport/HTTP failure (call sites keep their
+interface ResolvedLane {
+  provider: LlmProvider
+  url: string
+  headers: Record<string, string>
+  model: string
+}
+
+/** Lane resolution for ONE call. Lane 1 (the user's own endpoint) wins when
+ *  they saved one in Settings → AI Agent API; otherwise the built-in EdgeZero
+ *  lane — which ALWAYS resolves thanks to its hard defaults, so no AI feature
+ *  can dead-end on a fresh deployment and no env key is ever required. A DB
+ *  hiccup while reading the user config degrades to the built-in lane (the
+ *  AI adviser chat behaves identically via readAiAgentConfig → null → EdgeZero). */
+async function resolveLane(userId?: string): Promise<ResolvedLane> {
+  if (userId) {
+    try {
+      const cfg = await readAiAgentConfig(userId)
+      if (cfg) {
+        return {
+          provider: 'agent',
+          url: normalizeCompletionsUrl(cfg.endpoint),
+          headers: { 'Content-Type': 'application/json', ...aiAgentAuthHeaders(cfg) },
+          model: cfg.model,
+        }
+      }
+    } catch {
+      // DB unavailable — the built-in lane keeps AI working
+    }
+  }
+  const base = (process.env.AI_TRADE_BASE_URL?.trim() || BUILTIN_BASE_DEFAULT).replace(/\/+$/, '')
+  return {
+    provider: 'builtin',
+    url: normalizeCompletionsUrl(base),
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.AI_TRADE_API_KEY?.trim() || BUILTIN_KEY_DEFAULT}`,
+    },
+    model: AI_TRADE_DEFAULT_MODEL,
+  }
+}
+
+/** Human lane name for honest error messages. */
+function laneName(provider: LlmProvider): string {
+  return provider === 'agent' ? 'your AI Agent endpoint' : 'the built-in EdgeZero lane'
+}
+
+/** POST one chat completion to the resolved lane. Throws Error with a
+ *  lane-prefixed message on transport/HTTP failure (call sites keep their
  *  temperature/max_tokens param-fallback logic on top of this). */
 export async function llmChat(opts: LlmChatOptions): Promise<LlmCompletion> {
-  const status = await llmStatus()
-  if (!status.configured) {
-    throw new Error(`LLM provider not configured — ${llmSetupHint(status)}`)
-  }
+  const lane = await resolveLane(opts.userId)
 
-  const body: Record<string, unknown> = { messages: opts.messages }
+  const body: Record<string, unknown> = { messages: opts.messages, model: lane.model }
   if (opts.temperature != null) body.temperature = opts.temperature
   if (opts.max_tokens != null) body.max_tokens = opts.max_tokens
 
-  let url: string
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-
-  if (status.provider === 'custom') {
-    url = normalizeCompletionsUrl(process.env.LLM_API_URL as string)
-    body.model = status.model
-    headers.Authorization = `Bearer ${process.env.LLM_API_KEY?.trim() ?? ''}`
-  } else {
-    // sandbox internal API — same wire format the vendored SDK used, minus the SDK
-    const cfg = sandboxConfig ?? (await readSandboxConfig())
-    if (!cfg) throw new Error('sandbox LLM config vanished — restart to re-resolve')
-    url = `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`
-    headers.Authorization = `Bearer ${cfg.apiKey}`
-    headers['X-Z-AI-From'] = 'Z' // internal gateway routing header (was set by the removed SDK)
-    if (opts.thinking) body.thinking = opts.thinking // internal API wants the flag; others ignore it
-    if (cfg.chatId) headers['X-Chat-Id'] = cfg.chatId
-    if (cfg.userId) headers['X-User-Id'] = cfg.userId
-    if (cfg.token) headers['X-Token'] = cfg.token
-  }
-
   let res: Response
   try {
-    res = await fetch(url, {
+    res = await fetch(lane.url, {
       method: 'POST',
-      headers,
+      headers: lane.headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      cache: 'no-store',
     })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`LLM request failed (${status.provider} → ${url}): ${msg}`)
+    throw new Error(`LLM request failed (${laneName(lane.provider)} → ${lane.url}): ${msg}`)
   }
   if (!res.ok) {
     const text = (await res.text().catch(() => '')).slice(0, 200)
-    throw new Error(`LLM HTTP ${res.status} from ${status.provider} provider${text ? `: ${text}` : ''}`)
+    throw new Error(`LLM HTTP ${res.status} from ${laneName(lane.provider)}${text ? `: ${text}` : ''}`)
   }
   const json = (await res.json().catch(() => null)) as LlmCompletion | null
   if (!json || !Array.isArray(json.choices)) {
-    throw new Error(`LLM response malformed from ${status.provider} provider`)
+    throw new Error(`LLM response malformed from ${laneName(lane.provider)}`)
   }
   return json
 }

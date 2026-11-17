@@ -29,25 +29,26 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 // v2.12.52 — standalone transport (llmChat): no vendor SDK; the consolidation
-// pass rides the same LLM_API_URL/KEY/MODEL provider the auditor uses.
+// pass rides the user's own AI Agent endpoint when configured, else the
+// built-in EdgeZero lane (same resolution the auditor uses).
 function extractContent(completion: unknown): string {
   const content = (completion as { choices?: { message?: { content?: unknown } }[] })?.choices?.[0]?.message?.content
   if (typeof content !== 'string' || content.length === 0) throw new Error('empty LLM response')
   return content
 }
 
-async function callConsolidator(system: string, user: string): Promise<string> {
+async function callConsolidator(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
     const msgs = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]
     try {
-      return extractContent(await llmChat({ messages: msgs, temperature: 0.2, thinking: { type: 'disabled' } }))
+      return extractContent(await llmChat({ userId, messages: msgs, temperature: 0.2 }))
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       if (/temperature/i.test(msg)) {
-        return extractContent(await llmChat({ messages: msgs, thinking: { type: 'disabled' } }))
+        return extractContent(await llmChat({ userId, messages: msgs }))
       }
       throw e
     }
@@ -131,7 +132,7 @@ export async function POST(req: Request) {
       let nextRules: ParsedRule[] | null = null
       let via = 'llm'
       try {
-        const content = await callConsolidator(CONSOLIDATE_SYSTEM_PROMPT, CONSOLIDATE_USER_TEMPLATE(candJson, actJson))
+        const content = await callConsolidator(user.id, CONSOLIDATE_SYSTEM_PROMPT, CONSOLIDATE_USER_TEMPLATE(candJson, actJson))
         // reuse the auditor's strict parser: rule rows only (no audits/patterns)
         const parsed = parseAuditOutput(content, new Set())
         if (parsed && parsed.rules.length > 0) nextRules = parsed.rules.slice(0, ACTIVE_CAP)
