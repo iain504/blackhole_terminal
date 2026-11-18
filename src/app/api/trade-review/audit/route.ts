@@ -6,7 +6,7 @@ import { matchFifo } from '@/lib/trade-history'
 import { db } from '@/lib/db'
 import { handleError } from '@/lib/api-helpers'
 import {
-  AUDIT_BATCH_SIZE, AUDIT_SYSTEM_PROMPT, AUDIT_USER_TEMPLATE,
+  AUDIT_BATCH_SIZE, AUDIT_LIMITS, AUDIT_SYSTEM_PROMPT, AUDIT_USER_TEMPLATE,
   classifySession, isExtendedLike, computeExcursions, atrAtEntry,
   volumeRatioAtEntry, slippageBps, excursionTimeframe, buildAuditBatches,
   parseAuditOutput, ruleDedupeKey,
@@ -201,7 +201,8 @@ export async function POST(req: Request) {
 
     try {
       const limitRaw = Number(body.limit)
-      const limit = [12, 24, 36].includes(limitRaw) ? limitRaw : 24
+      // v2.12.55 — single source of truth: AUDIT_LIMITS (extended to 72)
+      const limit = (AUDIT_LIMITS as readonly number[]).includes(limitRaw) ? limitRaw : 24
 
       // 1) pull the recent closed-orders tape (page 1 — audits work on the
       //    most recent round-trips; ghost-widening is a history-display concern)

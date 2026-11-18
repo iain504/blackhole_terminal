@@ -287,6 +287,8 @@ export interface TradingOrder {
   legs: TradingOrder[] | null
   client_order_id?: string
   asset_class?: string
+  /** true when the order may execute in Alpaca extended (pre/post) sessions */
+  extended_hours?: boolean
   /** 'simple' | 'bracket' | 'oco' | 'oto' (Alpaca v2 order class) */
   order_class?: string
   /** bracket/OCO family id — legs of one family share it with the parent */
@@ -1963,6 +1965,12 @@ export async function closePositionFull(
             time_in_force: 'day',
             extended_hours: true,
             limit_price: extPx >= 1 ? extPx.toFixed(2) : extPx.toFixed(4),
+            // v2.12.55 — marker prefix: the exits builder must never mistake a
+            // working SYNTHETIC close (adverse-side limit, placed by an earlier
+            // cycle) for the position's real TP leg — the synthetic-TP monitor
+            // would otherwise see the close price as "the target" and either
+            // skip protection or double-fire. `tte-` = terminal exit family.
+            client_order_id: `ttx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
           }),
         })
         if (close.data && (close.data as TradingOrder).id) {

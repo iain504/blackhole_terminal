@@ -95,15 +95,20 @@ export async function POST(req: Request) {
       if (!rule) return NextResponse.json({ error: 'Rule not found' }, { status: 404 })
       if (action === 'promote') {
         // promoting one more onto a full board retires the lowest-ranked active
+        // (confidence × frequency × recency, rankCandidates) — v2.12.55: the
+        // eviction is DISCLOSED in the response so the UI can surface which
+        // guardrail gave way (silent loosening of the live set was invisible)
         const actives = await db.reviewRule.findMany({ where: { userId: user.id, status: 'active' } })
+        let evicted: { id: string; condition: string; action: string } | null = null
         if (actives.length >= ACTIVE_CAP && !actives.some((a) => a.id === rule.id)) {
           const worst = rankCandidates(actives.filter((a) => a.id !== rule.id)).slice(-1)[0]
           if (worst) {
             await db.reviewRule.update({ where: { id: worst.id }, data: { status: 'retired', retiredAt: new Date() } })
+            evicted = { id: worst.id, condition: worst.condition, action: worst.action }
           }
         }
         await db.reviewRule.update({ where: { id: rule.id }, data: { status: 'active', promotedAt: new Date(), retiredAt: null } })
-        return NextResponse.json({ ok: true, status: 'active' })
+        return NextResponse.json({ ok: true, status: 'active', evicted })
       }
       if (action === 'discard') {
         await db.reviewRule.update({ where: { id: rule.id }, data: { status: 'discarded' } })

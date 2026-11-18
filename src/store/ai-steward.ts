@@ -37,8 +37,9 @@
 import { create } from 'zustand'
 import type { AiChatMsg } from '@/lib/ai-trade'
 // v2.12.47 — isSlCrossed/estimateTrailStop power the DETERMINISTIC synthetic
-// SL (extended-hours doctrine: the engine, never the model, is the trigger)
-import { CORE_DISCIPLINES, estimateTrailStop, isSlCrossed } from '@/lib/ai-steward-disciplines'
+// SL (extended-hours doctrine: the engine, never the model, is the trigger);
+// v2.12.55 — isTpCrossed adds the profit twin (synthetic TP).
+import { CORE_DISCIPLINES, estimateTrailStop, isSlCrossed, isTpCrossed } from '@/lib/ai-steward-disciplines'
 // v2.12.43 — 保本夾緊：浮盈持倉的 SL 永不越過保本線（TWST 事故修復）
 import { clampStopToBreakeven, tightProtectiveStop } from '@/lib/steward-breakeven'
 import {
@@ -384,13 +385,19 @@ async function fetchJson(url: string, init?: RequestInit): Promise<{ status: num
 
 interface ExitInfo {
   orderId: string
-  kind: 'sl' | 'tp'
+  kind: 'sl' | 'tp' | 'close'
   stopPrice: number | null
   limitPrice: number | null
   trailPercent: number | null
   qty: string
   side: string
   type: string
+  status?: string
+  /** v2.12.55 — leg's time_in_force + extended-hours flag: a day+extended
+   *  TP CAN fill in the current extended session, a gtc/oco TP cannot */
+  tif?: string | null
+  extended?: boolean
+  clientOrderId?: string | null
 }
 
 interface PendingRow {
@@ -548,7 +555,7 @@ export async function runStewardOnce(): Promise<void> {
       fetchJson(`/api/trade-review/rules?active=1&mode=${cfg.mode}`, { signal: sig }).catch(() => ({ status: 0, j: null })),
     ])
 
-    const posJ = posRes.j as { positions?: PositionRow[]; exits?: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>; pending?: PendingRow[]; keysMissing?: unknown; authError?: unknown } | null
+    const posJ = posRes.j as { positions?: PositionRow[]; exits?: Record<string, { sl?: ExitInfo; tp?: ExitInfo; close?: ExitInfo }>; pending?: PendingRow[]; keysMissing?: unknown; authError?: unknown } | null
     const positions = Array.isArray(posJ?.positions) ? posJ!.positions : []
     const exits = posJ?.exits && typeof posJ.exits === 'object' ? posJ!.exits : {}
     const pending = Array.isArray(posJ?.pending) ? posJ!.pending : []
@@ -632,29 +639,24 @@ export async function runStewardOnce(): Promise<void> {
       ? Math.round((Date.parse(usClock.nextOpen) - Date.now()) / 60000)
       : null
 
-    // v2.12.47 — SYNTHETIC CLOSE-IN-FLIGHT detection (extended hours): a
-    // working ADVERSE-side limit on a position's exit side can only be a
-    // synthetic close fired by an earlier cycle (a resting TP sits on the
-    // FAVORABLE side; a marketable adverse limit would have filled). Used to
-    // (a) never double-fire the synthetic SL and (b) suppress the naked-SL
-    // complaint while that close order is honestly working toward the fill.
+    // v2.12.47 + v2.12.55 — SYNTHETIC CLOSE-IN-FLIGHT detection (extended
+    // hours): used to (a) never double-fire the synthetic SL/TP and (b)
+    // suppress the naked-SL complaint while that close order is honestly
+    // working toward the fill. v2.12.55 FIX: the old check looked in
+    // `pending` — but exit-side orders NEVER appear there while a position
+    // exists (the positions route maps them into the exits map instead), so
+    // the guard was dead code and the synthetic SL could double-fire. The
+    // close order now carries a `ttx-` client_order_id and surfaces as
+    // exits[sym].close — the honest source of "a synthetic close is working".
     const closeInFlight = new Set<string>()
     if (session === 'pre' || session === 'post') {
       for (const p of positions) {
         if (p.assetClass === 'crypto' || isCryptoSym(p.tradeSymbol || p.symbol)) continue
         const sym = (p.tradeSymbol || p.symbol).toUpperCase()
-        const q = qOf(p.tradeSymbol || p.symbol)
-        if (!q || !(q.price > 0)) continue
-        const long = p.side !== 'short'
-        const exitSide = long ? 'sell' : 'buy'
-        const working = pending.some((o) =>
-          o.symbol.toUpperCase() === sym &&
-          o.side === exitSide &&
-          o.type === 'limit' &&
-          o.limitPrice != null &&
-          (long ? o.limitPrice <= q.price : o.limitPrice >= q.price),
-        )
-        if (working) closeInFlight.add(sym)
+        const ex = exits[p.symbol] ?? exits[p.tradeSymbol] ?? {}
+        const cl = ex.close
+        const clStatus = cl?.status ?? 'new'
+        if (cl && clStatus !== 'filled' && clStatus !== 'canceled' && clStatus !== 'rejected') closeInFlight.add(sym)
       }
     }
 
@@ -757,6 +759,85 @@ export async function runStewardOnce(): Promise<void> {
       }
     }
 
+    // v2.12.55 — SYNTHETIC TAKE-PROFIT (the profit twin of the synthetic SL).
+    // The user's standing order: in extended hours (Pre AND Post) the AI
+    // 護盤 must act when price crosses TP **or** SL. The SL twin shipped in
+    // v2.12.47; the TP side did not — a GTC/OCO TP leg does NOT participate
+    // in the extended book, so a target reached at 18:00 ET used to sit
+    // there while the profit window evaporated with the reversal. The
+    // ENGINE (never the model — latency, thin books) compares the live
+    // quote with the TP line every cycle; a cross fires the same capped
+    // extended-hours limit close via the DELETE positions route, which
+    // first CANCELS the dead GTC/OCO legs (no accidental re-entry at the
+    // next regular open) then places the marketable ±1.5% limit close.
+    // Skips: crypto (native legs work 24/7), a synthetic close already in
+    // flight (never double-fire), engine-managed inventory, and a TP leg
+    // that is itself extended-enabled (day+extended — the exchange fills
+    // it; firing concurrently would be a second marketable sell).
+    interface SynthTpRow { p: PositionRow; sym: string; tpPx: number; q: number; long: boolean; outcome: string | null }
+    const synthTpRows: SynthTpRow[] = []
+    if (session === 'pre' || session === 'post') {
+      for (const p of positions) {
+        if (p.assetClass === 'crypto' || isCryptoSym(p.tradeSymbol || p.symbol)) continue
+        const sym = (p.tradeSymbol || p.symbol).toUpperCase()
+        if (closeInFlight.has(sym)) continue // close already working — never double-fire
+        if (!fullyManageable(p)) continue // engine-managed inventory: never killed
+        const ex = exits[p.symbol] ?? exits[p.tradeSymbol] ?? {}
+        const tpInfo = ex.tp
+        const tpPx = tpInfo?.limitPrice ?? null
+        if (tpPx == null || !(tpPx > 0)) continue
+        // the leg participates in THIS extended session — the exchange is the closer
+        if (tpInfo.tif === 'day' && tpInfo.extended) continue
+        const q = qOf(p.tradeSymbol || p.symbol)
+        if (!q || !(q.price > 0)) continue
+        const long = p.side !== 'short'
+        if (isTpCrossed(long ? 'long' : 'short', tpPx, q.price)) {
+          synthTpRows.push({ p, sym: p.tradeSymbol || p.symbol, tpPx, q: q.price, long, outcome: null })
+        }
+      }
+    }
+    for (const s of synthTpRows) {
+      const crossed = `TP ${fmtPrice(s.tpPx)} 已被現價 ${fmtPrice(s.q)} 穿越`
+      const kindBase = { kind: 'position' as const, symbol: s.sym, detail: '', payload: { from: 'synthetic_tp', tp: s.tpPx, price: s.q, side: s.long ? 'long' : 'short' } }
+      if (!cfg.closePositions) {
+        s.outcome = '已停用「允許平倉」開關 — 獲利窗口仍敞開'
+        skipped++
+        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'skipped', detail: `合成停利觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理或開啟開關` })
+        st0.addLog('warn', `⚠ ${s.sym} 合成停利觸發（${crossed}）— 已停用平倉開關，獲利窗口仍敞開`)
+        continue
+      }
+      if (actionsLeft() <= 0) {
+        s.outcome = '本輪動作數已達上限 — 下輪重試'
+        skipped++
+        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'skipped', detail: `合成停利觸發（延長時段 · ${crossed}）— ${s.outcome}` })
+        continue
+      }
+      if (cfg.dryRun) {
+        s.outcome = '試運行（不動單）'
+        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'dry_run', detail: `試運行：合成停利離場（延長時段 · ${crossed}）— 取消失效 TP 腿後以帶上限限價平倉` })
+        continue
+      }
+      try {
+        const r = await fetchJson(`/api/trading/positions/${encodeURIComponent(s.sym)}?mode=${cfg.mode}`, { method: 'DELETE', signal: sig })
+        if (r.status === 200) {
+          executed++
+          s.outcome = '已觸發停利離場（取消失效腿 + 帶上限延時限價平倉掛出）'
+          const extNote = String((r.j as { extendedNote?: string } | null)?.extendedNote || '')
+          drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'executed', detail: `合成停利已執行（延長時段 · ${crossed}）— ${s.outcome}${extNote ? `（${extNote}）` : ''}` })
+          st0.addLog('success', `${s.sym} 合成停利離場 — ${crossed}${extNote ? `（${extNote}）` : ''}`)
+        } else {
+          failed++
+          s.outcome = `離場失敗（HTTP ${r.status}）`
+          drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'failed', detail: `合成停利離場失敗（延長時段 · ${crossed}）— ${s.outcome}` })
+          st0.addLog('error', `${s.sym} 合成停利離場失敗 HTTP ${r.status}`)
+        }
+      } catch {
+        failed++
+        s.outcome = '離場連線失敗'
+        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'failed', detail: `合成停利離場連線失敗（延長時段 · ${crossed}）` })
+      }
+    }
+
     // 3) build the DATA block (everything the model may cite)
     const lines: string[] = []
     lines.push('市場狀態:')
@@ -767,7 +848,7 @@ export async function runStewardOnce(): Promise<void> {
     lines.push('')
     lines.push(`交易時段: ${sessionLabel}`)
     if (session === 'pre' || session === 'post') {
-      lines.push('- ⚠ 延長交易時段：Alpaca 不接受市價單（會被靜默擱置至下次 regular session）；原生 SL/TP 觸發盤外不生效 — 停損由本地合成 SL 監控（穿越即以帶上限限價離場），TP 限價單仍可成交。exit 建議仍可提出，終端會自動轉為帶上限限價執行。')
+      lines.push('- ⚠ 延長交易時段：Alpaca 不接受市價單（會被靜默擱置至下次 regular session）；原生 SL/TP 觸發盤外不生效 — 停損與停利均由本地合成監控（價格穿越 SL 或 TP 線即取消失效腿、以帶上限限價離場）；僅 time_in_force=day + extended_hours=true 的 TP 限價單可在延長時段由交易所自然成交。exit 建議仍可提出，終端會自動轉為帶上限限價執行。')
       if (closeInFlight.size > 0) {
         lines.push(`- 合成平倉進行中：${[...closeInFlight].join('、')} — 帶上限的延時限價平倉單已掛出；勿對這些持倉提出 reattach/amend/exit。`)
       }

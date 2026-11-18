@@ -17,7 +17,7 @@ function normSymbol(s: string): string {
 
 export interface ExitInfo {
   orderId: string
-  kind: 'sl' | 'tp'
+  kind: 'sl' | 'tp' | 'close'
   stopPrice: number | null
   limitPrice: number | null
   trailPercent: number | null
@@ -30,6 +30,12 @@ export interface ExitInfo {
    * supervisor-placed legs, `ttp-…` for user-attached crypto legs) */
   clientOrderId: string | null
   createdAt: string | null
+  /** v2.12.55 — time_in_force + extended-hours flag of the leg: the
+   * steward's synthetic-TP monitor must know whether the TP can actually
+   * fill in the CURRENT extended session (day+extended=true) or is dead
+   * until the next regular open (gtc / oco family). */
+  tif?: string | null
+  extended?: boolean
 }
 
 /** v2.12.30 — an OPEN exit-side (TP/SL/protection) order as a first-class
@@ -142,7 +148,7 @@ export interface KeysMissingInfo {
 export interface PositionsResponse {
   mode: string
   positions: PositionRow[]
-  exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }>
+  exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo; close?: ExitInfo }>
   pending: PendingOrderRow[]
   /** v2.12.30 — open exit-side (TP/SL/protection) orders incl. OCO legs and
    * orphans; the Positions tab renders them as rows with linkage + Cancel */
@@ -439,7 +445,7 @@ export async function GET(req: Request) {
       })
 
     // Map open exit orders (SL/TP legs) onto positions by symbol.
-    const exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo }> = {}
+    const exits: Record<string, { sl?: ExitInfo; tp?: ExitInfo; close?: ExitInfo }> = {}
     const byTradeSym = new Map(rows.map((r) => [normSymbol(r.tradeSymbol), r]))
     // Legs nested under a NOT-yet-filled parent belong to a PENDING entry
     // family — they are future legs, not exits of the open position (a held
@@ -487,22 +493,51 @@ export async function GET(req: Request) {
             side: o.side,
             type: o.type,
             status: o.status,
+            tif: o.time_in_force ?? null,
+            extended: Boolean(o.extended_hours),
             clientOrderId: o.client_order_id || null,
             createdAt: o.created_at ?? null,
           }
         } else if (o.type === 'limit' && isExitSide) {
-          bucket.tp = {
-            orderId: o.id,
-            kind: 'tp',
-            stopPrice: null,
-            limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
-            trailPercent: null,
-            qty: o.qty,
-            side: o.side,
-            type: o.type,
-            status: o.status,
-            clientOrderId: o.client_order_id || null,
-            createdAt: o.created_at ?? null,
+          // v2.12.55 — a `ttx-` client_order_id is the TERMINAL'S SYNTHETIC
+          // CLOSE (markable limit placed by an earlier cycle's synthetic
+          // SL/TP fire or an extended-hours 平倉). It rides the exit side and
+          // is a limit, so it used to be classified as the position's TP —
+          // poisoning the exits map (the steward read the close price as the
+          // target) and any TP-cross logic. It is a DIFFERENT thing: a close
+          // in flight working toward its own fill.
+          if ((o.client_order_id || '').startsWith('ttx-')) {
+            bucket.close = {
+              orderId: o.id,
+              kind: 'close',
+              stopPrice: null,
+              limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
+              trailPercent: null,
+              qty: o.qty,
+              side: o.side,
+              type: o.type,
+              status: o.status,
+              tif: o.time_in_force ?? null,
+              extended: Boolean(o.extended_hours),
+              clientOrderId: o.client_order_id || null,
+              createdAt: o.created_at ?? null,
+            }
+          } else {
+            bucket.tp = {
+              orderId: o.id,
+              kind: 'tp',
+              stopPrice: null,
+              limitPrice: o.limit_price ? parseFloat(o.limit_price) : null,
+              trailPercent: null,
+              qty: o.qty,
+              side: o.side,
+              type: o.type,
+              status: o.status,
+              tif: o.time_in_force ?? null,
+              extended: Boolean(o.extended_hours),
+              clientOrderId: o.client_order_id || null,
+              createdAt: o.created_at ?? null,
+            }
           }
         }
         exits[key] = bucket

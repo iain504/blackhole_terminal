@@ -81,6 +81,16 @@ export function isSlCrossed(side: 'long' | 'short', slPrice: number, refPrice: n
   return side === 'long' ? refPrice <= slPrice : refPrice >= slPrice
 }
 
+/** v2.12.55 — synthetic-TP cross test (the profit twin of the synthetic SL).
+ *  A GTC/OCO TP leg does not participate in the extended book either — when
+ *  the price reaches the TP line in pre/post the profit window must not be
+ *  left to evaporate with the reversal. long: exit when price rises to/above
+ *  the target; short: mirrored. */
+export function isTpCrossed(side: 'long' | 'short', tpPrice: number, refPrice: number): boolean {
+  if (!(tpPrice > 0) || !(refPrice > 0)) return false
+  return side === 'long' ? refPrice >= tpPrice : refPrice <= tpPrice
+}
+
 /** Estimated trigger line for a trailing stop that carries only
  *  trailPercent (the broker does not expose its computed stop): long trails
  *  BELOW the price, short trails ABOVE. Synthetic-SL monitoring uses this

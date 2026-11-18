@@ -158,7 +158,11 @@ export function excursionTimeframe(durationMs: number): Timeframe {
 // ---------------------------------------------------------------------------
 
 export const AUDIT_BATCH_SIZE = 6
-export const AUDIT_LIMITS = [12, 24, 36] as const
+/** v2.12.55 — the audit combobox/validation vocabulary. Extended from the
+ *  original [12, 24, 36] (user request): each +6 trades is one more LLM
+ *  batch, so 72 trades ≈ 12 sequential calls — the run is lock-guarded and
+ *  reports partial progress honestly, but expect minutes at the top end. */
+export const AUDIT_LIMITS = [12, 24, 36, 48, 60, 72] as const
 
 /** Split trades into auditor batches of 5–10 (default 6) — newest first.
  *  The size is clamped into the spec's 5-10 band (a batch smaller than 5

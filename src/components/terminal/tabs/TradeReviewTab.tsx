@@ -139,7 +139,7 @@ const parseTags = (raw: string): string[] => {
 export default function TradeReviewTab() {
   const { toast } = useToast()
   const [mode, setMode] = useState<Mode>('paper')
-  const [limit, setLimit] = useState<12 | 24 | 36>(24)
+  const [limit, setLimit] = useState<12 | 24 | 36 | 48 | 60 | 72>(24)
   const [batches, setBatches] = useState<BatchRow[]>([])
   const [rules, setRules] = useState<RuleRow[]>([])
   const [loaded, setLoaded] = useState(false)
@@ -261,12 +261,22 @@ export default function TradeReviewTab() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, ruleId }),
       })
-      const json = (await res.json().catch(() => null)) as { error?: string } | null
+      const json = (await res.json().catch(() => null)) as { error?: string; evicted?: { condition?: string; action?: string } | null } | null
       if (!res.ok) {
         toast({ title: 'Action failed', description: json?.error || `HTTP ${res.status}`, variant: 'destructive' })
         return
       }
-      toast({ title: action === 'promote' ? 'Rule promoted to ACTIVE' : action === 'discard' ? 'Rule discarded' : 'Rule retired' })
+      // v2.12.55 — promoting onto a full board (7/7) auto-retires the
+      // lowest-ranked active (confidence × frequency × recency); the eviction
+      // is disclosed here instead of silently loosening the live guardrails
+      if (action === 'promote' && json?.evicted?.condition) {
+        toast({
+          title: 'Rule promoted to ACTIVE — board was full (7/7)',
+          description: `Lowest-ranked active retired to make room: “${json.evicted.condition.slice(0, 80)}” — review it under Retired.`,
+        })
+      } else {
+        toast({ title: action === 'promote' ? 'Rule promoted to ACTIVE' : action === 'discard' ? 'Rule discarded' : 'Rule retired' })
+      }
     } catch {
       toast({ title: 'Action failed', description: 'Network error', variant: 'destructive' })
     } finally {
@@ -328,7 +338,7 @@ export default function TradeReviewTab() {
           </div>
           <select
             value={limit}
-            onChange={(e) => setLimit(Number(e.target.value) as 12 | 24 | 36)}
+            onChange={(e) => setLimit(Number(e.target.value) as 12 | 24 | 36 | 48 | 60 | 72)}
             className="h-7 rounded-md border border-zinc-700 bg-zinc-950 px-1.5 text-xs text-zinc-300"
             aria-label="Trades to audit"
             title="Most recent closed round-trips to audit (batches of 6 per LLM call)"
@@ -336,6 +346,9 @@ export default function TradeReviewTab() {
             <option value={12}>12 trades</option>
             <option value={24}>24 trades</option>
             <option value={36}>36 trades</option>
+            <option value={48}>48 trades</option>
+            <option value={60}>60 trades</option>
+            <option value={72}>72 trades</option>
           </select>
           <Button
             size="sm"
