@@ -27,8 +27,8 @@
 // same /chat/completions wire format — one timeout, one honest error shape.
 // Because Lane 2 always resolves, there is no "unconfigured" state to
 // pre-flight: a broken upstream surfaces as an honest per-call error instead
-// (gate → ERROR row fail-open, audit → failed-batch note, sentiment →
-// offline lexicon degradation).
+// (gate → ERROR row + engine fail-closed no-trade since v2.12.56, audit →
+// failed-batch note, sentiment → offline lexicon degradation).
 import { readAiAgentConfig, aiAgentAuthHeaders } from '@/lib/ai-agent'
 import { AI_TRADE_DEFAULT_MODEL } from '@/lib/ai-trade'
 

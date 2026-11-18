@@ -19,13 +19,17 @@ export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
 export const maxDuration = 120
 
+// v2.12.56 — FAIL-CLOSED engine contract. When the lane is dead the route
+// still answers 200 with an honest ERROR gate-log row + `error` note, and the
+// engine (react follow / instant fire) treats a missing verdict as NO-TRADE:
+// instant candidates are marked gated for the 24h loop, react plans stay
+// WAITING and re-run the gate on the next tick. A 503/gateway hiccup or an
+// unparseable verdict can never wave an unreviewed order through again.
+//
 // v2.12.52 — STANDALONE LLM transport on the platform's BUILT-IN config (no
 // vendor SDK, no new env keys): the user's own Settings → AI Agent endpoint
 // when saved, otherwise the built-in EdgeZero lane (hard defaults — works in
 // any fresh container out of the box). See src/lib/llm.ts for the lane order.
-// Fail-closed semantics unchanged: a dead lane surfaces as an honest ERROR
-// gate-log row + fail-open warn (the mechanical gates already ran) — never a
-// silent approve.
 //
 // v2.12.50 — PRE-TRADE VETO GATE (Risk & Regime Filter).
 //

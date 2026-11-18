@@ -1488,8 +1488,22 @@ export async function runScan(): Promise<void> {
             st0.addLog('info', `${v.symbol} 閘門縮量 — qty ${qty} → ${scaled}（×${gateMult.toFixed(2)}）`)
             qty = scaled
           }
+        } else if (g) {
+          // v2.12.56 — FAIL-CLOSED: the gate is unreachable / errored (503,
+          // gateway hiccup, dead LLM lane). The old behavior logged a warn and
+          // kept firing — that let unreviewed orders through on exactly the
+          // day the safety gate was needed most. No verdict → no order; the
+          // ledger row lands as 'gated' with the honest cause for the 24h loop.
+          const note = `Pre-Trade 閘門無裁決（${g.offlineReason}）— fail-closed：本輪不下單`
+          v.passed = false
+          v.gateNote = note
+          v.rejectReason = note
+          v.verdictStatus = 'gated'
+          st0.addLog('warn', `${v.symbol} ${note}`)
         } else {
-          st0.addLog('warn', `${v.symbol} 閘門離線（${g?.error ?? 'transport failed'}）— 機械閘門已通過，依原判斷跟進`)
+          // aborted mid-gate (scan cancelled) — a cancel is never a pass
+          v.passed = false
+          v.rejectReason = '掃描被取消'
         }
       }
       try {
@@ -1724,16 +1738,34 @@ function closePlan(p: AiPlanVM, status: AiPlanStatus, note: string, gateVeto = f
 
 // ---- v2.12.50 PRE-TRADE VETO GATE (client → /api/ai-trade/gate) -------------
 
+// v2.12.56 — last time the react path logged a gate-offline warning. A dead
+// LLM lane leaves triggered plans WAITING (fail-closed) and re-firing every
+// tick; without this throttle the activity feed would fill with one warn per
+// plan per 20s tick.
+let gateOfflineLastLogAt = 0
+
 interface GateCallResult {
   logId: string | null
   verdict: GateVerdict | null
   error: string | null
   citedDetail: { rule_id: string; condition: string; action: string }[]
+  /** v2.12.56 — true = NO verdict could be obtained: the gate API answered
+   *  non-200 (503/500/gateway), the route logged an ERROR row (LLM lane dead),
+   *  or the transport failed outright. Callers MUST fail CLOSED on this — a
+   *  safety gate that is unreachable must never wave the trade through. */
+  offline: boolean
+  /** Human-readable cause for the log/ledger: 'HTTP 503', the route's honest
+   *  error note ('LLM HTTP 503 from …'), or 'transport failed'. */
+  offlineReason: string
 }
 
-/** Ask the gatekeeper BEFORE the order lane. Returns null on transport failure
- *  (the caller fails open with an honest log — the mechanical gates already
- *  ran; a dead gate must not silently veto every trade forever). */
+/** Ask the gatekeeper BEFORE the order lane.
+ *  v2.12.56 FAIL-CLOSED contract:
+ *   · returns a result with `verdict` → caller applies the verdict normally
+ *   · returns a result with `offline: true` → caller must NOT order (block /
+ *     keep the plan waiting) — the exact 503-pass-through this version fixes
+ *   · returns null ONLY when the call was aborted mid-flight (scan cancelled)
+ *     — the caller treats it as a cancel, never as a pass. */
 async function callGate(args: {
   symbol: string
   side: 'buy' | 'sell'
@@ -1748,6 +1780,9 @@ async function callGate(args: {
   mode: string
   sig?: AbortSignal
 }): Promise<GateCallResult | null> {
+  const offline = (reason: string): GateCallResult => ({
+    logId: null, verdict: null, error: reason, citedDetail: [], offline: true, offlineReason: reason,
+  })
   try {
     const { status, j } = await fetchJson('/api/ai-trade/gate', {
       method: 'POST',
@@ -1763,12 +1798,13 @@ async function callGate(args: {
       }),
       signal: args.sig,
     })
-    if (status !== 200 || !j) return null
+    if (status !== 200 || !j) return offline(`HTTP ${status || 'no response'}`)
     const r = j as { ok?: boolean; logId?: string; verdict?: GateVerdict | null; error?: string | null; guardrailsDetail?: GateCallResult['citedDetail'] }
-    if (!r.ok) return null
-    return { logId: r.logId ?? null, verdict: r.verdict ?? null, error: r.error ?? null, citedDetail: r.guardrailsDetail ?? [] }
-  } catch {
-    return null
+    if (!r.ok) return offline(r.error ?? `HTTP ${status}`)
+    return { logId: r.logId ?? null, verdict: r.verdict ?? null, error: r.error ?? null, citedDetail: r.guardrailsDetail ?? [], offline: r.verdict == null, offlineReason: r.error ?? 'gate returned no verdict' }
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') return null
+    return offline(e instanceof Error ? `transport failed: ${e.message.slice(0, 120)}` : 'transport failed')
   }
 }
 
@@ -1929,8 +1965,20 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
       }
       gateMult = mult
       gateLogId = g.logId ?? null
+    } else if (g) {
+      // v2.12.56 — FAIL-CLOSED: no verdict → no order. A transient 503 must
+      // neither kill the plan NOR bypass the gate: the plan stays WAITING and
+      // the next react tick re-runs the gate while the trigger still holds
+      // (48h TTL closes it EXPIRED if the lane never recovers). The old warn-
+      // and-proceed branch let unreviewed orders through on exactly the day
+      // the safety gate was needed most.
+      if (Date.now() - gateOfflineLastLogAt > 60_000) {
+        gateOfflineLastLogAt = Date.now()
+        st.addLog('warn', `${p.symbol} Pre-Trade 閘門無裁決（${g.offlineReason}）— fail-closed：本輪不跟進，計劃保持等候待重試`)
+      }
+      return
     } else {
-      st.addLog('warn', `${p.symbol} 閘門離線（${g?.error ?? 'transport failed'}）— 機械閘門已通過，依原計劃跟進`)
+      return // aborted mid-gate (reactor stopped / scan cancelled) — never a pass
     }
   }
   // sizing — same math as the instant path (risk budget ÷ per-risk, 50% cap)
