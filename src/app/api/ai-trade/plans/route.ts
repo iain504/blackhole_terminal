@@ -69,6 +69,7 @@ interface PlanIn {
   rr?: unknown
   refPrice?: unknown
   reason?: unknown
+  strategy?: unknown
   regime?: unknown
   earnings?: unknown
   mode?: unknown
@@ -104,6 +105,10 @@ function sanitizePlan(p: PlanIn) {
   // The slash test is exact — crypto display spelling carries '/' (BTC/USD),
   // no US equity ever does.
   const cryptoNoShort = side === 'sell' && symbol.includes('/')
+  // v2.12.57 — the strategy-library playbook id the plan adopted
+  // (trend-pullback … range-fade); bounded slug, unknown values dropped.
+  const strategyRaw = typeof p.strategy === 'string' ? p.strategy.trim() : ''
+  const strategy = /^[A-Za-z0-9_-]{1,40}$/.test(strategyRaw) ? strategyRaw : null
   return {
     symbol,
     side,
@@ -115,6 +120,7 @@ function sanitizePlan(p: PlanIn) {
     rr,
     refPrice,
     reason: typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim().slice(0, 120) : null,
+    strategy,
     regime,
     earnings,
     mode: p.mode === 'live' ? 'live' : 'paper',
@@ -216,7 +222,7 @@ export async function GET(req: Request) {
         plans: rows.map((r) => ({
           id: r.id, symbol: r.symbol, side: r.side, bias: r.bias, confidence: r.confidence,
           trigger: r.trigger, tp: r.tp, sl: r.sl, rr: r.rr, refPrice: r.refPrice,
-          reason: r.reason, regime: r.regime, mode: r.mode, status: r.status,
+          reason: r.reason, strategy: r.strategy ?? null, regime: r.regime, mode: r.mode, status: r.status,
           createdAt: r.createdAt.getTime(),
         })),
         executedRecent,

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { requireUser, UnauthorizedError } from '@/lib/auth'
-import { isAiTradeModel, AI_TRADE_DEFAULT_MODEL, type AiChatMsg } from '@/lib/ai-trade'
+import { type AiChatMsg } from '@/lib/ai-trade'
 import { readAiAgentConfig, aiAgentAuthHeaders } from '@/lib/ai-agent'
 
 export const dynamic = 'force-dynamic'
@@ -36,10 +36,21 @@ export async function POST(req: Request) {
 
   // v2.12.20 — user-configurable AI Agent (Settings → AI Agent API). When the
   // user has saved their own OpenAI-compatible endpoint it OVERRIDES the
-  // built-in EdgeZero lane completely — including the model whitelist (their
-  // endpoint speaks its own model names). The credentials are decrypted
-  // server-side and never travel to the browser.
+  // operator env lane completely — including the model (their endpoint speaks
+  // its own model names). The credentials are decrypted server-side and never
+  // travel to the browser. v2.12.57 — the built-in EdgeZero default is gone:
+  // with neither lane configured, the route answers an honest 503 and every
+  // AI consumer (adviser, auto-trade scanner) shows the exact same note.
   const custom = await readAiAgentConfig(user.id)
+  const envBase = process.env.AI_TRADE_BASE_URL?.trim() || ''
+  const envKey = process.env.AI_TRADE_API_KEY?.trim() || ''
+  const envModel = process.env.AI_TRADE_MODEL?.trim() || ''
+  if (!custom && !(envBase && envKey && envModel)) {
+    return NextResponse.json(
+      { ok: false, error: 'AI 未設定 — 內建預設模型已移除（v2.12.57）：請於 Settings → AI Agent API 填入自訂端點與 API Key' },
+      { status: 503 },
+    )
+  }
 
   let body: {
     model?: string
@@ -53,11 +64,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
-  const model = custom
-    ? custom.model
-    : isAiTradeModel(body.model)
-      ? body.model
-      : AI_TRADE_DEFAULT_MODEL
+  // Lane 1: the user's own model. Lane 2: the operator env model. The client
+  // no longer picks a model — the endpoint it talks to owns that choice.
+  const model = custom ? custom.model : envModel
 
   // Sanitize the thread: keep the last N user/assistant turns, clamp sizes.
   const history: AiChatMsg[] = (Array.isArray(body.messages) ? body.messages : [])
@@ -80,11 +89,11 @@ export async function POST(req: Request) {
   }
   upstreamMessages.push(...history)
 
-  const base = custom ? custom.endpoint : process.env.AI_TRADE_BASE_URL || 'https://edgezero.space-z.ai/api/v1'
+  const base = custom ? custom.endpoint : envBase
   const authHeaders = custom
     ? aiAgentAuthHeaders(custom)
-    : { Authorization: `Bearer ${process.env.AI_TRADE_API_KEY || 'local'}` }
-  const lane = custom ? '自訂 AI 端點' : 'EdgeZero'
+    : { Authorization: `Bearer ${envKey}` }
+  const lane = custom ? '自訂 AI 端點' : '內建（env）'
 
   let upstream: Response
   try {
@@ -98,8 +107,8 @@ export async function POST(req: Request) {
   } catch (e) {
     const msg = e instanceof Error && e.name === 'TimeoutError'
       ? custom
-        ? `自訂 AI 端點逾時（110s）— 檢查 ${base} 的狀態，或改回內建 EdgeZero`
-        : '模型逾時（110s）— 請改用 Edge0 8B 快線或稍後再試'
+        ? `自訂 AI 端點逾時（110s）— 檢查 ${base} 的狀態，或稍後再試`
+        : `內建（env）模型逾時（110s）— 檢查 AI_TRADE_* 環境變數或稍後再試`
       : `無法連上 ${lane} 端點`
     return NextResponse.json({ ok: false, error: msg }, { status: 504 })
   }
@@ -113,10 +122,10 @@ export async function POST(req: Request) {
         : upstream.status === 401 || upstream.status === 403
           ? custom
             ? '自訂 AI 端點認證失敗（401/403）— 檢查 Settings → AI Agent 的 API Key / Secret'
-            : 'EdgeZero 認證失敗 — 檢查 AI_TRADE_API_KEY'
+            : '內建（env）認證失敗 — 檢查 AI_TRADE_API_KEY'
           : custom
             ? `自訂 AI 端點回應 ${upstream.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`
-            : `EdgeZero 回應 ${upstream.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`
+            : `內建（env）端點回應 ${upstream.status}${detail ? `: ${detail.slice(0, 200)}` : ''}`
     return NextResponse.json({ ok: false, error: msg }, { status })
   }
 

@@ -14,8 +14,14 @@ import {
 } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import { useToast } from '@/hooks/use-toast';
 import { useTerminal } from '@/store/terminal';
+import { useAiAutoStore } from '@/store/ai-auto-trade';
+import {
+  STRATEGY_LIBRARY, mergeStrategyParams,
+  type StrategyDef, type StrategyTuning,
+} from '@/lib/strategy-library';
 import { loadIndicators } from '@/lib/indicators';
 import { cn } from '@/lib/utils';
 import {
@@ -69,6 +75,77 @@ type AiAgentStatus = {
 const DEFAULT_GLOW_GRID = '#10b981';
 const DEFAULT_GLOW_ALGO = '#a855f7';
 
+/** v2.12.57 — one 戰略庫 row: enable switch + tunable params. Params commit on
+ *  blur (clamped to the declared range); the draft resets to the clamped store
+ *  value after every commit, so sanitize and cross-device sync always win. */
+function StrategyRow({
+  def,
+  tuning,
+  onPatch,
+}: {
+  def: StrategyDef;
+  tuning: StrategyTuning;
+  onPatch: (patch: Partial<StrategyTuning>) => void;
+}) {
+  // draft holds ONLY fields with uncommitted edits — everything else renders
+  // straight from the store tuning, so external changes (sanitize, cross-device
+  // sync) always win without a state-syncing effect.
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const display = (key: string, fallback: number) => draft[key] ?? String(fallback);
+  const commit = (key: string, min: number, max: number, fallback: number) => {
+    const raw = draft[key];
+    if (raw == null) return;
+    setDraft((d) => {
+      const next = { ...d };
+      delete next[key];
+      return next;
+    });
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return; // revert to the store value on garbage
+    onPatch({ params: { ...tuning.params, [key]: Math.min(max, Math.max(min, n)) } });
+  };
+  return (
+    <div
+      className={cn(
+        'rounded-lg border p-3 transition-opacity',
+        tuning.enabled ? 'border-zinc-800 bg-zinc-950/60' : 'border-zinc-900 bg-zinc-950/30 opacity-60'
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <Switch
+          checked={tuning.enabled}
+          onCheckedChange={(v) => onPatch({ enabled: v })}
+          aria-label={`啟用策略 ${def.name}`}
+        />
+        <span className="text-xs font-medium text-zinc-100">{def.name}</span>
+        <span className="font-mono text-[10px] text-zinc-500">{def.id}</span>
+      </div>
+      <p className="mt-1.5 text-[11px] leading-4 text-zinc-500">{def.desc}</p>
+      {def.params.length > 0 && (
+        <div className="mt-2.5 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {def.params.map((p) => (
+            <div key={p.key} className="flex flex-col gap-1">
+              <Label htmlFor={`strategy-${def.id}-${p.key}`} className="text-[10px] text-zinc-500">
+                {p.label}
+              </Label>
+              <Input
+                id={`strategy-${def.id}-${p.key}`}
+                inputMode="decimal"
+                value={display(p.key, tuning.params[p.key] ?? p.default)}
+                onChange={(e) => setDraft((d) => ({ ...d, [p.key]: e.target.value }))}
+                onBlur={() => commit(p.key, p.min, p.max, p.default)}
+                disabled={!tuning.enabled}
+                className="h-7 border-zinc-800 bg-zinc-950 px-2 text-[11px] text-zinc-100"
+                aria-label={p.label}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsDialog({
   open,
   onOpenChange,
@@ -111,6 +188,13 @@ export default function SettingsDialog({
   // Credential fields only ride along when TOUCHED — an empty-but-touched key
   // explicitly removes the credential (key-less endpoints like LAN Ollama).
   const [aiStatus, setAiStatus] = useState<AiAgentStatus | null>(null);
+  // v2.12.57 — 戰略庫 lives in the ai-auto store (the scan reads it live;
+  // localStorage persistence + account sync happen inside updateConfig)
+  const aiStrategies = useAiAutoStore((s) => s.config.strategies);
+  const updateAiAutoConfig = useAiAutoStore((s) => s.updateConfig);
+  const strategyEnabledCount = STRATEGY_LIBRARY.filter((d) => aiStrategies[d.id]?.enabled !== false).length;
+  const patchStrategy = (id: string, patch: Partial<StrategyTuning>) =>
+    updateAiAutoConfig({ strategies: mergeStrategyParams(aiStrategies, id, patch) });
   const [aiEndpoint, setAiEndpoint] = useState('');
   const [aiModel, setAiModel] = useState('');
   const [aiKey, setAiKey] = useState('');
@@ -617,7 +701,7 @@ export default function SettingsDialog({
   async function handleDisableAi() {
     if (
       !window.confirm(
-        'Remove the custom AI endpoint?\n\nThe AI adviser and auto-trade will use the built-in EdgeZero models again.'
+        'Remove the custom AI endpoint?\n\nThere is no built-in default anymore (v2.12.57): AI functions stay honestly offline until a new endpoint + API key is saved.'
       )
     )
       return;
@@ -627,7 +711,7 @@ export default function SettingsDialog({
       const data = await res.json().catch(() => null);
       if (!res.ok) throw new Error(data?.error || `Failed (${res.status}).`);
       applyAiStatus(data as AiAgentStatus);
-      toast({ title: 'Custom endpoint removed', description: 'Back to the built-in EdgeZero lane.' });
+      toast({ title: 'Custom endpoint removed', description: 'AI functions are now offline — configure a new endpoint to re-enable.' });
       window.dispatchEvent(new CustomEvent(SETTINGS_CHANGED_EVENT));
     } catch (err) {
       toast({
@@ -902,7 +986,9 @@ export default function SettingsDialog({
                   Custom · {aiStatus.endpointHost} · {aiStatus.model}
                 </Badge>
               ) : (
-                <Badge className="border-zinc-700 bg-zinc-800 text-zinc-300">Built-in EdgeZero</Badge>
+                <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-300">
+                  AI 未設定 — 內建預設已移除
+                </Badge>
               )}
               {aiStatus?.configured && aiStatus.keyMasked && (
                 <span className="font-mono text-[11px] text-zinc-400">Key {aiStatus.keyMasked}</span>
@@ -912,9 +998,11 @@ export default function SettingsDialog({
               )}
             </div>
             <p className="text-xs leading-relaxed text-zinc-500">
-              Bring your own OpenAI-compatible endpoint — the AI Trade adviser and the AI auto-trade
-              engine will use it instead of the built-in EdgeZero models. Paste the base URL (a trailing
-              /chat/completions is stripped automatically) and the exact model name your endpoint serves.
+              Required since v2.12.57 — the built-in default model is gone. To use ANY AI function
+              (adviser, auto-trade scanner, pre-trade gate) you must bring your own OpenAI-compatible
+              endpoint + API key (e.g. Gemini free tier via its OpenAI-compatible base URL). Paste the
+              base URL (a trailing /chat/completions is stripped automatically) and the exact model
+              name your endpoint serves. Without this, every AI surface stays honestly offline.
             </p>
             <div className="grid gap-2 sm:grid-cols-2">
               <div className="flex flex-col gap-1.5">
@@ -954,7 +1042,7 @@ export default function SettingsDialog({
                 <Input
                   id="ai-agent-key"
                   type="password"
-                  placeholder={aiStatus?.configured && aiStatus.keyMasked ? 'unchanged' : 'optional — key-less endpoints allowed'}
+                  placeholder={aiStatus?.configured && aiStatus.keyMasked ? 'unchanged' : 'required for cloud providers (Gemini / OpenAI …)'}
                   value={aiKey}
                   onChange={(e) => {
                     setAiKey(e.target.value);
@@ -1012,16 +1100,42 @@ export default function SettingsDialog({
                   disabled={aiSaving}
                   className="text-zinc-400 hover:text-zinc-200"
                 >
-                  Use built-in EdgeZero
+                  清除自訂端點（停用 AI 功能）
                 </Button>
               )}
             </div>
             <p className="text-xs leading-relaxed text-zinc-500">
               Most providers only need the API Key (sent as a Bearer header). The Secret is optional for
-              dual-key providers (rides an x-api-secret header). Clear the Key field and save to run a
-              key-less endpoint (e.g. LAN Ollama). Keys are encrypted (AES-256-GCM) and never leave the
-              server; Test proves reachability AND the model name before you save.
+              dual-key providers (rides an x-api-secret header). Only key-less LAN endpoints (Ollama)
+              may run without a key. Keys are encrypted (AES-256-GCM) and never leave the server; Test
+              proves reachability AND the model name before you save.
             </p>
+          </section>
+
+          <div className="h-px bg-zinc-800" />
+
+          {/* ------- AI 自動交易 · 戰略庫 (v2.12.57 — strategy library) ------- */}
+          <section className="flex flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Sparkles className="h-4 w-4 text-violet-400" />
+              <h3 className="text-sm font-semibold text-zinc-100">AI 自動交易 · 戰略庫</h3>
+              <Badge className="border-violet-500/40 bg-violet-500/10 text-violet-300">
+                {strategyEnabledCount}/{STRATEGY_LIBRARY.length} 啟用
+              </Badge>
+            </div>
+            <p className="text-xs leading-relaxed text-zinc-500">
+              掃描時終端按啟用策略為每個標的預篩「結構候選」— 觸發/SL/TP 由市場結構推導（近期擺動、窗口極值、測試過的支撐阻力 + ATR 緩衝），附 0-100 edge 分與證據清單；AI 模型只負責裁決哪一側優勢更大、環境是否值得出手。無合格候選 → 依紀律觀望（flat 是預設輸出）。停用的策略不參與預篩；參數即時生效並隨 AI 自動交易設定同步。
+            </p>
+            <div className="flex flex-col gap-2">
+              {STRATEGY_LIBRARY.map((def) => (
+                <StrategyRow
+                  key={def.id}
+                  def={def}
+                  tuning={aiStrategies[def.id] ?? { enabled: true, params: Object.fromEntries(def.params.map((p) => [p.key, p.default])) }}
+                  onPatch={(patch) => patchStrategy(def.id, patch)}
+                />
+              ))}
+            </div>
           </section>
 
           <div className="h-px bg-zinc-800" />

@@ -7,9 +7,11 @@ export const dynamic = 'force-dynamic'
 // GET /api/ai-trade/health — probe the ACTIVE lane so the UI can show an
 // honest 在線/離線 pill instead of failing silently at first question time.
 // v2.12.20: when the user configured their own AI Agent endpoint (Settings →
-// AI Agent API) it is probed instead of the built-in EdgeZero edge, and the
-// response reports which lane is live (`custom: true` + endpoint host +
-// model) so the AI Trade tab can badge it honestly.
+// AI Agent API) it is probed and the response reports which lane is live
+// (`custom: true` + endpoint host + model). v2.12.57: with no user config the
+// route probes the operator env lane (AI_TRADE_BASE_URL/KEY — all defaults
+// removed) and reports configured:false when nothing is set, so every AI
+// surface can badge the honest 「AI 未設定」 state.
 export async function GET() {
   try {
     const user = await requireUser()
@@ -53,9 +55,16 @@ export async function GET() {
       }
     }
 
-    // built-in EdgeZero lane
-    const base = process.env.AI_TRADE_BASE_URL || 'https://edgezero.space-z.ai/api/v1'
-    const key = process.env.AI_TRADE_API_KEY || 'local'
+    // v2.12.57 — operator env lane: NO built-in defaults anymore. All three
+    // env vars must be set, otherwise the UI gets the honest 未設定 state.
+    const base = process.env.AI_TRADE_BASE_URL?.trim() || ''
+    const key = process.env.AI_TRADE_API_KEY?.trim() || ''
+    if (!base || !key) {
+      return NextResponse.json(
+        { ok: false, custom: false, configured: false, error: 'AI 未設定 — 內建預設已移除：請於 Settings → AI Agent API 填入自訂端點與 API Key' },
+        { status: 200 },
+      )
+    }
     try {
       const res = await fetch(`${base}/models`, {
         headers: { Authorization: `Bearer ${key}` },

@@ -1,7 +1,7 @@
 'use client'
 
 // AI Trade Adviser (v2.12.17) — per-chart floating panel.
-// One-click chart reading by the EdgeZero model: the panel computes a
+// One-click chart reading by the configured AI endpoint: the panel computes a
 // technical snapshot from the bars ALREADY loaded in this chart (no extra
 // market fetches) and asks the model for a structured read: bias → levels →
 // risks → plan. Follow-up questions keep the same grounding. Honesty
@@ -12,20 +12,18 @@
 // for keyboard users.
 // v2.12.21 — the panel follows the user's AI Agent lane (Settings → AI Agent
 // API): when a custom OpenAI-compatible endpoint is saved the hardcoded
-// EdgeZero model Select is REPLACED by a 「自訂 · model」 badge — the chat
-// route uses the saved model anyway, so offering edge0 choices there was
-// misleading. Re-probes on the tt:settings-changed event.
+// EdgeZero model Select is REPLACED by a 「自訂 · model」 badge.
+// v2.12.57 — the EdgeZero model whitelist is GONE: unconfigured → the honest
+// 「AI 未設定」 badge (the chat answers the same note server-side).
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Sparkles, SendHorizontal, Square, X, LineChart, GripVertical, Bot } from 'lucide-react'
 import {
-  AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL,
   buildChartSnapshot, snapshotToText,
-  type AiTradeModel, type AiChatMsg,
+  type AiChatMsg,
 } from '@/lib/ai-trade'
 import type { Bar } from '@/lib/market-types'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
 import { Button } from '@/components/ui/button'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 
 const CHART_PROMPT =
@@ -70,7 +68,6 @@ export function AiTradeAdviser({
   getBars: () => Bar[]
   onClose: () => void
 }) {
-  const [model, setModel] = useState<AiTradeModel>(AI_TRADE_DEFAULT_MODEL)
   const [turns, setTurns] = useState<Turn[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -199,7 +196,6 @@ export function AiTradeAdviser({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model,
           messages: next.slice(-8),
           context: `Chart technical snapshot (computed from the ${snapshot.barCount} bars currently loaded in this chart):\n${snapshotToText(snapshot)}`,
           maxTokens: 700,
@@ -220,7 +216,7 @@ export function AiTradeAdviser({
       setBusy(false)
       abortRef.current = null
     }
-  }, [busy, getBars, symbol, timeframe, livePrice, model, turns])
+  }, [busy, getBars, symbol, timeframe, livePrice, turns])
 
   return (
     <div
@@ -286,16 +282,13 @@ export function AiTradeAdviser({
             <span className="truncate">自訂 · {aiCustom.model}</span>
           </span>
         ) : (
-          <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
-            <SelectTrigger className="h-6 w-[150px] border-zinc-800 bg-zinc-900/80 px-2 text-[10px] text-zinc-300" aria-label="AI model">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-              {AI_TRADE_MODELS.map((m) => (
-                <SelectItem key={m.id} value={m.id} className="text-[10px]">{m.title}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <span
+            className="flex h-6 min-w-0 items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 text-[10px] font-medium text-amber-300"
+            title="內建預設模型已移除（v2.12.57）— 於 Settings → AI Agent API 填入自訂端點與 API Key"
+          >
+            <Bot className="h-3 w-3 shrink-0" aria-hidden />
+            <span className="truncate">AI 未設定</span>
+          </span>
         )}
         <Button
           size="sm"
@@ -314,7 +307,7 @@ export function AiTradeAdviser({
           <div className="space-y-2 pt-1 text-center">
             <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900 lp-kai text-sm text-[#c2452d]" aria-hidden>道</div>
             <p className="text-[11px] leading-4 text-zinc-500">
-              以此圖已載入的K線計算技術快照，交給{aiCustom ? `自訂模型（${aiCustom.model}）` : 'EdgeZero'}推演。<br />不外乎資料、不承諾行情。
+              以此圖已載入的K線計算技術快照，交給{aiCustom ? `自訂模型（${aiCustom.model}）` : '已設定的 AI 端點'}推演。<br />不外乎資料、不承諾行情。
             </p>
           </div>
         )}

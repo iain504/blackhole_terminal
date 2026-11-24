@@ -12,7 +12,7 @@ import {
   parseAuditOutput, ruleDedupeKey,
   type EnrichedTrade,
 } from '@/lib/trade-review'
-import { llmChat } from '@/lib/llm'
+import { llmChat, type LlmMessage } from '@/lib/llm'
 import type { Bar } from '@/lib/market-types'
 
 // v2.12.52 — STANDALONE LLM transport on the platform's BUILT-IN config (no
@@ -57,7 +57,7 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
  *  temperature PARAM falls back to its default rather than failing the run. */
 async function callAuditor(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const msgs = [
+    const msgs: LlmMessage[] = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]

@@ -13,7 +13,7 @@ import {
   dailyAtr14, rvolFromBars, htfAlignment,
   type GateCandidateInput, type GateMarketContext, type GateVerdict,
 } from '@/lib/trade-gate'
-import { llmChat } from '@/lib/llm'
+import { llmChat, type LlmMessage } from '@/lib/llm'
 
 export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
@@ -112,7 +112,7 @@ function enqueueLlm<T>(fn: () => Promise<T>): Promise<T> {
  *  defaults rather than failing the gate. */
 async function callGatekeeper(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const msgs = [
+    const msgs: LlmMessage[] = [
       { role: 'system', content: system },
       { role: 'user', content: user },
     ]

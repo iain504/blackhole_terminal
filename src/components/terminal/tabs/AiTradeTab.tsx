@@ -1,16 +1,19 @@
 'use client'
 
-// AI Trade tab (v2.12.17) — EdgeZero adviser workspace.
-// A chat with the terminal's own OpenAI-compatible edge model, grounded in
-// live terminal data: account snapshot, open positions, watchlist quotes.
-// All upstream calls are proxied by /api/ai-trade/chat (the API key never
-// reaches the browser). Honesty contract: the model is told to say when the
-// data is insufficient — the tab never fakes a reply either.
+// AI Trade tab (v2.12.17) — AI adviser workspace.
+// A chat with the terminal's configured AI endpoint, grounded in live
+// terminal data: account snapshot, open positions, watchlist quotes. All
+// upstream calls are proxied by /api/ai-trade/chat (the API key never
+// reaches the browser). v2.12.57 — no built-in default model: with neither
+// the user's AI Agent endpoint nor the operator env lane configured, the
+// chat answers the honest 「AI 未設定」 note and points at Settings.
+// Honesty contract: the model is told to say when the data is insufficient —
+// the tab never fakes a reply either.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Bot, Sparkles, SendHorizontal, Square, RefreshCw, CircleAlert, ShieldAlert } from 'lucide-react'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { useAiAutoStore } from '@/store/ai-auto-trade'
-import { AI_TRADE_MODELS, AI_TRADE_DEFAULT_MODEL, type AiTradeModel, type AiChatMsg } from '@/lib/ai-trade'
+import { type AiChatMsg } from '@/lib/ai-trade'
 import { fmtPrice } from '@/lib/market-types'
 import { visibleAwareInterval } from '@/lib/visible-poll'
 import AiAutoTradePanel from './AiAutoTradePanel'
@@ -69,7 +72,6 @@ export default function AiTradeTab() {
   const updateAutoConfig = useAiAutoStore((s) => s.updateConfig)
   const selectedList = watchlists.find((l) => l.id === autoWatchlistId) ?? watchlists[0] ?? null
 
-  const [model, setModel] = useState<AiTradeModel>(AI_TRADE_DEFAULT_MODEL)
   const [messages, setMessages] = useState<AiChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -307,7 +309,6 @@ export default function AiTradeTab() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model,
           messages: next.slice(-24),
           context: includeCtx ? buildContext(ctxForPrompt) : undefined,
         }),
@@ -327,7 +328,7 @@ export default function AiTradeTab() {
       setBusy(false)
       abortRef.current = null
     }
-  }, [input, busy, messages, model, includeCtx, ctx, fetchCtx, buildContext])
+  }, [input, busy, messages, includeCtx, ctx, fetchCtx, buildContext])
 
   const cancel = useCallback(() => {
     abortRef.current?.abort()
@@ -343,7 +344,7 @@ export default function AiTradeTab() {
           <h1 className="text-sm font-semibold text-zinc-100">AI Trade 交易顧問</h1>
         </div>
         <span className="hidden text-[11px] text-zinc-500 sm:inline">
-          {health?.custom ? `自訂端點 · ${health.endpointHost || 'AI Agent'}` : 'EdgeZero · 本地推理邊緣'}
+          {health?.custom ? `自訂端點 · ${health.endpointHost || 'AI Agent'}` : 'AI 未設定 — 於 Settings → AI Agent API 填入端點'}
         </span>
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -362,8 +363,9 @@ export default function AiTradeTab() {
             <span className={cn('h-1.5 w-1.5 rounded-full', health == null ? 'bg-zinc-600' : health.ok ? 'bg-emerald-400' : 'bg-rose-400')} aria-hidden />
             {health == null ? '檢測中…' : health.ok ? '在線' : '離線'}
           </span>
-          {/* model picker — replaced by a custom-endpoint badge when the user's
-              own AI Agent API is active (the chat route uses its model anyway) */}
+          {/* v2.12.57 — the model picker is gone: the configured endpoint owns
+              the model. Show the custom badge, or the honest 未設定 pill that
+              points at Settings → AI Agent API. */}
           {health?.custom ? (
             <span
               className="flex h-7 items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 text-[11px] font-medium text-violet-300"
@@ -373,19 +375,13 @@ export default function AiTradeTab() {
               自訂 · {health.model || 'model'}
             </span>
           ) : (
-            <Select value={model} onValueChange={(v) => setModel(v as AiTradeModel)}>
-              <SelectTrigger className="h-7 w-[170px] border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="AI model">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-                {AI_TRADE_MODELS.map((m) => (
-                  <SelectItem key={m.id} value={m.id} className="text-[11px]">
-                    {m.title}
-                    <span className="ml-1.5 text-[9px] text-zinc-500">{m.hint}</span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <span
+              className="flex h-7 items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 text-[11px] font-medium text-amber-300"
+              title="內建預設模型已移除（v2.12.57）— 於 Settings → AI Agent API 填入自訂端點與 API Key"
+            >
+              <Bot className="h-3 w-3" aria-hidden />
+              AI 未設定
+            </span>
           )}
           {/* context toggle */}
           <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-zinc-400">

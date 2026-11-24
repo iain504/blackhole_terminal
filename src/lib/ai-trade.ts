@@ -1,27 +1,17 @@
-// AI Trade — EdgeZero adviser shared types + chart snapshot math.
+// AI Trade — adviser shared types + chart snapshot math.
 //
-// The EdgeZero endpoint is OpenAI-compatible (chat/completions). All upstream
-// calls happen in the backend routes (src/app/api/ai-trade/*) — the browser
-// only ever talks to those routes, so the API key stays server-side. This
-// file is safe to import from client code: no env reads here (the routes read
-// AI_TRADE_BASE_URL / AI_TRADE_API_KEY themselves).
+// v2.12.57 — the built-in EdgeZero model whitelist (edge0-8b/edge0-35b) is
+// GONE. AI functions resolve through the user's own Settings → AI Agent API
+// endpoint (endpoint + model + API key) or the operator env lane
+// (AI_TRADE_BASE_URL + AI_TRADE_API_KEY + AI_TRADE_MODEL); with neither, the
+// feature reports an honest 「AI 未設定」 error and every trade path fails
+// closed. All upstream calls happen in the backend routes
+// (src/app/api/ai-trade/*) — the browser only ever talks to those routes, so
+// the API key stays server-side. This file is safe to import from client
+// code: no env reads here.
 
 import type { Bar } from '@/lib/market-types'
 import { detectSrLevels } from '@/lib/sr'
-
-/** Models offered by the EdgeZero edge (whitelist — the route rejects others). */
-export const AI_TRADE_MODELS = [
-  { id: 'edge0-8b', title: 'Edge0 8B · 快', hint: 'fast lane · ~24 tok/s' },
-  { id: 'edge0-35b', title: 'Edge0 35B · 深', hint: 'deep lane · ~16 tok/s' },
-] as const
-
-export type AiTradeModel = (typeof AI_TRADE_MODELS)[number]['id']
-
-export const AI_TRADE_DEFAULT_MODEL: AiTradeModel = 'edge0-8b'
-
-export function isAiTradeModel(m: unknown): m is AiTradeModel {
-  return typeof m === 'string' && AI_TRADE_MODELS.some((x) => x.id === m)
-}
 
 // ---- chat wire types (browser ⇔ our route) --------------------------------
 
@@ -84,6 +74,13 @@ export interface ChartSnapshot {
   srResistancePct: number | null // distance to it, % (positive = above)
   srResistanceTouches: number | null
   atrPct50: number | null // ATR(50) as % of price — compare with atrPct (14)
+  // v2.12.57 — RECENT SWING STRUCTURE PACK (strategy-library pre-screening +
+  // prompt grounding): the last 5 bars' extremes (pullback/breakout triggers)
+  // and the 15 bars before them (the prior range a sweep/breakout must beat).
+  recentHigh5: number | null // highest high of the last 5 bars
+  recentLow5: number | null // lowest low of the last 5 bars
+  priorHigh15: number | null // highest high of bars [6..20] back
+  priorLow15: number | null // lowest low of bars [6..20] back
 }
 
 export interface HigherTfContext {
@@ -260,6 +257,13 @@ export function buildChartSnapshot(
     : []
   const sup = levels.filter((l) => l.side === 'support').sort((a, b) => b.price - a.price)[0] ?? null
   const res = levels.filter((l) => l.side === 'resistance').sort((a, b) => a.price - b.price)[0] ?? null
+  // v2.12.57 — recent swing structure (last 5 bars vs the 15 before them)
+  const last5 = win.slice(-5)
+  const prior15 = win.slice(-20, -5)
+  const recentHigh5 = last5.length ? Math.max(...last5.map((b) => b.high)) : null
+  const recentLow5 = last5.length ? Math.min(...last5.map((b) => b.low)) : null
+  const priorHigh15 = prior15.length ? Math.max(...prior15.map((b) => b.high)) : null
+  const priorLow15 = prior15.length ? Math.min(...prior15.map((b) => b.low)) : null
   return {
     symbol,
     timeframe,
@@ -289,6 +293,10 @@ export function buildChartSnapshot(
     srResistancePct: res && ref > 0 ? ((res.price - ref) / ref) * 100 : null,
     srResistanceTouches: res?.touches ?? null,
     atrPct50: atrPct(win, 50),
+    recentHigh5,
+    recentLow5,
+    priorHigh15,
+    priorLow15,
   }
 }
 
@@ -307,6 +315,7 @@ export function snapshotToText(s: ChartSnapshot): string {
     `MACD(12,26,9): line ${n(s.macdLine, 4)} · signal ${n(s.macdSignal, 4)} · histogram ${n(s.macdHist, 4)}${s.macdHistRising == null ? '' : s.macdHistRising ? ' (hist expanding)' : ' (hist contracting)'}`,
     `volume: last vs 20-avg ${n(s.volRatio)}× · up/down-bar volume ${s.upDownVolRatio == null ? 'n/a' : s.upDownVolRatio === Infinity ? 'all up' : n(s.upDownVolRatio)} · 5-bar vs 20-avg trend ${s.volTrendPct == null ? 'n/a' : `${n(s.volTrendPct)}%`}`,
     `nearest S/R: support ${n(s.srSupport, 4)} (${n(s.srSupportPct)}% below, ${s.srSupportTouches ?? 'n/a'} touches) · resistance ${n(s.srResistance, 4)} (${n(s.srResistancePct)}% above, ${s.srResistanceTouches ?? 'n/a'} touches)`,
+    `recent swings: last-5-bar high/low ${n(s.recentHigh5, 4)}/${n(s.recentLow5, 4)} · prior-15-bar high/low ${n(s.priorHigh15, 4)}/${n(s.priorLow15, 4)}`,
   ]
   if (s.htf) {
     lines.push(

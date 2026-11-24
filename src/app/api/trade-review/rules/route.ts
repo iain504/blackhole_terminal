@@ -7,7 +7,7 @@ import {
   rankCandidates, parseAuditOutput,
   type ParsedRule,
 } from '@/lib/trade-review'
-import { llmChat } from '@/lib/llm'
+import { llmChat, type LlmMessage } from '@/lib/llm'
 
 // v2.12.49 — Trade-review RULE lifecycle (closing the loop). The auditor
 // stores CANDIDATE guardrails; this route promotes/discards them one by one
@@ -39,7 +39,7 @@ function extractContent(completion: unknown): string {
 
 async function callConsolidator(userId: string, system: string, user: string): Promise<string> {
   return enqueueLlm(async () => {
-    const msgs = [
+    const msgs: LlmMessage[] = [
       { role: 'assistant', content: system },
       { role: 'user', content: user },
     ]

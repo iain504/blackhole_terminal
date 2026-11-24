@@ -9,7 +9,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw, Crosshair, TrendingUp, TrendingDown } from 'lucide-react'
 import { useAiAutoStore, AI_EVAL_FAIL_REASON, baseThresholds } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
-import { AI_TRADE_MODELS } from '@/lib/ai-trade'
 import { TIMEFRAMES } from '@/lib/market-types'
 import type { ScreenerResult } from '@/lib/screener'
 import { TaijiSpinner } from '@/components/theme/TaoistLoader'
@@ -429,7 +428,7 @@ export default function AiAutoTradePanel() {
           </Select>
         </div>
         <div className="space-y-1">
-          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">模型</Label>
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">AI 端點</Label>
           {aiCustom ? (
             <span
               className="flex h-7 items-center gap-1 rounded-md border border-violet-500/40 bg-violet-500/10 px-2 text-[10px] font-medium text-violet-300"
@@ -439,14 +438,13 @@ export default function AiAutoTradePanel() {
               <span className="truncate">自訂 · {aiCustom.model}</span>
             </span>
           ) : (
-            <Select value={cfg.model} onValueChange={(v) => updateConfig({ model: v as typeof cfg.model })}>
-              <SelectTrigger className="h-7 border-zinc-800 bg-zinc-900/80 text-[11px] text-zinc-200" aria-label="模型"><SelectValue /></SelectTrigger>
-              <SelectContent className="border-zinc-800 bg-zinc-950 text-zinc-200">
-                {AI_TRADE_MODELS.map((m) => (
-                  <SelectItem key={m.id} value={m.id} className="text-[11px]">{m.title}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <span
+              className="flex h-7 items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 text-[10px] font-medium text-amber-300"
+              title="內建預設模型已移除（v2.12.57）— 於 Settings → AI Agent API 填入自訂端點與 API Key，掃描才能呼叫模型"
+            >
+              <Bot className="h-3 w-3 shrink-0" aria-hidden />
+              <span className="truncate">AI 未設定</span>
+            </span>
           )}
         </div>
         <div className="space-y-1">
@@ -946,6 +944,11 @@ export default function AiAutoTradePanel() {
                       <span className={cn('shrink-0 text-[9px]', p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')}>
                         {p.side === 'buy' ? '▲等上攻' : '▼等跌破'}
                       </span>
+                      {p.strategy && (
+                        <span className="shrink-0 rounded border border-violet-500/30 bg-violet-500/10 px-1 text-[8.5px] font-medium text-violet-300" title={`採用戰略：${p.strategy}`}>
+                          {p.strategy}
+                        </span>
+                      )}
                     </span>
                     <span className="shrink-0 text-right font-mono text-[9px] leading-3 text-zinc-400">
                       觸發 {fmtPx(p.trigger)}

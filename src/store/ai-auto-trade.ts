@@ -1,4 +1,19 @@
-// AI 自動交易 (v2.12.18) — periodic EdgeZero-powered scanner over the watchlist.
+// AI 自動交易 (v2.12.57) — strategy-injected adjudication scanner.
+//
+// v2.12.57 — the planner no longer invents trades. Every scan first runs the
+// 戰略庫 (src/lib/strategy-library.ts): each ENABLED playbook deterministically
+// pre-screens the snapshot and emits a structure-true candidate (trigger/SL/TP
+// derived from recent swings, window extremes, tested S/R + ATR buffers; edge
+// 0-100 + named evidence). The prompt hands the model those candidates and
+// asks it to ADJUDICATE — which side has the larger edge, whether the
+// environment deserves the trade. Discipline locked in:
+//   · strict-first: no qualifying candidate → flat (the expected output)
+//   · both-side plans ONLY from different strategies with comparable edge
+//   · TP-repair REMOVED — an unreachable R:R rejects the plan, never inflates it
+//   · the built-in EdgeZero model lane is gone: AI functions require the
+//     user's own endpoint + API key (Settings → AI Agent API) or the operator
+//     env lane; unconfigured → honest error → fail-closed (v2.12.56 contract)
+// Legacy history (v2.12.18): periodic EdgeZero-powered scanner over the watchlist.
 //
 // Loop: every `intervalSec`, pull the first watchlist, fetch bars per symbol
 // (existing /api/market/bars), compute the SAME technical snapshots the chart
@@ -64,9 +79,13 @@
 // immediate-fire behavior for A/B.
 import { create } from 'zustand'
 import {
-  AI_TRADE_DEFAULT_MODEL, buildChartSnapshot, snapshotToText,
-  isAiTradeModel, type AiTradeModel, type AiChatMsg,
+  buildChartSnapshot, snapshotToText,
+  type AiChatMsg,
 } from '@/lib/ai-trade'
+import {
+  STRATEGY_LIBRARY, defaultStrategyConfig, sanitizeStrategyConfig,
+  screenSymbol, strategyBlockText, type StrategyTuning,
+} from '@/lib/strategy-library'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import {
@@ -75,7 +94,7 @@ import {
 } from '@/lib/ai-ops-sync'
 import {
   dynamicThresholds as regimeDynamicThresholds, concentrationCheck,
-  validatePlanSide, repairPlanTp, type GateRegime,
+  validatePlanSide, type GateRegime,
   isSpotCryptoSymbol, CRYPTO_NO_SHORT_NOTE,
 } from '@/lib/ai-trade-gates'
 import {
@@ -88,7 +107,6 @@ export interface AiAutoConfig {
   enabled: boolean
   intervalSec: number // scan period
   timeframe: Timeframe // bars the model reads
-  model: AiTradeModel
   minConfidence: number // 0–100
   minRR: number // reward:risk multiplier — threshold "1:minRR" (user spec e.g. 1:7)
   /** v2.12.38 — REACT-mode plan-creation gates. In react mode the discipline
@@ -143,13 +161,17 @@ export interface AiAutoConfig {
    *  the 24h review grades the GATEKEEPER (a veto that would have won flags
    *  the guardrail as possibly too strict). */
   gateEnabled: boolean
+  /** v2.12.57 — 戰略庫：per-strategy enable + tuning. The scan pre-screens
+   *  every enabled playbook over each snapshot (structure-true trigger/SL/TP
+   *  + edge score) and injects the candidates into the prompt; the model only
+   *  ADJUDICATES. Managed by Settings → AI 自動交易 · 戰略庫. */
+  strategies: Record<string, StrategyTuning>
 }
 
 export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   enabled: false,
   intervalSec: 300,
   timeframe: '1h',
-  model: AI_TRADE_DEFAULT_MODEL,
   minConfidence: 60,
   minRR: 7,
   // v2.12.38 — react plan gates: 45% confidence ≈ "2 aligned evidence classes
@@ -174,6 +196,7 @@ export const AI_AUTO_DEFAULT_CONFIG: AiAutoConfig = {
   blockConcentration: true,
   maxCorrelated: 2,
   gateEnabled: true,
+  strategies: defaultStrategyConfig(),
 }
 
 const LS_KEY = 'bh-ai-auto-cfg-v1'
@@ -193,7 +216,6 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     intervalSec: clampN(num(j.intervalSec, d.intervalSec), 60, 7200),
     timeframe: (typeof j.timeframe === 'string' && TIMEFRAMES[j.timeframe as Timeframe])
       ? j.timeframe as Timeframe : d.timeframe,
-    model: isAiTradeModel(j.model) ? j.model : d.model,
     minConfidence: clampN(num(j.minConfidence, d.minConfidence), 0, 100),
     minRR: clampN(num(j.minRR, d.minRR), 0.1, 100),
     // undefined (old saved configs) → the softer react defaults — the
@@ -222,6 +244,9 @@ export function sanitizeAiAutoConfig(input: unknown): AiAutoConfig {
     // undefined (old saved config) → default ON — the veto gate is the
     // capital-preservation layer and must not silently vanish on upgrade
     gateEnabled: j.gateEnabled === undefined ? d.gateEnabled : Boolean(j.gateEnabled),
+    // v2.12.57 — undefined (old saved config) → all 7 playbooks enabled with
+    // stock params (an upgrade must not silently change the strategy mix)
+    strategies: sanitizeStrategyConfig(j.strategies),
   }
 }
 
@@ -330,9 +355,9 @@ export interface AiVerdictPlan {
   rr: number
   status: 'created' | 'rejected'
   note: string | null
-  /** v2.12.38 — TP re-derived by the terminal as a mechanical R-multiple
-   *  target after the model's structural TP came in too close. */
-  repaired?: boolean
+  /** v2.12.57 — the strategy-library playbook this plan came from (the model
+   *  must adopt a pre-screened candidate's id). null for legacy plans. */
+  strategy?: string | null
 }
 
 export type AiPlanStatus = 'WAITING' | 'EXECUTED' | 'INVALIDATED' | 'EXPIRED' | 'GATED' | 'CANCELLED' | 'SUPERSEDED'
@@ -351,6 +376,8 @@ export interface AiPlanVM {
   rr: number
   refPrice: number
   reason: string | null
+  /** v2.12.57 — strategy-library playbook id the plan adopted */
+  strategy: string | null
   regime: string | null
   mode: string
   status: AiPlanStatus
@@ -588,51 +615,56 @@ function scanInstruction(n: number, minConf: number, minRR: number): string {
     `- confidence 是你對該方向的把握度，並已用近期勝率校準；direction 為 flat 時，entry/stop/target 與 confidence 全部填 0，reason 必須說出為何不交易的關鍵原因（如：證據不足/互相矛盾、區間中段無優勢、量價背離、事件風險）。`,
     `- 本引擎以勝率優先：無證據的標的判 flat 是正確輸出（寧可錯過、不可做錯），但「寧可錯過」指不降低證據標準，不是把信心一律壓到門檻之下 — 證據充分、風險可控的標的必須給出達標的信心與數字。`,
     `- DATA 區已提供 MACD(12,26,9)、RSI、量能分布（up/down-bar volume、5/20-bar 量能趨勢）、4× 高週期趨勢、最近測試的支撐/阻力（含觸及次數）、52 週區間位置，以及「選股」行（全宇宙篩選排名 · ATR14% 波動 · 量比 · 成交額）— 請一併考慮；高週期與短週期矛盾時誠實反映在 confidence 與 reason；高 ATR 標的的停損距離需按波動放寬，量比爆量代表事件驅動行情、留意假突破。`,
+    `- 標的下方如附「戰略候選」，其幾何由終端按戰略庫從市場結構推導（附 edge 與證據）— entry/stop/target 應與你所採候選一致，edge 高且證據 ≥2 類的一側優先；無候選且無明確結構 → flat。`,
+    `- 標的下方如附「戰略候選」，其幾何由終端按戰略庫從市場結構推導（附 edge 與證據）— entry/stop/target 應與你所採候選一致，edge 高且證據 ≥2 類的一側優先；無候選且無明確結構 → flat。`,
     `- 只能使用 DATA 區的數字，不可杜撰資料；每個標的都要有對應項目。`,
   ].join('\n')
 }
 
-/** v2.12.37 — react-mode planning instruction (React > Respond > Review).
- *  Same DATA block as the instant scan, but the model now outputs
- *  CONDITIONAL PLANS instead of a market-order command: per symbol a bias +
- *  confidence + up to ONE buy plan (fires when the market goes UP through
- *  the trigger) and ONE sell plan (fires on a DOWN-move through it), each
- *  with its own TP/SL. The terminal validates geometry, watches the market,
- *  and only follows a plan the market actually confirms — then reviews. */
-function scanInstructionPlans(
+/** v2.12.57 — 戰略裁決官 (STRATEGY ADJUDICATOR) planning instruction.
+ *  The terminal pre-screens every enabled playbook (strategy-library) and
+ *  hands the model concrete candidates: structure-true trigger/SL/TP + a
+ *  deterministic edge score + named evidence classes. The model's job is NO
+ *  LONGER to invent trades — it ADJUDICATES: which side has the larger edge,
+ *  whether the environment deserves the trade, and whether the geometry
+ *  needs tightening. Discipline answers locked in by the operator:
+ *   · flat is the DEFAULT when no candidate qualifies (strict-first)
+ *   · two-sided plans ONLY when the sides come from different strategies
+ *     with comparable edge (Δ ≤ 15) — a regime-defined range
+ *   · NO TP repair: a plan that can't clear min R:R from real structure is
+ *     rejected, not inflated (v2.12.57 removes the geometry-repair crutch). */
+function scanInstructionAdjudicate(
   n: number,
   longGate: { minConfidence: number; minRR: number },
   shortGate: { minConfidence: number; minRR: number },
 ): string {
-  // v2.12.38 — the model is told the EFFECTIVE per-direction gates (base
-  // config + regime surcharge already applied), so its planned geometry can
-  // clear exactly what the terminal will enforce — the v2.12.38 E2E scan
-  // caught the mismatch: the prompt said 1:1.6 while RISK_OFF longs were
-  // gated at 1:2.0, silently killing every well-formed plan.
+  // the model is told the EFFECTIVE per-direction gates (base config + regime
+  // surcharge already applied), so its planned geometry can clear exactly
+  // what the terminal will enforce for the current regime.
   const g = (x: { minConfidence: number; minRR: number }) => `信心 ≥ ${x.minConfidence}% 且 R:R ≥ 1:${x.minRR}`
   const sameGate = longGate.minConfidence === shortGate.minConfidence && longGate.minRR === shortGate.minRR
   const gateLine = sameGate
     ? `終端門檻（買賣計劃相同）：${g(longGate)}`
     : `終端門檻（依 regime 分方向）：buy 計劃 ${g(longGate)} · sell 計劃 ${g(shortGate)}`
   return [
-    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 共用「市場環境/近期表現/持倉」區）。請擔任量化作戰規劃引擎，遵循紀律 Plan your trade, trade your plan — React > Respond > Review：先分析、出「條件作戰計劃」（無計劃不下單）；終端會監控市場，價格觸及計劃觸發價才跟進下單，市場反向則計劃作廢。只輸出 JSON 陣列，禁止任何其他文字：`,
-    `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"buyTrigger":<數字>,"buyTp":<數字>,"buySl":<數字>,"sellTrigger":<數字>,"sellTp":<數字>,"sellSl":<數字>,"reason":"<繁體中文 ≤ 30 字>"}]`,
-    `計劃規則：`,
-    `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (buyTp − buyTrigger) ÷ (buyTrigger − buySl)；sell R:R = (sellTrigger − sellTp) ÷ (sellSl − sellTrigger)。例：現價 100，buyTrigger 100.5 / buySl 99 / buyTp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。送出前先代入算式自查；達不到門檻的側直接填 0（不要送會被拒的幾何）。`,
-    `- R:R 幾何技巧：TP 由結構（下一個 S/R）決定後，把觸發價「貼近現價」（+0.3% ~ +1%）可同時縮小風險距離並拉高 R:R — SL 距離遠時尤其有效；若貼近後仍達不到門檻，代表 TP 空間不足，該側不給計劃。`,
-    `- buy 計劃 = 突破/動能確認：buyTrigger 必須高於現價（+0.3% ~ +4%），市場「上攻」觸及才成立；buySl 掛在最近支撐之下（結構外，距離參考 ATR — 不可緊貼現價），buyTp 放在到達下一個阻力之前。`,
-    `- sell 計劃 = 跌破確認：sellTrigger 必須低於現價（−0.3% ~ −4%），市場「跌破」觸及才成立；sellSl 掛在最近阻力之上，sellTp 放在到達下一個支撐之前。`,
-    `- 現貨加密（標的含「/」如 BTC/USD、ETH/USD）在 Alpaca 只能做多、不可做空：不為加密標的給 sell 計劃 — 看空時 sell 側各數字填 0，reason 註明「加密不可做空，僅觀察」。`,
-    `- 只給證據支持的側：偏多證據給 buy 計劃、偏空證據給 sell 計劃；區間且雙向證據都成立時可同時給兩側（市場自己選方向，we follow the plan）。無計劃的一側該組數字填 0。`,
-    `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準。`,
-    `- 信心校準表：0–20 = 無優勢（flat）；25–40 = 單一證據類、投機性；45–60 = 兩類獨立證據同向且結構清楚；65–80 = 三類以上＋量能或高週期確認；85+ = 罕見（全部對齊）。誠實校準 — 證據足夠就給出對應數字，禁止把信心一律壓在 0 或 30。`,
-    `- react 紀律 = 市場確認才執行：計劃建立後須價格「觸及觸發價」才會下單，反向先破停損區即作廢、48 小時未觸發逾期作廢 — 因此「中等信心的條件計劃」是預期且正確的輸出，倉位會按信心自動縮小；不要自我審查到 flat，只有真正無證據才 flat（flat 時全部數字填 0，reason 說明關鍵原因）。`,
-    `- 證據計數：non-flat 方向需要「至少 2 類獨立證據同向」（趨勢/動量、量能、結構 S/R、高週期、情緒/環境）；證據互相矛盾或只有單一訊號 → 誠實 flat，所有數字填 0，reason 說明關鍵原因。`,
-    `- 市場環境：RISK_OFF 做多、RISK_ON 做空屬逆風 — 逆風側門檻已在上列分方向門檻中上調；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）假突破多 — buyTrigger 需更貼近確認位。`,
-    `- 近期表現/覆盤統計：這是本引擎真實成績與過往判斷 24 小時後的對帳結果。用它校準信心並選擇證據組合 — 某組合勝率明顯差時，同組合新訊號信心降 10–15 或改給反向側計劃，而非一律 flat（完全不出手會讓引擎失去校準資料）。`,
+    `以下是關注清單 ${n} 個標的的資料（DATA 區：每標的技術快照 + 戰略候選 + 共用「市場環境/近期表現/持倉」區）。請擔任戰略裁決官：終端已按啟用的戰略庫為每個標的預篩出幾何完整的候選（觸發/SL/TP 由市場結構推導，附 edge 與證據），你的工作不是發明交易，而是裁定 — 比較買賣兩側候選的 edge，判斷哪一側優勢更大、當前環境是否值得立計劃、幾何是否需要微調。React > Respond > Review：計劃須市場觸及觸發價才跟進，反向則作廢。只輸出 JSON 陣列，禁止任何其他文字：`,
+    `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"buy":{"strategy":"<候選策略id>","trigger":<數字>,"tp":<數字>,"sl":<數字>} 或 0,"sell":{"strategy":"<候選策略id>","trigger":<數字>,"tp":<數字>,"sl":<數字>} 或 0,"reason":"<繁體中文 ≤ 30 字，flat 時說明拒絕了哪些候選與原因>"}]`,
+    `裁決規則：`,
+    `- edge 比較：每個候選附 edge（0-100）與證據清單（趨勢/動量/量能/結構/高週期/位置）。取 edge 較高、證據 ≥2 類獨立同向的一側立計劃；證據互相矛盾或只有單一訊號 → 誠實 flat。`,
+    `- 雙側計劃僅限：買賣兩側來自不同策略、edge 相當（差 ≤ 15）、結構形成明確區間（如「箱體雙向」候選已同時給兩側）— 市場自己選方向，we follow the plan；否則只立較強一側，另一側填 0。`,
+    `- 幾何紀律：可微調候選（把觸發價貼近確認位可縮小風險距離、拉高 R:R），但 SL 不可移入結構內側、TP 不可越過其引用的支撐/阻力。終端已移除 TP 重推 — 達不到門檻的計劃會被直接拒絕（結構給不出合理 R:R 就是不該交易），送出前先代入算式自查，無法達標的側填 0。`,
+    `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (tp − trigger) ÷ (trigger − sl)；sell R:R = (trigger − tp) ÷ (sl − trigger)。例：現價 100，buy trigger 100.5 / sl 99 / tp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。`,
+    `- 採用的計劃必須填 strategy = 該候選行的策略 id（括號內英文，如 trend-pullback）；不可採用候選區沒有的幾何或杜撰策略。`,
+    `- 無合格候選、環境逆風、財報/事件風險、與持倉衝突 → 誠實 flat（兩側填 0，reason 說明拒絕原因）—「無設置即空倉」是本引擎的第一紀律，寧可錯過、不可做錯。`,
+    `- buy 計劃 = 突破/確認：trigger 必須高於現價（市場上攻觸及才成立）；sell 計劃 = 跌破確認：trigger 必須低於現價。SL 掛結構外（距離參考 ATR — 不可緊貼現價），TP 放到達其引用的下一個 S/R 之前。`,
+    `- 現貨加密（標的含「/」如 BTC/USD、ETH/USD）在 Alpaca 只能做多、不可做空：不為加密標的給 sell 計劃 — 看空時 sell 側填 0，reason 註明「加密不可做空」。`,
+    `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準。信心校準表：0–20 = 無優勢（flat）；25–40 = 單一證據類、投機性；45–60 = 兩類獨立證據同向且結構清楚；65–80 = 三類以上＋量能或高週期確認；85+ = 罕見（全部對齊）。誠實校準 — 禁止把信心一律壓在 0 或 30。`,
+    `- react 紀律 = 市場確認才執行：計劃建立後須價格「觸及觸發價」才會下單，反向先破停損區即作廢、48 小時未觸發逾期作廢 — 因此「中等信心的條件計劃」是預期且正確的輸出，倉位會按信心自動縮小；但證據不足時不要硬湊計劃。`,
+    `- 市場環境：RISK_OFF 做多、RISK_ON 做空屬逆風 — 逆風側門檻已在上列分方向門檻中上調；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）假突破多 — 突破類候選需更謹慎。`,
+    `- 近期表現/覆盤統計：這是本引擎真實成績與過往判斷 24 小時後的對帳結果。用它校準信心並選擇證據組合 — 某組合勝率明顯差時，同組合新訊號信心降 10–15 或改給反向側計劃。`,
     `- 財報/事件：「財報臨近（block）」標的必然被終端硬閘拒絕 — 直接 flat；「財報: N 天後」N ≤ 5 時 confidence 上限 55；共用區列出的 48 小時內高影響事件同樣壓低相關方向信心。`,
     `- 目前持倉：已持有標的不會再進場；避免與現有持倉高度相關的新方向；[集中風險] 標明 ⚠ 的持倉對不要再建同向計劃。`,
-    `- 數字只能取自 DATA 區，不可杜撰資料；每個標的都要有對應項目；無證據的標的判 flat 是正確輸出，但不要為了保守把有證據的標的也壓成 flat — 每輪請對證據最充分的標的給出計劃（若兩類證據同向）。`,
+    `- 數字只能取自 DATA 區與戰略候選區，不可杜撰資料；每個標的都要有對應項目。`,
   ].join('\n')
 }
 
@@ -676,7 +708,8 @@ export async function runScan(): Promise<void> {
   // v2.12.38 — mode-aware plan/verdict gates (react: 45/1.8, instant: 60/7)
   const base = baseThresholds(cfg)
   setScanning(true)
-  st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · ${cfg.model}${useReact ? ' · React 計劃模式' : ''}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
+  const stratOn = STRATEGY_LIBRARY.filter((d) => cfg.strategies[d.id]?.enabled !== false).length
+  st0.addLog('info', `掃描開始 — ${cfg.maxSymbols} 標的上限 · ${cfg.timeframe} K線 · 戰略庫 ${stratOn}/${STRATEGY_LIBRARY.length} 啟用${useReact ? ' · React 計劃模式' : ''}${cfg.dryRun ? ' · 試運行（不下單）' : ''}`)
   // v2.12.34 — auto-watchlist pool state (declared here so snapshotExtras
   // and the context pack below can read it): symbol → why it made the cut.
   const pickBySym = new Map<string, PickMeta>()
@@ -1051,7 +1084,9 @@ export async function runScan(): Promise<void> {
     }
 
     // 3) bars → snapshots (concurrency 3, demo-flagged kept but marked)
-    interface Snap { symbol: string; text: string; demo: boolean; lastClose: number }
+    //    v2.12.57 — the snapshot object rides along: the strategy screener
+    //    pre-screens each symbol BEFORE the model sees it.
+    interface Snap { symbol: string; text: string; snapshot: ReturnType<typeof buildChartSnapshot>; demo: boolean; lastClose: number }
     const snaps: Snap[] = []
     const skipped: string[] = []
     for (const group of chunk(scanSyms, 3)) {
@@ -1062,7 +1097,7 @@ export async function runScan(): Promise<void> {
           if (!Array.isArray(bars) || bars.length < 30) { skipped.push(sym); return null }
           const meta = (j?.meta ?? {}) as { demo?: boolean }
           const snap = buildChartSnapshot(bars as never, sym, cfg.timeframe, bars[bars.length - 1].close)
-          return { symbol: sym, text: snapshotToText(snap) + snapshotExtras(sym, snap.lastClose), demo: Boolean(meta.demo), lastClose: snap.lastClose }
+          return { symbol: sym, text: snapshotToText(snap) + snapshotExtras(sym, snap.lastClose), snapshot: snap, demo: Boolean(meta.demo), lastClose: snap.lastClose }
         }),
       )
       for (const r of settled) if (r.status === 'fulfilled' && r.value) snaps.push(r.value)
@@ -1072,6 +1107,22 @@ export async function runScan(): Promise<void> {
       st0.addLog('warn', '本輪無可用K線 — 未呼叫模型。')
       return
     }
+
+    // 3.5) v2.12.57 — 戰略庫 PRE-SCREEN. Every enabled playbook runs over each
+    // snapshot: structure-true trigger/SL/TP + edge score. The best buy and
+    // best sell candidate per symbol ride the prompt as [戰略候選]; the model
+    // adjudicates instead of inventing. Pure math — a broken detector can
+    // never kill the scan.
+    const candsBySym = new Map<string, ReturnType<typeof screenSymbol>>()
+    let candBuy = 0
+    let candSell = 0
+    for (const s of snaps) {
+      const cands = screenSymbol(s.snapshot, cfg.strategies)
+      candsBySym.set(s.symbol, cands)
+      if (cands.some((c) => c.side === 'buy')) candBuy++
+      if (cands.some((c) => c.side === 'sell')) candSell++
+    }
+    st0.addLog('info', `戰略預篩 — ${candBuy} 標的有 ▲buy 候選 · ${candSell} 標的有 ▼sell 候選（無候選的標的將依紀律觀望）`)
 
     // 4) batched verdict calls — 6 enriched snapshots + the shared context
     //    pack per call (keeps the DATA block inside the route's 8k context
@@ -1101,14 +1152,13 @@ export async function runScan(): Promise<void> {
         : { minConfidence: base.minConfidence, minRR: base.minRR }
       const longGate = dynGate('long')
       const shortGate = dynGate('short')
-      const dataBlock = (contextPack ? `${contextPack}\n\n` : '') + grp.map((s) => s.text + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
+      const dataBlock = (contextPack ? `${contextPack}\n\n` : '') + grp.map((s) => s.text + (candsBySym.get(s.symbol)?.length ? `\n\n${strategyBlockText(candsBySym.get(s.symbol)!)}` : '') + (s.demo ? '\n(note: DEMO bars — synthetic sample data)' : '')).join('\n\n')
       const res = await fetch('/api/ai-trade/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: cfg.model,
           messages: [{ role: 'user', content: useReact
-            ? scanInstructionPlans(grp.length, longGate, shortGate)
+            ? scanInstructionAdjudicate(grp.length, longGate, shortGate)
             : scanInstruction(grp.length, base.minConfidence, base.minRR) }] as AiChatMsg[],
           context: dataBlock,
           maxTokens: useReact ? Math.min(2400, 240 * grp.length + 400) : Math.min(2000, 200 * grp.length + 300),
@@ -1221,25 +1271,20 @@ export async function runScan(): Promise<void> {
             ? regimeDynamicThresholds(base.minConfidence, base.minRR, regimeState, side === 'buy' ? 'long' : 'short')
             : { minConfidence: base.minConfidence, minRR: base.minRR }
           if (confidence < dyn.minConfidence) { reject(`信心未達 ${dyn.minConfidence}%`); continue }
-          // v2.12.38 — R:R gate + GEOMETRY REPAIR. The model's trigger and
-          // structural SL stand; a TP that falls short of the floor is
-          // replaced by the mechanical R-multiple target (capped, honestly
-          // tagged) instead of silently killing the plan — the discipline
-          // lives in code, not in an 8B planner's arithmetic.
+          // v2.12.57 — R:R gate, NO GEOMETRY REPAIR. The old crutch re-derived
+          // an unreachable TP as a mechanical R-multiple and inflated targets
+          // into fantasy space — exactly the losses the operator reported.
+          // A plan that cannot clear the floor from REAL structure is
+          // rejected outright: the strategy candidate's TP already sits at
+          // its referenced S/R, so there is nothing honest left to stretch.
           if (geo.rr < dyn.minRR) {
-            const fix = repairPlanTp(side, raw.trigger, raw.sl, dyn.minRR)
-            if (fix) {
-              raw.tp = fix.tp
-              plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: fix.rr, status: 'created', note: null, repaired: true })
-              continue
-            }
-            reject(`R:R ${geo.rr.toFixed(2)} 未達 1:${dyn.minRR}（修復後仍超界 — 風險距離過寬）`)
+            reject(`R:R ${geo.rr.toFixed(2)} 未達 1:${dyn.minRR}（結構幾何不足 — 不重推 TP，計劃拒絕）`)
             continue
           }
           if (side === 'sell' && noShort.has(snap.symbol)) { reject(`該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''}`); continue }
           if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { reject('已有該標的持倉'); continue }
           if (snap.demo) { reject('⚠示範K線 — 非真實行情'); continue }
-          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null })
+          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null, strategy: raw.strategy })
         }
         v.plans = plans
         const created = plans.filter((p) => p.status === 'created')
@@ -1384,6 +1429,7 @@ export async function runScan(): Promise<void> {
           rr: p.rr,
           refPrice: v.refPrice ?? 0,
           reason: v.reason,
+          strategy: p.strategy ?? null,
           regime: regimeState,
           earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
           mode: cfg.mode,
@@ -1405,7 +1451,7 @@ export async function runScan(): Promise<void> {
             for (const p of v.plans ?? []) {
               if (p.status !== 'created') continue
               const dist = v.refPrice ? ((p.trigger - v.refPrice) / v.refPrice) * 100 : 0
-              st0.addLog('info', `${v.symbol} ${p.side === 'buy' ? '▲buy' : '▼sell'} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}（R:R 1:${p.rr.toFixed(1)} · 距現價 ${dist >= 0 ? '+' : ''}${dist.toFixed(1)}%${p.repaired ? ' · TP 終端重推' : ''}）`)
+              st0.addLog('info', `${v.symbol} ${p.side === 'buy' ? '▲buy' : '▼sell'} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}（R:R 1:${p.rr.toFixed(1)} · 距現價 ${dist >= 0 ? '+' : ''}${dist.toFixed(1)}%${p.strategy ? ` · 戰略 ${p.strategy}` : ''}）`)
             }
           }
           if (!cfg.enabled) st0.addLog('info', '自動交易開關未開 — 計劃保留，開啟後反應器開始監控')
@@ -1653,9 +1699,10 @@ function isAiPosition(p: { source?: string; sources?: { source?: string }[] }): 
 }
 
 /** v2.12.37 — extract one side's plan numbers from a react-mode model item.
- *  Flat fields preferred (buyTrigger/buyTp/buySl); a nested {"buy":{...}}
- *  object is tolerated. Any number missing/≤0 → no plan for that side. */
-function reactPlanFromItem(it: Record<string, unknown>, side: 'buy' | 'sell'): { trigger: number; tp: number; sl: number } | null {
+ *  v2.12.57 — the adjudicator's nested {"buy":{...,"strategy":"<id>"}} object
+ *  is the primary shape; legacy flat fields (buyTrigger/buyTp/buySl) still
+ *  parse. Any number missing/≤0 → no plan for that side. */
+function reactPlanFromItem(it: Record<string, unknown>, side: 'buy' | 'sell'): { trigger: number; tp: number; sl: number; strategy: string | null } | null {
   const pick = (x: unknown) => { const n = Number(x); return Number.isFinite(n) && n > 0 ? n : 0 }
   const nested = (it[side] ?? null)
   const src = nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : it
@@ -1663,7 +1710,8 @@ function reactPlanFromItem(it: Record<string, unknown>, side: 'buy' | 'sell'): {
   const tp = pick(src[side === 'buy' ? 'buyTp' : 'sellTp'] ?? src['tp'])
   const sl = pick(src[side === 'buy' ? 'buySl' : 'sellSl'] ?? src['sl'])
   if (!trigger || !tp || !sl) return null
-  return { trigger, tp, sl }
+  const strategyRaw = typeof src.strategy === 'string' ? src.strategy.trim().slice(0, 40) : ''
+  return { trigger, tp, sl, strategy: strategyRaw || null }
 }
 
 /** Adopt every WAITING plan this account owns (real server ids — the PATCH
@@ -1687,6 +1735,7 @@ async function hydratePlans(sig?: AbortSignal): Promise<void> {
         id, symbol, side, confidence: Math.round(Number(r.confidence) || 0),
         trigger, tp, sl, rr, refPrice,
         reason: typeof r.reason === 'string' ? r.reason : null,
+        strategy: typeof r.strategy === 'string' && r.strategy ? r.strategy : null,
         regime: typeof r.regime === 'string' ? r.regime : null,
         mode: r.mode === 'live' ? 'live' : 'paper',
         status: 'WAITING', statusNote: null,

@@ -1,40 +1,31 @@
-// v2.12.52 — standalone LLM transport (server-side only). NO vendor SDK, NO
-// new env keys.
+// v2.12.57 — standalone LLM transport (server-side only). NO vendor SDK, NO
+// built-in default model.
 //
 // Operator mandates that shaped this file:
 //   1. "docker cannot rely on z ai component — make it work alone"
 //      → the z-ai-web-dev-sdk dependency and its .z-ai-config FILE are gone;
 //        this module speaks plain OpenAI-compatible HTTP.
-//   2. "which AI model should already be built-in config — why a new env key?"
-//      → it is. The model choice resolves through config the platform already
-//        ships, in this order:
+//   2. "Remove edge0-8b default. User need to use AI function must input a
+//      API key." → the old hard defaults (edgezero.space-z.ai + 'local' +
+//      edge0-8b) are GONE. AI functions now resolve in this order:
 //
 //   Lane 1 — Settings → AI Agent API (PER-USER): the user's OWN OpenAI-
-//            compatible endpoint + model + key, stored AES-256-GCM encrypted
-//            in User.settings and managed by the existing UI
+//            compatible endpoint + model + API key, stored AES-256-GCM
+//            encrypted in User.settings and managed by the existing UI
 //            (/api/settings/ai-agent, with the /test probe). When saved it
 //            overrides everything — the exact precedence /api/ai-trade/chat
 //            has used since v2.12.20.
-//   Lane 2 — the BUILT-IN lane: AI_TRADE_BASE_URL / AI_TRADE_API_KEY
-//            (pre-existing optional operator overrides) with hard defaults
-//            (https://edgezero.space-z.ai/api/v1 + 'local', model edge0-8b —
-//            the same default the AI adviser chat always had). A fresh
-//            container runs every AI feature out of the box, zero setup.
+//   Lane 2 — the OPERATOR env lane: AI_TRADE_BASE_URL + AI_TRADE_API_KEY +
+//            AI_TRADE_MODEL (ALL three required — there is no default). For
+//            self-hosters who want AI before any user configures a key.
 //
-// Per-user features (post-trade auditor, pre-trade veto gate, rule
-// consolidation) resolve Lane 1 → Lane 2 for their calling user; the global
-// sentiment engine has no user context and rides Lane 2. Both lanes share the
-// same /chat/completions wire format — one timeout, one honest error shape.
-// Because Lane 2 always resolves, there is no "unconfigured" state to
-// pre-flight: a broken upstream surfaces as an honest per-call error instead
-// (gate → ERROR row + engine fail-closed no-trade since v2.12.56, audit →
-// failed-batch note, sentiment → offline lexicon degradation).
+//   With NEITHER lane configured, resolveLane returns null and llmChat throws
+//   the honest 「AI 未設定」 error — the pre-trade gate, planner, auditor and
+//   sentiment engine all fail closed on it (no verdict → no trade since
+//   v2.12.56), exactly like a dead upstream.
 import { readAiAgentConfig, aiAgentAuthHeaders } from '@/lib/ai-agent'
-import { AI_TRADE_DEFAULT_MODEL } from '@/lib/ai-trade'
 
 const REQUEST_TIMEOUT_MS = 90_000
-const BUILTIN_BASE_DEFAULT = 'https://edgezero.space-z.ai/api/v1'
-const BUILTIN_KEY_DEFAULT = 'local'
 
 export type LlmProvider = 'agent' | 'builtin'
 
@@ -69,12 +60,12 @@ interface ResolvedLane {
 }
 
 /** Lane resolution for ONE call. Lane 1 (the user's own endpoint) wins when
- *  they saved one in Settings → AI Agent API; otherwise the built-in EdgeZero
- *  lane — which ALWAYS resolves thanks to its hard defaults, so no AI feature
- *  can dead-end on a fresh deployment and no env key is ever required. A DB
- *  hiccup while reading the user config degrades to the built-in lane (the
- *  AI adviser chat behaves identically via readAiAgentConfig → null → EdgeZero). */
-async function resolveLane(userId?: string): Promise<ResolvedLane> {
+ *  they saved one in Settings → AI Agent API; otherwise the operator env lane
+ *  (all three vars required — no defaults ship anymore). Returns null when
+ *  NOTHING is configured: llmChat then throws the honest AI 未設定 error and
+ *  every caller fails closed. A DB hiccup while reading the user config
+ *  degrades to the env lane or the same honest error (never a guessed call). */
+async function resolveLane(userId?: string): Promise<ResolvedLane | null> {
   if (userId) {
     try {
       const cfg = await readAiAgentConfig(userId)
@@ -87,31 +78,36 @@ async function resolveLane(userId?: string): Promise<ResolvedLane> {
         }
       }
     } catch {
-      // DB unavailable — the built-in lane keeps AI working
+      // DB unavailable — fall through to the env lane / honest error
     }
   }
-  const base = (process.env.AI_TRADE_BASE_URL?.trim() || BUILTIN_BASE_DEFAULT).replace(/\/+$/, '')
+  const base = process.env.AI_TRADE_BASE_URL?.trim()
+  const key = process.env.AI_TRADE_API_KEY?.trim()
+  const model = process.env.AI_TRADE_MODEL?.trim()
+  if (!base || !key || !model) return null
   return {
     provider: 'builtin',
     url: normalizeCompletionsUrl(base),
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.AI_TRADE_API_KEY?.trim() || BUILTIN_KEY_DEFAULT}`,
-    },
-    model: AI_TRADE_DEFAULT_MODEL,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    model,
   }
 }
 
 /** Human lane name for honest error messages. */
 function laneName(provider: LlmProvider): string {
-  return provider === 'agent' ? 'your AI Agent endpoint' : 'the built-in EdgeZero lane'
+  return provider === 'agent' ? 'your AI Agent endpoint' : 'the operator env lane (AI_TRADE_*)'
 }
 
 /** POST one chat completion to the resolved lane. Throws Error with a
  *  lane-prefixed message on transport/HTTP failure (call sites keep their
- *  temperature/max_tokens param-fallback logic on top of this). */
+ *  temperature/max_tokens param-fallback logic on top of this). Throws the
+ *  「AI 未設定」 error when no lane is configured — callers must treat it
+ *  exactly like any other LLM failure (fail closed, honest note). */
 export async function llmChat(opts: LlmChatOptions): Promise<LlmCompletion> {
   const lane = await resolveLane(opts.userId)
+  if (!lane) {
+    throw new Error('AI 未設定 — 內建預設模型已移除（v2.12.57）：請於 Settings → AI Agent API 填入自訂端點與 API Key')
+  }
 
   const body: Record<string, unknown> = { messages: opts.messages, model: lane.model }
   if (opts.temperature != null) body.temperature = opts.temperature

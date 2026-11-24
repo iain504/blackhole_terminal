@@ -753,6 +753,7 @@ model AiTradePlan {
   rr         Float // terminal-computed at plan time (never trusted from the model)
   refPrice   Float // last close when the plan was written — the 距觸發% anchor
   reason     String?
+  strategy   String? // v2.12.57 — strategy-library playbook id the plan adopted (trend-pullback …)
   regime     String? // RISK_ON | NEUTRAL | RISK_OFF | UNKNOWN at plan time
   earnings   String? // 'block' | '<daysAway>' | 'unknown'
   mode       String // 'paper' | 'live' at plan time
