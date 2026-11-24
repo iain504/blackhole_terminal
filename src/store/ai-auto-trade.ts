@@ -358,6 +358,9 @@ export interface AiVerdictPlan {
   /** v2.12.57 — the strategy-library playbook this plan came from (the model
    *  must adopt a pre-screened candidate's id). null for legacy plans. */
   strategy?: string | null
+  /** v2.12.58 — the adopted candidate's edge score (0-100, deterministic).
+   *  null when the plan was not built from a strategy candidate. */
+  edge?: number | null
 }
 
 export type AiPlanStatus = 'WAITING' | 'EXECUTED' | 'INVALIDATED' | 'EXPIRED' | 'GATED' | 'CANCELLED' | 'SUPERSEDED'
@@ -378,6 +381,8 @@ export interface AiPlanVM {
   reason: string | null
   /** v2.12.57 — strategy-library playbook id the plan adopted */
   strategy: string | null
+  /** v2.12.58 — the adopted candidate's edge score (0-100) from the ledger */
+  edge: number | null
   regime: string | null
   mode: string
   status: AiPlanStatus
@@ -1123,6 +1128,17 @@ export async function runScan(): Promise<void> {
       if (cands.some((c) => c.side === 'sell')) candSell++
     }
     st0.addLog('info', `戰略預篩 — ${candBuy} 標的有 ▲buy 候選 · ${candSell} 標的有 ▼sell 候選（無候選的標的將依紀律觀望）`)
+    // v2.12.58 — per-symbol edge visibility: the operator sees the exact score
+    // the adjudicator will compare, before the model answers.
+    for (const s of snaps) {
+      const cands = candsBySym.get(s.symbol) ?? []
+      if (cands.length === 0) continue
+      const detail = cands
+        .sort((a, b) => b.edge - a.edge)
+        .map((c) => `${c.side === 'buy' ? '▲' : '▼'}${c.strategyId} edge ${c.edge}·R:R ${c.rr.toFixed(2)}`)
+        .join(' · ')
+      st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}`)
+    }
 
     // 4) batched verdict calls — 6 enriched snapshots + the shared context
     //    pack per call (keeps the DATA block inside the route's 8k context
@@ -1252,11 +1268,18 @@ export async function runScan(): Promise<void> {
       // reactor executes only when the market actually confirms.
       if (useReact) {
         const plans: AiVerdictPlan[] = []
+        // v2.12.58 — the adopted candidate's edge rides the verdict for the UI
+        const candEdge = (strategyId: string | null, planSide: 'buy' | 'sell'): number | null => {
+          if (!strategyId) return null
+          const hit = candsBySym.get(snap.symbol)?.find((c) => c.strategyId === strategyId && c.side === planSide)
+          return hit ? hit.edge : null
+        }
         for (const side of ['buy', 'sell'] as const) {
           const raw = reactPlanFromItem(it, side)
           if (!raw) continue
+          const edge = candEdge(raw.strategy, side)
           const geo = validatePlanSide(side, snap.lastClose, raw.trigger, raw.tp, raw.sl)
-          const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note })
+          const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note, edge })
           if (!geo.ok || geo.rr == null) { reject(geo.reason ?? '計劃未通過驗證'); continue }
           // v2.12.40 — Alpaca spot crypto cannot be shorted: a sell plan the
           // broker can NEVER take dies here with the honest reason, before any
@@ -1284,7 +1307,7 @@ export async function runScan(): Promise<void> {
           if (side === 'sell' && noShort.has(snap.symbol)) { reject(`該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''}`); continue }
           if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { reject('已有該標的持倉'); continue }
           if (snap.demo) { reject('⚠示範K線 — 非真實行情'); continue }
-          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null, strategy: raw.strategy })
+          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null, strategy: raw.strategy, edge })
         }
         v.plans = plans
         const created = plans.filter((p) => p.status === 'created')
@@ -1430,6 +1453,7 @@ export async function runScan(): Promise<void> {
           refPrice: v.refPrice ?? 0,
           reason: v.reason,
           strategy: p.strategy ?? null,
+          edge: p.edge ?? null,
           regime: regimeState,
           earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
           mode: cfg.mode,
@@ -1736,6 +1760,7 @@ async function hydratePlans(sig?: AbortSignal): Promise<void> {
         trigger, tp, sl, rr, refPrice,
         reason: typeof r.reason === 'string' ? r.reason : null,
         strategy: typeof r.strategy === 'string' && r.strategy ? r.strategy : null,
+        edge: Number.isFinite(Number(r.edge)) && Number(r.edge) > 0 ? Math.round(Number(r.edge)) : null,
         regime: typeof r.regime === 'string' ? r.regime : null,
         mode: r.mode === 'live' ? 'live' : 'paper',
         status: 'WAITING', statusNote: null,

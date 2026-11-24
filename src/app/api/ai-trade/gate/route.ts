@@ -10,15 +10,23 @@ import { detectSrLevels } from '@/lib/sr'
 import { classifySession, matchActiveRules, rankCandidates } from '@/lib/trade-review'
 import {
   GATE_SYSTEM_PROMPT, GATE_USER_TEMPLATE, buildGateSnapshot, parseGateOutput,
+  mechanicalGateVerdict,
   dailyAtr14, rvolFromBars, htfAlignment,
   type GateCandidateInput, type GateMarketContext, type GateVerdict,
 } from '@/lib/trade-gate'
-import { llmChat, type LlmMessage } from '@/lib/llm'
+import { llmChat, laneConfigured, type LlmMessage } from '@/lib/llm'
 
 export const dynamic = 'force-dynamic'
 // the gatekeeper runs at temp 0.1 and must answer before the order lane waits
 export const maxDuration = 120
 
+// v2.12.58 — AI-OPTIONAL gate. An UNCONFIGURED AI lane no longer deadlocks
+// every follow: the route falls back to mechanicalGateVerdict (code-enforced
+// spread/RVOL/drawdown/session rules on the same deterministic snapshot — the
+// plan already went through AI adjudication + mechanical validation at
+// creation). A CONFIGURED lane that fails keeps the v2.12.56 fail-closed
+// contract: verdict missing → no order, plan stays WAITING for the next tick.
+//
 // v2.12.56 — FAIL-CLOSED engine contract. When the lane is dead the route
 // still answers 200 with an honest ERROR gate-log row + `error` note, and the
 // engine (react follow / instant fire) treats a missing verdict as NO-TRADE:
@@ -294,23 +302,34 @@ export async function POST(req: Request) {
 
     const snapshot = buildGateSnapshot(candidate, ctx)
 
-    // 2) gatekeeper verdict (LLM) — a failure becomes an honest ERROR row,
-    //    never a silent approve
+    // 2) gatekeeper verdict — v2.12.58 AI-OPTIONAL branch:
+    //    • lane NOT configured → mechanicalGateVerdict (code rules on the same
+    //      snapshot): react plans were already AI-adjudicated at creation, so
+    //      an absent second opinion no longer deadlocks every follow. Honest
+    //      【機械規則】 rationale rides the same log row.
+    //    • lane configured → the gatekeeper LLM @ temp 0.1 as before; a lane
+    //      that is configured but FAILS still fails closed (v2.12.56).
     let verdict: GateVerdict | null = null
     let errorNote: string | null = null
-    try {
-      const content = await callGatekeeper(
-        user.id,
-        GATE_SYSTEM_PROMPT,
-        GATE_USER_TEMPLATE(
-          JSON.stringify(snapshot, null, 1),
-          JSON.stringify(guardrails.map(({ rule_id, condition, action }) => ({ rule_id, condition, action })), null, 1),
-        ),
-      )
-      verdict = parseGateOutput(content, validRuleIds)
-      if (!verdict) errorNote = 'gatekeeper returned unparseable output'
-    } catch (e) {
-      errorNote = e instanceof Error ? e.message.slice(0, 300) : 'gatekeeper call failed'
+    let mechanical = false
+    if (!(await laneConfigured(user.id))) {
+      verdict = mechanicalGateVerdict(ctx, snapshot)
+      mechanical = true
+    } else {
+      try {
+        const content = await callGatekeeper(
+          user.id,
+          GATE_SYSTEM_PROMPT,
+          GATE_USER_TEMPLATE(
+            JSON.stringify(snapshot, null, 1),
+            JSON.stringify(guardrails.map(({ rule_id, condition, action }) => ({ rule_id, condition, action })), null, 1),
+          ),
+        )
+        verdict = parseGateOutput(content, validRuleIds)
+        if (!verdict) errorNote = 'gatekeeper returned unparseable output'
+      } catch (e) {
+        errorNote = e instanceof Error ? e.message.slice(0, 300) : 'gatekeeper call failed'
+      }
     }
 
     // 3) persist + answer
@@ -359,6 +378,7 @@ export async function POST(req: Request) {
     return NextResponse.json({
       ok: true, logId: row.id, mode,
       verdict: verdict ?? null,
+      mechanical,
       error: errorNote,
       guardrailsDetail: citedDetail,
       quotesOk,

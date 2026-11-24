@@ -70,6 +70,7 @@ interface PlanIn {
   refPrice?: unknown
   reason?: unknown
   strategy?: unknown
+  edge?: unknown
   regime?: unknown
   earnings?: unknown
   mode?: unknown
@@ -109,6 +110,9 @@ function sanitizePlan(p: PlanIn) {
   // (trend-pullback … range-fade); bounded slug, unknown values dropped.
   const strategyRaw = typeof p.strategy === 'string' ? p.strategy.trim() : ''
   const strategy = /^[A-Za-z0-9_-]{1,40}$/.test(strategyRaw) ? strategyRaw : null
+  // v2.12.58 — the adopted candidate's edge score (0-100); anything else is null
+  const edgeNum = Math.round(Number(p.edge))
+  const edge = Number.isFinite(edgeNum) && edgeNum >= 0 && edgeNum <= 100 ? edgeNum : null
   return {
     symbol,
     side,
@@ -121,6 +125,7 @@ function sanitizePlan(p: PlanIn) {
     refPrice,
     reason: typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim().slice(0, 120) : null,
     strategy,
+    edge,
     regime,
     earnings,
     mode: p.mode === 'live' ? 'live' : 'paper',
@@ -222,7 +227,7 @@ export async function GET(req: Request) {
         plans: rows.map((r) => ({
           id: r.id, symbol: r.symbol, side: r.side, bias: r.bias, confidence: r.confidence,
           trigger: r.trigger, tp: r.tp, sl: r.sl, rr: r.rr, refPrice: r.refPrice,
-          reason: r.reason, strategy: r.strategy ?? null, regime: r.regime, mode: r.mode, status: r.status,
+          reason: r.reason, strategy: r.strategy ?? null, edge: r.edge ?? null, regime: r.regime, mode: r.mode, status: r.status,
           createdAt: r.createdAt.getTime(),
         })),
         executedRecent,

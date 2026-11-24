@@ -300,6 +300,104 @@ export function buildGateSnapshot(input: GateCandidateInput, ctx: GateMarketCont
 }
 
 // ---------------------------------------------------------------------------
+// v2.12.58 — mechanical gate (AI-optional fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * v2.12.58 — CODE-ENFORCED gate for the AI-未設定 case.
+ *
+ * Why this exists: since v2.12.57 the model's job at plan time is ADJUDICATION
+ * (compare strategy candidates, adopt geometry) and the terminal re-validates
+ * R:R against the REAL fill price on every follow (reactTick's slippage
+ * re-price). The gatekeeper LLM's second opinion at execution time was
+ * therefore redundant the moment the AI lane is not even configured — but the
+ * v2.12.56 fail-closed rule turned "AI 未設定 + gate on" into "every follow
+ * deadlocks until the 48h TTL", which the operator hit as "all trades are
+ * blocked".
+ *
+ * So when NO lane is configured, the gate applies these mechanical rules —
+ * the deterministic subset of the gatekeeper prompt, computed from the same
+ * snapshot (only clearly broken EXECUTION conditions veto; strategy/geometry
+ * judgment already happened at plan time and is not re-litigated here):
+ *
+ *   1. spread_to_stop_ratio > 0.15            → REJECT (friction eats the stop)
+ *   2. RVOL < 0.5 (any session)               → REJECT (participation collapsed)
+ *   3. RVOL < 1.0 in extended/overnight       → REJECT (prompt's own rule)
+ *   4. daily drawdown ≤ −5%                   → REJECT (day circuit-breaker)
+ *   5. daily drawdown ≤ −3%                   → APPROVE_REDUCED_SIZE ×0.5
+ *   6. < 10 min to the regular close (equity) → REJECT (no fresh brackets)
+ *
+ * Data unavailable (quote/RVOL/drawdown null) → noted in the rationale, never
+ * guessed into a veto. A CONFIGURED lane that then FAILS still fails closed
+ * (v2.12.56 contract preserved for the configured-but-dead case).
+ */
+export function mechanicalGateVerdict(ctx: GateMarketContext, snapshot: GateSnapshot): GateVerdict {
+  const checks: string[] = []
+  const missing: string[] = []
+
+  // 1) spread friction vs the stop distance
+  if (snapshot.microstructure.spread_to_stop_ratio != null) {
+    checks.push(`價差/停損距 ${snapshot.microstructure.spread_to_stop_ratio.toFixed(3)}`)
+    if (snapshot.microstructure.spread_to_stop_ratio > 0.15) {
+      return mechanical('REJECT', 1, `價差佔停損距 ${snapshot.microstructure.spread_to_stop_ratio.toFixed(3)} > 0.15 — 摩擦成本吞噬風險距離`)
+    }
+  } else {
+    missing.push('價差')
+  }
+
+  // 2+3) relative volume
+  if (snapshot.microstructure.rvol != null) {
+    checks.push(`RVOL ${snapshot.microstructure.rvol.toFixed(2)}`)
+    if (snapshot.microstructure.rvol < 0.5) {
+      return mechanical('REJECT', 1, `RVOL ${snapshot.microstructure.rvol.toFixed(2)} < 0.5 — 參與度枯竭`)
+    }
+    if (ctx.extendedLike && snapshot.microstructure.rvol < 1.0) {
+      return mechanical('REJECT', 1, `延長時段 RVOL ${snapshot.microstructure.rvol.toFixed(2)} < 1.0 — 流動性不足以護住停損`)
+    }
+  } else {
+    missing.push('RVOL')
+  }
+
+  // 4+5) daily drawdown circuit-breaker / shrink
+  if (ctx.dailyDrawdownPct != null) {
+    checks.push(`當日回撤 ${ctx.dailyDrawdownPct.toFixed(2)}%`)
+    if (ctx.dailyDrawdownPct <= -5) {
+      return mechanical('REJECT', 1, `當日回撤 ${ctx.dailyDrawdownPct.toFixed(2)}% ≤ −5% — 日內熔斷，今日不再開新倉`)
+    }
+  } else {
+    missing.push('當日回撤')
+  }
+
+  // 6) too close to the regular close for a fresh bracket (crypto has no close)
+  if (ctx.minutesToClose != null && ctx.minutesToClose < 10) {
+    checks.push(`收盤前 ${ctx.minutesToClose} 分鐘`)
+    return mechanical('REJECT', 1, `距常規收盤 ${ctx.minutesToClose} 分鐘 — 不在收盤前開新 bracket`)
+  }
+
+  if (ctx.dailyDrawdownPct != null && ctx.dailyDrawdownPct <= -3) {
+    checks.push(`當日回撤 ${ctx.dailyDrawdownPct.toFixed(2)}%`)
+    return mechanical('APPROVE_REDUCED_SIZE', 0.5, `當日回撤 ${ctx.dailyDrawdownPct.toFixed(2)}% ≤ −3% — 通過但倉位減半`)
+  }
+
+  const missNote = missing.length > 0 ? `（無數據未計：${missing.join('、')}）` : ''
+  return mechanical('APPROVE', 1, `機械規則全過：${checks.length > 0 ? checks.join(' · ') : '無可用檢查數據'}${missNote}`)
+}
+
+/** Build the honest mechanical verdict (confidence 1.0 — these are code rules,
+ *  not guesses). */
+function mechanical(decision: GateDecision, sizeMultiplier: number, reason: string): GateVerdict {
+  return {
+    decision,
+    confidenceScore: 1,
+    sizeMultiplier,
+    orderParams: null,
+    guardrailsTriggered: [],
+    risk: null,
+    rationale: `【機械規則】${reason}`,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // prompts (temperature 0.0–0.1 enforced at the call site)
 // ---------------------------------------------------------------------------
 

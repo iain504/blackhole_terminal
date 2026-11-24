@@ -93,6 +93,16 @@ async function resolveLane(userId?: string): Promise<ResolvedLane | null> {
   }
 }
 
+/** v2.12.58 — is ANY lane configured for this user (Lane 1 or the env lane)?
+ *  The pre-trade gate asks this BEFORE calling llmChat: an UNCONFIGURED lane
+ *  downgrades the gate to its deterministic mechanical rules instead of
+ *  deadlocking every follow (the plan was already AI-adjudicated at creation
+ *  in react mode — there is no second AI opinion to fail closed for). A
+ *  CONFIGURED lane that then fails keeps the v2.12.56 fail-closed contract. */
+export async function laneConfigured(userId?: string): Promise<boolean> {
+  return (await resolveLane(userId)) != null
+}
+
 /** Human lane name for honest error messages. */
 function laneName(provider: LlmProvider): string {
   return provider === 'agent' ? 'your AI Agent endpoint' : 'the operator env lane (AI_TRADE_*)'

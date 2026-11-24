@@ -856,12 +856,13 @@ export default function AiAutoTradePanel() {
                       {v.plans.map((p) => (
                         <span
                           key={p.side}
-                          title={p.note ?? `${p.side} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}`}
+                          title={p.note ?? `${p.side} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}${p.strategy ? ` · 戰略 ${p.strategy}${p.edge != null ? ` · edge ${p.edge}` : ''}` : ''}`}
                           className={p.status === 'created'
                             ? (p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')
                             : 'text-zinc-600 line-through'}
                         >
                           {p.side === 'buy' ? '▲' : '▼'}{p.status === 'created' ? fmtPx(p.trigger) : '拒'}
+                          {p.status === 'created' && p.edge != null && <span className="ml-0.5 text-[8.5px] text-violet-300" title="戰略候選 edge 評分（0-100）">e{p.edge}</span>}
                         </span>
                       ))}
                     </span>
@@ -945,8 +946,8 @@ export default function AiAutoTradePanel() {
                         {p.side === 'buy' ? '▲等上攻' : '▼等跌破'}
                       </span>
                       {p.strategy && (
-                        <span className="shrink-0 rounded border border-violet-500/30 bg-violet-500/10 px-1 text-[8.5px] font-medium text-violet-300" title={`採用戰略：${p.strategy}`}>
-                          {p.strategy}
+                        <span className="shrink-0 rounded border border-violet-500/30 bg-violet-500/10 px-1 text-[8.5px] font-medium text-violet-300" title={`採用戰略：${p.strategy}${p.edge != null ? ` · edge ${p.edge}` : ''}`}>
+                          {p.strategy}{p.edge != null ? <span className="ml-0.5 text-violet-200/80">{p.edge}</span> : null}
                         </span>
                       )}
                     </span>
