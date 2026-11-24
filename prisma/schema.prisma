@@ -895,7 +895,7 @@ model PreTradeGateLog {
   target          Float?
   rr              Float?
   decision        String // APPROVE | APPROVE_REDUCED_SIZE | REJECT | ERROR
-  confidenceScore Float? // 0-1 gatekeeper conviction
+  confidenceScore Float? // 0-100 gatekeeper conviction (v2.12.59; legacy 0-1 rows normalized at read)
   sizeMultiplier  Float? // 0-1 (hard-capped at 1.0 — the gate may only shrink risk)
   sessionTag      String? // pre | regular | post | overnight | weekend | crypto-24h
   minutesToClose  Int? // regular-session minutes remaining at decision time

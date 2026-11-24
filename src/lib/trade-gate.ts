@@ -153,10 +153,13 @@ export interface GateRiskAssessment {
   session_transition_risk: GateSessionRisk
 }
 
-/** The validated gatekeeper verdict — what the DB row and the client get. */
+/** The validated gatekeeper verdict — what the DB row and the client get.
+ *  v2.12.59 — confidenceScore is 0-100 (same scale as the planner confidence
+ *  and every other confidence number in the terminal; the old 0-1 scale made
+ *  the gate speak a different language than the engine it guards). */
 export interface GateVerdict {
   decision: GateDecision
-  confidenceScore: number // 0-1
+  confidenceScore: number // 0-100
   sizeMultiplier: number // 0-1 (≤ 1 — the gate may only shrink risk)
   orderParams: GateOrderParams | null
   guardrailsTriggered: string[] // validated rule ids (G1..G7)
@@ -383,12 +386,12 @@ export function mechanicalGateVerdict(ctx: GateMarketContext, snapshot: GateSnap
   return mechanical('APPROVE', 1, `機械規則全過：${checks.length > 0 ? checks.join(' · ') : '無可用檢查數據'}${missNote}`)
 }
 
-/** Build the honest mechanical verdict (confidence 1.0 — these are code rules,
- *  not guesses). */
+/** Build the honest mechanical verdict (confidence 100 — these are code
+ *  rules, not guesses). */
 function mechanical(decision: GateDecision, sizeMultiplier: number, reason: string): GateVerdict {
   return {
     decision,
-    confidenceScore: 1,
+    confidenceScore: 100,
     sizeMultiplier,
     orderParams: null,
     guardrailsTriggered: [],
@@ -413,6 +416,7 @@ PRE-TRADE DECISION RULES:
 3. Regime & Structure Alignment: Veto counter-trend entries fighting strong higher-timeframe momentum unless a clear exhaustion/reversal catalyst is present. Ensure the distance to major support/resistance exceeds the proposed Take-Profit target (tp_clears_structure=false is a structural veto input). Require net expected Reward-to-Risk (after accounting for 2x current bid-ask spread slippage) to exceed 1.8:1.
 4. Historical Guardrail Enforcement: Evaluate the trade against EVERY rule in <historical_guardrails>. These are HARD constraints distilled from this account's own post-trade audits. If any rule condition is met, you MUST obey its action and cite its rule_id in guardrails_triggered. Never cite a rule_id that is not in the block.
 5. Risk Cap: Never recommend increasing position size above 1.0 (100% of standard risk unit). You may scale down (0.25 to 0.75) when volatility, session-transition risk, or drawdown state is elevated.
+6. Output Scale: "confidence_score" is an INTEGER 0-100 — your conviction in THIS decision (50 = borderline coin-flip, 85+ = near-certain). It is the same 0-100 scale as the planner confidence you receive; never answer with a 0-1 decimal like 0.85. "size_multiplier" IS a fraction 0.0-1.0.
 
 Output strictly valid JSON matching the requested schema. No prose outside the JSON.`
 
@@ -429,7 +433,7 @@ ${guardrailsJson}
 Return JSON in this exact format:
 {
   "decision": "APPROVE | APPROVE_REDUCED_SIZE | REJECT",
-  "confidence_score": 0.0,
+  "confidence_score": 0,
   "size_multiplier": 0.0,
   "recommended_order_params": {
     "order_type": "LIMIT | MARKET",
@@ -457,6 +461,16 @@ const asNum = (v: unknown): number => {
   return Number.isFinite(n) ? n : Number.NaN
 }
 const clamp01 = (v: number): number => Math.min(1, Math.max(0, v))
+// v2.12.59 — the confidence scale is 0-100 everywhere in the terminal now.
+const clamp100 = (v: number): number => Math.min(100, Math.max(0, v))
+/** Normalize a model-supplied confidence to the 0-100 scale: a 0-1 decimal
+ *  answer (0.85) is a fraction of 100, not a phantom 1%. The whole (0, 1]
+ *  range reads as a fraction — a fraction-habit model answers 0.95/1.0 for
+ *  "certain" and lands at 95/100; an integer-scale answer of exactly 1
+ *  ("almost no conviction") is a practically nonexistent verdict (a model
+ *  with 1% conviction goes flat instead of drafting a full plan), and the
+ *  same rule keeps the scan-path parser and this one identical. */
+const confTo100 = (v: number): number => clamp100(v > 0 && v <= 1 ? v * 100 : v)
 
 function extractJsonObject(text: string): Record<string, unknown> | null {
   if (!text) return null
@@ -477,8 +491,10 @@ function extractJsonObject(text: string): Record<string, unknown> | null {
  * prompt compliance):
  *  · decision must be one of the three — anything else → null (no trade on
  *    a malformed verdict)
- *  · confidence_score / size_multiplier clamped to 0..1 — Rule 5's hard cap
- *    (the gate may only SHRINK risk) lives here, not in the prompt
+ *  · confidence_score normalized to 0..100 (a 0-1 decimal is ×100 — the
+ *    gate speaks the same 0-100 language as the planner since v2.12.59);
+ *    size_multiplier clamped to 0..1 — Rule 5's hard cap (the gate may only
+ *    SHRINK risk) lives here, not in the prompt
  *  · guardrails_triggered entries NOT in the injected id set are DROPPED
  *    (hallucination guard — a fabricated citation must not reach the DB)
  *  · enum fields (alignment / session risk / order params) validated
@@ -538,7 +554,7 @@ export function parseGateOutput(text: string, validRuleIds: Set<string>): GateVe
 
   return {
     decision: decision as GateDecision,
-    confidenceScore: clamp01(Number.isFinite(conf) ? conf : 0.5),
+    confidenceScore: confTo100(Number.isFinite(conf) ? conf : 50),
     sizeMultiplier: clamp01(Number.isFinite(mult) ? mult : decision === 'APPROVE_REDUCED_SIZE' ? 0.5 : 1),
     orderParams,
     guardrailsTriggered: ids,
@@ -562,7 +578,7 @@ export function gateDecisionNote(v: GateVerdict, symbol: string, side: 'buy' | '
   const dirZh = side === 'buy' ? '做多' : '做空'
   const rules = extra?.rules && extra.rules.length > 0 ? ` · 護欄 ${extra.rules.join(',')}` : ''
   const size = v.decision === 'APPROVE_REDUCED_SIZE' && extra?.sizeMult != null ? ` ×${extra.sizeMult.toFixed(2)} 倉位` : ''
-  return `閘門${DECISION_ZH[v.decision]} — ${dirZh} ${symbol}（信心 ${(v.confidenceScore * 100).toFixed(0)}%${size}）${rules} · ${v.rationale}`
+  return `閘門${DECISION_ZH[v.decision]} — ${dirZh} ${symbol}（信心 ${v.confidenceScore.toFixed(0)}%${size}）${rules} · ${v.rationale}`
 }
 
 /** Permanent-memory lesson when a GATE VETO's shadow trade is graded 24h

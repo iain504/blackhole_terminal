@@ -390,6 +390,13 @@ export async function POST(req: Request) {
 
 // --- GET: recent evaluations + stats + gatekeeper audit -----------------------
 
+// v2.12.59 — legacy rows stored the old 0-1 scale; normalize at read so old
+// and new rows speak the same 0-100 language (a legacy 0.85 → 85, a legacy
+// mechanical 1 → 100). A fresh-scale row can only be ≤ 1 at 0/1 — 1/100
+// conviction is a practically nonexistent verdict, so the heuristic is safe.
+const gateConfPct = (v: number | null): number | null =>
+  v == null ? null : Math.round(v > 0 && v <= 1 ? v * 100 : v)
+
 export async function GET(req: Request) {
   try {
     const user = await getSessionUser()
@@ -463,7 +470,7 @@ export async function GET(req: Request) {
       gateAudit,
       logs: logs.map((r) => ({
         id: r.id, symbol: r.symbol, side: r.side, decision: r.decision,
-        confidenceScore: r.confidenceScore, sizeMultiplier: r.sizeMultiplier,
+        confidenceScore: gateConfPct(r.confidenceScore), sizeMultiplier: r.sizeMultiplier,
         sessionTag: r.sessionTag, spreadPct: r.spreadPct, rvol: r.rvol,
         htfAlignment: r.htfAlignment, rationale: r.rationale, error: r.error,
         planId: r.planId, orderId: r.orderId, createdAt: r.createdAt.getTime(),

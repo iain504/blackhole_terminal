@@ -663,7 +663,7 @@ function scanInstructionAdjudicate(
     `- 無合格候選、環境逆風、財報/事件風險、與持倉衝突 → 誠實 flat（兩側填 0，reason 說明拒絕原因）—「無設置即空倉」是本引擎的第一紀律，寧可錯過、不可做錯。`,
     `- buy 計劃 = 突破/確認：trigger 必須高於現價（市場上攻觸及才成立）；sell 計劃 = 跌破確認：trigger 必須低於現價。SL 掛結構外（距離參考 ATR — 不可緊貼現價），TP 放到達其引用的下一個 S/R 之前。`,
     `- 現貨加密（標的含「/」如 BTC/USD、ETH/USD）在 Alpaca 只能做多、不可做空：不為加密標的給 sell 計劃 — 看空時 sell 側填 0，reason 註明「加密不可做空」。`,
-    `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準。信心校準表：0–20 = 無優勢（flat）；25–40 = 單一證據類、投機性；45–60 = 兩類獨立證據同向且結構清楚；65–80 = 三類以上＋量能或高週期確認；85+ = 罕見（全部對齊）。誠實校準 — 禁止把信心一律壓在 0 或 30。`,
+    `- direction 是你的主要傾向（long/short/flat）；confidence 是對主要傾向的把握度，並已用近期勝率校準，一律用 0-100 整數刻度（50 = 五成把握；禁止 0.5 這類 0-1 小數）。信心校準表：0–20 = 無優勢（flat）；25–40 = 單一證據類、投機性；45–60 = 兩類獨立證據同向且結構清楚；65–80 = 三類以上＋量能或高週期確認；85+ = 罕見（全部對齊）。誠實校準 — 禁止把信心一律壓在 0 或 30。`,
     `- react 紀律 = 市場確認才執行：計劃建立後須價格「觸及觸發價」才會下單，反向先破停損區即作廢、48 小時未觸發逾期作廢 — 因此「中等信心的條件計劃」是預期且正確的輸出，倉位會按信心自動縮小；但證據不足時不要硬湊計劃。`,
     `- 市場環境：RISK_OFF 做多、RISK_ON 做空屬逆風 — 逆風側門檻已在上列分方向門檻中上調；區間位置 >90% 追高 / <10% 追跌要特別保守；波動緊縮（ATR14 < ATR50）假突破多 — 突破類候選需更謹慎。`,
     `- 近期表現/覆盤統計：這是本引擎真實成績與過往判斷 24 小時後的對帳結果。用它校準信心並選擇證據組合 — 某組合勝率明顯差時，同組合新訊號信心降 10–15 或改給反向側計劃。`,
@@ -1238,7 +1238,13 @@ export async function runScan(): Promise<void> {
     const verdicts: AiAutoVerdict[] = snaps.map((snap) => {
       const it = bySym.get(snap.symbol)
       const direction: AiAutoDirection = it?.direction === 'long' || it?.direction === 'short' ? it.direction : 'flat'
-      const confidence = clampN(Math.round(num(it?.confidence, 0)), 0, 100)
+      // v2.12.59 — SCALE ALIGNMENT: the prompt asks for a 0-100 integer, but a
+      // model with a 0-1 habit answers 0.85 — Math.round would turn that into
+      // a phantom 1% and silently block EVERY candidate at the confidence gate
+      // (the exact "all trades blocked" failure). Values in (0, 1] are read as
+      // fractions of 100 instead of being rounded into nothing.
+      const rawConf = num(it?.confidence, 0)
+      const confidence = clampN(Math.round(rawConf > 0 && rawConf <= 1 ? rawConf * 100 : rawConf), 0, 100)
       const entry = it?.entry != null && Number.isFinite(Number(it.entry)) && Number(it.entry) > 0 ? Number(it.entry) : null
       const stop = it?.stop != null && Number.isFinite(Number(it.stop)) && Number(it.stop) > 0 ? Number(it.stop) : null
       const target = it?.target != null && Number.isFinite(Number(it.target)) && Number(it.target) > 0 ? Number(it.target) : null
