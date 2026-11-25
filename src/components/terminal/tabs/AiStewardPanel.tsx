@@ -250,7 +250,7 @@ export default function AiStewardPanel() {
           </Select>
         </div>
         <div className="space-y-1">
-          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">權限</Label>
+          <Label className="text-[9px] uppercase tracking-wider text-zinc-500">持倉權限</Label>
           <div className="flex flex-col gap-1 pt-0.5 text-[10px] text-zinc-400">
             <label className="flex items-center gap-1.5">
               <Switch checked={cfg.amendPositions} onCheckedChange={(v) => updateConfig({ amendPositions: v })} aria-label="允許調整持倉 TP/SL" className="scale-90" />
@@ -260,8 +260,11 @@ export default function AiStewardPanel() {
         </div>
       </div>
 
-      {/* remaining permission switches */}
-      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] text-zinc-400">
+      {/* v2.12.60 — named section so the close switch is findable: the
+          synthetic-SL/TP skip message quotes 「市價平倉（高風險）」 verbatim,
+          and this is where that switch lives */}
+      <p className="mt-2 text-[9px] font-semibold uppercase tracking-widest text-zinc-500">平倉 / 改單權限</p>
+      <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] text-zinc-400">
         <label className="flex items-center gap-1.5">
           <Switch checked={cfg.amendOrders} onCheckedChange={(v) => updateConfig({ amendOrders: v })} aria-label="允許修改掛單" className="scale-90" />
           修改掛單 entry/TP/SL
@@ -272,7 +275,7 @@ export default function AiStewardPanel() {
         </label>
         <label className="flex items-center gap-1.5">
           <Switch checked={cfg.closePositions} onCheckedChange={(v) => updateConfig({ closePositions: v })} aria-label="允許市價平倉" className="scale-90" />
-          市價平倉（高風險）
+          <span className="font-medium text-amber-400">市價平倉（高風險）</span>
         </label>
         <label className="flex items-center gap-1.5">
           <Switch checked={cfg.dryRun} onCheckedChange={(v) => updateConfig({ dryRun: v })} aria-label="試運行模式" className="scale-90" />

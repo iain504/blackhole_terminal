@@ -689,8 +689,9 @@ export async function runStewardOnce(): Promise<void> {
     // every cycle; a cross fires the capped extended-hours limit close via
     // the DELETE positions route (which converts to a marketable limit,
     // band ±1.5% = sell ≤ bid×0.985 — the slippage cap). Respects the
-    // terminal's standing gates (dry-run / 允許平倉 / action cap / engine-
-    // managed inventory) and posts the same honest events as the model path.
+    // terminal's standing gates (dry-run / 市價平倉（高風險） permission /
+    // action cap / engine-managed inventory) and posts the same honest
+    // events as the model path.
     interface SynthRow { p: PositionRow; sym: string; slPx: number; est: boolean; q: number; long: boolean; outcome: string | null }
     const synthRows: SynthRow[] = []
     if (session === 'pre' || session === 'post') {
@@ -721,10 +722,13 @@ export async function runStewardOnce(): Promise<void> {
       const crossed = `SL ${fmtPrice(s.slPx)}${s.est ? '（trail 推算）' : ''} 已被現價 ${fmtPrice(s.q)} 穿越`
       const kindBase = { kind: 'position' as const, symbol: s.sym, detail: '', payload: { from: 'synthetic_sl', sl: s.slPx, price: s.q, side: s.long ? 'long' : 'short' } }
       if (!cfg.closePositions) {
-        s.outcome = '已停用「允許平倉」開關 — 持倉仍暴露'
+        // v2.12.60 — the message must quote the EXACT visible label of the
+        // switch (「市價平倉（高風險）」 in the AI 護倉 panel) — the old wording
+        // 「允許平倉」 matched no UI text and the user could not find the toggle.
+        s.outcome = '已停用「市價平倉（高風險）」權限 — 持倉仍暴露'
         skipped++
-        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'skipped', detail: `合成停損觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理或開啟開關` })
-        st0.addLog('warn', `⚠ ${s.sym} 合成停損觸發（${crossed}）— 已停用平倉開關，持倉仍暴露`)
+        drafts.push({ ...kindBase, action: 'synthetic_sl', status: 'skipped', detail: `合成停損觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理，或到 AI 交易 tab「AI 護倉」面板的「平倉 / 改單權限」開啟該開關` })
+        st0.addLog('warn', `⚠ ${s.sym} 合成停損觸發（${crossed}）— 已停用市價平倉權限，持倉仍暴露（AI 護倉面板可開啟）`)
         continue
       }
       if (actionsLeft() <= 0) {
@@ -800,10 +804,10 @@ export async function runStewardOnce(): Promise<void> {
       const crossed = `TP ${fmtPrice(s.tpPx)} 已被現價 ${fmtPrice(s.q)} 穿越`
       const kindBase = { kind: 'position' as const, symbol: s.sym, detail: '', payload: { from: 'synthetic_tp', tp: s.tpPx, price: s.q, side: s.long ? 'long' : 'short' } }
       if (!cfg.closePositions) {
-        s.outcome = '已停用「允許平倉」開關 — 獲利窗口仍敞開'
+        s.outcome = '已停用「市價平倉（高風險）」權限 — 獲利窗口仍敞開'
         skipped++
-        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'skipped', detail: `合成停利觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理或開啟開關` })
-        st0.addLog('warn', `⚠ ${s.sym} 合成停利觸發（${crossed}）— 已停用平倉開關，獲利窗口仍敞開`)
+        drafts.push({ ...kindBase, action: 'synthetic_tp', status: 'skipped', detail: `合成停利觸發（延長時段 · ${crossed}）— ${s.outcome}；請手動處理，或到 AI 交易 tab「AI 護倉」面板的「平倉 / 改單權限」開啟該開關` })
+        st0.addLog('warn', `⚠ ${s.sym} 合成停利觸發（${crossed}）— 已停用市價平倉權限，獲利窗口仍敞開（AI 護倉面板可開啟）`)
         continue
       }
       if (actionsLeft() <= 0) {
@@ -987,7 +991,7 @@ export async function runStewardOnce(): Promise<void> {
       if (action === 'exit') {
         if (!cfg.closePositions) {
           skipped++
-          drafts.push({ ...kindBase, action: 'close', status: 'skipped', detail: `${reason} — 已停用「允許平倉」開關` })
+          drafts.push({ ...kindBase, action: 'close', status: 'skipped', detail: `${reason} — 已停用「市價平倉（高風險）」權限（AI 護倉面板可開啟）` })
           continue
         }
         if (conf < cfg.minConfidence) {
