@@ -656,6 +656,7 @@ function scanInstructionAdjudicate(
     `[{"symbol":"<快照中的標的>","direction":"long|short|flat","confidence":<0-100 整數>,"buy":{"strategy":"<候選策略id>","trigger":<數字>,"tp":<數字>,"sl":<數字>} 或 0,"sell":{"strategy":"<候選策略id>","trigger":<數字>,"tp":<數字>,"sl":<數字>} 或 0,"reason":"<繁體中文 ≤ 30 字，flat 時說明拒絕了哪些候選與原因>"}]`,
     `裁決規則：`,
     `- edge 比較：每個候選附 edge（0-100）與證據清單（趨勢/動量/量能/結構/高週期/位置）。取 edge 較高、證據 ≥2 類獨立同向的一側立計劃；證據互相矛盾或只有單一訊號 → 誠實 flat。`,
+    `- M.E.T. 多重優勢（J Law 框架，Ch.6-9）：每個標的的候選行附「M.E.T. 多 X(w…) vs 空 Y(w…)」兩側逐類優勢對比與 M.E.T.A. 匯聚區。入場前先比兩側 — 優勢明顯偏向一側時，逆優勢側候選必須棄用或大幅降信心（−15 以上）；順勢側才可立計劃。M.E.T.A. 匯聚區 = 多項優勢同時匯聚的回調買入/反彈沽出區域：SL 應藏匯聚區外側（跌穿即假設失效），TP 對測試阻力/支撐前 — 這就是 5:1 結構的來源。勢均力敵（balanced）→ flat。`,
     `- 雙側計劃僅限：買賣兩側來自不同策略、edge 相當（差 ≤ 15）、結構形成明確區間（如「箱體雙向」候選已同時給兩側）— 市場自己選方向，we follow the plan；否則只立較強一側，另一側填 0。`,
     `- 幾何紀律：可微調候選（把觸發價貼近確認位可縮小風險距離、拉高 R:R），但 SL 不可移入結構內側、TP 不可越過其引用的支撐/阻力。終端已移除 TP 重推 — 達不到門檻的計劃會被直接拒絕（結構給不出合理 R:R 就是不該交易），送出前先代入算式自查，無法達標的側填 0。`,
     `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (tp − trigger) ÷ (trigger − sl)；sell R:R = (trigger − tp) ÷ (sl − trigger)。例：現價 100，buy trigger 100.5 / sl 99 / tp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。`,
@@ -1137,7 +1138,10 @@ export async function runScan(): Promise<void> {
         .sort((a, b) => b.edge - a.edge)
         .map((c) => `${c.side === 'buy' ? '▲' : '▼'}${c.strategyId} edge ${c.edge}·R:R ${c.rr.toFixed(2)}`)
         .join(' · ')
-      st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}`)
+      // v2.12.61 — the M.E.T. both-side comparison rides the log too: the
+      // operator sees WHY the edge moved (which side owns the symbol)
+      const met = cands.find((c) => c.met)?.met
+      st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}${met ? ` · M.E.T. ${met.summary}` : ''}`)
     }
 
     // 4) batched verdict calls — 6 enriched snapshots + the shared context

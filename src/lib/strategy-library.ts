@@ -26,6 +26,11 @@
 
 import type { ChartSnapshot } from '@/lib/ai-trade'
 import { PLAN_BAND } from '@/lib/ai-trade-gates'
+// v2.12.61 — M.E.T. 多重優勢對比 (J Law's Multiple Edge Trading System):
+// every symbol gets a both-side edge enumeration (Ch.6-9) and the comparison
+// adjusts the candidates' deterministic edge — a setup aligned with the
+// symbol-level edge majority is worth more than one fighting it.
+import { metVerdict, metZoneText, type MetContext } from '@/lib/met-engine'
 
 export interface StrategyParam {
   key: string
@@ -54,6 +59,9 @@ export interface StrategyCandidate {
   evidence: string[]
   /** ≤30 char 繁中 rationale */
   note: string
+  /** v2.12.61 — the symbol-level M.E.T. both-side edge comparison this
+   *  candidate rides on (identical for all candidates of one snapshot) */
+  met?: MetContext
 }
 
 export interface StrategyTuning {
@@ -575,6 +583,26 @@ export function screenSymbol(s: ChartSnapshot, cfg: Record<string, StrategyTunin
       // a broken detector must never kill the scan — skip it
     }
   }
+  // v2.12.61 — M.E.T. OVERLAY (Ch.9: 「比較做多和做空優勢…判斷現在這個價位
+  // 買家還是賣家較強」): the evidence-class edge measures the SETUP; the
+  // both-side comparison measures the SYMBOL. A setup that fights the
+  // symbol-level edge majority is downgraded (−3 per dominance point, cap
+  // 15) — Ch.7's 200MA-support example that lost to five short edges — and
+  // one aligned with it is upgraded. Clamped to the same 20-95 band.
+  let met: MetContext | null = null
+  try {
+    met = metVerdict(s)
+  } catch {
+    met = null // M.E.T. must never kill the screener
+  }
+  if (met) {
+    const delta = met.leader === 'balanced' ? 0 : Math.min(15, met.dominance * 3)
+    for (const c of all) {
+      const aligned = met.leader === 'long' ? c.side === 'buy' : met.leader === 'short' ? c.side === 'sell' : false
+      c.edge = clampN(c.edge + (met.leader === 'balanced' ? 0 : aligned ? delta : -delta), 20, 95)
+      c.met = met
+    }
+  }
   const best = (side: 'buy' | 'sell') =>
     all.filter((c) => c.side === side).sort((a, b) => b.edge - a.edge)[0] ?? null
   const out: StrategyCandidate[] = []
@@ -592,9 +620,20 @@ export function strategyBlockText(cands: StrategyCandidate[]): string {
   }
   const lines = cands.map((c) => {
     const trig = `觸發 ${fmtPx(c.trigger)} · SL ${fmtPx(c.sl)} · TP ${fmtPx(c.tp)}`
-    return `${c.side === 'buy' ? '▲' : '▼'} ${c.strategyName}(${c.strategyId}) | ${trig} | R:R 1:${c.rr.toFixed(2)} | edge ${c.edge} | 證據: ${c.evidence.join('+')} | ${c.note}`
+    const met = c.met
+    const metBits = met
+      ? ` | M.E.T. ${met.summary}${metZoneText(met) ? ` · ${metZoneText(met)}` : ''}`
+      : ''
+    return `${c.side === 'buy' ? '▲' : '▼'} ${c.strategyName}(${c.strategyId}) | ${trig} | R:R 1:${c.rr.toFixed(2)} | edge ${c.edge} | 證據: ${c.evidence.join('+')}${metBits} | ${c.note}`
   })
-  return ['[戰略候選 · 終端預篩 — 幾何由結構推導，可採用或微調，不可杜撰]', ...lines].join('\n')
+  const met = cands.find((c) => c.met)?.met
+  const head = ['[戰略候選 · 終端預篩 — 幾何由結構推導，可採用或微調，不可杜撰]']
+  if (met) {
+    head.push(
+      `[M.E.T. 優勢對比] ${met.summary}${met.zone ? ` · ${metZoneText(met)}` : ''} — 兩側證據逐類對比後，優勢偏向 ${met.leader === 'long' ? '買方' : met.leader === 'short' ? '賣方' : '不明（觀望）'}；edge 已含 ±對比調整。逆優勢側候選應降級或棄用（等優勢匯聚，不見單一信號就入市）。`,
+    )
+  }
+  return [...head, ...lines].join('\n')
 }
 
 /** 繁中 names for the log/panel — resolved through the library. */

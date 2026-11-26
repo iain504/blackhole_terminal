@@ -5,8 +5,8 @@
 // @/store/ai-auto-trade (module scope), so the scan keeps running when this
 // tab is unmounted. Honesty contract: every candidate shows WHY it passed or
 // was rejected; the log never hides a failed order.
-import { useEffect, useMemo, useState } from 'react'
-import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw, Crosshair, TrendingUp, TrendingDown } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Bot, Play, Square, Trash2, TriangleAlert, CircleCheck, CircleX, Minus, ListChecks, Radar, RefreshCw, Crosshair, TrendingUp, TrendingDown, ChartColumnBig } from 'lucide-react'
 import { useAiAutoStore, AI_EVAL_FAIL_REASON, baseThresholds } from '@/store/ai-auto-trade'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import { TIMEFRAMES } from '@/lib/market-types'
@@ -18,6 +18,9 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
+// v2.12.61 — M.E.T. (Multiple Edge Trading System): R:R tier grading + the
+// Ch.16 expectancy audit client types. Pure math — safe on the client.
+import { rrTier, RR_TIER_LABEL, type ExpectancyStats } from '@/lib/met-engine'
 
 const INTERVAL_OPTIONS = [
   { v: 60, label: '1 分鐘' },
@@ -35,6 +38,25 @@ const TF_OPTIONS = ['1m', '5m', '15m', '1h', '4h', '1D'] as const
 const SETTINGS_CHANGED_EVENT = 'tt:settings-changed'
 
 const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
+
+/** M.E.T. R:R tier → 繁中 label for tooltips (empty string when untiered) */
+const tierLabel = (rr: number | null | undefined): string => {
+  const t = rrTier(rr)
+  return t ? RR_TIER_LABEL[t] : ''
+}
+
+// v2.12.61 — 期望值審計 response shape (GET /api/ai-trade/expectancy)
+interface ExpResp {
+  mode?: string
+  days?: number
+  configured?: boolean
+  authError?: boolean
+  overall?: ExpectancyStats | null
+  ai?: ExpectancyStats | null
+  recovery?: { lossPct: number; needPct: number }[] | null
+  note?: string | null
+  aiNote?: string | null
+}
 
 // v2.12.37 — plan lifecycle counts from the ledger (polled every 60s)
 interface PlanStats {
@@ -148,6 +170,28 @@ export default function AiAutoTradePanel() {
     const t = setInterval(() => tickTock((x) => x + 1), 1000)
     return () => clearInterval(t)
   }, [cfg.enabled, nextScanAt])
+
+  // v2.12.61 — 期望值審計 (M.E.T. Ch.16 實作功課): pull the closed-trade
+  // statistics for this account + window. Refetches on mode/window change
+  // and via the refresh button — never polled (the ledger only moves on fills).
+  const [expDays, setExpDays] = useState(180)
+  const [exp, setExp] = useState<ExpResp | null>(null)
+  const [expLoading, setExpLoading] = useState(false)
+  const loadExpectancy = useCallback(async () => {
+    setExpLoading(true)
+    try {
+      const r = await fetch(`/api/ai-trade/expectancy?mode=${cfg.mode}&days=${expDays}`)
+      const j = (await r.json().catch(() => null)) as ExpResp | null
+      setExp(j && typeof j === 'object' ? j : null)
+    } catch {
+      setExp(null)
+    } finally {
+      setExpLoading(false)
+    }
+  }, [cfg.mode, expDays])
+  useEffect(() => {
+    void loadExpectancy()
+  }, [loadExpectancy])
 
   // v2.12.37 — plan review stats (60s poll; resolve=1 also drives the 24h
   // review pass server-side, same pattern as the verdict reconciliation)
@@ -856,7 +900,7 @@ export default function AiAutoTradePanel() {
                       {v.plans.map((p) => (
                         <span
                           key={p.side}
-                          title={p.note ?? `${p.side} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}${p.strategy ? ` · 戰略 ${p.strategy}${p.edge != null ? ` · edge ${p.edge}` : ''}` : ''}`}
+                          title={p.note ?? `${p.side} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl} · R:R 1:${p.rr.toFixed(2)}${tierLabel(p.rr) ? `（${tierLabel(p.rr)}）` : ''}${p.strategy ? ` · 戰略 ${p.strategy}${p.edge != null ? ` · edge ${p.edge}` : ''}` : ''}`}
                           className={p.status === 'created'
                             ? (p.side === 'buy' ? 'text-emerald-400' : 'text-rose-400')
                             : 'text-zinc-600 line-through'}
@@ -955,6 +999,21 @@ export default function AiAutoTradePanel() {
                       觸發 {fmtPx(p.trigger)}
                       <span className="ml-1 text-zinc-500">TL {fmtPx(p.tp)}/SL {fmtPx(p.sl)}</span>
                       {p.rr > 0 && <span className="ml-1 text-zinc-500">R:R 1:{p.rr.toFixed(1)}</span>}
+                      {/* v2.12.61 — M.E.T. R:R tier (Ch.11): A ≥5 · B ≥2 · C ≥1.2 */}
+                      {(() => {
+                        const t = rrTier(p.rr)
+                        return t ? (
+                          <span
+                            className={cn(
+                              'ml-1 rounded px-1 text-[8.5px]',
+                              t === 'A' ? 'bg-emerald-500/15 text-emerald-400' : t === 'B' ? 'bg-zinc-600/25 text-zinc-300' : 'bg-amber-500/15 text-amber-400',
+                            )}
+                            title={`回報風險比分級（M.E.T.）：${RR_TIER_LABEL[t]}`}
+                          >
+                            {t}
+                          </span>
+                        ) : null
+                      })()}
                       {dist != null && <span className="ml-1 text-violet-300" title="計劃時現價距觸發價的百分比">距 {dist >= 0 ? '+' : ''}{dist.toFixed(1)}%</span>}
                       <span className="ml-1 text-zinc-600">{ageLabel}</span>
                     </span>
@@ -991,6 +1050,91 @@ export default function AiAutoTradePanel() {
         </div>
         )
       })()}
+
+      {/* v2.12.61 — 期望值審計 (M.E.T. Ch.16 實作功課): compute the real
+          numbers from ALL closed trades — win rate × payoff → expectancy +
+          Profit Factor — and answer honestly: 這套系統真的賺到錢嗎？ */}
+      <div className="mt-2">
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <span className="flex items-center gap-1 text-[9px] font-semibold uppercase tracking-widest text-zinc-500">
+            <ChartColumnBig className="h-3 w-3" aria-hidden />
+            期望值審計（M.E.T.）
+          </span>
+          <span className="flex items-center gap-0.5">
+            {[90, 180, 365].map((d) => (
+              <button
+                key={d}
+                type="button"
+                onClick={() => setExpDays(d)}
+                aria-label={`審計窗口 ${d} 天`}
+                className={cn(
+                  'rounded px-1 py-0.5 font-mono text-[8.5px] transition-colors',
+                  expDays === d ? 'bg-zinc-800 text-zinc-200' : 'text-zinc-600 hover:text-zinc-400',
+                )}
+              >
+                {d}天
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => void loadExpectancy()}
+              className="ml-1 text-zinc-600 hover:text-zinc-400"
+              aria-label="重新計算期望值"
+            >
+              <RefreshCw className={cn('h-3 w-3', expLoading && 'animate-spin')} aria-hidden />
+            </button>
+          </span>
+        </div>
+        {exp?.authError ? (
+          <p className="text-[10px] text-amber-400">API keys 無法解密 — 到 Settings → API keys 重新儲存後才能審計。</p>
+        ) : exp != null && exp.configured === false ? (
+          <p className="text-[10px] leading-4 text-zinc-600">
+            未設定 Alpaca keys — 期望值審計需要真實（Paper/Live）已平倉交易。設定後這裡會用全部平倉紀錄計算 勝率 × 回報風險比 → 期望值與 Profit Factor。
+          </p>
+        ) : expLoading && !exp ? (
+          <p className="text-[10px] text-zinc-600">計算中…</p>
+        ) : !exp || !exp.overall || exp.overall.count === 0 ? (
+          <p className="text-[10px] leading-4 text-zinc-600">
+            近 {exp?.days ?? expDays} 天無已平倉交易 — 讓系統跑出樣本後再審計（Ch.16：不要只挑最好的幾宗，全部符合規則的交易都要算進去）。
+          </p>
+        ) : (() => {
+          const o = exp.overall
+          const good = o.expectancyPct > 0 && (o.profitFactor == null || o.profitFactor > 1)
+          const mid = !good && o.profitFactor != null && o.profitFactor >= 1
+          return (
+            <>
+              <p className={cn('text-[10px] leading-4', good ? 'text-emerald-400' : mid ? 'text-amber-400' : 'text-rose-400')}>{exp.note}</p>
+              <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[9.5px] leading-4 text-zinc-400 sm:grid-cols-3">
+                <span>樣本 <b className="text-zinc-200">{o.count}</b> 宗（勝 {o.wins}/虧 {o.losses}）</span>
+                <span>勝率 <b className="text-zinc-200">{o.winRate.toFixed(1)}%</b></span>
+                <span>盈虧比 <b className="text-zinc-200">{o.payoff != null ? `1:${o.payoff.toFixed(2)}` : '—'}</b></span>
+                <span>均盈 <b className="text-emerald-400">${o.avgWin.toFixed(2)}</b></span>
+                <span>均虧 <b className="text-rose-400">${o.avgLoss.toFixed(2)}</b></span>
+                <span>期望值 <b className={o.expectancyUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'}>${o.expectancyUsd >= 0 ? '+' : ''}{o.expectancyUsd.toFixed(2)}/宗</b></span>
+                <span>Profit Factor <b className="text-zinc-200">{o.profitFactor != null ? o.profitFactor.toFixed(2) : '∞'}</b></span>
+                <span>平衡勝率 <b className="text-zinc-200">{o.breakevenWinRate != null ? `${o.breakevenWinRate.toFixed(1)}%` : '—'}</b></span>
+                <span>最長連虧 <b className="text-zinc-200">{o.longestLossStreak}</b> 宗</span>
+                <span>累計 <b className={o.cumReturnPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>{o.cumReturnPct >= 0 ? '+' : ''}{o.cumReturnPct.toFixed(2)}%</b></span>
+                <span>最大回撤 <b className="text-amber-400">-{o.maxDrawdownPct.toFixed(2)}%</b></span>
+                <span>窗口 <b className="text-zinc-200">{exp.days}</b> 天 · {exp.mode}</span>
+              </div>
+              {exp.ai && (
+                <p className="mt-1 text-[9.5px] leading-4 text-zinc-400">
+                  <span className="text-violet-300">AI 系統子樣本（tta-）</span> — {exp.ai.count} 宗 · 勝率 {exp.ai.winRate.toFixed(1)}% · 盈虧比 {exp.ai.payoff != null ? `1:${exp.ai.payoff.toFixed(2)}` : '—'} · 期望值 ${exp.ai.expectancyUsd >= 0 ? '+' : ''}{exp.ai.expectancyUsd.toFixed(2)}/宗 · PF {exp.ai.profitFactor != null ? exp.ai.profitFactor.toFixed(2) : '∞'}{exp.aiNote ? ` — ${exp.aiNote}` : ''}
+                </p>
+              )}
+              {exp.recovery && exp.recovery.length > 0 && (
+                <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
+                  回本數學（Ch.13 · 非對稱）：{exp.recovery.map((r) => `蝕 ${r.lossPct}% → 賺 ${r.needPct}%`).join(' · ')} — 回撤越小，複利越能工作。
+                </p>
+              )}
+            </>
+          )
+        })()}
+        <p className="mt-1 text-[9px] leading-3.5 text-zinc-600">
+          M.E.T. Ch.12-14 — 賭場三原則：遊戲要有正期望值 · 每注風險夠小（本終端：權益 × {cfg.riskPct}% × 信心/100）· 大量重複執行。勝率 × 回報風險比的組合才是優勢 — 專注提升盈虧比（B 級 ≥2 可接受、A 級 ≥5 優先）比追求高勝率更實際。
+        </p>
+      </div>
 
       {/* activity log */}
       <div className="mt-2">
