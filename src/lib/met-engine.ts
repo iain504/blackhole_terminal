@@ -15,6 +15,18 @@
 //   Ch.16   實作功課：用全部已平倉交易計 勝率 / 均盈均虧 / 期望值 /
 //           Profit Factor，判斷系統是否真的賺到錢 → computeExpectancy()
 //
+// v2.12.62 — the deep-dive course (Edge 1 動能與趨勢 + Edge 2 支持與阻力
+// 八大秘訣) lands as deterministic detectors:
+//
+//   Edge 1  Ch.10-17  強勢趨勢 vs 一般趨勢的解剖（大漲小回 · follow-through
+//           燭身少重疊 · 升量≫跌量 · 回調不破 20MA · 高週期同向）→
+//           trendMomentum() — 強勢趨勢的順勢側是第一重優勢。
+//   Edge 2  Ch.18-28  支持與阻力八大秘訣 → srZoneIntegrity()（秘訣1-2 區間
+//           記憶 + 匯聚區成員；秘訣3 flip 由 priorLow15/priorHigh15 引用；
+//           秘訣4 測試 ≥4 次力量衰竭）+ shakeoutRead()（秘訣5 洗盤/假突破
+//           刺穿收回）+ setupRead()（Ch.13 constructive 整理：縮波動+量縮）
+//           + chaseNote()（Ch.28 MRNA：不追離理想進場 >2% 的價）。
+//
 // All math is pure + client-safe (no fetch, no env) — same contract as
 // strategy-library.ts. Detection reads ONLY ChartSnapshot fields, so a demo
 // snapshot degrades honestly (fewer edges, never invented ones).
@@ -52,15 +64,24 @@ export interface MetContext {
   zone: { lo: number; hi: number; basis: string } | null
   /** 繁中 one-liner for logs + prompt, e.g. 「多 5(w6) vs 空 1(w1) — 偏多 · M.E.T.A.」 */
   summary: string
+  /** v2.12.62 — Edge 1: the symbol's 強勢/一般趨勢 anatomy (Ch.10-17) */
+  tm: TrendMomentum
+  /** v2.12.62 — Edge 2: per-side M.E.T.A. zone integrity (8 secrets) */
+  zones: { long: SrZoneIntegrity | null; short: SrZoneIntegrity | null }
+  /** v2.12.62 — Edge 2 secret 5: shakeout / failed-breakout trap read */
+  shakeout: ShakeoutRead
+  /** v2.12.62 — Ch.13: constructive 整理 (setup) maturity */
+  setup: SetupRead
 }
 
 const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
 
-function summarize(longEdges: MetEdge[], shortEdges: MetEdge[], longW: number, shortW: number, meta: boolean): { leader: MetContext['leader']; dominance: number; summary: string } {
+function summarize(longEdges: MetEdge[], shortEdges: MetEdge[], longW: number, shortW: number, meta: boolean, tm: TrendMomentum): { leader: MetContext['leader']; dominance: number; summary: string } {
   const dominance = Math.abs(longW - shortW)
   const leader: MetContext['leader'] = longW > shortW + 1 ? 'long' : shortW > longW + 1 ? 'short' : 'balanced'
   const side = leader === 'long' ? '偏多' : leader === 'short' ? '偏空' : '勢均力敵'
-  const summary = `多 ${longEdges.length}(w${longW}) vs 空 ${shortEdges.length}(w${shortW}) — ${side}${meta && leader !== 'balanced' ? ' · M.E.T.A.' : ''}`
+  const grade = TREND_GRADE_ZH[tm.grade]
+  const summary = `${grade} · 多 ${longEdges.length}(w${longW}) vs 空 ${shortEdges.length}(w${shortW}) — ${side}${meta && leader !== 'balanced' ? ' · M.E.T.A.' : ''}`
   return { leader, dominance, summary }
 }
 
@@ -68,6 +89,9 @@ function summarize(longEdges: MetEdge[], shortEdges: MetEdge[], longW: number, s
  *  「入場前先問自己三條問題 — 我在這個位置有沒有優勢？有多少個？又有多少
  *  不利因素反對我的假設？」). Deterministic; every rule quotes the course. */
 export function metVerdict(s: ChartSnapshot): MetContext {
+  const tm = trendMomentum(s)
+  const shakeout = shakeoutRead(s)
+  const setup = setupRead(s)
   const px = s.lastClose
   const longEdges: MetEdge[] = []
   const shortEdges: MetEdge[] = []
@@ -131,31 +155,225 @@ export function metVerdict(s: ChartSnapshot): MetContext {
 
   const longW = longEdges.reduce((a, e) => a + e.w, 0)
   const shortW = shortEdges.reduce((a, e) => a + e.w, 0)
-  const { leader, dominance, summary } = summarize(longEdges, shortEdges, longW, shortW, false)
+  const { leader, dominance } = summarize(longEdges, shortEdges, longW, shortW, false, tm)
   const meta = (leader === 'long' ? longEdges.length : shortEdges.length) >= 3 && dominance >= 2 && leader !== 'balanced'
-  const sum2 = summarize(longEdges, shortEdges, longW, shortW, meta)
 
-  // --- M.E.T.A. zone (Ch.8: 「多項技術優勢匯聚、沽壓逐漸減弱的區域」) ---
-  let zone: MetContext['zone'] = null
-  if (leader !== 'balanced' && atr != null) {
-    const lvl = leader === 'long' ? s.srSupport : s.srResistance
-    const touches = leader === 'long' ? s.srSupportTouches : s.srResistanceTouches
-    const ref = leader === 'long' ? s.sma20 : s.sma20
-    if (lvl != null) {
-      const basisParts: string[] = [`測試${leader === 'long' ? '支撐' : '阻力'}${touches ? `×${touches}` : ''}`]
-      // SMA20 confluence (Ch.8 example 2: pullback INTO the 200/20MA cluster)
-      if (ref != null && Math.abs(ref - lvl) <= atr) basisParts.push('SMA20 匯聚')
-      zone = { lo: lvl - atr * 0.5, hi: lvl + atr * 0.5, basis: basisParts.join(' + ') }
-    }
+  // --- v2.12.62 — M.E.T.A. zones per side (Edge 2: 秘訣1-4 zone engine) ---
+  const zones = {
+    long: srZoneIntegrity(s, 'long'),
+    short: srZoneIntegrity(s, 'short'),
   }
+  // leader-side shorthand kept for metZoneText/back-compat
+  const leaderZone = leader === 'short' ? zones.short : zones.long
+  const zone: MetContext['zone'] = leaderZone
+    ? { lo: leaderZone.lo, hi: leaderZone.hi, basis: leaderZone.members.join(' + ') || '測試位' }
+    : null
 
-  return { longEdges, shortEdges, longW, shortW, leader: sum2.leader, dominance: sum2.dominance, meta, zone, summary: sum2.summary }
+  const sum3 = summarize(longEdges, shortEdges, longW, shortW, meta, tm)
+  return { longEdges, shortEdges, longW, shortW, leader: sum3.leader, dominance: sum3.dominance, meta, zone, summary: sum3.summary, tm, zones, shakeout, setup }
 }
 
 /** zone line for the prompt/log — null when no M.E.T.A. zone */
 export function metZoneText(m: MetContext): string | null {
   if (!m.zone) return null
   return `M.E.T.A. 匯聚區 ${fmtPx(m.zone.lo)}–${fmtPx(m.zone.hi)}（${m.zone.basis}）`
+}
+
+// ---- v2.12.62 — Edge 1: Momentum & Trend (Ch.10-17 強勢 vs 一般趨勢) --------
+
+export type TrendGrade = 'STRONG_UP' | 'UP' | 'NEUTRAL' | 'DOWN' | 'STRONG_DOWN'
+
+export const TREND_GRADE_ZH: Record<TrendGrade, string> = {
+  STRONG_UP: '強勢升',
+  UP: '溫和升',
+  NEUTRAL: '無趨勢',
+  DOWN: '溫和跌',
+  STRONG_DOWN: '強勢跌',
+}
+
+export interface TrendMomentum {
+  grade: TrendGrade
+  /** 0-100 anatomy score of the leading side — ≥60 = 強勢 (Ch.17 checklist
+   *  《動能趨勢交易秘訣》), 35-59 = 方向存在但不強勁, below = 一般/無趨勢 */
+  score: number
+  /** 繁中 checklist hits quoted verbatim in the prompt/log */
+  signals: string[]
+  /** 「強勢升 78 · 大漲小回 · 升量>跌量 · 高週期同向」 */
+  summary: string
+}
+
+/** Edge 1 detector — the course's summary table (Ch.17 《動能與趨勢小總結》)
+ *  rendered as a deterministic checklist over ChartSnapshot fields:
+ *   · 大漲小回/大跌小升 → window change ≥5% + position in range ≥68%/≤32%
+ *   · follow-through → MACD histogram expanding with the move
+ *   · 量能 → up/down-bar volume ratio ≥1.3 (升量≫跌量) mirrored
+ *   · 均線 → price above/below SMA20 with SMA20>SMA50 (多頭排列)
+ *   · 波動 → ATR(14) expanding over ATR(50) = 趨勢發動
+ *   · 高週期 → the 4×TF context agrees (±2%)
+ * A STRONG grade means pullbacks held the 20MA and price rides the short
+ * MAs — exactly the stock the course tells you to trade, and never against. */
+export function trendMomentum(s: ChartSnapshot): TrendMomentum {
+  const px = s.lastClose
+  const up: string[] = []
+  let upScore = 0
+  const dn: string[] = []
+  let dnScore = 0
+  const bump = (side: 'up' | 'dn', pts: number, text: string) => {
+    if (side === 'up') { upScore += pts; up.push(text) } else { dnScore += pts; dn.push(text) }
+  }
+
+  // 均線 (Ch.17: 強勢趨勢沿 10/20MA 上行，極少觸及 50MA — 多頭/空頭排列承重)
+  if (s.sma20 != null && s.sma50 != null) {
+    if (px > s.sma20 && s.sma20 > s.sma50) bump('up', 22, '均線多頭排列')
+    else if (px < s.sma20 && s.sma20 < s.sma50) bump('dn', 22, '均線空頭排列')
+  }
+  // follow-through (Ch.11: 燭身少重疊 · 突破後繼續突破 — MACD 柱同步擴張/收縮)
+  if (s.macdHistRising === true) bump('up', 14, 'MACD 柱擴張（跟進走勢）')
+  else if (s.macdHistRising === false) bump('dn', 14, 'MACD 柱收縮（跟進走勢）')
+  // 量能 (Ch.14: 「成交量是一切動能的燃料」— 升放量跌縮量 = 懸殊失衡)
+  if (s.upDownVolRatio != null && Number.isFinite(s.upDownVolRatio)) {
+    if (s.upDownVolRatio >= 1.3) bump('up', 14, `升量 ≫ 跌量（${s.upDownVolRatio.toFixed(1)}×）`)
+    else if (s.upDownVolRatio <= 0.77) bump('dn', 14, `跌量 ≫ 升量（${(1 / s.upDownVolRatio).toFixed(1)}×）`)
+  }
+  if (s.volRatio != null && s.volRatio >= 1.3 && s.changePct >= 0.5) bump('up', 8, `放量發動 ${s.volRatio.toFixed(1)}×`)
+  else if (s.volRatio != null && s.volRatio >= 1.3 && s.changePct <= -0.5) bump('dn', 8, `放量下殺 ${s.volRatio.toFixed(1)}×`)
+  // 大漲小回 (Ch.17: 幅度大 · 需時極短 — 窗口漲跌 ≥5% 且收在高位/低位)
+  if (s.changePct >= 5) bump('up', 8, `波段 +${s.changePct.toFixed(1)}%`)
+  else if (s.changePct <= -5) bump('dn', 8, `波段 ${s.changePct.toFixed(1)}%`)
+  if (s.rangePosPct != null) {
+    if (s.rangePosPct >= 68) bump('up', 10, `收在窗口高位 ${s.rangePosPct.toFixed(0)}%`)
+    else if (s.rangePosPct <= 32) bump('dn', 10, `收在窗口低位 ${s.rangePosPct.toFixed(0)}%`)
+  }
+  // 波動擴張 (強勢趨勢發動時 ATR(14) > ATR(50)；一般趨勢不相上下)
+  if (s.atrPct != null && s.atrPct50 != null && s.atrPct > s.atrPct50) {
+    if (s.changePct > 0) bump('up', 10, '波動擴張（趨勢發動）')
+    else if (s.changePct < 0) bump('dn', 10, '波動擴張（趨勢發動）')
+  }
+  // 高週期同向 (Ch.26-28: higher time frame 支配 lower time frame)
+  if (s.htf) {
+    if (s.htf.changePct >= 2 || (s.htf.sma20 != null && s.htf.sma50 != null && s.htf.sma20 > s.htf.sma50)) bump('up', 10, `高週期同向（${s.htf.label} ${s.htf.changePct >= 0 ? '+' : ''}${s.htf.changePct.toFixed(1)}%）`)
+    else if (s.htf.changePct <= -2 || (s.htf.sma20 != null && s.htf.sma50 != null && s.htf.sma20 < s.htf.sma50)) bump('dn', 10, `高週期同向（${s.htf.label} ${s.htf.changePct.toFixed(1)}%）`)
+  }
+
+  const strong = upScore >= dnScore ? up : dn
+  const score = Math.max(upScore, dnScore)
+  const grade: TrendGrade =
+    score >= 60 ? (upScore >= dnScore ? 'STRONG_UP' : 'STRONG_DOWN')
+    : score >= 35 ? (upScore >= dnScore ? 'UP' : 'DOWN')
+    : 'NEUTRAL'
+  const signals = strong.slice(0, 4)
+  const zh = TREND_GRADE_ZH[grade]
+  const summary = signals.length > 0 ? `${zh} ${score} · ${signals.join(' · ')}` : `${zh}（無趨勢解剖特徵）`
+  return { grade, score, signals, summary }
+}
+
+// ---- v2.12.62 — Edge 2: Support & Resistance 8 secrets (Ch.18-28) ----------
+
+export interface SrZoneIntegrity {
+  side: 'long' | 'short'
+  /** the zone (秘訣2: S/R is a ZONE, never a line) — level ± max(0.5 ATR, 0.4%) */
+  lo: number
+  hi: number
+  /** M.E.T.A. members defending this zone (Ch.8: 越多種交易人同守一個位置越可靠) */
+  members: string[]
+  /** 秘訣2: the stop lives OUTSIDE the zone edge (long: lo−buf · short: hi+buf) */
+  stop: number
+  /** 秘訣4: tested ≥4 times → 力量衰竭 (a volume breakout through it wins) */
+  decayed: boolean
+  /** 「匯聚區 172.3–174.8（測試支撐×3+SMA20 在區內）· SL 171.9 區外」 */
+  text: string
+}
+
+/** Edge 2 zone engine — assembles the M.E.T.A. zone for ONE side from the
+ *  tested level + MA confluence + prior-swing flip reference, then derives
+ *  the course's zone-external stop. Deterministic; null when the snapshot
+ *  has no tested level on that side (never invent one). */
+export function srZoneIntegrity(s: ChartSnapshot, side: 'long' | 'short'): SrZoneIntegrity | null {
+  const px = s.lastClose
+  const lvl = side === 'long' ? s.srSupport : s.srResistance
+  const touches = side === 'long' ? s.srSupportTouches : s.srResistanceTouches
+  if (lvl == null || !Number.isFinite(lvl) || lvl <= 0 || px <= 0) return null
+  const atr = s.atrPct != null && s.atrPct > 0 ? (px * s.atrPct) / 100 : null
+  const half = Math.max(atr != null ? atr * 0.5 : 0, lvl * 0.004)
+  const lo = lvl - half
+  const hi = lvl + half
+  const members: string[] = []
+  if ((touches ?? 0) >= 2) members.push(`測試${side === 'long' ? '支撐' : '阻力'}×${touches}`)
+  if (s.sma20 != null && s.sma20 >= lo && s.sma20 <= hi) members.push('SMA20 在區內')
+  if (s.sma50 != null && s.sma50 >= lo && s.sma50 <= hi) members.push('SMA50 在區內')
+  // 秘訣3 flip: a prior swing extreme inside the zone = the flipped level's
+  // memory (2022-10 S&P500 前浪底支持 → 2020 阻力變支持 examples)
+  const prior = side === 'long' ? s.priorLow15 : s.priorHigh15
+  if (prior != null && prior >= lo * 0.995 && prior <= hi * 1.005) members.push(side === 'long' ? '前浪底 flip 區' : '前浪頂 flip 區')
+  const buf = Math.max(atr != null ? atr * 0.35 : 0, lvl * 0.003)
+  const stop = side === 'long' ? lo - buf : hi + buf
+  const decayed = (touches ?? 0) >= 4
+  const decayTxt = decayed ? ' · 測試過多已衰竭' : ''
+  const text = `匯聚區 ${fmtPx(lo)}–${fmtPx(hi)}${members.length ? `（${members.join('+')}）` : ''} · SL ${fmtPx(stop)} 區外${decayTxt}`
+  return { side, lo, hi, members, stop, decayed, text }
+}
+
+export interface ShakeoutRead {
+  /** the side the TRAP favours (洗盤→long · 假突破→short); null = no read */
+  side: 'long' | 'short' | null
+  text: string
+}
+
+/** Edge 2 secret 5 — overshoot / shakeout (洗盤): price pierces the level
+ *  fast then reclaims it = trap; the trapped side becomes fuel for the
+ *  180° reversal (AMD example). Read from the last-5-bar extreme vs the
+ *  tested level and the close's side of it. */
+export function shakeoutRead(s: ChartSnapshot): ShakeoutRead {
+  if (s.srSupport != null && s.recentLow5 != null && s.recentLow5 < s.srSupport && s.lastClose > s.srSupport) {
+    return { side: 'long', text: '洗盤：低點刺穿支撐已收回 — 回測買點，破位交易人成為燃料' }
+  }
+  if (s.srResistance != null && s.recentHigh5 != null && s.recentHigh5 > s.srResistance && s.lastClose < s.srResistance) {
+    return { side: 'short', text: '假突破：高點破阻力已收回 — 回測沽點，追突破者成為燃料' }
+  }
+  return { side: null, text: '' }
+}
+
+export interface SetupRead {
+  ready: boolean
+  text: string
+}
+
+/** Ch.13 《什麼是 Setup》 — constructive 整理: volatility contracting
+ *  (ATR14 < ATR50) AND volume drying up (5-bar vol below 20-bar avg).
+ *  The course: don't chase the burst; wait for the tight, low-volume
+ *  consolidation, THEN take the trigger. */
+export function setupRead(s: ChartSnapshot): SetupRead {
+  const squeeze = s.atrPct != null && s.atrPct50 != null && s.atrPct < s.atrPct50 * 0.92
+  const dryUp = s.volTrendPct != null && s.volTrendPct < 0
+  if (squeeze && dryUp) {
+    return { ready: true, text: `整理成熟：縮波動 + 量縮 ${s.volTrendPct?.toFixed(0)}% — 等觸發不追` }
+  }
+  return { ready: false, text: '' }
+}
+
+/** Ch.28 MRNA lesson: the gap-down opened 3% below the ideal entry and the
+ *  course DID NOT chase — it waited for the intraday pullback to ~211. A
+ *  trigger >2% from the planning price is a high-chase plan: flag it. */
+export function chaseNote(trigger: number, refPrice: number): string | null {
+  if (!Number.isFinite(trigger) || !Number.isFinite(refPrice) || refPrice <= 0 || trigger <= 0) return null
+  const dist = Math.abs(trigger - refPrice) / refPrice
+  return dist > 0.02 ? `高追 ${(dist * 100).toFixed(1)}%（理想進場 ≤2% 距離）` : null
+}
+
+/** Compose the M.E.T. plan annotation persisted on the ledger row and shown
+ *  on the plan card: trend grade + the adopted side's zone/stop + trap/setup
+ *  reads + the chase flag. ≤160 chars; null when nothing applies. */
+export function metPlanNote(m: MetContext, side: 'buy' | 'sell', trigger: number, refPrice: number): string | null {
+  const bits: string[] = []
+  if (m.tm.grade !== 'NEUTRAL') bits.push(m.tm.summary)
+  const z = m.zones[side === 'buy' ? 'long' : 'short']
+  if (z) bits.push(z.text)
+  if (m.shakeout.side === (side === 'buy' ? 'long' : 'short') && m.shakeout.text) bits.push(m.shakeout.text)
+  if (m.setup.ready) bits.push(m.setup.text)
+  const chase = chaseNote(trigger, refPrice)
+  if (chase) bits.push(chase)
+  const joined = bits.join(' · ')
+  return joined ? joined.slice(0, 160) : null
 }
 
 // ---- R:R tiers (Ch.10-11: 回報風險比優先於勝率) -----------------------------

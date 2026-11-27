@@ -86,6 +86,9 @@ import {
   STRATEGY_LIBRARY, defaultStrategyConfig, sanitizeStrategyConfig,
   screenSymbol, strategyBlockText, type StrategyTuning,
 } from '@/lib/strategy-library'
+// v2.12.62 — the M.E.T. plan annotation (trend grade · 匯聚區/區外 SL ·
+// 洗盤/整理 · 高追) is composed once at plan-creation time and persisted
+import { metPlanNote } from '@/lib/met-engine'
 import { TIMEFRAMES, type Timeframe } from '@/lib/market-types'
 import { useTerminal, watchlistSymbols } from '@/store/terminal'
 import {
@@ -361,6 +364,9 @@ export interface AiVerdictPlan {
   /** v2.12.58 — the adopted candidate's edge score (0-100, deterministic).
    *  null when the plan was not built from a strategy candidate. */
   edge?: number | null
+  /** v2.12.62 — the M.E.T. annotation persisted with the plan (trend grade ·
+   *  匯聚區/區外 SL · 洗盤/整理 reads · 高追 flag) — shown on the plan card. */
+  metNote?: string | null
 }
 
 export type AiPlanStatus = 'WAITING' | 'EXECUTED' | 'INVALIDATED' | 'EXPIRED' | 'GATED' | 'CANCELLED' | 'SUPERSEDED'
@@ -383,6 +389,8 @@ export interface AiPlanVM {
   strategy: string | null
   /** v2.12.58 — the adopted candidate's edge score (0-100) from the ledger */
   edge: number | null
+  /** v2.12.62 — the M.E.T. annotation from the ledger (trend/zone/trap note) */
+  metNote: string | null
   regime: string | null
   mode: string
   status: AiPlanStatus
@@ -657,6 +665,9 @@ function scanInstructionAdjudicate(
     `裁決規則：`,
     `- edge 比較：每個候選附 edge（0-100）與證據清單（趨勢/動量/量能/結構/高週期/位置）。取 edge 較高、證據 ≥2 類獨立同向的一側立計劃；證據互相矛盾或只有單一訊號 → 誠實 flat。`,
     `- M.E.T. 多重優勢（J Law 框架，Ch.6-9）：每個標的的候選行附「M.E.T. 多 X(w…) vs 空 Y(w…)」兩側逐類優勢對比與 M.E.T.A. 匯聚區。入場前先比兩側 — 優勢明顯偏向一側時，逆優勢側候選必須棄用或大幅降信心（−15 以上）；順勢側才可立計劃。M.E.T.A. 匯聚區 = 多項優勢同時匯聚的回調買入/反彈沽出區域：SL 應藏匯聚區外側（跌穿即假設失效），TP 對測試阻力/支撐前 — 這就是 5:1 結構的來源。勢均力敵（balanced）→ flat。`,
+    `- 趨勢是第一重優勢（M.E.T. Edge 1，Ch.10-17）：標的附「趨勢動能」評級（強勢升/強勢跌/溫和/無趨勢 — 大漲小回·跟進走勢·升量≫跌量·均線排列·高週期同向的解剖結果）。強勢升只做買側、強勢跌只做賣側 — 逆強勢趨勢的候選必須棄用（強勢趨勢回調不破 20MA，逆勢勝率低）；溫和/無趨勢 → 證據門檻更高、傾向 flat。`,
+    `- SL 藏匯聚區外側 + 測試衰竭（M.E.T. Edge 2 秘訣1-4）：候選行附建議 SL 位（匯聚區外緣）— 微調 SL 時不得移入區間內側，跌出區間 = 假設失效；「測試×4 已衰竭」標記的位不可再當支撐/阻力依賴（被測試越多次力量越小），帶量穿越衰竭位的突破計劃反而可信。`,
+    `- 洗盤與回測是常態，不追價（M.E.T. Edge 2 秘訣4-6）：附「洗盤/假突破」標記的標的 = 刺穿後收回的陷阱 — 反轉側才是優勢側，回測（back test）進場點優先於追第一次刺穿；「整理成熟」標記 = 縮波動量縮，等觸發不追。觸發價距現價 >2% 屬高追（MRNA 教訓：開市價離理想進場 3% 就等盤中回調）— 候選行標「高追 X%」時 confidence 降 10 或改用回調側。`,
     `- 雙側計劃僅限：買賣兩側來自不同策略、edge 相當（差 ≤ 15）、結構形成明確區間（如「箱體雙向」候選已同時給兩側）— 市場自己選方向，we follow the plan；否則只立較強一側，另一側填 0。`,
     `- 幾何紀律：可微調候選（把觸發價貼近確認位可縮小風險距離、拉高 R:R），但 SL 不可移入結構內側、TP 不可越過其引用的支撐/阻力。終端已移除 TP 重推 — 達不到門檻的計劃會被直接拒絕（結構給不出合理 R:R 就是不該交易），送出前先代入算式自查，無法達標的側填 0。`,
     `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (tp − trigger) ÷ (trigger − sl)；sell R:R = (trigger − tp) ÷ (sl − trigger)。例：現價 100，buy trigger 100.5 / sl 99 / tp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。`,
@@ -1141,7 +1152,11 @@ export async function runScan(): Promise<void> {
       // v2.12.61 — the M.E.T. both-side comparison rides the log too: the
       // operator sees WHY the edge moved (which side owns the symbol)
       const met = cands.find((c) => c.met)?.met
-      st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}${met ? ` · M.E.T. ${met.summary}` : ''}`)
+      // v2.12.62 — Edge 1 grade + zone/trap reads visible before the model answers
+      const metLog = met
+        ? ` · M.E.T. ${met.summary}${met.zones[met.leader === 'short' ? 'short' : 'long']?.text ? ` · ${met.zones[met.leader === 'short' ? 'short' : 'long']!.text}` : ''}${met.shakeout.side != null && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}`
+        : ''
+      st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}${metLog}`)
     }
 
     // 4) batched verdict calls — 6 enriched snapshots + the shared context
@@ -1284,12 +1299,21 @@ export async function runScan(): Promise<void> {
           const hit = candsBySym.get(snap.symbol)?.find((c) => c.strategyId === strategyId && c.side === planSide)
           return hit ? hit.edge : null
         }
+        // v2.12.62 — the adopted candidate's M.E.T. annotation (trend grade ·
+        // 匯聚區/區外 SL · 洗盤/整理 · 高追) rides the plan to the ledger + card
+        const candMetNote = (strategyId: string | null, planSide: 'buy' | 'sell', trigger: number): string | null => {
+          if (!strategyId) return null
+          const hit = candsBySym.get(snap.symbol)?.find((c) => c.strategyId === strategyId && c.side === planSide)
+          if (!hit?.met) return null
+          try { return metPlanNote(hit.met, planSide, trigger, snap.lastClose) } catch { return null }
+        }
         for (const side of ['buy', 'sell'] as const) {
           const raw = reactPlanFromItem(it, side)
           if (!raw) continue
           const edge = candEdge(raw.strategy, side)
+          const metNote = candMetNote(raw.strategy, side, raw.trigger)
           const geo = validatePlanSide(side, snap.lastClose, raw.trigger, raw.tp, raw.sl)
-          const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note, edge })
+          const reject = (note: string) => plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr ?? 0, status: 'rejected', note, edge, metNote })
           if (!geo.ok || geo.rr == null) { reject(geo.reason ?? '計劃未通過驗證'); continue }
           // v2.12.40 — Alpaca spot crypto cannot be shorted: a sell plan the
           // broker can NEVER take dies here with the honest reason, before any
@@ -1317,7 +1341,7 @@ export async function runScan(): Promise<void> {
           if (side === 'sell' && noShort.has(snap.symbol)) { reject(`該標的不可做空${assetMap.get(snap.symbol)?.assetClass === 'crypto' ? '（現貨加密）' : ''}`); continue }
           if (openSyms.has(snap.symbol) || openSyms.has(snap.symbol.replace('/', ''))) { reject('已有該標的持倉'); continue }
           if (snap.demo) { reject('⚠示範K線 — 非真實行情'); continue }
-          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null, strategy: raw.strategy, edge })
+          plans.push({ side, trigger: raw.trigger, tp: raw.tp, sl: raw.sl, rr: geo.rr, status: 'created', note: null, strategy: raw.strategy, edge, metNote })
         }
         v.plans = plans
         const created = plans.filter((p) => p.status === 'created')
@@ -1464,6 +1488,7 @@ export async function runScan(): Promise<void> {
           reason: v.reason,
           strategy: p.strategy ?? null,
           edge: p.edge ?? null,
+          metNote: p.metNote ?? null,
           regime: regimeState,
           earnings: (() => { const ea = earningsBySym.get(v.symbol.replace('/', '').toUpperCase()); return ea ? (ea.inBlock ? 'block' : ea.known && ea.daysAway != null ? String(Math.min(ea.daysAway, 999)) : 'unknown') : null })(),
           mode: cfg.mode,
@@ -1485,7 +1510,7 @@ export async function runScan(): Promise<void> {
             for (const p of v.plans ?? []) {
               if (p.status !== 'created') continue
               const dist = v.refPrice ? ((p.trigger - v.refPrice) / v.refPrice) * 100 : 0
-              st0.addLog('info', `${v.symbol} ${p.side === 'buy' ? '▲buy' : '▼sell'} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}（R:R 1:${p.rr.toFixed(1)} · 距現價 ${dist >= 0 ? '+' : ''}${dist.toFixed(1)}%${p.strategy ? ` · 戰略 ${p.strategy}` : ''}）`)
+              st0.addLog('info', `${v.symbol} ${p.side === 'buy' ? '▲buy' : '▼sell'} 觸發 ${p.trigger} · TP ${p.tp} / SL ${p.sl}（R:R 1:${p.rr.toFixed(1)} · 距現價 ${dist >= 0 ? '+' : ''}${dist.toFixed(1)}%${p.strategy ? ` · 戰略 ${p.strategy}` : ''}）${p.metNote ? ` — M.E.T. ${p.metNote}` : ''}`)
             }
           }
           if (!cfg.enabled) st0.addLog('info', '自動交易開關未開 — 計劃保留，開啟後反應器開始監控')
@@ -1771,6 +1796,7 @@ async function hydratePlans(sig?: AbortSignal): Promise<void> {
         reason: typeof r.reason === 'string' ? r.reason : null,
         strategy: typeof r.strategy === 'string' && r.strategy ? r.strategy : null,
         edge: Number.isFinite(Number(r.edge)) && Number(r.edge) > 0 ? Math.round(Number(r.edge)) : null,
+        metNote: typeof r.metNote === 'string' && r.metNote ? r.metNote : null,
         regime: typeof r.regime === 'string' ? r.regime : null,
         mode: r.mode === 'live' ? 'live' : 'paper',
         status: 'WAITING', statusNote: null,

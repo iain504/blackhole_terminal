@@ -71,6 +71,7 @@ interface PlanIn {
   reason?: unknown
   strategy?: unknown
   edge?: unknown
+  metNote?: unknown
   regime?: unknown
   earnings?: unknown
   mode?: unknown
@@ -113,6 +114,9 @@ function sanitizePlan(p: PlanIn) {
   // v2.12.58 — the adopted candidate's edge score (0-100); anything else is null
   const edgeNum = Math.round(Number(p.edge))
   const edge = Number.isFinite(edgeNum) && edgeNum >= 0 && edgeNum <= 100 ? edgeNum : null
+  // v2.12.62 — the M.E.T. annotation (trend grade · 匯聚區/區外 SL · 洗盤/整理 ·
+  // 高追) composed by the terminal at plan-creation time; ≤160 chars, else null
+  const metNote = typeof p.metNote === 'string' && p.metNote.trim() ? p.metNote.trim().slice(0, 160) : null
   return {
     symbol,
     side,
@@ -126,6 +130,7 @@ function sanitizePlan(p: PlanIn) {
     reason: typeof p.reason === 'string' && p.reason.trim() ? p.reason.trim().slice(0, 120) : null,
     strategy,
     edge,
+    metNote,
     regime,
     earnings,
     mode: p.mode === 'live' ? 'live' : 'paper',
@@ -227,7 +232,9 @@ export async function GET(req: Request) {
         plans: rows.map((r) => ({
           id: r.id, symbol: r.symbol, side: r.side, bias: r.bias, confidence: r.confidence,
           trigger: r.trigger, tp: r.tp, sl: r.sl, rr: r.rr, refPrice: r.refPrice,
-          reason: r.reason, strategy: r.strategy ?? null, edge: r.edge ?? null, regime: r.regime, mode: r.mode, status: r.status,
+          reason: r.reason, strategy: r.strategy ?? null, edge: r.edge ?? null,
+          metNote: r.metNote ?? null,
+          regime: r.regime, mode: r.mode, status: r.status,
           createdAt: r.createdAt.getTime(),
         })),
         executedRecent,

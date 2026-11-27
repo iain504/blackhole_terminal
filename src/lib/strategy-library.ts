@@ -30,7 +30,7 @@ import { PLAN_BAND } from '@/lib/ai-trade-gates'
 // every symbol gets a both-side edge enumeration (Ch.6-9) and the comparison
 // adjusts the candidates' deterministic edge — a setup aligned with the
 // symbol-level edge majority is worth more than one fighting it.
-import { metVerdict, metZoneText, type MetContext } from '@/lib/met-engine'
+import { metVerdict, metZoneText, chaseNote, type MetContext, type TrendGrade } from '@/lib/met-engine'
 
 export interface StrategyParam {
   key: string
@@ -59,6 +59,10 @@ export interface StrategyCandidate {
   evidence: string[]
   /** ≤30 char 繁中 rationale */
   note: string
+  /** v2.12.62 — the snapshot's last close when screened (the no-chase %
+   *  anchor from the MRNA lesson — 觸發距現價 >2% = 高追）. Set by screenSymbol
+   *  for every surviving candidate. */
+  refPrice?: number
   /** v2.12.61 — the symbol-level M.E.T. both-side edge comparison this
    *  candidate rides on (identical for all candidates of one snapshot) */
   met?: MetContext
@@ -589,6 +593,7 @@ export function screenSymbol(s: ChartSnapshot, cfg: Record<string, StrategyTunin
   // symbol-level edge majority is downgraded (−3 per dominance point, cap
   // 15) — Ch.7's 200MA-support example that lost to five short edges — and
   // one aligned with it is upgraded. Clamped to the same 20-95 band.
+  for (const c of all) c.refPrice = s.lastClose
   let met: MetContext | null = null
   try {
     met = metVerdict(s)
@@ -601,6 +606,18 @@ export function screenSymbol(s: ChartSnapshot, cfg: Record<string, StrategyTunin
       const aligned = met.leader === 'long' ? c.side === 'buy' : met.leader === 'short' ? c.side === 'sell' : false
       c.edge = clampN(c.edge + (met.leader === 'balanced' ? 0 : aligned ? delta : -delta), 20, 95)
       c.met = met
+    }
+    // v2.12.62 — Edge 1 (Ch.10-17): 趨勢是第一重優勢。A STRONG trend grade is
+    // the course's own first filter — 「當你懂得判斷趨勢…你就會獲得第一重
+    // 重要的優勢」— so strong-trend-ALIGNED candidates gain +4 and candidates
+    // fighting a strong trend lose −6 (強勢升只做多側、強勢跌只做空側).
+    // UP/DOWN grades adjust nothing (the evidence classes already scored them).
+    const g: TrendGrade = met.tm.grade
+    if (g === 'STRONG_UP' || g === 'STRONG_DOWN') {
+      const strongSide: 'buy' | 'sell' = g === 'STRONG_UP' ? 'buy' : 'sell'
+      for (const c of all) {
+        c.edge = clampN(c.edge + (c.side === strongSide ? 4 : -6), 20, 95)
+      }
     }
   }
   const best = (side: 'buy' | 'sell') =>
@@ -622,7 +639,7 @@ export function strategyBlockText(cands: StrategyCandidate[]): string {
     const trig = `觸發 ${fmtPx(c.trigger)} · SL ${fmtPx(c.sl)} · TP ${fmtPx(c.tp)}`
     const met = c.met
     const metBits = met
-      ? ` | M.E.T. ${met.summary}${metZoneText(met) ? ` · ${metZoneText(met)}` : ''}`
+      ? ` | M.E.T. ${met.summary}${metZoneText(met) ? ` · ${metZoneText(met)}` : ''}${met.zones[c.side === 'buy' ? 'long' : 'short']?.text ? ` · ${met.zones[c.side === 'buy' ? 'long' : 'short']!.text}` : ''}${met.shakeout.side === (c.side === 'buy' ? 'long' : 'short') && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}${c.refPrice ? ` · ${chaseNote(c.trigger, c.refPrice)}` : ''}`
       : ''
     return `${c.side === 'buy' ? '▲' : '▼'} ${c.strategyName}(${c.strategyId}) | ${trig} | R:R 1:${c.rr.toFixed(2)} | edge ${c.edge} | 證據: ${c.evidence.join('+')}${metBits} | ${c.note}`
   })
@@ -631,6 +648,12 @@ export function strategyBlockText(cands: StrategyCandidate[]): string {
   if (met) {
     head.push(
       `[M.E.T. 優勢對比] ${met.summary}${met.zone ? ` · ${metZoneText(met)}` : ''} — 兩側證據逐類對比後，優勢偏向 ${met.leader === 'long' ? '買方' : met.leader === 'short' ? '賣方' : '不明（觀望）'}；edge 已含 ±對比調整。逆優勢側候選應降級或棄用（等優勢匯聚，不見單一信號就入市）。`,
+    )
+    // v2.12.62 — Edge 1 anatomy + Edge 2 trap/setup reads ride the header once
+    const trap = met.shakeout.side != null ? ` · ${met.shakeout.text}` : ''
+    const setup = met.setup.ready ? ` · ${met.setup.text}` : ''
+    head.push(
+      `[M.E.T. 趨勢動能] ${met.tm.summary}${trap}${setup} — Edge 1（Ch.10-17）：強勢趨勢只做順勢側，逆強勢趨勢候選必須棄用；SL 藏匯聚區外側（各候選行附建議 SL 位，跌出區間 = 假設失效）。`,
     )
   }
   return [...head, ...lines].join('\n')

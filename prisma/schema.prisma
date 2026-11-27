@@ -755,6 +755,7 @@ model AiTradePlan {
   reason     String?
   strategy   String? // v2.12.57 — strategy-library playbook id the plan adopted (trend-pullback …)
   edge       Int?    // v2.12.58 — the adopted candidate's deterministic edge score (0-100)
+  metNote    String? // v2.12.62 — M.E.T. annotation (trend grade · 匯聚區/區外 SL · 洗盤/整理 · 高追)
   regime     String? // RISK_ON | NEUTRAL | RISK_OFF | UNKNOWN at plan time
   earnings   String? // 'block' | '<daysAway>' | 'unknown'
   mode       String // 'paper' | 'live' at plan time

@@ -994,6 +994,16 @@ export default function AiAutoTradePanel() {
                           {p.strategy}{p.edge != null ? <span className="ml-0.5 text-violet-200/80">{p.edge}</span> : null}
                         </span>
                       )}
+                      {/* v2.12.62 — M.E.T. annotation chip (Edge 1 趨勢動能 · Edge 2
+                          匯聚區/區外 SL · 洗盤/整理 · 高追) — hover for the full note */}
+                      {p.metNote && (
+                        <span
+                          className="shrink-0 max-w-[46%] truncate rounded border border-amber-500/30 bg-amber-500/10 px-1 text-[8.5px] text-amber-300"
+                          title={`M.E.T.（J Law 深度課）：${p.metNote}`}
+                        >
+                          {p.metNote.startsWith('強勢') ? '◆' : '◇'} {p.metNote}
+                        </span>
+                      )}
                     </span>
                     <span className="shrink-0 text-right font-mono text-[9px] leading-3 text-zinc-400">
                       觸發 {fmtPx(p.trigger)}
