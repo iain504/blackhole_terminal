@@ -668,6 +668,9 @@ function scanInstructionAdjudicate(
     `- 趨勢是第一重優勢（M.E.T. Edge 1，Ch.10-17）：標的附「趨勢動能」評級（強勢升/強勢跌/溫和/無趨勢 — 大漲小回·跟進走勢·升量≫跌量·均線排列·高週期同向的解剖結果）。強勢升只做買側、強勢跌只做賣側 — 逆強勢趨勢的候選必須棄用（強勢趨勢回調不破 20MA，逆勢勝率低）；溫和/無趨勢 → 證據門檻更高、傾向 flat。`,
     `- SL 藏匯聚區外側 + 測試衰竭（M.E.T. Edge 2 秘訣1-4）：候選行附建議 SL 位（匯聚區外緣）— 微調 SL 時不得移入區間內側，跌出區間 = 假設失效；「測試×4 已衰竭」標記的位不可再當支撐/阻力依賴（被測試越多次力量越小），帶量穿越衰竭位的突破計劃反而可信。`,
     `- 洗盤與回測是常態，不追價（M.E.T. Edge 2 秘訣4-6）：附「洗盤/假突破」標記的標的 = 刺穿後收回的陷阱 — 反轉側才是優勢側，回測（back test）進場點優先於追第一次刺穿；「整理成熟」標記 = 縮波動量縮，等觸發不追。觸發價距現價 >2% 屬高追（MRNA 教訓：開市價離理想進場 3% 就等盤中回調）— 候選行標「高追 X%」時 confidence 降 10 或改用回調側。`,
+    `- 均線紀律（M.E.T. EP4）：MA pack 已附 SMA10/20/50/200 + EMA20 與 5 根斜率。均線不可單獨作為進場理由 — 至少再疊 1-2 個其他優勢（測試位/趨勢線/flip 區）；弱勢股跌到 200MA 不是買點（TSLA 教訓），強勢股低量回踩 10/20MA 才是機會（RBLX 教訓）— 「均線支撐/阻力陣列」附語境閘門，「閘門生效」側不得用均線當支撐/阻力依據；SMA20/EMA20 帶 = 可視化支撐/阻力區間（區不是線）；均線被穿越 ≠ 失效，按前文後理判斷。`,
+    `- 止損與再進場（M.E.T. EP4）：止損絕不可放在支撐面上（正常回測就會把你洗出）— 有「第二層」標記時 SL 藏第二層外側；第二層同時是跌破第一層後的再進場計劃（OSCR 教訓：錯過突破/被洗出後仍有回測 10/50MA 的第二次機會，不必 FOMO）。每筆計劃的候選行附出場劇本：趁強賣出（到阻力先減持）/ 趁弱賣出（跌破均線才走）/ 混合 — 趨勢 STRONG 用趁弱、環境 hostile 用趁強；獲利達初始風險 4 倍起分批。`,
+    `- 利潤軟墊（錦囊一）：[利潤軟墊] 行是本引擎已實現淨利 — 新倉風險應由利潤承擔而非本金；軟墊 ≤ 0 時終端已自動將倉位減半（年初/連虧後保守開局），模型應同步壓低 confidence 與出計劃頻率；順手且軟墊豐厚時才按紀律進取（赢谷輸縮），且進取時也只用利潤冒險。`,
     `- 雙側計劃僅限：買賣兩側來自不同策略、edge 相當（差 ≤ 15）、結構形成明確區間（如「箱體雙向」候選已同時給兩側）— 市場自己選方向，we follow the plan；否則只立較強一側，另一側填 0。`,
     `- 幾何紀律：可微調候選（把觸發價貼近確認位可縮小風險距離、拉高 R:R），但 SL 不可移入結構內側、TP 不可越過其引用的支撐/阻力。終端已移除 TP 重推 — 達不到門檻的計劃會被直接拒絕（結構給不出合理 R:R 就是不該交易），送出前先代入算式自查，無法達標的側填 0。`,
     `- ${gateLine}。R:R 由終端以觸發價重算：buy R:R = (tp − trigger) ÷ (trigger − sl)；sell R:R = (trigger − tp) ÷ (sl − trigger)。例：現價 100，buy trigger 100.5 / sl 99 / tp 104 → R:R = 3.5 ÷ 1.5 = 2.33 ✓。`,
@@ -895,6 +898,13 @@ export async function runScan(): Promise<void> {
     let regimeState: GateRegime = null
     let calendarLine: string | null = null
     let perfLine: string | null = null
+    // v2.12.63 — 利潤軟墊 (錦囊一): Σ realized pnl of the engine's closed
+    // trades (filled from /api/trading/history below); null = data unavailable
+    let cushionUsd: number | null = null
+    // v2.12.63 — this round's cumulative NEW open risk, so the fire loop can
+    // enforce 「本輪新倉總風險 ≤ 利潤軟墊」 instead of each trade risking
+    // principal while a cushion exists
+    let roundRiskUsed = 0
     let holdingsLine: string | null = null
     let concLine: string | null = null
     let retroLine: string | null = null
@@ -971,6 +981,10 @@ export async function runScan(): Promise<void> {
       const trades = (Array.isArray(hist?.trades) ? hist.trades : [])
         .filter((t) => t && Number.isFinite(Number(t.pnl)))
         .map((t) => ({ pnl: Number(t.pnl), side: t.side === 'short' ? 'short' : 'long' }))
+      // v2.12.63 — 利潤軟墊 (錦囊一): Σ realized pnl of the engine's closed
+      // trades — the ONLY money new risk should ever draw from. Shared with
+      // the prompt (calibration) and the sizing below (mechanical cap).
+      cushionUsd = trades.length > 0 ? trades.reduce((a, t) => a + t.pnl, 0) : null
       if (trades.length > 0) {
         const ts = trades.slice(0, 100)
         const wins = ts.filter((t) => t.pnl > 0)
@@ -1083,8 +1097,13 @@ export async function runScan(): Promise<void> {
       return lines.length ? `\n${lines.join(' · ')}` : ''
     }
     // the shared block rides EVERY model call (identical across chunks)
+    const cushionPct = cushionUsd != null && equity != null && equity > 0 ? (cushionUsd / equity) * 100 : null
+    const cushionLine = cushionUsd == null
+      ? null
+      : `已實現淨利 $${cushionUsd.toFixed(0)}${cushionPct != null ? `（權益 ${cushionPct >= 0 ? '+' : ''}${cushionPct.toFixed(1)}%）` : ''} — 錦囊一：新倉風險由利潤承擔不用本金；軟墊 ≤0 時終端自動減半倉位（保守開局），順手且軟墊豐厚才按紀律進取（赢谷輸縮）`
     const contextPack = [
       regimeLine ? `[市場環境] ${regimeLine}` : null,
+      cushionLine ? `[利潤軟墊] ${cushionLine}` : null,
       calendarLine ? `[事件] ${calendarLine}` : null,
       perfLine ? `[近期表現（本引擎真實成績 — 校準 confidence 用）] ${perfLine}` : null,
       retroLine ? `[覆盤統計（24h 標記對帳）] ${retroLine}` : null,
@@ -1152,9 +1171,10 @@ export async function runScan(): Promise<void> {
       // v2.12.61 — the M.E.T. both-side comparison rides the log too: the
       // operator sees WHY the edge moved (which side owns the symbol)
       const met = cands.find((c) => c.met)?.met
-      // v2.12.62 — Edge 1 grade + zone/trap reads visible before the model answers
+      // v2.12.62 — Edge 1 grade + zone/trap reads visible before the model answers;
+      // v2.12.63 — EP4 MA stack + 出場劇本 ride the log too
       const metLog = met
-        ? ` · M.E.T. ${met.summary}${met.zones[met.leader === 'short' ? 'short' : 'long']?.text ? ` · ${met.zones[met.leader === 'short' ? 'short' : 'long']!.text}` : ''}${met.shakeout.side != null && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}`
+        ? ` · M.E.T. ${met.summary}${met.zones[met.leader === 'short' ? 'short' : 'long']?.text ? ` · ${met.zones[met.leader === 'short' ? 'short' : 'long']!.text}` : ''}${met.ma.summary ? ` · 均線 ${met.ma.summary}` : ''}${met.shakeout.side != null && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}`
         : ''
       st0.addLog('info', `${s.symbol} 戰略候選 — ${detail}${metLog}`)
     }
@@ -1532,7 +1552,28 @@ export async function runScan(): Promise<void> {
       st0.addLog('success', `${v.symbol} 達標 — ${dirLabel(v.direction)} · 信心 ${v.confidence}% · R:R 1:${v.rr?.toFixed(1)}${v.demoBars ? ' · ⚠示範K線' : ''}`)
       if (equity == null) { v.passed = false; v.rejectReason = '無帳戶權益 — 無法計算倉位'; continue }
       const price = v.entry!
-      const riskAmt = equity * (cfg.riskPct / 100) * (v.confidence / 100)
+      // v2.12.63 — 錦囊一 sizing: 風險預算由利潤軟墊承擔，不是本金。
+      //  · cushion ≤ 0（年初/連虧，沒有軟墊）→ ×0.5 保守開局
+      //  · cushion > 0 → 本輪新倉總風險 ≤ 軟墊（軟墊先花，本金不動）
+      const baseRisk = equity * (cfg.riskPct / 100) * (v.confidence / 100)
+      let riskAmt = baseRisk
+      if (cushionUsd != null && cushionUsd <= 0) {
+        riskAmt *= 0.5
+        st0.addLog('info', `${v.symbol} 利潤軟墊 $${cushionUsd.toFixed(0)} ≤ 0 — 保守開局，風險預算減半（錦囊一：不用本金冒險）`)
+      } else if (cushionUsd != null && cushionUsd > 0) {
+        const remain = cushionUsd - roundRiskUsed
+        if (remain <= 0) {
+          v.passed = false
+          v.rejectReason = `利潤軟墊已用盡（本輪新倉風險 $${roundRiskUsed.toFixed(0)} ≥ 軟墊 $${cushionUsd.toFixed(0)}）— 錦囊一：不用本金冒險`
+          st0.addLog('warn', `${v.symbol} 跳過 — ${v.rejectReason}`)
+          continue
+        }
+        if (riskAmt > remain) {
+          st0.addLog('info', `${v.symbol} 利潤軟墊封頂 — 風險預算 $${riskAmt.toFixed(0)} → $${remain.toFixed(0)}（軟墊 $${cushionUsd.toFixed(0)} · 本輪已用 $${roundRiskUsed.toFixed(0)}）`)
+          riskAmt = remain
+        }
+      }
+      roundRiskUsed += riskAmt
       const perRisk = Math.abs(price - v.stop!)
       let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
       const maxNotional = equity * 0.5
@@ -2015,10 +2056,13 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
     }
     return
   }
-  const [pos, acc, eaRes] = await Promise.all([
+  const [pos, acc, eaRes, histRes] = await Promise.all([
     fetchJson('/api/trading/positions').catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
     fetchJson('/api/trading/account').catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
     fetchJson(`/api/market/earnings?symbols=${encodeURIComponent(p.symbol)}`).catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
+    // v2.12.63 — 利潤軟墊: the reactor sizes from the SAME cushion rule as
+    // the scanner (錦囊一 — risk the profit, never the principal)
+    fetchJson(`/api/trading/history?mode=${cfg.mode}&limit=150`).catch(() => ({ status: 0, j: null as Record<string, unknown> | null })),
   ])
   const posJ = pos.j as { positions?: { symbol?: string; source?: string; sources?: { source?: string }[] }[] } | null
   const posArr = posJ?.positions ?? []
@@ -2100,7 +2144,22 @@ async function executePlan(p: AiPlanVM, last: number): Promise<void> {
   let bp = Number(accJ?.account?.buyingPower)
   if (!Number.isFinite(bp) || bp <= 0) bp = equity
   const price = last
-  const riskAmt = equity * (cfg.riskPct / 100) * (p.confidence / 100)
+  // v2.12.63 — 錦囊一 sizing (react path): cushion ≤ 0 → ×0.5 保守開局;
+  // cushion > 0 → this fill's risk is capped at the cushion (profit finances
+  // the trade, principal stays untouched). Same rule as the scanner.
+  const cushionUsd = (() => {
+    const h = histRes.j as { trades?: { pnl?: number }[] } | null
+    const ts = (Array.isArray(h?.trades) ? h.trades : []).filter((t) => t && Number.isFinite(Number(t.pnl)))
+    return ts.length > 0 ? ts.reduce((a, t) => a + Number(t.pnl), 0) : null
+  })()
+  let riskAmt = equity * (cfg.riskPct / 100) * (p.confidence / 100)
+  if (cushionUsd != null && cushionUsd <= 0) {
+    riskAmt *= 0.5
+    st.addLog('info', `${p.symbol} 利潤軟墊 $${cushionUsd.toFixed(0)} ≤ 0 — 保守開局，風險預算減半（錦囊一）`)
+  } else if (cushionUsd != null && cushionUsd > 0 && riskAmt > cushionUsd) {
+    st.addLog('info', `${p.symbol} 利潤軟墊封頂 — 風險預算 $${riskAmt.toFixed(0)} → $${cushionUsd.toFixed(0)}（錦囊一：不用本金冒險）`)
+    riskAmt = cushionUsd
+  }
   const perRisk = Math.abs(price - p.sl)
   let qty = perRisk > 0 ? Math.floor((riskAmt / perRisk) * 1e4) / 1e4 : 0
   // v2.12.50 — the gate may only SHRINK risk: APPROVE_REDUCED_SIZE scales the

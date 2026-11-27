@@ -619,6 +619,16 @@ export function screenSymbol(s: ChartSnapshot, cfg: Record<string, StrategyTunin
         c.edge = clampN(c.edge + (c.side === strongSide ? 4 : -6), 20, 95)
       }
     }
+    // v2.12.63 — EP4 thrust→reaction texture (Ch.10 APP 5-edge example):
+    // a high-volume thrust + low-volume pullback/bounce is a real entry
+    // advantage for the read's side — aligned candidates +2, the counter
+    // side −2 (bouncing into resistance ON LOW VOLUME is the CAR 沽點).
+    if (met.pullback.side != null) {
+      const pbSide: 'buy' | 'sell' = met.pullback.side === 'long' ? 'buy' : 'sell'
+      for (const c of all) {
+        c.edge = clampN(c.edge + (c.side === pbSide ? 2 : -2), 20, 95)
+      }
+    }
   }
   const best = (side: 'buy' | 'sell') =>
     all.filter((c) => c.side === side).sort((a, b) => b.edge - a.edge)[0] ?? null
@@ -639,7 +649,7 @@ export function strategyBlockText(cands: StrategyCandidate[]): string {
     const trig = `觸發 ${fmtPx(c.trigger)} · SL ${fmtPx(c.sl)} · TP ${fmtPx(c.tp)}`
     const met = c.met
     const metBits = met
-      ? ` | M.E.T. ${met.summary}${metZoneText(met) ? ` · ${metZoneText(met)}` : ''}${met.zones[c.side === 'buy' ? 'long' : 'short']?.text ? ` · ${met.zones[c.side === 'buy' ? 'long' : 'short']!.text}` : ''}${met.shakeout.side === (c.side === 'buy' ? 'long' : 'short') && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}${c.refPrice ? ` · ${chaseNote(c.trigger, c.refPrice)}` : ''}`
+      ? ` | M.E.T. ${met.summary}${metZoneText(met) ? ` · ${metZoneText(met)}` : ''}${met.zones[c.side === 'buy' ? 'long' : 'short']?.text ? ` · ${met.zones[c.side === 'buy' ? 'long' : 'short']!.text}` : ''}${met.layers[c.side === 'buy' ? 'long' : 'short']?.text ? ` · ${met.layers[c.side === 'buy' ? 'long' : 'short']!.text}` : ''}${met.exit[c.side === 'buy' ? 'long' : 'short'].text ? ` · ${met.exit[c.side === 'buy' ? 'long' : 'short'].text}` : ''}${met.shakeout.side === (c.side === 'buy' ? 'long' : 'short') && met.shakeout.text ? ` · ${met.shakeout.text}` : ''}${met.pullback.side === (c.side === 'buy' ? 'long' : 'short') && met.pullback.text ? ` · ${met.pullback.text}` : ''}${met.setup.ready ? ` · ${met.setup.text}` : ''}${c.refPrice ? ` · ${chaseNote(c.trigger, c.refPrice)}` : ''}`
       : ''
     return `${c.side === 'buy' ? '▲' : '▼'} ${c.strategyName}(${c.strategyId}) | ${trig} | R:R 1:${c.rr.toFixed(2)} | edge ${c.edge} | 證據: ${c.evidence.join('+')}${metBits} | ${c.note}`
   })
@@ -655,6 +665,14 @@ export function strategyBlockText(cands: StrategyCandidate[]): string {
     head.push(
       `[M.E.T. 趨勢動能] ${met.tm.summary}${trap}${setup} — Edge 1（Ch.10-17）：強勢趨勢只做順勢側，逆強勢趨勢候選必須棄用；SL 藏匯聚區外側（各候選行附建議 SL 位，跌出區間 = 假設失效）。`,
     )
+    // v2.12.63 — EP4 均線 pack rides the header once: stack + TSLA gate + the
+    // SMA20/EMA20 band + the SL/re-entry discipline (傻豬豬 rule)
+    const maLine = met.ma.summary
+    if (maLine) {
+      head.push(
+        `[M.E.T. 均線] ${maLine} — EP4：均線不可單獨作為進場理由（需疊 ≥1 個其他優勢）；「閘門生效」側不得以均線當支撐/阻力依據（TSLA 200MA 教訓）；止損絕不放支撐面上，有第二層時藏第二層外側，第二層即跌破後的再進場計劃（每個計劃必須附再進場劇本）。`,
+      )
+    }
   }
   return [...head, ...lines].join('\n')
 }

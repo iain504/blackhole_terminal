@@ -72,6 +72,14 @@ export interface MetContext {
   shakeout: ShakeoutRead
   /** v2.12.62 — Ch.13: constructive 整理 (setup) maturity */
   setup: SetupRead
+  /** v2.12.63 — EP4: MA stack per side (10/20/50/200+EMA20) + TSLA gate */
+  ma: MaConfluenceRead
+  /** v2.12.63 — EP4: thrust→reaction bar volume texture (APP/CAR lessons) */
+  pullback: PullbackRead
+  /** v2.12.63 — EP4: the deeper M.E.T.A. layer per side (GFI lesson) */
+  layers: { long: MetaLayer2 | null; short: MetaLayer2 | null }
+  /** v2.12.63 — EP4: 賣出策略 playbook per side (Ch.7-9) */
+  exit: { long: ExitPlaybook; short: ExitPlaybook }
 }
 
 const fmtPx = (n: number) => (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4))
@@ -92,6 +100,10 @@ export function metVerdict(s: ChartSnapshot): MetContext {
   const tm = trendMomentum(s)
   const shakeout = shakeoutRead(s)
   const setup = setupRead(s)
+  // v2.12.63 — EP4 reads (computed before the edge loop: the edge rules
+  // consume the MA gate + pullback texture directly)
+  const metMa = maConfluence(s, tm)
+  const metPullback = pullbackQuality(s, tm)
   const px = s.lastClose
   const longEdges: MetEdge[] = []
   const shortEdges: MetEdge[] = []
@@ -153,6 +165,32 @@ export function metVerdict(s: ChartSnapshot): MetContext {
     else if (s.rangePosPct >= 55) shortEdges.push({ cat: '位置', desc: `窗口位置偏高（${s.rangePosPct.toFixed(0)}%）近阻力`, w: 1 })
   }
 
+  // --- v2.12.63 — EP4 均線 edges (MA as an S/R family member) ---
+  // Ch.21 rule 1: 「移動平均線不可以作為單一的進場理據」 — the stack rides as
+  // ONE edge and only when the TSLA context gate opens (grade supports the
+  // side); a flip-reclaim member (回測收回) is the course's weight-bearing
+  // variant (w=2, SMCI's second-day retest).
+  if (!metMa.long.gated && metMa.long.mas.length > 0) {
+    const names = metMa.long.mas.map((m) => m.name).slice(0, 3).join('/')
+    longEdges.push({ cat: '均線', desc: `均線支撐陣列 ${names}`, w: metMa.long.mas.some((m) => m.flip) ? 2 : 1 })
+    const flipM = metMa.long.mas.find((m) => m.flip)
+    if (flipM) longEdges.push({ cat: '均線', desc: `${flipM.name} 回測收回（支撐重立）`, w: 2 })
+  }
+  if (!metMa.short.gated && metMa.short.mas.length > 0) {
+    const names = metMa.short.mas.map((m) => m.name).slice(0, 3).join('/')
+    shortEdges.push({ cat: '均線', desc: `均線阻力陣列 ${names}`, w: metMa.short.mas.some((m) => m.flip) ? 2 : 1 })
+    const flipM = metMa.short.mas.find((m) => m.flip)
+    if (flipM) shortEdges.push({ cat: '均線', desc: `${flipM.name} 回測受壓（阻力重立）`, w: 2 })
+  }
+  if (metMa.zone20?.priceInside) {
+    if (tm.grade === 'UP' || tm.grade === 'STRONG_UP') longEdges.push({ cat: '均線', desc: '價貼 20MA 帶整理（低吸帶）', w: 1 })
+    else if (tm.grade === 'DOWN' || tm.grade === 'STRONG_DOWN') shortEdges.push({ cat: '均線', desc: '價貼 20MA 帶整理（反彈沽帶）', w: 1 })
+  }
+  // --- v2.12.63 — EP4 量能 edge: thrust→reaction bar texture (APP 5-edge
+  // example: 前一天大陽燭大成交量 + 當日低量拉回 = 短期動力 + 低量優勢) ---
+  if (metPullback.side === 'long') longEdges.push({ cat: '量能', desc: '高量陽線後低量回調', w: 1 })
+  else if (metPullback.side === 'short') shortEdges.push({ cat: '量能', desc: '低量反彈入阻力（沽點）', w: 1 })
+
   const longW = longEdges.reduce((a, e) => a + e.w, 0)
   const shortW = shortEdges.reduce((a, e) => a + e.w, 0)
   const { leader, dominance } = summarize(longEdges, shortEdges, longW, shortW, false, tm)
@@ -163,6 +201,16 @@ export function metVerdict(s: ChartSnapshot): MetContext {
     long: srZoneIntegrity(s, 'long'),
     short: srZoneIntegrity(s, 'short'),
   }
+  // v2.12.63 — EP4: the deeper M.E.T.A. layer (GFI 第一層短暫失守 → 第二層
+  // 才有反應) + the 賣出策略 playbook per side (Ch.7-9)
+  const layers = {
+    long: metaLayer2(s, 'long', zones.long),
+    short: metaLayer2(s, 'short', zones.short),
+  }
+  const exit = {
+    long: exitPlaybook(s, 'long', tm),
+    short: exitPlaybook(s, 'short', tm),
+  }
   // leader-side shorthand kept for metZoneText/back-compat
   const leaderZone = leader === 'short' ? zones.short : zones.long
   const zone: MetContext['zone'] = leaderZone
@@ -170,7 +218,7 @@ export function metVerdict(s: ChartSnapshot): MetContext {
     : null
 
   const sum3 = summarize(longEdges, shortEdges, longW, shortW, meta, tm)
-  return { longEdges, shortEdges, longW, shortW, leader: sum3.leader, dominance: sum3.dominance, meta, zone, summary: sum3.summary, tm, zones, shakeout, setup }
+  return { longEdges, shortEdges, longW, shortW, leader: sum3.leader, dominance: sum3.dominance, meta, zone, summary: sum3.summary, tm, zones, shakeout, setup, ma: metMa, pullback: metPullback, layers, exit }
 }
 
 /** zone line for the prompt/log — null when no M.E.T.A. zone */
@@ -360,15 +408,246 @@ export function chaseNote(trigger: number, refPrice: number): string | null {
   return dist > 0.02 ? `高追 ${(dist * 100).toFixed(1)}%（理想進場 ≤2% 距離）` : null
 }
 
-/** Compose the M.E.T. plan annotation persisted on the ledger row and shown
- *  on the plan card: trend grade + the adopted side's zone/stop + trap/setup
- *  reads + the chase flag. ≤160 chars; null when nothing applies. */
-export function metPlanNote(m: MetContext, side: 'buy' | 'sell', trigger: number, refPrice: number): string | null {
+// ---- v2.12.63 — EP4 移動平均線 (the MA as an S/R family member) -------------
+//
+// Source: J Law EP4 《移動平均線》 — the course's own chapter map:
+//   Ch.1-2   MA 名稱隨時間維度變（10MA ≠ 10天線）· MA 是會移動的趨勢線，
+//            是區間不是死線；穿越後角色反轉（支持↔阻力）。
+//   Ch.3     何時用哪條取決於前文後理：弱勢股跌到 200MA 不是買點（TSLA
+//            2025-02 教訓）；強勢股回踩 10/20MA 不進場就沒機會（RBLX）。
+//   Ch.4     SMA vs EMA 對績效影響不顯著 — 因為 MA 從不單獨使用。
+//   Ch.9     SMCI：同時開 SMA20+EMA20 → 兩條線自動構成可視化區間。
+//   Ch.12    GFI：第一層 M.E.T.A. 短暫失守 → 第二層才有反應；止損千萬
+//            不可放在支撐面上（傻豬豬規則）。
+//   Ch.13-14 OSCR：錯過突破不要 FOMO — 回測 10/50MA + flip 區 = 第二、
+//            三次進場機會；每筆交易必須有再進場計劃。
+//   Ch.7-9   賣出策略：趁強勢賣出（Sell Into Strength）/ 趁弱勢賣出（Sell
+//            Into Weakness）/ 混合 — 錦囊三：策略必須配合市場環境。
+//   Ch.22    錦囊一：用利潤抵消風險，不用本金（profit cushion）。
+
+export interface MaStackSide {
+  /** MAs on this side of the close — support stack BELOW (long) / resistance
+   *  stack ABOVE (short) — within max(1.2 ATR, 1.2%) of the close */
+  mas: { name: string; value: number; slopePct: number | null; flip: boolean }[]
+  /** TSLA gate: the stack only counts for the side the trend grade supports */
+  gated: boolean
+  gateNote: string
+  /** 「支撐陣列 SMA10/20（斜 +0.4%/+0.2%）· SMA20 回測收回」 or '' */
+  text: string
+}
+
+export interface MaConfluenceRead {
+  long: MaStackSide
+  short: MaStackSide
+  /** SMA20/EMA20 pair band (Ch.9: 開兩條 20MA 自動構成可視化區間) */
+  zone20: { lo: number; hi: number; priceInside: boolean; text: string } | null
+  /** compact one-liner for logs/prompt (both sides + band) */
+  summary: string
+}
+
+/** EP4 MA stack reader — enumerates which of SMA10/20/50/200 + EMA20 sit
+ *  within max(1.2 ATR, 1.2%) of the close on each side, with 5-bar slope and
+ *  the Ch.2 role-flip read (last-5 pierce + reclaimed = the MA re-armed as
+ *  that side's level). The Ch.3 TSLA gate closes the long stack unless the
+ *  trend grade supports buying (and mirrors for shorts — a strong stock's
+ *  10/20MA pullback is an ENTRY area, never a shorting edge). */
+export function maConfluence(s: ChartSnapshot, tm: TrendMomentum): MaConfluenceRead {
+  const px = s.lastClose
+  const atrAbs = s.atrPct != null && s.atrPct > 0 ? (px * s.atrPct) / 100 : null
+  const tol = Math.max(atrAbs != null ? atrAbs * 1.2 : 0, px * 0.012)
+  const src: { name: string; value: number; slopePct: number | null }[] = []
+  const add = (name: string, v: number | null, slope: number | null) => {
+    if (v != null && Number.isFinite(v) && v > 0) src.push({ name, value: v, slopePct: slope })
+  }
+  add('SMA10', s.sma10, s.sma10SlopePct)
+  add('SMA20', s.sma20, s.sma20SlopePct)
+  add('EMA20', s.ema20, null)
+  add('SMA50', s.sma50, s.sma50SlopePct)
+  add('SMA200', s.sma200, s.sma200SlopePct)
+
+  const build = (side: 'long' | 'short'): MaStackSide => {
+    const isLong = side === 'long'
+    const mas = src
+      .filter((m) => (isLong ? m.value < px : m.value > px) && Math.abs(m.value - px) <= tol)
+      .map((m) => ({
+        ...m,
+        flip: isLong
+          ? s.recentLow5 != null && s.recentLow5 < m.value && px > m.value
+          : s.recentHigh5 != null && s.recentHigh5 > m.value && px < m.value,
+      }))
+      .sort((a, b) => (isLong ? b.value - a.value : a.value - b.value)) // nearest first
+    const gradeOk = isLong
+      ? tm.grade === 'UP' || tm.grade === 'STRONG_UP'
+      : tm.grade === 'DOWN' || tm.grade === 'STRONG_DOWN'
+    const gated = !gradeOk
+    const gateNote = isLong
+      ? '語境閘門：弱勢/無趨勢股的均線支撐不作數（TSLA 200MA 教訓 — 均線只是位置參考，不是買點）'
+      : '語境閘門：強勢股的均線阻力不追空（回踩 10/20MA 是強勢股的進場區，RBLX 教訓）'
+    let text = ''
+    if (mas.length > 0) {
+      const slopes = mas.slice(0, 3).map((m) => (m.slopePct == null ? '' : ` ${m.slopePct >= 0 ? '+' : ''}${m.slopePct.toFixed(1)}%`)).join('/')
+      const flipName = mas.find((m) => m.flip)?.name
+      text = `${isLong ? '支撐' : '阻力'}陣列 ${mas.map((m) => m.name).join('/')}${slopes ? `（斜${slopes}）` : ''}${flipName ? ` · ${flipName} 回測收回` : ''}${gated ? ' · 閘門生效' : ''}`
+    }
+    return { mas, gated, gateNote, text }
+  }
+
+  const long = build('long')
+  const short = build('short')
+
+  let zone20: MaConfluenceRead['zone20'] = null
+  if (s.sma20 != null && s.ema20 != null && px > 0) {
+    const lo = Math.min(s.sma20, s.ema20)
+    const hi = Math.max(s.sma20, s.ema20)
+    const widthPct = ((hi - lo) / px) * 100
+    if (widthPct <= 1.5) {
+      const priceInside = px >= lo && px <= hi
+      zone20 = {
+        lo, hi, priceInside,
+        text: `20MA 帶 ${fmtPx(lo)}–${fmtPx(hi)}（寬 ${widthPct.toFixed(2)}%）${priceInside ? ' · 價在帶內整理' : ''}`,
+      }
+    }
+  }
+
+  const parts = [long.text ? `多側 ${long.text}` : '', short.text ? `空側 ${short.text}` : '', zone20 ? zone20.text : ''].filter(Boolean)
+  return { long, short, zone20, summary: parts.join(' · ') }
+}
+
+export interface PullbackRead {
+  side: 'long' | 'short' | null
+  text: string
+}
+
+/** EP4 thrust→reaction bar texture (Ch.10 APP: 前一天大陽燭配大成交量，翌日
+ *  低成交量拉回 = 短期動力 + 低量優勢，兩個 edge；Ch.18 CAR: 低量反彈回
+ *  Breakout Level + 20MA 同時阻力 = 沽點). Both bars are read from the
+ *  snapshot's two-bar texture; gated by the trend grade (a thrust into a
+ *  hostile tape is not the course's pattern). */
+export function pullbackQuality(s: ChartSnapshot, tm: TrendMomentum): PullbackRead {
+  const thrustUp = s.prevVolRatio != null && s.prevVolRatio >= 1.2 && (s.prevBarChangePct ?? -99) >= 1
+  const reactDown = s.volRatio != null && s.volRatio <= 0.8 && (s.lastBarChangePct ?? 99) <= 0
+  if (thrustUp && reactDown && (tm.grade === 'UP' || tm.grade === 'STRONG_UP')) {
+    return { side: 'long', text: '高量陽線後低量回調（進場優勢）' }
+  }
+  const thrustDn = s.prevVolRatio != null && s.prevVolRatio >= 1.2 && (s.prevBarChangePct ?? 99) <= -1
+  const reactUp = s.volRatio != null && s.volRatio <= 0.8 && (s.lastBarChangePct ?? -99) >= 0
+  if (thrustDn && reactUp && (tm.grade === 'DOWN' || tm.grade === 'STRONG_DOWN')) {
+    return { side: 'short', text: '低量反彈入阻力（沽點）' }
+  }
+  return { side: null, text: '' }
+}
+
+export interface MetaLayer2 {
+  side: 'long' | 'short'
+  level: number
+  lo: number
+  hi: number
+  /** confluence members defending the deeper layer (GFI: flip 位 + 20MA) */
+  members: string[]
+  /** 「第二層 172.0–173.4（SMA50+前浪底）— SL 藏其外 · 再進場計劃」 */
+  text: string
+}
+
+/** EP4 GFI lesson (Ch.12): the FIRST M.E.T.A. layer can briefly give way —
+ *  price drops to a SECOND layer before reacting. Finds the nearest distinct
+ *  confluence BELOW the long zone (or ABOVE the short zone) built from the
+ *  MA ladder + the prior swing. Ch.25 傻豬豬 rule: the stop NEVER sits on a
+ *  support face — with a layer 2 present it hides beyond it; layer 2 doubles
+ *  as the mandatory re-entry plan (Ch.14). */
+export function metaLayer2(s: ChartSnapshot, side: 'long' | 'short', zone: SrZoneIntegrity | null): MetaLayer2 | null {
+  if (!zone) return null
+  const px = s.lastClose
+  const atrAbs = s.atrPct != null && s.atrPct > 0 ? (px * s.atrPct) / 100 : null
+  if (atrAbs == null) return null
+  const minGap = Math.max(atrAbs * 0.5, zone.lo * 0.004)
+  const src: { name: string; value: number }[] = []
+  const add = (name: string, v: number | null) => {
+    if (v != null && Number.isFinite(v) && v > 0) src.push({ name, value: v })
+  }
+  add('SMA20', s.sma20)
+  add('SMA50', s.sma50)
+  add('SMA200', s.sma200)
+  add(side === 'long' ? '前浪底' : '前浪頂', side === 'long' ? s.priorLow15 : s.priorHigh15)
+  const isLong = side === 'long'
+  const deeper = src.filter((m) => (isLong ? m.value < zone.lo - minGap : m.value > zone.hi + minGap))
+  if (deeper.length === 0) return null
+  deeper.sort((a, b) => (isLong ? b.value - a.value : a.value - b.value)) // nearest distinct layer first
+  const level = deeper[0].value
+  const half = Math.max(atrAbs * 0.5, level * 0.004)
+  const members = deeper.filter((m) => Math.abs(m.value - level) <= half).map((m) => m.name)
+  const lo = level - half
+  const hi = level + half
+  const text = `第二層 ${fmtPx(lo)}–${fmtPx(hi)}（${members.join('+')}）— SL 藏其外 · 跌破第一層後的再進場區`
+  return { side, level, lo, hi, members, text }
+}
+
+export type ExitMode = 'WEAKNESS' | 'STRENGTH' | 'MIXED'
+
+export interface ExitPlaybook {
+  side: 'long' | 'short'
+  mode: ExitMode
+  /** 趁弱賣出 trigger — long: the nearest MA below (close below it = out);
+   *  short: the nearest MA above (close above it = out) */
+  weaknessLevel: number | null
+  /** 趁強賣出 target — the tested wall (resistance for longs, support for
+   *  shorts) or the prior swing when no tested wall is mapped */
+  strengthLevel: number | null
+  /** 「出場混合：到 632 先減持 · 跌破 618 清倉」 */
+  text: string
+}
+
+/** EP4 賣出策略 playbook (Ch.7-9 + 錦囊三). The course's own mapping:
+ *  STRONG trend → sell-into-weakness (hold the leader until the MA breaks —
+ *  the Judy Lai +156.98% SMCI exit); milder trend → mixed or sell-into-
+ *  strength at the wall (protect the giveback when the trend doesn't pay
+ *  for holding). Every plan carries BOTH levels so the exit is pre-planned,
+ *  never improvised. */
+export function exitPlaybook(s: ChartSnapshot, side: 'long' | 'short', tm: TrendMomentum): ExitPlaybook {
+  const px = s.lastClose
+  const isLong = side === 'long'
+  const maList = [
+    { name: 'SMA10', v: s.sma10 },
+    { name: 'SMA20', v: s.sma20 },
+    { name: 'SMA50', v: s.sma50 },
+  ].filter((m) => m.v != null && Number.isFinite(m.v) && m.v > 0) as { name: string; v: number }[]
+  const weaknessLevel = isLong
+    ? maList.filter((m) => m.v < px).sort((a, b) => b.v - a.v)[0]?.v ?? null
+    : maList.filter((m) => m.v > px).sort((a, b) => a.v - b.v)[0]?.v ?? null
+  const strengthLevel = isLong
+    ? (s.srResistance != null && s.srResistance > px ? s.srResistance : s.priorHigh15 != null && s.priorHigh15 > px ? s.priorHigh15 : null)
+    : (s.srSupport != null && s.srSupport < px ? s.srSupport : s.priorLow15 != null && s.priorLow15 < px ? s.priorLow15 : null)
+  const g = tm.grade
+  const strong = isLong ? g === 'STRONG_UP' : g === 'STRONG_DOWN'
+  const hostile = isLong ? g === 'STRONG_DOWN' || g === 'DOWN' : g === 'STRONG_UP' || g === 'UP'
+  const mode: ExitMode = strong
+    ? 'WEAKNESS'
+    : hostile
+      ? 'STRENGTH'
+      : weaknessLevel != null && strengthLevel != null ? 'MIXED' : weaknessLevel != null ? 'WEAKNESS' : 'STRENGTH'
+  const modeZh = mode === 'WEAKNESS' ? '趁弱賣出' : mode === 'STRENGTH' ? '趁強賣出' : '混合'
   const bits: string[] = []
-  if (m.tm.grade !== 'NEUTRAL') bits.push(m.tm.summary)
-  const z = m.zones[side === 'buy' ? 'long' : 'short']
+  if (mode !== 'STRENGTH' && weaknessLevel != null) bits.push(`跌破 ${fmtPx(weaknessLevel)} 走`)
+  if (mode !== 'WEAKNESS' && strengthLevel != null) bits.push(`到 ${fmtPx(strengthLevel)} 減持`)
+  const text = bits.length > 0 ? `出場${modeZh}：${bits.join(' · ')} · 獲利≥4×R 分批` : ''
+  return { side, mode, weaknessLevel, strengthLevel, text }
+}
+
+/** Compose the M.E.T. plan annotation persisted on the ledger row and shown
+ *  on the plan card: trend grade + the adopted side's zone/stop + the deeper
+ *  layer (SL discipline + re-entry) + the exit playbook + trap/chase flags.
+ *  ≤160 chars; null when nothing applies. */
+export function metPlanNote(m: MetContext, side: 'buy' | 'sell', trigger: number, refPrice: number): string | null {
+  const isLong = side === 'buy'
+  const bits: string[] = []
+  if (m.tm.grade !== 'NEUTRAL') bits.push(TREND_GRADE_ZH[m.tm.grade])
+  const z = m.zones[isLong ? 'long' : 'short']
   if (z) bits.push(z.text)
-  if (m.shakeout.side === (side === 'buy' ? 'long' : 'short') && m.shakeout.text) bits.push(m.shakeout.text)
+  const layer = m.layers[isLong ? 'long' : 'short']
+  if (layer) bits.push(layer.text)
+  const exit = m.exit[isLong ? 'long' : 'short']
+  if (exit.text) bits.push(exit.text)
+  if (m.shakeout.side === (isLong ? 'long' : 'short') && m.shakeout.text) bits.push(m.shakeout.text)
+  if (m.pullback.side === (isLong ? 'long' : 'short') && m.pullback.text) bits.push(m.pullback.text)
   if (m.setup.ready) bits.push(m.setup.text)
   const chase = chaseNote(trigger, refPrice)
   if (chase) bits.push(chase)

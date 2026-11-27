@@ -81,6 +81,25 @@ export interface ChartSnapshot {
   recentLow5: number | null // lowest low of the last 5 bars
   priorHigh15: number | null // highest high of bars [6..20] back
   priorLow15: number | null // lowest low of bars [6..20] back
+  // v2.12.63 — EP4 移動平均線 pack (J Law's MA course): the 10/20/50/200 SMA
+  // ladder + EMA20 (the SMA20/EMA20 pair auto-draws the MA zone the course
+  // keeps on screen) + each MA's 5-bar slope (slope = trend strength/direction
+  // — Ch.21 summary point 3). sma200 is computed on the FULL loaded bars (750
+  // on 1D), not the 120-bar analysis window; null when the data can't carry it
+  // (honest degradation — fewer MAs, never invented ones).
+  sma10: number | null
+  sma200: number | null
+  ema20: number | null
+  sma10SlopePct: number | null // 5-bar slope, % of the MA value
+  sma20SlopePct: number | null
+  sma50SlopePct: number | null
+  sma200SlopePct: number | null
+  // last-two-bar volume/price texture (EP4 APP/CAR: 高量陽線後低量回調 =
+  // 進場優勢 · 低量反彈入阻力 = 沽點) — the strategy/pullback detectors read
+  // the thrust bar and the reaction bar separately
+  prevVolRatio: number | null // bar[-2] volume vs 20-bar average
+  prevBarChangePct: number | null // bar[-2] close vs bar[-3] close, %
+  lastBarChangePct: number | null // last bar close vs prior close, %
 }
 
 export interface HigherTfContext {
@@ -199,6 +218,23 @@ function rsi(closes: number[], n = 14): number | null {
   return 100 - 100 / (1 + rs)
 }
 
+/** SMA value ending at a specific index (window slides backwards from `end`). */
+function smaAt(xs: number[], n: number, end: number): number | null {
+  if (end + 1 < n || end >= xs.length) return null
+  let s = 0
+  for (let i = end - n + 1; i <= end; i++) s += xs[i]
+  return s / n
+}
+
+/** 5-bar slope of an MA as % of its current value (Ch.21: 斜度反映趨勢力量
+ *  與方向) — null when the series can't support two MA points 5 bars apart. */
+function slopePct(xs: number[], n: number): number | null {
+  const a = smaAt(xs, n, xs.length - 1)
+  const b = smaAt(xs, n, xs.length - 6)
+  if (a == null || b == null || b === 0) return null
+  return ((a - b) / b) * 100
+}
+
 /** Average true range (simple average of the last n TRs) as % of price. */
 function atrPct(bars: Bar[], n = 14): number | null {
   if (bars.length < n + 1) return null
@@ -223,6 +259,9 @@ export function buildChartSnapshot(
 ): ChartSnapshot {
   const win = bars.slice(-CHART_WINDOW)
   const closes = win.map((b) => b.close)
+  // v2.12.63 — EP4: SMA200/slopes need the full loaded series (750 bars on
+  // 1D), not just the 120-bar window
+  const closesFull = bars.map((b) => b.close)
   const last = closes[closes.length - 1] ?? 0
   const first = closes[0] ?? last
   const vols = win.map((b) => (Number.isFinite(b.volume) ? b.volume : 0))
@@ -297,6 +336,18 @@ export function buildChartSnapshot(
     recentLow5,
     priorHigh15,
     priorLow15,
+    // v2.12.63 — EP4 MA pack: 10/200 SMA + EMA20 + slopes read the FULL
+    // close series (the window is a display frame, not a data ceiling)
+    sma10: smaAt(closesFull, 10, closesFull.length - 1),
+    sma200: smaAt(closesFull, 200, closesFull.length - 1),
+    ema20: ema(closesFull, 20),
+    sma10SlopePct: slopePct(closesFull, 10),
+    sma20SlopePct: slopePct(closesFull, 20),
+    sma50SlopePct: slopePct(closesFull, 50),
+    sma200SlopePct: slopePct(closesFull, 200),
+    prevVolRatio: volAvg && volAvg > 0 && vols.length >= 2 ? vols[vols.length - 2] / volAvg : null,
+    prevBarChangePct: closes.length >= 3 && closes[closes.length - 3] > 0 ? ((closes[closes.length - 2] - closes[closes.length - 3]) / closes[closes.length - 3]) * 100 : null,
+    lastBarChangePct: closes.length >= 2 && closes[closes.length - 2] > 0 ? ((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2]) * 100 : null,
   }
 }
 
@@ -316,6 +367,9 @@ export function snapshotToText(s: ChartSnapshot): string {
     `volume: last vs 20-avg ${n(s.volRatio)}× · up/down-bar volume ${s.upDownVolRatio == null ? 'n/a' : s.upDownVolRatio === Infinity ? 'all up' : n(s.upDownVolRatio)} · 5-bar vs 20-avg trend ${s.volTrendPct == null ? 'n/a' : `${n(s.volTrendPct)}%`}`,
     `nearest S/R: support ${n(s.srSupport, 4)} (${n(s.srSupportPct)}% below, ${s.srSupportTouches ?? 'n/a'} touches) · resistance ${n(s.srResistance, 4)} (${n(s.srResistancePct)}% above, ${s.srResistanceTouches ?? 'n/a'} touches)`,
     `recent swings: last-5-bar high/low ${n(s.recentHigh5, 4)}/${n(s.recentLow5, 4)} · prior-15-bar high/low ${n(s.priorHigh15, 4)}/${n(s.priorLow15, 4)}`,
+    // v2.12.63 — EP4 MA pack + last-two-bar texture
+    `MA pack: SMA10/20/50/200 ${n(s.sma10, 4)}/${n(s.sma20, 4)}/${n(s.sma50, 4)}/${n(s.sma200, 4)} · EMA20 ${n(s.ema20, 4)} · slope(5-bar) ${s.sma10SlopePct == null ? 'n/a' : `${n(s.sma10SlopePct)}%`}/${s.sma20SlopePct == null ? 'n/a' : `${n(s.sma20SlopePct)}%`}/${s.sma50SlopePct == null ? 'n/a' : `${n(s.sma50SlopePct)}%`}/${s.sma200SlopePct == null ? 'n/a' : `${n(s.sma200SlopePct)}%`}`,
+    `last bars: bar[-1] ${s.lastBarChangePct == null ? 'n/a' : `${s.lastBarChangePct >= 0 ? '+' : ''}${n(s.lastBarChangePct)}%`} vol ${n(s.volRatio)}× · bar[-2] ${s.prevBarChangePct == null ? 'n/a' : `${s.prevBarChangePct >= 0 ? '+' : ''}${n(s.prevBarChangePct)}%`} vol ${n(s.prevVolRatio)}×`,
   ]
   if (s.htf) {
     lines.push(
